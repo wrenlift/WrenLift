@@ -1316,6 +1316,119 @@ pub fn take_osr_exit() -> Option<OsrExitRecord> {
     OSR_EXIT.with(|e| e.borrow_mut().take())
 }
 
+/// Baseline code reporting its `count`th entry: proposes the top tier
+/// when the engine's policy says so.
+#[cfg(feature = "host")]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_tier_tick(func_id: u64, count: u64) -> u64 {
+    let vm = read_jit_ctx().vm as *mut crate::runtime::vm::VM;
+    if vm.is_null() {
+        return 0;
+    }
+    // SAFETY: the context's vm pointer is the running VM; compiled code
+    // only runs while it is alive.
+    let vm = unsafe { &mut *vm };
+    vm.engine.native_tick(
+        crate::runtime::engine::FuncId(func_id as u32),
+        count as u32,
+        &vm.interner,
+    );
+    0
+}
+
+/// Baseline code at a loop header whose function has top-tier code:
+/// `buf` holds `n` (register, value) pairs of the header's live-ins.
+/// Runs the top tier's OSR entry for that header to completion and
+/// returns its result, or the internal undefined sentinel when no
+/// entry takes these values, in which case the poll is switched off
+/// for the function.
+///
+/// # Safety
+/// `buf` must point at `2 * n` readable u64s; compiled code passes its
+/// own stack buffer.
+#[cfg(feature = "host")]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64, n: u64) -> u64 {
+    let decline = Value::UNDEFINED.to_bits();
+    let vm = read_jit_ctx().vm as *mut crate::runtime::vm::VM;
+    if vm.is_null() {
+        return decline;
+    }
+    let vm = unsafe { &mut *vm };
+    let id = crate::runtime::engine::FuncId(func_id as u32);
+    let Some(entry) = vm
+        .engine
+        .top_tier_osr_entry(id, crate::mir::BlockId(header as u32))
+    else {
+        vm.engine.stop_retier(id);
+        return decline;
+    };
+    let pairs: Vec<(u32, Value)> = (0..n as usize)
+        .map(|i| unsafe {
+            (
+                *buf.add(2 * i) as u32,
+                Value::from_bits(*buf.add(2 * i + 1)),
+            )
+        })
+        .collect();
+    let integral = |v: Value| {
+        v.as_num()
+            .map(|n| n == n.trunc() && n.abs() <= 9007199254740992.0)
+            .unwrap_or(false)
+    };
+    let mut args: Vec<Value> = Vec::with_capacity(entry.live_in_regs.len());
+    for (i, reg) in entry.live_in_regs.iter().enumerate() {
+        let needs_field = entry.live_in_field.get(i).copied().flatten().is_some();
+        let needs_num = entry.live_in_num.get(i).copied().unwrap_or(false);
+        let needs_int = entry.live_in_int.get(i).copied().unwrap_or(false);
+        let value = pairs.iter().find(|(r, _)| r == reg).map(|(_, v)| *v);
+        match value {
+            Some(v)
+                if !needs_field
+                    && !v.is_undefined()
+                    && !(needs_num && !v.is_num())
+                    && !(needs_int && !integral(v)) =>
+            {
+                args.push(v)
+            }
+            _ => {
+                if env_flag(&OSR_TRACE, "WLIFT_OSR_TRACE") {
+                    eprintln!(
+                        "osr-trace: retier decline FuncId({}) bb{} v{}",
+                        func_id, header, reg
+                    );
+                }
+                vm.engine.stop_retier(id);
+                return decline;
+            }
+        }
+    }
+    let depth = jit_depth();
+    if depth >= MAX_JIT_DEPTH {
+        return decline;
+    }
+    if env_flag(&OSR_TRACE, "WLIFT_OSR_TRACE") {
+        eprintln!(
+            "osr-trace: [{:.2}ms] retier FuncId({}) bb{} argc={}",
+            crate::runtime::engine::trace_clock_ms(),
+            func_id,
+            header,
+            args.len()
+        );
+    }
+    vm.engine.note_osr_entry(id);
+    let saved_func_id = unsafe { (*jit_state()).ctx.current_func_id };
+    unsafe { (*jit_state()).ctx.current_func_id = func_id };
+    set_jit_depth(depth + 1);
+    let f: extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(entry.ptr) };
+    let result = f(args.as_ptr() as *const u64);
+    set_jit_depth(depth);
+    unsafe { (*jit_state()).ctx.current_func_id = saved_func_id };
+    result
+}
+
+static OSR_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 #[inline(always)]
 fn set_current_native_shadow_roots_ptr(ptr: *mut Value) {
     unsafe {
@@ -6012,6 +6125,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Strings
         "wren_string_concat" => Some(wren_string_concat as *const () as usize),
         "wren_osr_exit" => Some(wren_osr_exit as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_tier_tick" => Some(wren_tier_tick as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_retier" => Some(wren_retier as *const () as usize),
         "wren_to_string" => Some(wren_to_string as *const () as usize),
         "wren_const_string" => Some(wren_const_string as *const () as usize),
         // Type checks & guards

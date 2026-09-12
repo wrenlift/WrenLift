@@ -55,8 +55,8 @@ pub mod cl {
     use cranelift_module::{Linkage, Module};
     use std::collections::{HashMap, HashSet};
 
-    const QNAN: u64 = 0x7FFC_0000_0000_0000;
-    const SIGN_BIT: u64 = 1u64 << 63;
+    pub(crate) const QNAN: u64 = 0x7FFC_0000_0000_0000;
+    pub(crate) const SIGN_BIT: u64 = 1u64 << 63;
     /// Top-16-bit pattern for an object NaN-box: `SIGN_BIT | QNAN`. A
     /// receiver Value is an object iff `(value & TAG_OBJ) == TAG_OBJ`
     /// — every other Wren Value (Number, Null, Bool, Undefined,
@@ -65,12 +65,12 @@ pub mod cl {
     /// because the load offset (`HEADER_CLASS`) doesn't fail
     /// "safely" for a non-object: a Number's f64 bits, masked
     /// through PTR_MASK, can land at an unmapped page and SIGSEGV.
-    const TAG_OBJ: u64 = SIGN_BIT | QNAN;
-    const TAG_NULL: u64 = QNAN; // 0x7FFC_0000_0000_0000 — no extra bits
-    const TAG_FALSE: u64 = QNAN | 1;
-    const TAG_TRUE: u64 = QNAN | 2;
+    pub(crate) const TAG_OBJ: u64 = SIGN_BIT | QNAN;
+    pub(crate) const TAG_NULL: u64 = QNAN; // 0x7FFC_0000_0000_0000 — no extra bits
+    pub(crate) const TAG_FALSE: u64 = QNAN | 1;
+    pub(crate) const TAG_TRUE: u64 = QNAN | 2;
     // Note: QNAN | 3 = TAG_UNDEFINED (not null!)
-    const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    pub(crate) const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     /// Emit a guarded receiver-class load: returns `(obj_ptr,
     /// recv_class)` iff the receiver is a NaN-boxed object,
@@ -81,7 +81,7 @@ pub mod cl {
     /// Whether AArch64 `fmov` encodes the value as an immediate
     /// (zero, or ±(16..=31)/16 × 2^(-3..=4)); x86-64 folds the rest
     /// cheaply enough that the same rule is used for both.
-    fn f64_is_fmov_immediate(n: f64) -> bool {
+    pub(crate) fn f64_is_fmov_immediate(n: f64) -> bool {
         if n == 0.0 {
             return true;
         }
@@ -94,7 +94,7 @@ pub mod cl {
         (-3..=4).contains(&exp)
     }
 
-    fn const_f64_of(mir: &MirFunction, vid: ValueId) -> Option<f64> {
+    pub(crate) fn const_f64_of(mir: &MirFunction, vid: ValueId) -> Option<f64> {
         mir.blocks.iter().find_map(|b| {
             b.instructions.iter().find_map(|(d, i)| match i {
                 Instruction::ConstF64(c) if *d == vid => Some(*c),
@@ -103,7 +103,7 @@ pub mod cl {
         })
     }
 
-    fn is_positive_power_of_two(c: f64) -> bool {
+    pub(crate) fn is_positive_power_of_two(c: f64) -> bool {
         c > 0.0
             && c.is_finite()
             && (c.to_bits() & ((1u64 << 52) - 1)) == 0
@@ -951,7 +951,7 @@ pub mod cl {
     // Cache once into a `OnceLock<bool>`.
 
     #[inline]
-    fn env_jit_callsite_ic() -> bool {
+    pub(crate) fn env_jit_callsite_ic() -> bool {
         use std::sync::OnceLock;
         static CACHED: OnceLock<bool> = OnceLock::new();
         *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some())
@@ -992,12 +992,83 @@ pub mod cl {
     /// interpreter.
     const COLD_LOOP_EXIT_AFTER: i64 = 256;
 
-    fn jit_modvars_cell() -> usize {
+    /// What baseline code does for the tier above it: count its entries
+    /// and outermost-loop iterations in `cell`, calling `wren_tier_tick`
+    /// when the count reaches the cell's next tick, and poll the cell's
+    /// re-tier word at each header in `retier_headers` (outermost loops
+    /// only), handing the header's live-ins to `wren_retier` when the
+    /// word is set.
+    #[derive(Clone, Default)]
+    pub struct TierHook {
+        pub func_id: u32,
+        pub cell: usize,
+        pub retier_headers: HashSet<BlockId>,
+    }
+
+    thread_local! {
+        static JIT_TIER_HOOK: std::cell::RefCell<Option<TierHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Set the tier hook for this thread's next compile; `None` clears it.
+    pub fn set_jit_tier_hook(hook: Option<TierHook>) {
+        JIT_TIER_HOOK.with(|c| *c.borrow_mut() = hook);
+    }
+
+    fn jit_tier_hook() -> Option<TierHook> {
+        JIT_TIER_HOOK.with(|c| c.borrow().clone())
+    }
+
+    /// Byte offsets inside `engine::TierCell`.
+    const TIER_CELL_CALLS: i32 = 0;
+    const TIER_CELL_RETIER: i32 = 4;
+    const TIER_CELL_NEXT_TICK: i32 = 8;
+
+    /// Bump the cell's count and call `wren_tier_tick` when it reaches
+    /// the next tick.
+    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
+    fn emit_tier_tick(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        hook: &TierHook,
+    ) -> Result<(), String> {
+        let cell = builder.ins().iconst(types::I64, hook.cell as i64);
+        let c = builder
+            .ins()
+            .uload32(MemFlags::trusted(), cell, TIER_CELL_CALLS);
+        let c1 = builder.ins().iadd_imm_u(c, 1);
+        builder
+            .ins()
+            .istore32(MemFlags::trusted(), c1, cell, TIER_CELL_CALLS);
+        let next = builder
+            .ins()
+            .uload32(MemFlags::trusted(), cell, TIER_CELL_NEXT_TICK);
+        let tick = builder.ins().icmp(IntCC::Equal, c1, next);
+        let tick_block = builder.create_block();
+        let cont_block = builder.create_block();
+        builder.set_cold_block(tick_block);
+        builder.ins().brif(tick, tick_block, &[], cont_block, &[]);
+        builder.switch_to_block(tick_block);
+        let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
+        let f = get_runtime_fn(module, builder, "wren_tier_tick", 2)?;
+        builder.ins().call(f, &[fid, c1]);
+        builder.ins().jump(cont_block, &[]);
+        builder.switch_to_block(cont_block);
+        Ok(())
+    }
+
+    pub(crate) fn jit_modvars_cell() -> usize {
         JIT_MODVARS_CELL.with(|c| c.get())
     }
 
     #[inline]
-    fn env_pure_leaf_direct() -> bool {
+    pub(crate) fn env_pure_leaf_direct() -> bool {
         use std::sync::OnceLock;
         static CACHED: OnceLock<bool> = OnceLock::new();
         *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some())
@@ -1464,13 +1535,13 @@ pub mod cl {
     }
 
     #[derive(Clone)]
-    struct OsrEntryLayout {
-        target_block: BlockId,
-        external_args: Vec<ValueId>,
-        param_count: u16,
+    pub(crate) struct OsrEntryLayout {
+        pub(crate) target_block: BlockId,
+        pub(crate) external_args: Vec<ValueId>,
+        pub(crate) param_count: u16,
     }
 
-    fn should_compile_osr_entries(mir: &MirFunction, interner: &Interner) -> bool {
+    pub(crate) fn should_compile_osr_entries(mir: &MirFunction, interner: &Interner) -> bool {
         // Runtime OSR transfer covers top-level/module frames and now
         // method/closure frames reached from the interpreter. The per-block
         // `osr_entry_layout` analysis still rejects loops whose live-in layout
@@ -1664,7 +1735,7 @@ pub mod cl {
     /// Loop headers of the function: targets of edges whose source they
     /// dominate. Block ids are no guide once passes append blocks out of
     /// order, so this uses dominators.
-    fn collect_osr_targets(mir: &MirFunction) -> Vec<BlockId> {
+    pub(crate) fn collect_osr_targets(mir: &MirFunction) -> Vec<BlockId> {
         use crate::mir::opt::licm::{compute_dominators, compute_rpo};
         let mut with_preds = mir.clone();
         with_preds.compute_predecessors();
@@ -1709,7 +1780,7 @@ pub mod cl {
             .any(|target| target.0 <= block.id.0)
     }
 
-    fn osr_entry_layout(mir: &MirFunction, target: BlockId) -> Option<OsrEntryLayout> {
+    pub(crate) fn osr_entry_layout(mir: &MirFunction, target: BlockId) -> Option<OsrEntryLayout> {
         let target_idx = target.0 as usize;
         let target_block = mir.blocks.get(target_idx)?;
         // Live-ins arrive boxed; the entry unboxes a parameter carried
@@ -1799,106 +1870,8 @@ pub mod cl {
         })
     }
 
-    fn infer_osr_value_types(mir: &MirFunction) -> Vec<MirType> {
-        let mut value_types = vec![MirType::Void; mir.next_value as usize];
-        for block in &mir.blocks {
-            for &(value, ty) in &block.params {
-                value_types[value.0 as usize] = ty;
-            }
-        }
-        for block in &mir.blocks {
-            for &(dst, ref inst) in &block.instructions {
-                let ty = match inst {
-                    Instruction::ConstNum(_)
-                    | Instruction::ConstBool(_)
-                    | Instruction::ConstNull
-                    | Instruction::ConstString(_)
-                    | Instruction::Add(..)
-                    | Instruction::Sub(..)
-                    | Instruction::Mul(..)
-                    | Instruction::Div(..)
-                    | Instruction::Mod(..)
-                    | Instruction::Neg(..)
-                    | Instruction::Box(_)
-                    | Instruction::GetField(..)
-                    | Instruction::GetStaticField(_)
-                    | Instruction::GetModuleVar(_)
-                    | Instruction::Call { .. }
-                    | Instruction::CallKnownFunc { .. }
-                    | Instruction::CallStaticSelf { .. }
-                    | Instruction::SuperCall { .. }
-                    | Instruction::MakeClosure { .. }
-                    | Instruction::GetUpvalue(_)
-                    | Instruction::MakeList(_)
-                    | Instruction::MakeMap(_)
-                    | Instruction::MakeRange(..)
-                    | Instruction::StringConcat(_)
-                    | Instruction::ToString(_)
-                    | Instruction::SubscriptGet { .. }
-                    | Instruction::BitAnd(..)
-                    | Instruction::BitOr(..)
-                    | Instruction::BitXor(..)
-                    | Instruction::BitNot(_)
-                    | Instruction::Shl(..)
-                    | Instruction::Shr(..) => MirType::Value,
-                    Instruction::ConstF64(_)
-                    | Instruction::MathUnaryF64(..)
-                    | Instruction::MathBinaryF64(..)
-                    | Instruction::AddF64(..)
-                    | Instruction::SubF64(..)
-                    | Instruction::MulF64(..)
-                    | Instruction::DivF64(..)
-                    | Instruction::ModF64(..)
-                    | Instruction::NegF64(_)
-                    | Instruction::Unbox(_) => MirType::F64,
-                    Instruction::ConstI64(_) => MirType::I64,
-                    Instruction::CmpLt(..)
-                    | Instruction::CmpGt(..)
-                    | Instruction::CmpLe(..)
-                    | Instruction::CmpGe(..)
-                    | Instruction::CmpEq(..)
-                    | Instruction::CmpNe(..)
-                    | Instruction::CmpLtF64(..)
-                    | Instruction::CmpGtF64(..)
-                    | Instruction::CmpLeF64(..)
-                    | Instruction::CmpGeF64(..)
-                    | Instruction::Not(_)
-                    | Instruction::IsType(..)
-                    | Instruction::ClassIs(..)
-                    | Instruction::ObjectIs(..)
-                    | Instruction::ClosureFnIs(..)
-                    | Instruction::CmpLtI64(..)
-                    | Instruction::CmpGtI64(..)
-                    | Instruction::CmpLeI64(..)
-                    | Instruction::CmpGeI64(..) => MirType::Bool,
-                    Instruction::AddI64(..)
-                    | Instruction::SubI64(..)
-                    | Instruction::MulI64(..)
-                    | Instruction::RemI64(..)
-                    | Instruction::BandI64(..)
-                    | Instruction::NegI64(_) => MirType::I64,
-                    Instruction::I64ToF64(_) => MirType::F64,
-                    Instruction::GuardNum(src)
-                    | Instruction::GuardBool(src)
-                    | Instruction::Move(src)
-                    | Instruction::SetField(_, _, src)
-                    | Instruction::SetStaticField(_, src)
-                    | Instruction::SetModuleVar(_, src)
-                    | Instruction::SetUpvalue(_, src) => value_types[src.0 as usize],
-                    Instruction::GuardClass(src, _) | Instruction::GuardProtocol(src, _) => {
-                        value_types[src.0 as usize]
-                    }
-                    Instruction::SubscriptSet { value, .. } => value_types[value.0 as usize],
-                    Instruction::BlockParam(idx) => block
-                        .params
-                        .get(*idx as usize)
-                        .map(|(_, ty)| *ty)
-                        .unwrap_or(MirType::Value),
-                };
-                value_types[dst.0 as usize] = ty;
-            }
-        }
-        value_types
+    pub(crate) fn infer_osr_value_types(mir: &MirFunction) -> Vec<MirType> {
+        crate::mir::infer_value_types(mir)
     }
 
     fn emit_osr_external_constants(
@@ -2014,6 +1987,9 @@ pub mod cl {
             "wren_bit_shr",
             "wren_alloc_simd4f",
             "wren_alloc_simd4i",
+            "wren_osr_exit",
+            "wren_tier_tick",
+            "wren_retier",
         ];
 
         for name in &names {
@@ -2484,7 +2460,42 @@ pub mod cl {
                 cold_exits.insert(header, (counter, buf, live));
             }
         }
-        let exit_value_types = if cold_exits.is_empty() {
+        // Re-tier polls at outermost loop headers, JIT bodies only.
+        let tier_hook = if aot_config.is_none() && f64_self_id.is_none() {
+            jit_tier_hook()
+        } else {
+            None
+        };
+        let mut retier_polls: HashMap<BlockId, (cranelift_codegen::ir::StackSlot, Vec<ValueId>)> =
+            HashMap::new();
+        if let Some(hook) = &tier_hook {
+            for header in &hook.retier_headers {
+                if header.0 as usize >= mir.blocks.len() {
+                    continue;
+                }
+                // The body's own live-ins at the header; the top tier's
+                // entry names the same registers when it compiled the
+                // same shape, and the transfer declines otherwise.
+                let live: Vec<ValueId> = osr_external_live_values(mir, *header)
+                    .into_iter()
+                    .chain(mir.blocks[header.0 as usize].params.iter().map(|(p, _)| *p))
+                    .collect();
+                if live
+                    .iter()
+                    .any(|v| mir.scalar_param_sources.contains_key(v))
+                {
+                    continue;
+                }
+                let buf =
+                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (live.len().max(1) * 16) as u32,
+                        3,
+                    ));
+                retier_polls.insert(*header, (buf, live));
+            }
+        }
+        let exit_value_types = if cold_exits.is_empty() && retier_polls.is_empty() {
             Vec::new()
         } else {
             infer_osr_value_types(mir)
@@ -3158,31 +3169,7 @@ pub mod cl {
                 builder.set_cold_block(exit_block);
                 builder.ins().brif(hot, exit_block, &[], cont_block, &[]);
                 builder.switch_to_block(exit_block);
-                for (i, vid) in live.iter().enumerate() {
-                    let Some(&v) = val_map.get(vid) else {
-                        return Err(format!("cold exit live-in {:?} undefined", vid));
-                    };
-                    let boxed = match exit_value_types.get(vid.0 as usize) {
-                        Some(MirType::F64) => builder.ins().bitcast(types::I64, MemFlags::new(), v),
-                        Some(MirType::I64) => {
-                            let f = builder.ins().fcvt_from_sint(types::F64, v);
-                            builder.ins().bitcast(types::I64, MemFlags::new(), f)
-                        }
-                        Some(MirType::Bool) if raw_bools.contains(vid) => {
-                            let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
-                            let f = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                            builder.ins().select(v, t, f)
-                        }
-                        _ => v,
-                    };
-                    let reg = builder.ins().iconst(types::I64, vid.0 as i64);
-                    builder
-                        .ins()
-                        .stack_store(types::I64, reg, *buf, (i * 16) as i32);
-                    builder
-                        .ins()
-                        .stack_store(types::I64, boxed, *buf, (i * 16 + 8) as i32);
-                }
+                emit_live_snapshot(builder, live, &val_map, &raw_bools, &exit_value_types, *buf)?;
                 let buf_ptr = builder.ins().stack_addr(types::I64, *buf, 0);
                 let header_id = builder.ins().iconst(types::I64, bid.0 as i64);
                 let n = builder.ins().iconst(types::I64, live.len() as i64);
@@ -3190,6 +3177,59 @@ pub mod cl {
                 let call = builder.ins().call(exit_fn, &[header_id, buf_ptr, n]);
                 let sentinel = builder.inst_results(call)[0];
                 builder.ins().return_(&[sentinel]);
+                builder.switch_to_block(cont_block);
+            }
+
+            if let Some((_, live)) = retier_polls.get(&bid) {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    let missing: Vec<ValueId> = live
+                        .iter()
+                        .copied()
+                        .filter(|v| !val_map.contains_key(v))
+                        .collect();
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "osr-trace: retier poll skipped at bb{} live-ins undefined: {:?}",
+                            bid.0, missing
+                        );
+                    }
+                }
+            }
+            if let (Some(hook), Some((buf, live))) = (
+                &tier_hook,
+                retier_polls
+                    .get(&bid)
+                    .filter(|(_, live)| live.iter().all(|v| val_map.contains_key(v))),
+            ) {
+                emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+                let cell = builder.ins().iconst(types::I64, hook.cell as i64);
+                let word = builder
+                    .ins()
+                    .uload32(MemFlags::trusted(), cell, TIER_CELL_RETIER);
+                let exit_block = builder.create_block();
+                let cont_block = builder.create_block();
+                builder.set_cold_block(exit_block);
+                builder.ins().brif(word, exit_block, &[], cont_block, &[]);
+                builder.switch_to_block(exit_block);
+                emit_live_snapshot(builder, live, &val_map, &raw_bools, &exit_value_types, *buf)?;
+                let buf_ptr = builder.ins().stack_addr(types::I64, *buf, 0);
+                let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
+                let header_id = builder.ins().iconst(types::I64, bid.0 as i64);
+                let n = builder.ins().iconst(types::I64, live.len() as i64);
+                let retier_fn = get_runtime_fn(module, builder, "wren_retier", 4)?;
+                let call = builder.ins().call(retier_fn, &[fid, header_id, buf_ptr, n]);
+                let result = builder.inst_results(call)[0];
+                let undefined = builder.ins().iconst(
+                    types::I64,
+                    crate::runtime::value::Value::UNDEFINED.to_bits() as i64,
+                );
+                let declined = builder.ins().icmp(IntCC::Equal, result, undefined);
+                let ret_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(declined, cont_block, &[], ret_block, &[]);
+                builder.switch_to_block(ret_block);
+                builder.ins().return_(&[result]);
                 builder.switch_to_block(cont_block);
             }
 
@@ -3297,6 +3337,9 @@ pub mod cl {
                 // makes it available to every subsequent GetUpvalue /
                 // SetUpvalue lowering site without re-reading TLS or
                 // calling the per-access helper.
+                if let Some(hook) = tier_hook.as_ref().filter(|h| h.cell != 0) {
+                    emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+                }
                 if let Some(cfg) = aot_config {
                     if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
                         let f = get_runtime_fn(module, builder, "wren_load_jit_closure", 0)?;
@@ -3768,6 +3811,44 @@ pub mod cl {
     }
 
     /// Describes what the fast-path of an inline boxed binary operation does.
+    /// Store `live` into `buf` as `(register, boxed value)` pairs, the
+    /// layout `wren_osr_exit` and `wren_retier` read.
+    fn emit_live_snapshot(
+        builder: &mut FunctionBuilder,
+        live: &[ValueId],
+        val_map: &HashMap<ValueId, Value>,
+        raw_bools: &HashSet<ValueId>,
+        value_types: &[MirType],
+        buf: cranelift_codegen::ir::StackSlot,
+    ) -> Result<(), String> {
+        for (i, vid) in live.iter().enumerate() {
+            let Some(&v) = val_map.get(vid) else {
+                return Err(format!("snapshot live-in {:?} undefined", vid));
+            };
+            let boxed = match value_types.get(vid.0 as usize) {
+                Some(MirType::F64) => builder.ins().bitcast(types::I64, MemFlags::new(), v),
+                Some(MirType::I64) => {
+                    let f = builder.ins().fcvt_from_sint(types::F64, v);
+                    builder.ins().bitcast(types::I64, MemFlags::new(), f)
+                }
+                Some(MirType::Bool) if raw_bools.contains(vid) => {
+                    let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+                    let f = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                    builder.ins().select(v, t, f)
+                }
+                _ => v,
+            };
+            let reg = builder.ins().iconst(types::I64, vid.0 as i64);
+            builder
+                .ins()
+                .stack_store(types::I64, reg, buf, (i * 16) as i32);
+            builder
+                .ins()
+                .stack_store(types::I64, boxed, buf, (i * 16 + 8) as i32);
+        }
+        Ok(())
+    }
+
     enum InlineBinOp {
         /// f64 arithmetic: "fadd", "fsub", "fmul", "fdiv", "frem"
         Arith(&'static str),
@@ -6878,7 +6959,7 @@ pub mod cl {
     /// Compute reverse post-order of MIR blocks starting from bb0.
     /// Guarantees dominators are visited before the blocks they dominate.
     #[allow(dead_code)]
-    fn compute_rpo(mir: &MirFunction) -> Vec<usize> {
+    pub(crate) fn compute_rpo(mir: &MirFunction) -> Vec<usize> {
         let n = mir.blocks.len();
         let mut visited = vec![false; n];
         let mut post_order = Vec::with_capacity(n);
@@ -6908,7 +6989,7 @@ pub mod cl {
         post_order
     }
 
-    fn compute_rpo_from(mir: &MirFunction, start: BlockId) -> Vec<usize> {
+    pub(crate) fn compute_rpo_from(mir: &MirFunction, start: BlockId) -> Vec<usize> {
         let n = mir.blocks.len();
         let mut visited = vec![false; n];
         let mut post_order = Vec::with_capacity(n);

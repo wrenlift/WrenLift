@@ -4857,3 +4857,96 @@ System.print(val)
         assert_eq!(output.trim(), "false", "{:?}", mode);
     }
 }
+
+#[test]
+fn e2e_top_tier_promotion_and_retier_match_interpreter() {
+    // Low thresholds so every shape reaches the top tier inside the
+    // test: methods promoted through their entry count, the module
+    // body's loops transferred mid-loop from baseline code, boxed and
+    // float arithmetic, remainders, math intrinsics, fields, module
+    // variables, closures, lists, maps and strings. Output is compared
+    // with the interpreter.
+    let src = r#"
+class Acc {
+  construct new() {
+    _sum = 0
+    _n = 0
+  }
+  add(x) {
+    _sum = _sum + x
+    _n = _n + 1
+    return this
+  }
+  mean { _n == 0 ? 0 : _sum / _n }
+  sum { _sum }
+}
+class Body {
+  construct new(x, v) {
+    _x = x
+    _v = v
+  }
+  x { _x }
+  v { _v }
+  step(dt) {
+    _x = _x + _v * dt
+    if (_x > 10) _v = -_v
+    if (_x < -10) _v = -_v
+  }
+}
+var total = 0
+var acc = Acc.new()
+var bodies = []
+for (i in 0...8) bodies.add(Body.new(i * 1.5 - 4, (i % 3) - 1.25))
+for (i in 0...20000) {
+  var b = bodies[i % 8]
+  b.step(0.01)
+  acc.add(b.x)
+  total = total + (i % 7) * 0.5 - (i & 3)
+  if (i % 4096 == 0) total = total + (i.sqrt + i.sin.abs).floor
+}
+var names = {}
+var words = ["a", "b", "c", "d"]
+var text = ""
+for (i in 0...3000) {
+  var w = words[i % 4]
+  names[w] = (names[w] || 0) + 1
+  if (i % 1000 == 0) text = text + w + i.toString
+}
+var mul = Fn.new { |a, b| a * b }
+var fsum = 0
+for (i in 0...5000) fsum = fsum + mul.call(i, 2) % 9
+System.print(total)
+System.print(acc.sum.truncate)
+System.print((acc.mean * 1000).round / 1000)
+System.print(bodies.map { |b| (b.x * 100).round / 100 }.toList)
+System.print(names["a"] + names["d"])
+System.print(text)
+System.print(fsum)
+"#;
+    let run = |mode: ExecutionMode| {
+        use std::sync::Arc;
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = errors.clone();
+        let config = VMConfig {
+            error_fn: Some(Box::new(move |_, _, _, msg| {
+                sink.lock().unwrap().push(msg.to_string());
+            })),
+            execution_mode: mode,
+            jit_threshold: 20,
+            opt_threshold: 40,
+            ..VMConfig::default()
+        };
+        let (result, output, _) = run_with_config(src, config);
+        let errors = errors.lock().unwrap().clone();
+        (result, output, errors)
+    };
+    let (r0, expected, e0) = run(ExecutionMode::Interpreter);
+    assert!(matches!(r0, InterpretResult::Success), "{:?}", e0);
+    // Once with the tiers warm in the same process and once in a fresh
+    // engine so the promotion path runs at least twice.
+    for _ in 0..2 {
+        let (r1, output, e1) = run(ExecutionMode::Tiered);
+        assert!(matches!(r1, InterpretResult::Success), "{:?}", e1);
+        assert_eq!(output, expected);
+    }
+}

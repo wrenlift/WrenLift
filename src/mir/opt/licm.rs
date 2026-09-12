@@ -177,8 +177,8 @@ pub(crate) fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
         if cur == a {
             return true;
         }
-        if idom[cur] == cur {
-            return false; // reached entry without finding a
+        if idom[cur] == cur || idom[cur] == usize::MAX {
+            return false; // reached the entry, or an unreachable block
         }
         cur = idom[cur];
     }

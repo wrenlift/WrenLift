@@ -162,7 +162,7 @@ pub fn inline_known_calls(func: &mut MirFunction, sites: &HashMap<ValueId, Known
                         _ => i += 1,
                     }
                 }
-                let mut slow = version_loop(func, &body, &idom);
+                let mut slow = version_loop(func, lp.header, &body, &idom);
                 for s in in_loop {
                     inline_site(func, s.dst, sites, slow.as_mut());
                 }
@@ -185,6 +185,8 @@ fn locate(func: &MirFunction, dst: ValueId) -> Option<(BlockId, usize)> {
 
 /// The generic copy of a versioned loop.
 struct SlowCopy {
+    /// The copy's loop header.
+    header: BlockId,
     /// Blocks of the copy, extended as sites split them.
     blocks: HashSet<BlockId>,
     /// Fast-world value → its clone in the copy.
@@ -213,6 +215,7 @@ fn dominated(idom: &[usize], a: usize, b: usize) -> bool {
 /// the loop, which the exit-parameter rewrite does not handle.
 fn version_loop(
     func: &mut MirFunction,
+    header: BlockId,
     body: &HashSet<BlockId>,
     idom: &[usize],
 ) -> Option<SlowCopy> {
@@ -253,10 +256,11 @@ fn version_loop(
         if needed.is_empty() {
             continue;
         }
+        let types = crate::mir::infer_value_types(func);
         let mut rename: HashMap<ValueId, ValueId> = HashMap::new();
         for &v in &needed {
             let p = func.new_value();
-            func.block_mut(e).params.push((p, MirType::Value));
+            func.block_mut(e).params.push((p, param_type(&types, v)));
             rename.insert(v, p);
         }
         for bi in 0..func.blocks.len() {
@@ -317,10 +321,21 @@ fn version_loop(
         fast_to_slow.iter().map(|(f, s)| (*s, *f)).collect();
     func.osr_excluded.extend(block_map.values().copied());
     Some(SlowCopy {
+        header: block_map[&header],
         blocks: block_map.values().copied().collect(),
         fast_to_slow,
         slow_to_fast,
     })
+}
+
+/// A parameter carrying `v` keeps `v`'s representation; comparison
+/// results travel boxed.
+fn param_type(types: &[MirType], v: ValueId) -> MirType {
+    match types.get(v.0 as usize) {
+        Some(MirType::F64) => MirType::F64,
+        Some(MirType::I64) => MirType::I64,
+        _ => MirType::Value,
+    }
 }
 
 fn append_edge_args(term: &mut Terminator, target: BlockId, extra: &[ValueId]) {
@@ -442,7 +457,7 @@ fn inline_site(
         Some(copy) => {
             let slow_dst = copy.fast_to_slow[&dst];
             copy.slow_to_fast.insert(slow_dst, slow_result);
-            let target = slow_continuation(func, copy, slow_dst);
+            let target = slow_continuation(func, copy, slow_dst, slow_block);
             let args: Vec<ValueId> = func
                 .block(target)
                 .params
@@ -458,7 +473,12 @@ fn inline_site(
 /// Split the slow copy after its own copy of the call and turn every
 /// copy-defined value live there into a parameter of the tail, so the
 /// fast world's guard failure can enter with its own values.
-fn slow_continuation(func: &mut MirFunction, copy: &mut SlowCopy, slow_dst: ValueId) -> BlockId {
+fn slow_continuation(
+    func: &mut MirFunction,
+    copy: &mut SlowCopy,
+    slow_dst: ValueId,
+    slow_block: BlockId,
+) -> BlockId {
     let (block, k) = locate(func, slow_dst).expect("slow copy holds the cloned call");
     let post = split_after(func, block, k);
     func.block_mut(block).terminator = Terminator::Branch {
@@ -467,6 +487,15 @@ fn slow_continuation(func: &mut MirFunction, copy: &mut SlowCopy, slow_dst: Valu
     };
     copy.blocks.insert(post);
 
+    // Dominance inside the copy is that of the loop entered at its
+    // header. Until a site links the fast world in, the copy is
+    // unreachable and every block would look undominated; a provisional
+    // edge from the generic-call block to the header, replaced by the
+    // caller with the real continuation, gives the copy its shape.
+    func.block_mut(slow_block).terminator = Terminator::Branch {
+        target: copy.header,
+        args: Vec::new(),
+    };
     func.compute_predecessors();
     let rpo = compute_rpo(func);
     let idom = compute_dominators(func, &rpo);
@@ -481,10 +510,11 @@ fn slow_continuation(func: &mut MirFunction, copy: &mut SlowCopy, slow_dst: Valu
         .collect();
     needed.sort_by_key(|v| v.0);
 
+    let types = crate::mir::infer_value_types(func);
     let mut rename: HashMap<ValueId, ValueId> = HashMap::new();
     for &v in &needed {
         let p = func.new_value();
-        func.block_mut(post).params.push((p, MirType::Value));
+        func.block_mut(post).params.push((p, param_type(&types, v)));
         rename.insert(v, p);
         let fast = copy.slow_to_fast[&v];
         copy.slow_to_fast.insert(p, fast);

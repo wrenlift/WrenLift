@@ -30,6 +30,116 @@ use crate::mir::MirFunction;
 /// CHA-known sites without a method-cache lookup).
 pub type ChaMap = HashMap<SymbolId, Vec<(usize, u32, usize)>>;
 
+/// Counters baseline code keeps for the tier above it: its own entry
+/// count, and the re-tier word it polls at outermost loop headers,
+/// set once top-tier code with OSR entries is installed. Offsets are
+/// baked into compiled code (`cranelift_backend::TIER_CELL_*`).
+#[repr(C)]
+#[derive(Default)]
+pub struct TierCell {
+    pub calls: std::sync::atomic::AtomicU32,
+    pub retier: std::sync::atomic::AtomicU32,
+    /// The count at which the code next calls `wren_tier_tick`; the
+    /// helper moves it, so the call happens only when a decision can
+    /// change.
+    pub next_tick: std::sync::atomic::AtomicU32,
+}
+
+impl TierCell {
+    fn set_next_tick(&self, at: u32) {
+        self.next_tick
+            .store(at, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One thread with a bounded queue for top-tier compiles, the shape of
+/// beadie's promotion broker: a full queue rejects the proposal and the
+/// function is re-proposed later.
+#[cfg(feature = "host")]
+struct Promoter {
+    tx: mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(feature = "host")]
+impl Promoter {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(256);
+        std::thread::Builder::new()
+            .name("wlift-promoter".into())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .expect("spawn promoter thread");
+        Self { tx }
+    }
+
+    fn submit(&self, job: Box<dyn FnOnce() + Send>) -> bool {
+        self.tx.try_send(job).is_ok()
+    }
+}
+
+/// `WLIFT_PROMOTE_GATE=0` proposes every hot function to the top tier;
+/// unset keeps the worth gate. Safe to run with either way.
+fn promotion_gate_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WLIFT_PROMOTE_GATE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// What the top tier could win on a function, judged from its MIR
+/// before a compile is spent: nothing for a loop-free body that is
+/// mostly a call, little for a loop whose body is mostly calls, and
+/// the rest for a loop with real work between the calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopTierCeiling {
+    None,
+    Low,
+    High,
+}
+
+pub fn top_tier_ceiling(mir: &MirFunction) -> TopTierCeiling {
+    use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
+    use crate::mir::Instruction;
+    let is_call = |i: &Instruction| {
+        matches!(
+            i,
+            Instruction::Call { .. }
+                | Instruction::CallKnownFunc { .. }
+                | Instruction::CallStaticSelf { .. }
+                | Instruction::SuperCall { .. }
+        )
+    };
+    let instrs: usize = mir.blocks.iter().map(|b| b.instructions.len()).sum();
+    let calls: usize = mir
+        .blocks
+        .iter()
+        .map(|b| b.instructions.iter().filter(|(_, i)| is_call(i)).count())
+        .sum();
+    if mir.blocks.is_empty() {
+        return TopTierCeiling::None;
+    }
+    let mut with_preds = mir.clone();
+    with_preds.compute_predecessors();
+    let rpo = compute_rpo(&with_preds);
+    let idom = compute_dominators(&with_preds, &rpo);
+    if detect_loops(&with_preds, &idom).is_empty() {
+        if instrs.saturating_sub(calls) <= 8 {
+            return TopTierCeiling::None;
+        }
+        return TopTierCeiling::Low;
+    }
+    if calls * 3 >= instrs {
+        TopTierCeiling::Low
+    } else {
+        TopTierCeiling::High
+    }
+}
+
 /// Optional shared CHA snapshot threaded through codegen.
 pub type SharedCha = Option<Arc<ChaMap>>;
 
@@ -627,6 +737,19 @@ pub struct ExecutionEngine {
     pub optimized_leaf: Vec<bool>,
     /// Optimized native metadata indexed by FuncId.
     pub optimized_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
+    /// Per function, the counters its baseline code reads and writes;
+    /// boxed so the address baked into the code stays valid.
+    #[allow(clippy::vec_box)]
+    tier_cells: Vec<Box<TierCell>>,
+    /// Invocation count before which the top tier is not proposed again
+    /// for the function (a declined proposal doubles it).
+    promote_retry_at: Vec<u32>,
+    /// Functions the top tier will never take: the worth gate refused
+    /// them or their compile failed.
+    promote_refused: Vec<bool>,
+    /// The thread top-tier compiles run on, started on first use.
+    #[cfg(feature = "host")]
+    promoter: Option<Promoter>,
     /// Bytecode pointers indexed by FuncId. O(1) lookup for bytecode dispatch.
     /// null entries mean bytecode not yet compiled for this function.
     pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
@@ -877,6 +1000,11 @@ impl ExecutionEngine {
             optimized_osr_entries: Vec::new(),
             optimized_leaf: Vec::new(),
             optimized_metadata: Vec::new(),
+            tier_cells: Vec::new(),
+            promote_retry_at: Vec::new(),
+            promote_refused: Vec::new(),
+            #[cfg(feature = "host")]
+            promoter: None,
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
@@ -935,6 +1063,9 @@ impl ExecutionEngine {
         self.optimized_osr_entries.push(Vec::new());
         self.optimized_leaf.push(false);
         self.optimized_metadata.push(None);
+        self.tier_cells.push(Box::new(TierCell::default()));
+        self.promote_retry_at.push(0);
+        self.promote_refused.push(false);
         self.bc_cache.push(std::ptr::null());
         #[cfg(feature = "host")]
         self.threaded_code.push(None); // None = not yet checked
@@ -2664,6 +2795,11 @@ impl ExecutionEngine {
                 self.optimized_leaf[idx] = inline_safe;
                 self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
+                if !native_ptr.is_null() && !osr_entries.is_empty() {
+                    self.tier_cells[idx]
+                        .retier
+                        .store(1, std::sync::atomic::Ordering::Release);
+                }
                 // Swap both pointer and OSR table atomically to
                 // optimized tier. Beadie bumps the bead's generation
                 // so stale baseline OSR lookups can't race.
@@ -2790,24 +2926,140 @@ impl ExecutionEngine {
                 // count first equals `jit_threshold`.
                 self.tier.should_promote_on_tick(id, self.jit_threshold)
             }
-            Some(FuncBody::Native {
-                optimized_executable,
-                ..
-            }) if optimized_executable.is_none()
-                && self.tier_states.get(idx).copied() == Some(TierState::BaselineNative)
-                && self.compiling_tier.get(idx).copied().flatten().is_none() =>
-            {
-                // Optimized tier-up uses the SAME bead counter, just with
-                // an absolute threshold of (baseline_threshold + opt_threshold).
-                // Since the counter is monotonically increasing and
-                // comparison is exact equality, this fires exactly once
-                // per function — matching the legacy `opt_call_count ==
-                // opt_threshold` semantics without a second counter.
-                let total = self.jit_threshold.saturating_add(self.opt_threshold);
-                self.tier.should_promote_on_tick(id, total)
+            Some(FuncBody::Native { .. }) => {
+                self.tier.tick(id);
+                let count = self.tier.invocations(id);
+                self.propose_top_tier(idx, count)
             }
             _ => false,
         }
+    }
+
+    /// Invocation count at which the top tier is proposed: the
+    /// threshold less a fifth, so the compile is queued ahead of it.
+    pub fn top_tier_queue_at(&self) -> u32 {
+        self.opt_threshold
+            .saturating_sub(self.opt_threshold / 5)
+            .max(1)
+    }
+
+    /// Whether `count` invocations of a baseline-compiled function
+    /// propose the top tier now. The proposal is compared with `>=`, so
+    /// it fires until the compile is queued; a function whose baseline
+    /// is not installed, whose compile is in flight, or which the tier
+    /// refused is never proposed.
+    fn propose_top_tier(&self, idx: usize, count: u32) -> bool {
+        if crate::codegen::top_tier() == crate::codegen::TopTier::Off {
+            return false;
+        }
+        if self.promote_refused.get(idx).copied().unwrap_or(true) {
+            return false;
+        }
+        if self.tier_states.get(idx).copied() != Some(TierState::BaselineNative)
+            || self.compiling_tier.get(idx).copied().flatten().is_some()
+        {
+            return false;
+        }
+        match self.functions.get(idx) {
+            Some(FuncBody::Native {
+                optimized_executable,
+                ..
+            }) if optimized_executable.is_none() => {}
+            _ => return false,
+        }
+        count >= self.top_tier_queue_at() && count >= self.promote_retry_at[idx]
+    }
+
+    /// Baseline code's own entry count crossing a sampling point.
+    #[cfg(feature = "host")]
+    pub fn native_tick(&mut self, id: FuncId, count: u32, interner: &crate::intern::Interner) {
+        if self.mode != ExecutionMode::Tiered {
+            return;
+        }
+        if tier_trace_enabled() {
+            eprintln!(
+                "tier-trace: [{:.2}ms] tick FuncId({}) count={}",
+                trace_clock_ms(),
+                id.0,
+                count
+            );
+        }
+        let idx = id.0 as usize;
+        // Native code is a safepoint for installs too; nothing running
+        // is dropped, the lower tier's code stays owned by the function.
+        self.poll_compilations();
+        if self.propose_top_tier(idx, count) {
+            self.request_tier_up(id, interner);
+        }
+        let Some(cell) = self.tier_cells.get(idx) else {
+            return;
+        };
+        let settled = self.promote_refused[idx]
+            || self.tier_states[idx] == TierState::OptimizedNative
+            || crate::codegen::top_tier() == crate::codegen::TopTier::Off;
+        if settled {
+            cell.set_next_tick(u32::MAX);
+        } else if self.compiling_tier[idx].is_some() {
+            // Compile in flight: come back to install it.
+            cell.set_next_tick(count.saturating_add(4096));
+        } else {
+            cell.set_next_tick(
+                count
+                    .saturating_add(64)
+                    .max(self.promote_retry_at[idx])
+                    .max(self.top_tier_queue_at()),
+            );
+        }
+    }
+
+    /// The top tier's OSR entry for a loop header, once installed.
+    pub fn top_tier_osr_entry(
+        &self,
+        id: FuncId,
+        header: crate::mir::BlockId,
+    ) -> Option<NativeOsrEntry> {
+        let idx = id.0 as usize;
+        if self.tier_states.get(idx).copied() != Some(TierState::OptimizedNative) {
+            return None;
+        }
+        self.optimized_osr_entries
+            .get(idx)?
+            .iter()
+            .find(|e| e.target_block == header)
+            .cloned()
+    }
+
+    /// Stop baseline code polling for a transfer into the top tier.
+    pub fn stop_retier(&self, id: FuncId) {
+        if let Some(cell) = self.tier_cells.get(id.0 as usize) {
+            cell.retier.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Outermost loop headers of `mir`, the points baseline code polls
+    /// for a transfer into the top tier.
+    fn retier_headers(mir: &MirFunction) -> std::collections::HashSet<crate::mir::BlockId> {
+        use crate::mir::opt::licm::{
+            compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
+        };
+        let mut out = std::collections::HashSet::new();
+        if mir.blocks.is_empty() {
+            return out;
+        }
+        let mut with_preds = mir.clone();
+        with_preds.compute_predecessors();
+        let rpo = compute_rpo(&with_preds);
+        let idom = compute_dominators(&with_preds, &rpo);
+        let loops = merge_loops_by_header(&detect_loops(&with_preds, &idom));
+        for lp in &loops {
+            let nested = loops
+                .iter()
+                .any(|other| other.header != lp.header && other.body.contains(&lp.header));
+            if !nested {
+                out.insert(lp.header);
+            }
+        }
+        out
     }
 
     /// Sample argument types during interpretation for profile-guided compilation.
@@ -3043,14 +3295,6 @@ impl ExecutionEngine {
                 }
             }
         }
-        // Don't start optimized-tier compilation while any other compile
-        // is in flight — the optimizer can hang on complex functions and
-        // would block all progress. `pending_count` is bumped per submit
-        // and decremented in `poll_compilations`, so it reflects all
-        // baseline submissions currently walking the broker's pipeline.
-        if tier == CompileTier::Optimized && self.pending_count != 0 {
-            return;
-        }
         if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
             return;
         }
@@ -3058,6 +3302,34 @@ impl ExecutionEngine {
             return;
         };
         let mir = Arc::clone(body.mir());
+        if tier == CompileTier::Optimized {
+            if crate::codegen::top_tier() == crate::codegen::TopTier::Off {
+                return;
+            }
+            if promotion_gate_enabled() && top_tier_ceiling(&mir) == TopTierCeiling::None {
+                self.promote_refused[idx] = true;
+                if tier_trace_enabled() {
+                    eprintln!(
+                        "tier-trace: [{:.2}ms] skip Optimized FuncId({}) reason=no-headroom",
+                        trace_clock_ms(),
+                        id.0
+                    );
+                }
+                return;
+            }
+        }
+        let tier_hook = if tier == CompileTier::Baseline
+            && crate::codegen::top_tier() != crate::codegen::TopTier::Off
+        {
+            self.tier_cells[idx].set_next_tick(self.top_tier_queue_at());
+            Some(crate::codegen::cranelift_backend::cl::TierHook {
+                func_id: id.0,
+                cell: self.tier_cells[idx].as_ref() as *const TierCell as usize,
+                retier_headers: Self::retier_headers(&mir),
+            })
+        } else {
+            None
+        };
         let sroa_mir = self.scalar_replaced(id, &mir, interner);
         let profile = self.get_type_profile(id).cloned();
         let trace_name = self
@@ -3166,6 +3438,7 @@ impl ExecutionEngine {
             }
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
             crate::codegen::cranelift_backend::cl::set_jit_cold_headers(cold);
+            crate::codegen::cranelift_backend::cl::set_jit_tier_hook(tier_hook);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -3180,6 +3453,7 @@ impl ExecutionEngine {
                 cha_for_codegen.clone(),
             );
             crate::codegen::cranelift_backend::cl::set_jit_cold_headers(Default::default());
+            crate::codegen::cranelift_backend::cl::set_jit_tier_hook(None);
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
             let result = result
                 .map_err(|e| {
@@ -3253,12 +3527,21 @@ impl ExecutionEngine {
         // through the same channel, where the install swaps the bead's
         // code and OSR table.
         if tier == CompileTier::Optimized {
-            std::thread::Builder::new()
-                .name(format!("wlift-opt-{}", id.0))
-                .spawn(move || {
-                    let _ = compile_fn();
-                })
-                .ok();
+            let promoter = self.promoter.get_or_insert_with(Promoter::start);
+            if !promoter.submit(Box::new(move || {
+                let _ = compile_fn();
+            })) {
+                // Nothing is in flight; propose again at double the count.
+                self.compiling_tier[idx] = None;
+                self.pending_count = self.pending_count.saturating_sub(1);
+                let count = self.tier.invocations(id).max(
+                    self.tier_cells[idx]
+                        .calls
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                self.promote_retry_at[idx] = count.saturating_mul(2).max(count + 1);
+                self.tier_cells[idx].set_next_tick(self.promote_retry_at[idx]);
+            }
             return;
         }
         let submit_result = self
@@ -3315,6 +3598,13 @@ impl ExecutionEngine {
                 }
             }
             if idx < self.functions.len() {
+                if matches!(result, CompilationResult::Failed { .. })
+                    && self.compiling_tier.get(idx).copied().flatten()
+                        == Some(CompileTier::Optimized)
+                {
+                    // The same compile fails the same way; never re-propose.
+                    self.promote_refused[idx] = true;
+                }
                 if let CompilationResult::Compiled {
                     tier,
                     executable,

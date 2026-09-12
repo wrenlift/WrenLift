@@ -24,6 +24,8 @@ pub mod aot_state_machine;
 pub mod cfg;
 #[cfg(feature = "cranelift")]
 pub mod cranelift_backend;
+#[cfg(feature = "llvm")]
+pub mod llvm_backend;
 pub mod native_meta;
 pub mod regalloc;
 // `runtime_fns` is mostly small TLS / context shims that the BC
@@ -1908,6 +1910,9 @@ pub enum CompiledFunction {
     /// Cranelift-compiled code (owns the JIT module memory).
     #[cfg(feature = "cranelift")]
     CraneliftOwned(cranelift_backend::cl::CraneliftCompiledCode),
+    /// LLVM-compiled code (owns the execution engine).
+    #[cfg(feature = "llvm")]
+    LlvmOwned(llvm_backend::llvm::LlvmCompiledCode),
     /// WebAssembly module bytes.
     Wasm(wasm::WasmModule),
 }
@@ -1969,6 +1974,8 @@ impl CompiledFunction {
             CompiledFunction::Aarch64(code) => Ok(ExecutableFunction::Aarch64(code)),
             #[cfg(feature = "cranelift")]
             CompiledFunction::CraneliftOwned(cl) => Ok(ExecutableFunction::Cranelift(cl)),
+            #[cfg(feature = "llvm")]
+            CompiledFunction::LlvmOwned(l) => Ok(ExecutableFunction::Llvm(l)),
             CompiledFunction::Wasm(_) => {
                 Err("WASM modules cannot be made directly executable; use a WASM runtime".into())
             }
@@ -1997,6 +2004,8 @@ pub enum ExecutableFunction {
     Aarch64(aarch64::CompiledCode),
     #[cfg(feature = "cranelift")]
     Cranelift(cranelift_backend::cl::CraneliftCompiledCode),
+    #[cfg(feature = "llvm")]
+    Llvm(llvm_backend::llvm::LlvmCompiledCode),
 }
 
 impl ExecutableFunction {
@@ -2013,6 +2022,8 @@ impl ExecutableFunction {
             ExecutableFunction::Aarch64(code) => code.as_fn(),
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(cl) => std::mem::transmute_copy(&cl.fn_ptr),
+            #[cfg(feature = "llvm")]
+            ExecutableFunction::Llvm(l) => std::mem::transmute_copy(&l.fn_ptr),
             #[allow(unreachable_patterns)]
             _ => panic!("ExecutableFunction::as_fn called on a wasm-only build"),
         }
@@ -2023,6 +2034,8 @@ impl ExecutableFunction {
         match self {
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(cl) => cl.fn_ptr,
+            #[cfg(feature = "llvm")]
+            ExecutableFunction::Llvm(l) => l.fn_ptr,
             _ => unsafe { self.as_fn::<*const u8>() },
         }
     }
@@ -2032,6 +2045,8 @@ impl ExecutableFunction {
         match self {
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(cl) => &cl.osr_entries,
+            #[cfg(feature = "llvm")]
+            ExecutableFunction::Llvm(l) => &l.osr_entries,
             _ => &[],
         }
     }
@@ -2045,6 +2060,8 @@ impl ExecutableFunction {
             ExecutableFunction::Aarch64(_) => true,
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(_) => true,
+            #[cfg(feature = "llvm")]
+            ExecutableFunction::Llvm(_) => true,
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -2063,6 +2080,51 @@ impl ExecutableFunction {
             _ => 0,
         }
     }
+}
+
+/// Which backend the optimised tier uses. `WLIFT_TIER1=off|cranelift|llvm`;
+/// the default is llvm when built with the `llvm` feature and the GC scans
+/// native frames conservatively, cranelift otherwise. Safe to set at any time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopTier {
+    Off,
+    Cranelift,
+    Llvm,
+}
+
+pub fn top_tier() -> TopTier {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<TopTier> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let default = if cfg!(feature = "llvm")
+            && !crate::runtime::gc_trait::jit_needs_write_barriers()
+        {
+            TopTier::Llvm
+        } else {
+            TopTier::Cranelift
+        };
+        match std::env::var("WLIFT_TIER1").as_deref() {
+            Ok("off") | Ok("0") => TopTier::Off,
+            Ok("cranelift") => TopTier::Cranelift,
+            Ok("llvm") => {
+                if cfg!(feature = "llvm") {
+                    TopTier::Llvm
+                } else {
+                    eprintln!("[tier] WLIFT_TIER1=llvm but this build has no llvm feature; using cranelift");
+                    TopTier::Cranelift
+                }
+            }
+            Ok(other) if !other.is_empty() => {
+                eprintln!("[tier] ignoring WLIFT_TIER1='{other}' (expected off|cranelift|llvm)");
+                default
+            }
+            _ => default,
+        }
+    })
+}
+
+pub fn top_tier_is_llvm() -> bool {
+    top_tier() == TopTier::Llvm
 }
 
 /// Compile a MIR function to native code or WASM for the given target.
@@ -2255,6 +2317,23 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             } else {
                 mir
             };
+            #[cfg(feature = "llvm")]
+            if compile_tier == CompileTier::Optimized && top_tier_is_llvm() {
+                let compiled = llvm_backend::llvm::compile_mir(
+                    mir_ref,
+                    interner,
+                    callsite_ic_ptrs.as_deref(),
+                    callsite_ic_live_ptrs.as_deref(),
+                    jit_code_base,
+                    inline_bodies.clone(),
+                    cha_by_method.clone(),
+                )?;
+                return Ok(CompiledArtifact {
+                    code: CompiledFunction::LlvmOwned(compiled),
+                    native_meta: None,
+                    needs_shadow_frame: false,
+                });
+            }
             let mut compiled = cranelift_backend::cl::compile_mir(
                 mir_ref,
                 interner,

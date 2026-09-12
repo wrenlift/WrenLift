@@ -1,0 +1,2245 @@
+//! LLVM top tier.
+//!
+//! Lowers the same MIR the optimised Cranelift tier takes to LLVM IR
+//! and compiles it with MCJIT. The generated code has the same ABI as
+//! the Cranelift tier: every parameter and the result are NaN-boxed
+//! `i64`s, runtime helpers are the `wren_*` functions reached through
+//! their addresses, and each loop header that qualifies gets an OSR
+//! entry taking a pointer to its live-ins.
+//!
+//! Block parameters live in `alloca`s so the lowering can store to
+//! them on every edge without building phis; mem2reg in the O2
+//! pipeline turns them back into SSA.
+#[cfg(feature = "llvm")]
+pub mod llvm {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use inkwell::attributes::AttributeLoc;
+    use inkwell::basic_block::BasicBlock;
+    use inkwell::builder::Builder;
+    use inkwell::context::Context;
+    use inkwell::execution_engine::ExecutionEngine;
+    use inkwell::intrinsics::Intrinsic;
+    use inkwell::module::Module;
+    use inkwell::passes::PassBuilderOptions;
+    use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
+    use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
+    use inkwell::values::{
+        BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue,
+        PointerValue,
+    };
+    use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
+
+    use crate::codegen::cranelift_backend::cl::{
+        collect_osr_targets, const_f64_of, env_jit_callsite_ic, env_pure_leaf_direct,
+        infer_osr_value_types, is_positive_power_of_two, jit_modvars_cell, osr_entry_layout,
+        should_compile_osr_entries, OsrEntryLayout, PTR_MASK, QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ,
+        TAG_TRUE,
+    };
+    use crate::codegen::NativeOsrEntry;
+    use crate::intern::Interner;
+    use crate::mir::{
+        osr_reachable_blocks, osr_rematerializable_defs, BlockId, Instruction, MirFunction,
+        MirType, Terminator, ValueId,
+    };
+    use crate::runtime::object_layout::*;
+
+    /// Compiled output of the LLVM tier. The engine owns the code; the
+    /// context outlives it (fields drop in order).
+    pub struct LlvmCompiledCode {
+        pub fn_ptr: *const u8,
+        pub osr_entries: Vec<NativeOsrEntry>,
+        _engine: ExecutionEngine<'static>,
+        _context: Box<Context>,
+    }
+
+    // SAFETY: the engine's memory is self-contained; nothing else
+    // touches the context after the compile.
+    unsafe impl Send for LlvmCompiledCode {}
+    unsafe impl Sync for LlvmCompiledCode {}
+
+    type InlineBodies = Arc<HashMap<u32, Arc<MirFunction>>>;
+
+    /// An OSR entry awaiting its address: target block, parameter
+    /// count, symbol, and the live-in register descriptions.
+    type OsrDef = (
+        BlockId,
+        u16,
+        String,
+        Vec<u32>,
+        Vec<bool>,
+        Vec<Option<u16>>,
+        Vec<bool>,
+    );
+
+    /// `WLIFT_LLVM_IR=1` prints every module after optimisation.
+    fn env_llvm_ir() -> bool {
+        std::env::var_os("WLIFT_LLVM_IR").is_some()
+    }
+
+    /// `WLIFT_LLVM_PASSES` overrides the middle-end pipeline; `off` skips it.
+    fn pass_spec() -> String {
+        std::env::var("WLIFT_LLVM_PASSES").unwrap_or_else(|_| "default<O2>".to_string())
+    }
+
+    /// `WLIFT_LLVM_CODEGEN=0|1|2|3` sets MCJIT's code generation level.
+    fn codegen_level() -> OptimizationLevel {
+        match std::env::var("WLIFT_LLVM_CODEGEN").as_deref() {
+            Ok("0") => OptimizationLevel::None,
+            Ok("1") => OptimizationLevel::Less,
+            Ok("3") => OptimizationLevel::Aggressive,
+            _ => OptimizationLevel::Default,
+        }
+    }
+
+    fn init_llvm() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            Target::initialize_native(&InitializationConfig::default())
+                .expect("native target init");
+            ExecutionEngine::link_in_mc_jit();
+        });
+    }
+
+    fn host_target_machine() -> Result<TargetMachine, String> {
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
+        let cpu = TargetMachine::get_host_cpu_name().to_string();
+        let features = TargetMachine::get_host_cpu_features().to_string();
+        target
+            .create_target_machine(
+                &triple,
+                &cpu,
+                &features,
+                OptimizationLevel::Aggressive,
+                RelocMode::Default,
+                CodeModel::JITDefault,
+            )
+            .ok_or_else(|| "no target machine for host".to_string())
+    }
+
+    /// Compile a MIR function with LLVM. Same inputs as the Cranelift
+    /// tier so the two lower identical MIR.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_mir(
+        mir: &MirFunction,
+        interner: &Interner,
+        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&[usize]>,
+        jit_code_base: Option<*const *const u8>,
+        inline_bodies: Option<InlineBodies>,
+        cha_by_method: crate::runtime::engine::SharedCha,
+    ) -> Result<LlvmCompiledCode, String> {
+        init_llvm();
+        let t0 = std::time::Instant::now();
+        let context = Box::new(Context::create());
+        // SAFETY: the box lives in the returned struct and drops after
+        // the engine, so nothing built from this reference outlives it.
+        let ctx: &'static Context = unsafe { &*(Box::as_ref(&context) as *const Context) };
+        let func_name = interner.resolve(mir.name);
+        let safe_name = format!(
+            "wlift_{}",
+            func_name.replace(['(', ')', ',', ' ', '='], "_")
+        );
+        let module = ctx.create_module(&safe_name);
+        let machine = host_target_machine()?;
+        module.set_triple(&machine.get_triple());
+        module.set_data_layout(&machine.get_target_data().get_data_layout());
+
+        let i64t = ctx.i64_type();
+        let ptr_ty = ctx.ptr_type(AddressSpace::default());
+        let params: Vec<BasicMetadataTypeEnum> =
+            (0..mir.arity as usize).map(|_| i64t.into()).collect();
+        let main_ty = i64t.fn_type(&params, false);
+        let main_fn = module.add_function(&safe_name, main_ty, None);
+        stamp_function(ctx, &machine, main_fn);
+
+        // Every OSR header that qualifies; the body is lowered once with
+        // an entry switch over the main entry and these.
+        let mut layouts: Vec<OsrEntryLayout> = Vec::new();
+        if should_compile_osr_entries(mir, interner) {
+            for target in collect_osr_targets(mir) {
+                if let Some(layout) = osr_entry_layout(mir, target) {
+                    layouts.push(layout);
+                }
+            }
+        }
+
+        let shared = Shared {
+            ctx,
+            module: &module,
+            machine: &machine,
+            mir,
+            callsite_ic_ptrs,
+            callsite_ic_live_ptrs,
+            jit_code_base,
+            inline_bodies: inline_bodies.as_ref(),
+            cha_by_method: cha_by_method.as_deref(),
+            main_fn,
+        };
+
+        let mut osr_defs: Vec<OsrDef> = Vec::new();
+        if layouts.is_empty() {
+            Lower::new(&shared, main_fn, &[]).run()?;
+        } else {
+            // `body(which, args)`: which 0 is the main entry with the
+            // parameters in `args`, which k the k-th header with its
+            // live-ins there. Kept out of line so the trampolines stay
+            // one call each instead of copies of the body.
+            let body_ty = i64t.fn_type(&[i64t.into(), ptr_ty.into()], false);
+            let body_fn = module.add_function(&format!("{}_body", safe_name), body_ty, None);
+            stamp_function(ctx, &machine, body_fn);
+            body_fn.add_attribute(
+                AttributeLoc::Function,
+                ctx.create_enum_attribute(
+                    inkwell::attributes::Attribute::get_named_enum_kind_id("noinline"),
+                    0,
+                ),
+            );
+            Lower::new(&shared, body_fn, &layouts).run()?;
+
+            let b = ctx.create_builder();
+            let entry = ctx.append_basic_block(main_fn, "entry");
+            b.position_at_end(entry);
+            let n = (mir.arity as usize).max(1);
+            let buf = b
+                .build_alloca(i64t.array_type(n as u32), "args")
+                .map_err(|e| e.to_string())?;
+            for i in 0..mir.arity as usize {
+                let slot = unsafe {
+                    b.build_in_bounds_gep(i64t, buf, &[i64t.const_int(i as u64, false)], "slot")
+                }
+                .map_err(|e| e.to_string())?;
+                b.build_store(slot, main_fn.get_nth_param(i as u32).unwrap())
+                    .map_err(|e| e.to_string())?;
+            }
+            let r = b
+                .build_call(body_fn, &[i64t.const_zero().into(), buf.into()], "r")
+                .map_err(|e| e.to_string())?
+                .try_as_basic_value()
+                .basic()
+                .unwrap();
+            b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+
+            let i64_params: HashSet<ValueId> = mir
+                .blocks
+                .iter()
+                .flat_map(|b| b.params.iter())
+                .filter(|(_, t)| *t == MirType::I64)
+                .map(|(p, _)| *p)
+                .collect();
+            for (k, layout) in layouts.iter().enumerate() {
+                let target = layout.target_block;
+                let name = format!("{}_osr_bb{}", safe_name, target.0);
+                let ty = i64t.fn_type(&[ptr_ty.into()], false);
+                let f = module.add_function(&name, ty, None);
+                stamp_function(ctx, &machine, f);
+                let entry = ctx.append_basic_block(f, "entry");
+                b.position_at_end(entry);
+                let which = i64t.const_int((k + 1) as u64, false);
+                let r = b
+                    .build_call(
+                        body_fn,
+                        &[which.into(), f.get_nth_param(0).unwrap().into()],
+                        "r",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap();
+                b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                let live: Vec<ValueId> = layout
+                    .external_args
+                    .iter()
+                    .copied()
+                    .chain(mir.blocks[target.0 as usize].params.iter().map(|(p, _)| *p))
+                    .collect();
+                osr_defs.push((
+                    target,
+                    layout.param_count,
+                    name,
+                    live.iter()
+                        .map(|v| {
+                            mir.scalar_param_sources
+                                .get(v)
+                                .map(|(o, _)| o.0)
+                                .unwrap_or(v.0)
+                        })
+                        .collect(),
+                    live.iter()
+                        .map(|v| mir.speculated_num_params.contains(v))
+                        .collect(),
+                    live.iter()
+                        .map(|v| mir.scalar_param_sources.get(v).map(|(_, f)| *f))
+                        .collect(),
+                    live.iter().map(|v| i64_params.contains(v)).collect(),
+                ));
+            }
+        }
+
+        let t_build = t0.elapsed();
+        if let Err(e) = module.verify() {
+            if std::env::var_os("WLIFT_JIT_DEBUG").is_some() || env_llvm_ir() {
+                eprintln!("{}", module.print_to_string().to_string());
+            }
+            return Err(format!("llvm verifier: {}", e.to_string()));
+        }
+        let spec = pass_spec();
+        if spec != "off" {
+            module
+                .run_passes(&spec, &machine, PassBuilderOptions::create())
+                .map_err(|e| format!("run_passes({spec}): {}", e))?;
+        }
+        let t_opt = t0.elapsed();
+        if env_llvm_ir() {
+            eprintln!("=== LLVM IR for {} ===", safe_name);
+            eprintln!("{}", module.print_to_string().to_string());
+            eprintln!("=== end ===");
+        }
+
+        let engine = module
+            .create_jit_execution_engine(codegen_level())
+            .map_err(|e| e.to_string())?;
+        let fn_ptr = engine
+            .get_function_address(&safe_name)
+            .map_err(|e| e.to_string())? as *const u8;
+        if std::env::var_os("WLIFT_TIER_TRACE").is_some() {
+            eprintln!(
+                "tier-trace: llvm {} build={:?} opt={:?} codegen={:?}",
+                safe_name,
+                t_build,
+                t_opt - t_build,
+                t0.elapsed() - t_opt
+            );
+        }
+        let mut osr_entries = Vec::with_capacity(osr_defs.len());
+        for (target_block, param_count, name, regs, num, field, int) in osr_defs {
+            let Ok(addr) = engine.get_function_address(&name) else {
+                continue;
+            };
+            osr_entries.push(NativeOsrEntry {
+                target_block,
+                param_count,
+                ptr: addr as *const u8,
+                live_in_regs: regs,
+                live_in_num: num,
+                live_in_field: field,
+                live_in_int: int,
+            });
+        }
+        Ok(LlvmCompiledCode {
+            fn_ptr,
+            osr_entries,
+            _engine: engine,
+            _context: context,
+        })
+    }
+
+    /// Frame pointers on every body (the conservative scanner and the
+    /// call stubs read them) and the host CPU, which MCJIT's default
+    /// machine would not select on its own.
+    fn stamp_function(ctx: &Context, machine: &TargetMachine, f: FunctionValue) {
+        f.add_attribute(
+            AttributeLoc::Function,
+            ctx.create_string_attribute("frame-pointer", "all"),
+        );
+        f.add_attribute(
+            AttributeLoc::Function,
+            ctx.create_string_attribute("target-cpu", &machine.get_cpu().to_string()),
+        );
+        f.add_attribute(
+            AttributeLoc::Function,
+            ctx.create_string_attribute(
+                "target-features",
+                &machine.get_feature_string().to_string_lossy(),
+            ),
+        );
+    }
+
+    /// Inputs shared by the main body and every OSR entry of one compile.
+    struct Shared<'ctx, 'a> {
+        ctx: &'ctx Context,
+        module: &'a Module<'ctx>,
+        #[allow(dead_code)]
+        machine: &'a TargetMachine,
+        mir: &'a MirFunction,
+        callsite_ic_ptrs: Option<&'a [crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&'a [usize]>,
+        jit_code_base: Option<*const *const u8>,
+        inline_bodies: Option<&'a InlineBodies>,
+        cha_by_method: Option<&'a crate::runtime::engine::ChaMap>,
+        main_fn: FunctionValue<'ctx>,
+    }
+
+    /// Lowering state for one LLVM function (the body or an OSR entry).
+    struct Lower<'ctx, 'a> {
+        sh: &'a Shared<'ctx, 'a>,
+        b: Builder<'ctx>,
+        f: FunctionValue<'ctx>,
+        /// OSR headers this body can be entered at; empty means the
+        /// function's own entry only.
+        entries: &'a [OsrEntryLayout],
+        blocks: Vec<BasicBlock<'ctx>>,
+        /// Alloca per block parameter and per live-in the OSR region
+        /// redefines.
+        slots: HashMap<ValueId, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
+        osr_vars: HashSet<ValueId>,
+        vals: HashMap<ValueId, BasicValueEnum<'ctx>>,
+        raw_bools: HashSet<ValueId>,
+        value_types: Vec<MirType>,
+        call_site_idx: usize,
+        block_call_site_base: Vec<usize>,
+        receiver: Option<IntValue<'ctx>>,
+        /// Main-entry parameters when the body has an entry switch.
+        param_regs: Vec<IntValue<'ctx>>,
+        /// Set while lowering an inlined callee body: its own value map,
+        /// receiver, and no inline caches.
+        inline_depth: u32,
+        tmp: u32,
+    }
+
+    macro_rules! bail {
+        ($($t:tt)*) => { return Err(format!($($t)*)) };
+    }
+
+    impl<'ctx, 'a> Lower<'ctx, 'a> {
+        fn new(
+            sh: &'a Shared<'ctx, 'a>,
+            f: FunctionValue<'ctx>,
+            entries: &'a [OsrEntryLayout],
+        ) -> Self {
+            let mir = sh.mir;
+            let mut block_call_site_base = Vec::with_capacity(mir.blocks.len());
+            let mut running = 0usize;
+            for blk in &mir.blocks {
+                block_call_site_base.push(running);
+                for (_, inst) in &blk.instructions {
+                    if matches!(
+                        inst,
+                        Instruction::Call { .. } | Instruction::SuperCall { .. }
+                    ) {
+                        running += 1;
+                    }
+                }
+            }
+            Self {
+                sh,
+                b: sh.ctx.create_builder(),
+                f,
+                entries,
+                blocks: Vec::new(),
+                slots: HashMap::new(),
+                osr_vars: HashSet::new(),
+                vals: HashMap::new(),
+                raw_bools: HashSet::new(),
+                value_types: infer_osr_value_types(mir),
+                call_site_idx: 0,
+                block_call_site_base,
+                receiver: None,
+                param_regs: Vec::new(),
+                inline_depth: 0,
+                tmp: 0,
+            }
+        }
+
+        // ── Types and constants ────────────────────────────────────────
+
+        fn i64t(&self) -> inkwell::types::IntType<'ctx> {
+            self.sh.ctx.i64_type()
+        }
+        fn f64t(&self) -> inkwell::types::FloatType<'ctx> {
+            self.sh.ctx.f64_type()
+        }
+        fn i1t(&self) -> inkwell::types::IntType<'ctx> {
+            self.sh.ctx.bool_type()
+        }
+        fn ptrt(&self) -> inkwell::types::PointerType<'ctx> {
+            self.sh.ctx.ptr_type(AddressSpace::default())
+        }
+        fn c64(&self, v: u64) -> IntValue<'ctx> {
+            self.i64t().const_int(v, false)
+        }
+        fn cf64(&self, v: f64) -> FloatValue<'ctx> {
+            self.f64t().const_float(v)
+        }
+        fn name(&mut self, base: &str) -> String {
+            self.tmp += 1;
+            format!("{base}{}", self.tmp)
+        }
+
+        fn helper_type(&self, n: usize) -> FunctionType<'ctx> {
+            let params: Vec<BasicMetadataTypeEnum> = (0..n).map(|_| self.i64t().into()).collect();
+            self.i64t().fn_type(&params, false)
+        }
+
+        /// Call a `wren_*` runtime helper by name; all-`i64` ABI.
+        fn call_helper(
+            &mut self,
+            name: &str,
+            args: &[IntValue<'ctx>],
+        ) -> Result<IntValue<'ctx>, String> {
+            let Some(addr) = crate::codegen::runtime_fns::resolve(name) else {
+                bail!("unknown runtime helper {name}");
+            };
+            let ty = self.helper_type(args.len());
+            self.call_addr(
+                ty,
+                addr,
+                &args.iter().map(|a| (*a).into()).collect::<Vec<_>>(),
+            )
+            .map(|v| v.into_int_value())
+        }
+
+        fn call_addr(
+            &mut self,
+            ty: FunctionType<'ctx>,
+            addr: usize,
+            args: &[BasicMetadataValueEnum<'ctx>],
+        ) -> Result<BasicValueEnum<'ctx>, String> {
+            let ptr = self
+                .b
+                .build_int_to_ptr(self.c64(addr as u64), self.ptrt(), "fp")
+                .map_err(|e| e.to_string())?;
+            let call = self
+                .b
+                .build_indirect_call(ty, ptr, args, "call")
+                .map_err(|e| e.to_string())?;
+            call.try_as_basic_value()
+                .basic()
+                .ok_or_else(|| "helper returned void".to_string())
+        }
+
+        /// A libm function declared by name, so LLVM knows it is pure
+        /// and MCJIT binds it from the process.
+        fn libm_decl(&mut self, name: &str, arity: usize) -> FunctionValue<'ctx> {
+            if let Some(f) = self.sh.module.get_function(name) {
+                return f;
+            }
+            let params: Vec<BasicMetadataTypeEnum> =
+                (0..arity).map(|_| self.f64t().into()).collect();
+            let f = self
+                .sh
+                .module
+                .add_function(name, self.f64t().fn_type(&params, false), None);
+            let ctx = self.sh.ctx;
+            f.add_attribute(
+                AttributeLoc::Function,
+                ctx.create_enum_attribute(
+                    inkwell::attributes::Attribute::get_named_enum_kind_id("nounwind"),
+                    0,
+                ),
+            );
+            f.add_attribute(
+                AttributeLoc::Function,
+                ctx.create_string_attribute("memory", "none"),
+            );
+            f
+        }
+
+        fn libm1(&mut self, name: &str, x: FloatValue<'ctx>) -> Result<FloatValue<'ctx>, String> {
+            let f = self.libm_decl(name, 1);
+            let call = self
+                .b
+                .build_call(f, &[x.into()], name)
+                .map_err(|e| e.to_string())?;
+            Ok(call
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_float_value())
+        }
+
+        fn libm2(
+            &mut self,
+            name: &str,
+            x: FloatValue<'ctx>,
+            y: FloatValue<'ctx>,
+        ) -> Result<FloatValue<'ctx>, String> {
+            let f = self.libm_decl(name, 2);
+            let call = self
+                .b
+                .build_call(f, &[x.into(), y.into()], name)
+                .map_err(|e| e.to_string())?;
+            Ok(call
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_float_value())
+        }
+
+        fn intrinsic1(
+            &mut self,
+            name: &str,
+            x: FloatValue<'ctx>,
+        ) -> Result<FloatValue<'ctx>, String> {
+            let intr = Intrinsic::find(name).ok_or_else(|| format!("no intrinsic {name}"))?;
+            let decl = intr
+                .get_declaration(self.sh.module, &[self.f64t().into()])
+                .ok_or_else(|| format!("no declaration for {name}"))?;
+            let call = self
+                .b
+                .build_call(decl, &[x.into()], "intr")
+                .map_err(|e| e.to_string())?;
+            Ok(call
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_float_value())
+        }
+
+        fn intrinsic2(
+            &mut self,
+            name: &str,
+            x: FloatValue<'ctx>,
+            y: FloatValue<'ctx>,
+        ) -> Result<FloatValue<'ctx>, String> {
+            let intr = Intrinsic::find(name).ok_or_else(|| format!("no intrinsic {name}"))?;
+            let decl = intr
+                .get_declaration(self.sh.module, &[self.f64t().into()])
+                .ok_or_else(|| format!("no declaration for {name}"))?;
+            let call = self
+                .b
+                .build_call(decl, &[x.into(), y.into()], "intr")
+                .map_err(|e| e.to_string())?;
+            Ok(call
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_float_value())
+        }
+
+        // ── Memory ─────────────────────────────────────────────────────
+
+        fn addr(&mut self, base: IntValue<'ctx>, off: i64) -> Result<PointerValue<'ctx>, String> {
+            let a = if off == 0 {
+                base
+            } else {
+                self.b
+                    .build_int_add(base, self.c64(off as u64), "addr")
+                    .map_err(|e| e.to_string())?
+            };
+            self.b
+                .build_int_to_ptr(a, self.ptrt(), "p")
+                .map_err(|e| e.to_string())
+        }
+
+        fn load64(&mut self, base: IntValue<'ctx>, off: i64) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(base, off)?;
+            self.b
+                .build_load(self.i64t(), p, "ld")
+                .map(|v| v.into_int_value())
+                .map_err(|e| e.to_string())
+        }
+
+        fn load8(&mut self, base: IntValue<'ctx>, off: i64) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(base, off)?;
+            let v = self
+                .b
+                .build_load(self.sh.ctx.i8_type(), p, "ld8")
+                .map(|v| v.into_int_value())
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_int_z_extend(v, self.i64t(), "zx")
+                .map_err(|e| e.to_string())
+        }
+
+        fn store64(
+            &mut self,
+            base: IntValue<'ctx>,
+            off: i64,
+            v: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            let p = self.addr(base, off)?;
+            self.b.build_store(p, v).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// Stack buffer of `n` i64 slots, as an integer address.
+        fn stack_buf(&mut self, n: usize) -> Result<(PointerValue<'ctx>, IntValue<'ctx>), String> {
+            let entry = self.f.get_first_basic_block().unwrap();
+            let cur = self.b.get_insert_block().unwrap();
+            match entry.get_first_instruction() {
+                Some(first) => self.b.position_before(&first),
+                None => self.b.position_at_end(entry),
+            }
+            let ty = self.i64t().array_type(n.max(1) as u32);
+            let p = self.b.build_alloca(ty, "buf").map_err(|e| e.to_string())?;
+            self.b.position_at_end(cur);
+            let addr = self
+                .b
+                .build_ptr_to_int(p, self.i64t(), "bufaddr")
+                .map_err(|e| e.to_string())?;
+            Ok((p, addr))
+        }
+
+        // ── Value conversions ──────────────────────────────────────────
+
+        fn get(&self, v: &ValueId) -> Result<BasicValueEnum<'ctx>, String> {
+            self.vals
+                .get(v)
+                .copied()
+                .ok_or_else(|| format!("undefined value {:?}", v))
+        }
+        fn geti(&self, v: &ValueId) -> Result<IntValue<'ctx>, String> {
+            match self.get(v)? {
+                BasicValueEnum::IntValue(i) => Ok(i),
+                BasicValueEnum::FloatValue(f) => self
+                    .b
+                    .build_bit_cast(f, self.i64t(), "bits")
+                    .map(|v| v.into_int_value())
+                    .map_err(|e| e.to_string()),
+                other => bail!("expected int for {:?}, got {:?}", v, other),
+            }
+        }
+        fn getf(&self, v: &ValueId) -> Result<FloatValue<'ctx>, String> {
+            match self.get(v)? {
+                BasicValueEnum::FloatValue(f) => Ok(f),
+                BasicValueEnum::IntValue(i) if i.get_type().get_bit_width() == 64 => self
+                    .b
+                    .build_bit_cast(i, self.f64t(), "f")
+                    .map(|v| v.into_float_value())
+                    .map_err(|e| e.to_string()),
+                other => bail!("expected f64 for {:?}, got {:?}", v, other),
+            }
+        }
+
+        /// A boxed Wren value for `v`, boxing raw booleans and floats.
+        fn boxed(&mut self, v: &ValueId) -> Result<IntValue<'ctx>, String> {
+            match self.get(v)? {
+                BasicValueEnum::IntValue(i) if i.get_type().get_bit_width() == 1 => {
+                    self.box_bool(i)
+                }
+                BasicValueEnum::IntValue(i) => {
+                    if self.value_types.get(v.0 as usize) == Some(&MirType::I64)
+                        && !self.raw_bools.contains(v)
+                    {
+                        let f = self
+                            .b
+                            .build_signed_int_to_float(i, self.f64t(), "i2f")
+                            .map_err(|e| e.to_string())?;
+                        self.bits(f)
+                    } else {
+                        Ok(i)
+                    }
+                }
+                BasicValueEnum::FloatValue(f) => self.bits(f),
+                other => bail!("cannot box {:?}", other),
+            }
+        }
+
+        fn bits(&self, f: FloatValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            self.b
+                .build_bit_cast(f, self.i64t(), "bits")
+                .map(|v| v.into_int_value())
+                .map_err(|e| e.to_string())
+        }
+        fn f64_of(&self, i: IntValue<'ctx>) -> Result<FloatValue<'ctx>, String> {
+            self.b
+                .build_bit_cast(i, self.f64t(), "f")
+                .map(|v| v.into_float_value())
+                .map_err(|e| e.to_string())
+        }
+        fn box_bool(&self, c: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            self.b
+                .build_select(c, self.c64(TAG_TRUE), self.c64(TAG_FALSE), "boolbox")
+                .map(|v| v.into_int_value())
+                .map_err(|e| e.to_string())
+        }
+
+        fn icmp(
+            &self,
+            p: IntPredicate,
+            a: IntValue<'ctx>,
+            b: IntValue<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            self.b
+                .build_int_compare(p, a, b, "icmp")
+                .map_err(|e| e.to_string())
+        }
+        fn fcmp(
+            &self,
+            p: FloatPredicate,
+            a: FloatValue<'ctx>,
+            b: FloatValue<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            self.b
+                .build_float_compare(p, a, b, "fcmp")
+                .map_err(|e| e.to_string())
+        }
+        fn and(&self, a: IntValue<'ctx>, b: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            self.b.build_and(a, b, "and").map_err(|e| e.to_string())
+        }
+
+        fn is_nan_boxed(&self, v: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let m = self.and(v, self.c64(QNAN))?;
+            self.icmp(IntPredicate::EQ, m, self.c64(QNAN))
+        }
+
+        fn new_block(&mut self, base: &str) -> BasicBlock<'ctx> {
+            let n = self.name(base);
+            self.sh.ctx.append_basic_block(self.f, &n)
+        }
+        fn br(&self, bb: BasicBlock<'ctx>) -> Result<(), String> {
+            self.b
+                .build_unconditional_branch(bb)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        fn cbr(
+            &self,
+            c: IntValue<'ctx>,
+            t: BasicBlock<'ctx>,
+            f: BasicBlock<'ctx>,
+        ) -> Result<(), String> {
+            self.b
+                .build_conditional_branch(c, t, f)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        fn phi(
+            &mut self,
+            ty: BasicTypeEnum<'ctx>,
+            incoming: &[(BasicValueEnum<'ctx>, BasicBlock<'ctx>)],
+        ) -> Result<BasicValueEnum<'ctx>, String> {
+            let phi = self.b.build_phi(ty, "phi").map_err(|e| e.to_string())?;
+            for (v, bb) in incoming {
+                phi.add_incoming(&[(v as &dyn BasicValue, *bb)]);
+            }
+            Ok(phi.as_basic_value())
+        }
+
+        /// Guarded receiver-class load: `(obj_ptr, class)` on the returned
+        /// block, or a branch to `not_object` for a non-object value.
+        fn class_load_guarded(
+            &mut self,
+            recv: IntValue<'ctx>,
+            not_object: BasicBlock<'ctx>,
+        ) -> Result<(IntValue<'ctx>, IntValue<'ctx>), String> {
+            let high = self.and(recv, self.c64(TAG_OBJ))?;
+            let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(TAG_OBJ))?;
+            let obj = self.new_block("obj");
+            self.cbr(is_obj, obj, not_object)?;
+            self.b.position_at_end(obj);
+            let ptr = self.and(recv, self.c64(PTR_MASK))?;
+            let class = self.load64(ptr, HEADER_CLASS as i64)?;
+            Ok((ptr, class))
+        }
+
+        // ── Driver ─────────────────────────────────────────────────────
+
+        fn run(mut self) -> Result<(), String> {
+            let mir = self.sh.mir;
+            let ctx = self.sh.ctx;
+            let prologue = ctx.append_basic_block(self.f, "prologue");
+            for i in 0..mir.blocks.len() {
+                self.blocks
+                    .push(ctx.append_basic_block(self.f, &format!("bb{i}")));
+            }
+            self.b.position_at_end(prologue);
+
+            let slot_type = |vid: ValueId, this: &Self| -> BasicTypeEnum<'ctx> {
+                match this.value_types.get(vid.0 as usize) {
+                    Some(MirType::F64) => this.f64t().into(),
+                    _ => this.i64t().into(),
+                }
+            };
+            // Parameter slots.
+            for block in &mir.blocks {
+                for (p, _) in &block.params {
+                    let lt = slot_type(*p, &self);
+                    let slot = self
+                        .b
+                        .build_alloca(lt, &format!("v{}", p.0))
+                        .map_err(|e| e.to_string())?;
+                    self.slots.insert(*p, (slot, lt));
+                }
+            }
+            // Values an OSR entry defines that the body also defines
+            // (live-ins and the constants an entry rematerialises) get a
+            // slot too; every block reads them from it.
+            for layout in self.entries {
+                let mut vars: Vec<ValueId> = layout.external_args.clone();
+                vars.extend(osr_rematerializable_defs(mir, layout.target_block).into_keys());
+                for vid in vars {
+                    if self.slots.contains_key(&vid) {
+                        continue;
+                    }
+                    let lt = slot_type(vid, &self);
+                    let slot = self
+                        .b
+                        .build_alloca(lt, &format!("o{}", vid.0))
+                        .map_err(|e| e.to_string())?;
+                    self.slots.insert(vid, (slot, lt));
+                    self.osr_vars.insert(vid);
+                }
+            }
+
+            if self.entries.is_empty() {
+                let entry = &mir.blocks[0];
+                let params: Vec<IntValue> = (0..mir.arity as usize)
+                    .map(|i| self.f.get_nth_param(i as u32).unwrap().into_int_value())
+                    .collect();
+                self.receiver = params.first().copied();
+                for &(vid, ref inst) in &entry.instructions {
+                    if let Instruction::BlockParam(idx) = inst {
+                        if let Some(p) = params.get(*idx as usize) {
+                            self.vals.insert(vid, (*p).into());
+                        }
+                    }
+                }
+                self.br(self.blocks[0])?;
+            } else {
+                // Entry switch: 0 is the main entry, k the k-th header.
+                let which = self.f.get_nth_param(0).unwrap().into_int_value();
+                let args_ptr = self.f.get_nth_param(1).unwrap().into_pointer_value();
+                let args_addr = self
+                    .b
+                    .build_ptr_to_int(args_ptr, self.i64t(), "args")
+                    .map_err(|e| e.to_string())?;
+                let main_entry = self.new_block("main");
+                let mut cases: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+                let mut entry_blocks = Vec::new();
+                for k in 0..self.entries.len() {
+                    let bb = self.new_block("osr");
+                    cases.push((self.c64((k + 1) as u64), bb));
+                    entry_blocks.push(bb);
+                }
+                self.b
+                    .build_switch(which, main_entry, &cases)
+                    .map_err(|e| e.to_string())?;
+
+                // Main entry: parameters arrive through `args`. They are
+                // read into slots so the loop headers see one definition
+                // whichever entry was taken.
+                self.b.position_at_end(main_entry);
+                let entry = &mir.blocks[0];
+                let mut params: Vec<IntValue<'ctx>> = Vec::new();
+                for i in 0..mir.arity as usize {
+                    params.push(self.load64(args_addr, (i as i64) * VALUE_SIZE as i64)?);
+                }
+                self.receiver = params.first().copied();
+                for &(vid, ref inst) in &entry.instructions {
+                    if let Instruction::BlockParam(idx) = inst {
+                        if let Some(p) = params.get(*idx as usize) {
+                            if let Some((slot, _)) = self.slots.get(&vid).copied() {
+                                self.b.build_store(slot, *p).map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+                }
+                self.param_regs = params;
+                self.br(self.blocks[0])?;
+
+                for (k, layout) in self.entries.iter().enumerate() {
+                    self.b.position_at_end(entry_blocks[k]);
+                    let mut slot = 0i64;
+                    for vid in &layout.external_args {
+                        let raw = self.load64(args_addr, slot * VALUE_SIZE as i64)?;
+                        slot += 1;
+                        let v = self.osr_incoming(*vid, raw)?;
+                        let (p, _) = self.slots[vid];
+                        self.b.build_store(p, v).map_err(|e| e.to_string())?;
+                    }
+                    let target = &mir.blocks[layout.target_block.0 as usize];
+                    for (p, _) in &target.params {
+                        let raw = self.load64(args_addr, slot * VALUE_SIZE as i64)?;
+                        slot += 1;
+                        let v = self.osr_incoming(*p, raw)?;
+                        let (slotp, _) = self.slots[p];
+                        self.b.build_store(slotp, v).map_err(|e| e.to_string())?;
+                    }
+                    for (vid, inst) in osr_rematerializable_defs(mir, layout.target_block) {
+                        let v: BasicValueEnum = match inst {
+                            Instruction::ConstNum(n) => self.c64(n.to_bits()).into(),
+                            Instruction::ConstBool(b) => {
+                                self.c64(if b { TAG_TRUE } else { TAG_FALSE }).into()
+                            }
+                            Instruction::ConstNull => self.c64(TAG_NULL).into(),
+                            Instruction::ConstF64(n) => self.cf64(n).into(),
+                            Instruction::ConstI64(n) => self.c64(n as u64).into(),
+                            _ => bail!("non-rematerializable OSR external value"),
+                        };
+                        let (p, _) = self.slots[&vid];
+                        self.b.build_store(p, v).map_err(|e| e.to_string())?;
+                    }
+                    self.br(self.blocks[layout.target_block.0 as usize])?;
+                }
+            }
+
+            let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
+            let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
+            for &bi in &rpo {
+                let bb = self.blocks[bi];
+                self.b.position_at_end(bb);
+                if !reachable.contains(&bi) {
+                    self.b.build_unreachable().map_err(|e| e.to_string())?;
+                    continue;
+                }
+                self.lower_block(bi)?;
+            }
+            for bb in self.blocks.iter() {
+                if bb.get_terminator().is_none() {
+                    self.b.position_at_end(*bb);
+                    self.b.build_unreachable().map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        }
+
+        /// A live-in read from the OSR argument array, in the type the
+        /// body carries it: boxed, raw f64, or integer.
+        fn osr_incoming(
+            &mut self,
+            vid: ValueId,
+            raw: IntValue<'ctx>,
+        ) -> Result<BasicValueEnum<'ctx>, String> {
+            Ok(match self.value_types.get(vid.0 as usize) {
+                Some(MirType::F64) => self.f64_of(raw)?.into(),
+                Some(MirType::I64) => {
+                    let f = self.f64_of(raw)?;
+                    self.b
+                        .build_float_to_signed_int(f, self.i64t(), "f2i")
+                        .map_err(|e| e.to_string())?
+                        .into()
+                }
+                _ => raw.into(),
+            })
+        }
+
+        fn lower_block(&mut self, bi: usize) -> Result<(), String> {
+            let mir = self.sh.mir;
+            let block = &mir.blocks[bi];
+            self.call_site_idx = self.block_call_site_base[bi];
+            for (p, _) in &block.params {
+                let (slot, ty) = self.slots[p];
+                let v = self
+                    .b
+                    .build_load(ty, slot, &format!("v{}", p.0))
+                    .map_err(|e| e.to_string())?;
+                self.vals.insert(*p, v);
+            }
+            let osr_vars: Vec<ValueId> = self.osr_vars.iter().copied().collect();
+            for vid in osr_vars {
+                let (slot, ty) = self.slots[&vid];
+                let v = self
+                    .b
+                    .build_load(ty, slot, &format!("o{}", vid.0))
+                    .map_err(|e| e.to_string())?;
+                self.vals.insert(vid, v);
+            }
+            for &(vid, ref inst) in &block.instructions {
+                let v = self.lower_instruction(vid, inst)?;
+                if let Some(v) = v {
+                    self.vals.insert(vid, v);
+                    if is_raw_bool(inst) {
+                        self.raw_bools.insert(vid);
+                    }
+                    if self.osr_vars.contains(&vid) {
+                        let (slot, _) = self.slots[&vid];
+                        self.b.build_store(slot, v).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            self.lower_terminator(&block.terminator)
+        }
+
+        /// Store the edge's arguments into the target's parameter slots.
+        fn pass_args(&mut self, target: BlockId, args: &[ValueId]) -> Result<(), String> {
+            let params = &self.sh.mir.blocks[target.0 as usize].params;
+            let mut stores: Vec<(PointerValue<'ctx>, BasicValueEnum<'ctx>)> = Vec::new();
+            for (i, a) in args.iter().enumerate() {
+                let Some((p, ty)) = params.get(i) else {
+                    continue;
+                };
+                let (slot, _) = self.slots[p];
+                let v: BasicValueEnum = match ty {
+                    MirType::F64 => self.getf(a)?.into(),
+                    MirType::I64 => match self.get(a)? {
+                        BasicValueEnum::IntValue(i) if i.get_type().get_bit_width() == 64 => {
+                            i.into()
+                        }
+                        BasicValueEnum::FloatValue(f) => self
+                            .b
+                            .build_float_to_signed_int(f, self.i64t(), "f2i")
+                            .map_err(|e| e.to_string())?
+                            .into(),
+                        other => bail!("bad i64 edge arg {:?}", other),
+                    },
+                    _ => self.boxed(a)?.into(),
+                };
+                stores.push((slot, v));
+            }
+            for (slot, v) in stores {
+                self.b.build_store(slot, v).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+
+        fn truthy(&mut self, c: &ValueId) -> Result<IntValue<'ctx>, String> {
+            match self.get(c)? {
+                BasicValueEnum::IntValue(i) if i.get_type().get_bit_width() == 1 => Ok(i),
+                _ => {
+                    let v = self.boxed(c)?;
+                    let nf = self.icmp(IntPredicate::NE, v, self.c64(TAG_FALSE))?;
+                    let nn = self.icmp(IntPredicate::NE, v, self.c64(TAG_NULL))?;
+                    self.and(nf, nn)
+                }
+            }
+        }
+
+        fn lower_terminator(&mut self, term: &Terminator) -> Result<(), String> {
+            match term {
+                Terminator::Return(v) => {
+                    let r = self.boxed(v)?;
+                    self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                }
+                Terminator::ReturnNull => {
+                    let r = self.c64(TAG_NULL);
+                    self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                }
+                Terminator::Branch { target, args } => {
+                    self.pass_args(*target, args)?;
+                    self.br(self.blocks[target.0 as usize])?;
+                }
+                Terminator::CondBranch {
+                    condition,
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                } => {
+                    let c = self.truthy(condition)?;
+                    if true_args.is_empty() && false_args.is_empty() {
+                        self.cbr(
+                            c,
+                            self.blocks[true_target.0 as usize],
+                            self.blocks[false_target.0 as usize],
+                        )?;
+                    } else {
+                        // Each edge stores its own arguments on a
+                        // trampoline block.
+                        let tb = self.new_block("t");
+                        let fb = self.new_block("f");
+                        self.cbr(c, tb, fb)?;
+                        self.b.position_at_end(tb);
+                        self.pass_args(*true_target, true_args)?;
+                        self.br(self.blocks[true_target.0 as usize])?;
+                        self.b.position_at_end(fb);
+                        self.pass_args(*false_target, false_args)?;
+                        self.br(self.blocks[false_target.0 as usize])?;
+                    }
+                }
+                Terminator::Unreachable => {
+                    self.b.build_unreachable().map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        }
+
+        // ── Instructions ───────────────────────────────────────────────
+
+        fn lower_instruction(
+            &mut self,
+            _dst: ValueId,
+            inst: &Instruction,
+        ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+            use Instruction as I;
+            let v: BasicValueEnum<'ctx> = match inst {
+                I::ConstNum(n) => self.c64(n.to_bits()).into(),
+                I::ConstBool(b) => self.c64(if *b { TAG_TRUE } else { TAG_FALSE }).into(),
+                I::ConstNull => self.c64(TAG_NULL).into(),
+                I::ConstF64(n) => self.cf64(*n).into(),
+                I::ConstI64(n) => self.c64(*n as u64).into(),
+                I::BlockParam(idx) => {
+                    if self.entries.is_empty() || self.inline_depth > 0 {
+                        return Ok(None);
+                    }
+                    match self.param_regs.get(*idx as usize) {
+                        Some(p) => (*p).into(),
+                        None => return Ok(None),
+                    }
+                }
+                I::Move(s) => self.get(s)?,
+
+                I::Add(a, b) => self.boxed_binop(a, b, BinOp::Add, "wren_num_add")?.into(),
+                I::Sub(a, b) => self.boxed_binop(a, b, BinOp::Sub, "wren_num_sub")?.into(),
+                I::Mul(a, b) => self.boxed_binop(a, b, BinOp::Mul, "wren_num_mul")?.into(),
+                I::Div(a, b) => self.boxed_binop(a, b, BinOp::Div, "wren_num_div")?.into(),
+                I::Mod(a, b) => self.boxed_binop(a, b, BinOp::Rem, "wren_num_mod")?.into(),
+                I::CmpLt(a, b) => self
+                    .boxed_binop(a, b, BinOp::Cmp(FloatPredicate::OLT), "wren_cmp_lt")?
+                    .into(),
+                I::CmpGt(a, b) => self
+                    .boxed_binop(a, b, BinOp::Cmp(FloatPredicate::OGT), "wren_cmp_gt")?
+                    .into(),
+                I::CmpLe(a, b) => self
+                    .boxed_binop(a, b, BinOp::Cmp(FloatPredicate::OLE), "wren_cmp_le")?
+                    .into(),
+                I::CmpGe(a, b) => self
+                    .boxed_binop(a, b, BinOp::Cmp(FloatPredicate::OGE), "wren_cmp_ge")?
+                    .into(),
+                I::CmpEq(a, b) => self
+                    .boxed_binop(a, b, BinOp::Cmp(FloatPredicate::OEQ), "wren_cmp_eq")?
+                    .into(),
+                I::CmpNe(a, b) => self
+                    .boxed_binop(a, b, BinOp::Cmp(FloatPredicate::UNE), "wren_cmp_ne")?
+                    .into(),
+                I::Neg(a) => {
+                    let la = self.boxed(a)?;
+                    let is_box = self.is_nan_boxed(la)?;
+                    let fast = self.new_block("negf");
+                    let slow = self.new_block("negs");
+                    let merge = self.new_block("negm");
+                    self.cbr(is_box, slow, fast)?;
+                    self.b.position_at_end(fast);
+                    let fa = self.f64_of(la)?;
+                    let n = self
+                        .b
+                        .build_float_neg(fa, "fneg")
+                        .map_err(|e| e.to_string())?;
+                    let nb = self.bits(n)?;
+                    self.br(merge)?;
+                    self.b.position_at_end(slow);
+                    let s = self.call_helper("wren_num_neg", &[la])?;
+                    let slow_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    self.phi(
+                        self.i64t().into(),
+                        &[(nb.into(), fast), (s.into(), slow_end)],
+                    )?
+                }
+                I::Not(a) => {
+                    let v = self.boxed(a)?;
+                    let f = self.icmp(IntPredicate::EQ, v, self.c64(TAG_FALSE))?;
+                    let n = self.icmp(IntPredicate::EQ, v, self.c64(TAG_NULL))?;
+                    let falsy = self.b.build_or(f, n, "falsy").map_err(|e| e.to_string())?;
+                    self.box_bool(falsy)?.into()
+                }
+
+                I::GetField(recv, idx) => {
+                    let r = self.boxed(recv)?;
+                    let obj = self.and(r, self.c64(PTR_MASK))?;
+                    let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
+                    self.load64(fields, (*idx as i64) * VALUE_SIZE as i64)?
+                        .into()
+                }
+                I::SetField(recv, idx, val) => {
+                    let r = self.boxed(recv)?;
+                    let v = self.boxed(val)?;
+                    let obj = self.and(r, self.c64(PTR_MASK))?;
+                    let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
+                    self.store64(fields, (*idx as i64) * VALUE_SIZE as i64, v)?;
+                    if crate::runtime::gc_trait::jit_needs_write_barriers() {
+                        self.call_helper("wren_write_barrier", &[r, v])?;
+                    }
+                    v.into()
+                }
+                I::GetModuleVar(idx) => {
+                    let cell = jit_modvars_cell();
+                    if cell != 0 {
+                        let cellv = self.c64(cell as u64);
+                        let base = self.load64(cellv, 0)?;
+                        let len = self.load64(cellv, 8)?;
+                        let in_range = self.icmp(IntPredicate::ULT, self.c64(*idx as u64), len)?;
+                        let hit = self.new_block("mvh");
+                        let miss = self.new_block("mvm");
+                        let merge = self.new_block("mvj");
+                        self.cbr(in_range, hit, miss)?;
+                        self.b.position_at_end(hit);
+                        let v = self.load64(base, (*idx as i64) * 8)?;
+                        self.br(merge)?;
+                        self.b.position_at_end(miss);
+                        let null = self.c64(TAG_NULL);
+                        self.br(merge)?;
+                        self.b.position_at_end(merge);
+                        self.phi(self.i64t().into(), &[(v.into(), hit), (null.into(), miss)])?
+                    } else {
+                        self.call_helper("wren_get_module_var", &[self.c64(*idx as u64)])?
+                            .into()
+                    }
+                }
+                I::SetModuleVar(idx, val) => {
+                    let v = self.boxed(val)?;
+                    let cell = jit_modvars_cell();
+                    if cell != 0 {
+                        let cellv = self.c64(cell as u64);
+                        let base = self.load64(cellv, 0)?;
+                        let len = self.load64(cellv, 8)?;
+                        let in_range = self.icmp(IntPredicate::ULT, self.c64(*idx as u64), len)?;
+                        let hit = self.new_block("svh");
+                        let miss = self.new_block("svm");
+                        let merge = self.new_block("svj");
+                        self.cbr(in_range, hit, miss)?;
+                        self.b.position_at_end(hit);
+                        self.store64(base, (*idx as i64) * 8, v)?;
+                        self.br(merge)?;
+                        self.b.position_at_end(miss);
+                        self.call_helper("wren_set_module_var", &[self.c64(*idx as u64), v])?;
+                        self.br(merge)?;
+                        self.b.position_at_end(merge);
+                    } else {
+                        self.call_helper("wren_set_module_var", &[self.c64(*idx as u64), v])?;
+                    }
+                    v.into()
+                }
+
+                I::Call {
+                    receiver,
+                    method,
+                    args,
+                    ..
+                } => self.lower_call(receiver, *method, args)?.into(),
+                I::CallKnownFunc {
+                    func_id,
+                    method,
+                    expected_class,
+                    inline_getter_field,
+                    pure_leaf,
+                    receiver,
+                    args,
+                } => self
+                    .lower_known_call(
+                        *func_id,
+                        *method,
+                        *expected_class,
+                        *inline_getter_field,
+                        *pure_leaf,
+                        receiver,
+                        args,
+                    )?
+                    .into(),
+                I::SuperCall { method, args } => {
+                    if args.len() > 4 {
+                        bail!("SuperCall with arity {} not supported by JIT", args.len());
+                    }
+                    let name = [
+                        "wren_super_call_0",
+                        "wren_super_call_1",
+                        "wren_super_call_2",
+                        "wren_super_call_3",
+                        "wren_super_call_4",
+                    ][args.len()];
+                    let mut call_args = vec![self.c64(method.index() as u64)];
+                    for a in args {
+                        call_args.push(self.boxed(a)?);
+                    }
+                    self.call_helper(name, &call_args)?.into()
+                }
+                I::CallStaticSelf { args } => {
+                    if self.inline_depth > 0 {
+                        bail!("CallStaticSelf inside an inlined body");
+                    }
+                    let mut call_args: Vec<BasicMetadataValueEnum> = Vec::new();
+                    if let Some(r) = self.receiver {
+                        call_args.push(r.into());
+                    }
+                    for a in args {
+                        call_args.push(self.boxed(a)?.into());
+                    }
+                    let call = self
+                        .b
+                        .build_call(self.sh.main_fn, &call_args, "self")
+                        .map_err(|e| e.to_string())?;
+                    call.try_as_basic_value().basic().unwrap()
+                }
+
+                I::MakeList(elems) => {
+                    if elems.len() <= 4 {
+                        let name = [
+                            "wren_make_list",
+                            "wren_make_list_1",
+                            "wren_make_list_2",
+                            "wren_make_list_3",
+                            "wren_make_list_4",
+                        ][elems.len()];
+                        let mut a = Vec::new();
+                        for e in elems {
+                            a.push(self.boxed(e)?);
+                        }
+                        self.call_helper(name, &a)?.into()
+                    } else {
+                        let list = self.call_helper("wren_make_list", &[])?;
+                        for e in elems {
+                            let v = self.boxed(e)?;
+                            self.call_helper("wren_list_add", &[list, v])?;
+                        }
+                        list.into()
+                    }
+                }
+                I::MakeMap(pairs) => {
+                    let map = self.call_helper("wren_make_map", &[])?;
+                    for (k, v) in pairs {
+                        let k = self.boxed(k)?;
+                        let v = self.boxed(v)?;
+                        self.call_helper("wren_map_set", &[map, k, v])?;
+                    }
+                    map.into()
+                }
+                I::MakeRange(from, to, inclusive) => {
+                    let f = self.boxed(from)?;
+                    let t = self.boxed(to)?;
+                    let i = self.c64(*inclusive as u64);
+                    self.call_helper("wren_make_range", &[f, t, i])?.into()
+                }
+                I::StringConcat(parts) => {
+                    if parts.is_empty() {
+                        self.c64(TAG_NULL).into()
+                    } else {
+                        let mut acc = self.boxed(&parts[0])?;
+                        for p in &parts[1..] {
+                            let v = self.boxed(p)?;
+                            acc = self.call_helper("wren_string_concat", &[acc, v])?;
+                        }
+                        acc.into()
+                    }
+                }
+                I::ToString(a) => {
+                    let v = self.boxed(a)?;
+                    self.call_helper("wren_to_string", &[v])?.into()
+                }
+                I::GetUpvalue(idx) => self
+                    .call_helper("wren_get_upvalue", &[self.c64(*idx as u64)])?
+                    .into(),
+                I::SetUpvalue(idx, val) => {
+                    let v = self.boxed(val)?;
+                    self.call_helper("wren_set_upvalue", &[self.c64(*idx as u64), v])?
+                        .into()
+                }
+                I::GetStaticField(sym) => self
+                    .call_helper("wren_get_static_field", &[self.c64(sym.index() as u64)])?
+                    .into(),
+                I::SetStaticField(sym, val) => {
+                    let v = self.boxed(val)?;
+                    self.call_helper("wren_set_static_field", &[self.c64(sym.index() as u64), v])?
+                        .into()
+                }
+                I::MakeClosure { fn_id, upvalues } => {
+                    let n = upvalues.len();
+                    let fid = self.c64(*fn_id as u64);
+                    if n <= 8 {
+                        let name = format!("wren_make_closure_{n}");
+                        let mut a = vec![fid];
+                        for uv in upvalues {
+                            a.push(self.boxed(uv)?);
+                        }
+                        self.call_helper(&name, &a)?.into()
+                    } else {
+                        let (_, buf) = self.stack_buf(n)?;
+                        for (i, uv) in upvalues.iter().enumerate() {
+                            let v = self.boxed(uv)?;
+                            self.store64(buf, (i * 8) as i64, v)?;
+                        }
+                        self.call_helper("wren_make_closure_n", &[fid, self.c64(n as u64), buf])?
+                            .into()
+                    }
+                }
+                I::SubscriptGet { receiver, args } => {
+                    let mut a = vec![self.boxed(receiver)?];
+                    for x in args {
+                        a.push(self.boxed(x)?);
+                    }
+                    self.call_helper("wren_subscript_get", &a)?.into()
+                }
+                I::SubscriptSet {
+                    receiver,
+                    args,
+                    value,
+                } => {
+                    let mut a = vec![self.boxed(receiver)?];
+                    for x in args {
+                        a.push(self.boxed(x)?);
+                    }
+                    a.push(self.boxed(value)?);
+                    self.call_helper("wren_subscript_set", &a)?.into()
+                }
+                I::BitAnd(a, b) => self.helper2("wren_bit_and", a, b)?.into(),
+                I::BitOr(a, b) => self.helper2("wren_bit_or", a, b)?.into(),
+                I::BitXor(a, b) => self.helper2("wren_bit_xor", a, b)?.into(),
+                I::Shl(a, b) => self.helper2("wren_bit_shl", a, b)?.into(),
+                I::Shr(a, b) => self.helper2("wren_bit_shr", a, b)?.into(),
+                I::BitNot(a) => {
+                    let v = self.boxed(a)?;
+                    self.call_helper("wren_bit_not", &[v])?.into()
+                }
+                I::IsType(a, class_sym) => {
+                    let v = self.boxed(a)?;
+                    self.call_helper("wren_is_type", &[v, self.c64(class_sym.index() as u64)])?
+                        .into()
+                }
+                I::ConstString(idx) => self
+                    .call_helper("wren_const_string", &[self.c64(*idx as u64)])?
+                    .into(),
+
+                I::ClassIs(a, class_ptr) => {
+                    let v = self.boxed(a)?;
+                    let cur = self.b.get_insert_block().unwrap();
+                    let merge = self.new_block("cim");
+                    let (_, class) = self.class_load_guarded(v, merge)?;
+                    let hit = self.icmp(IntPredicate::EQ, class, self.c64(*class_ptr as u64))?;
+                    let obj_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    let no = self.i1t().const_zero();
+                    self.phi(
+                        self.i1t().into(),
+                        &[(no.into(), cur), (hit.into(), obj_end)],
+                    )?
+                }
+                I::ObjectIs(a, obj_ptr) => {
+                    let v = self.boxed(a)?;
+                    let expected = self.c64(TAG_OBJ | (*obj_ptr as u64 & PTR_MASK));
+                    self.icmp(IntPredicate::EQ, v, expected)?.into()
+                }
+                I::ClosureFnIs(a, fn_ptr) => {
+                    let v = self.boxed(a)?;
+                    let high = self.and(v, self.c64(TAG_OBJ))?;
+                    let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(TAG_OBJ))?;
+                    let cur = self.b.get_insert_block().unwrap();
+                    let obj = self.new_block("cfo");
+                    let clo = self.new_block("cfc");
+                    let merge = self.new_block("cfm");
+                    self.cbr(is_obj, obj, merge)?;
+                    self.b.position_at_end(obj);
+                    let ptr = self.and(v, self.c64(PTR_MASK))?;
+                    let ty = self.load8(ptr, HEADER_OBJ_TYPE as i64)?;
+                    let is_clo = self.icmp(
+                        IntPredicate::EQ,
+                        ty,
+                        self.c64(crate::runtime::object::ObjType::Closure as u64),
+                    )?;
+                    self.cbr(is_clo, clo, merge)?;
+                    self.b.position_at_end(clo);
+                    let function = self.load64(ptr, CLOSURE_FUNCTION as i64)?;
+                    let hit = self.icmp(IntPredicate::EQ, function, self.c64(*fn_ptr as u64))?;
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    let no = self.i1t().const_zero();
+                    self.phi(
+                        self.i1t().into(),
+                        &[(no.into(), cur), (no.into(), obj), (hit.into(), clo)],
+                    )?
+                }
+
+                I::AddI64(a, b) => self
+                    .b
+                    .build_int_add(self.geti(a)?, self.geti(b)?, "add")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::SubI64(a, b) => self
+                    .b
+                    .build_int_sub(self.geti(a)?, self.geti(b)?, "sub")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::MulI64(a, b) => self
+                    .b
+                    .build_int_mul(self.geti(a)?, self.geti(b)?, "mul")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::RemI64(a, b) => self
+                    .b
+                    .build_int_signed_rem(self.geti(a)?, self.geti(b)?, "rem")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::BandI64(a, b) => self.and(self.geti(a)?, self.geti(b)?)?.into(),
+                I::NegI64(a) => self
+                    .b
+                    .build_int_neg(self.geti(a)?, "neg")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::CmpLtI64(a, b) => self
+                    .icmp(IntPredicate::SLT, self.geti(a)?, self.geti(b)?)?
+                    .into(),
+                I::CmpGtI64(a, b) => self
+                    .icmp(IntPredicate::SGT, self.geti(a)?, self.geti(b)?)?
+                    .into(),
+                I::CmpLeI64(a, b) => self
+                    .icmp(IntPredicate::SLE, self.geti(a)?, self.geti(b)?)?
+                    .into(),
+                I::CmpGeI64(a, b) => self
+                    .icmp(IntPredicate::SGE, self.geti(a)?, self.geti(b)?)?
+                    .into(),
+                I::I64ToF64(a) => self
+                    .b
+                    .build_signed_int_to_float(self.geti(a)?, self.f64t(), "i2f")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+
+                I::AddF64(a, b) => self
+                    .b
+                    .build_float_add(self.getf(a)?, self.getf(b)?, "fadd")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::SubF64(a, b) => self
+                    .b
+                    .build_float_sub(self.getf(a)?, self.getf(b)?, "fsub")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::MulF64(a, b) => self
+                    .b
+                    .build_float_mul(self.getf(a)?, self.getf(b)?, "fmul")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::DivF64(a, b) => self
+                    .b
+                    .build_float_div(self.getf(a)?, self.getf(b)?, "fdiv")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::ModF64(a, b) => {
+                    let av = self.getf(a)?;
+                    let bv = self.getf(b)?;
+                    if let Some(c) =
+                        const_f64_of(self.sh.mir, *b).filter(|c| is_positive_power_of_two(*c))
+                    {
+                        let q = self
+                            .b
+                            .build_float_mul(av, self.cf64(1.0 / c), "q")
+                            .map_err(|e| e.to_string())?;
+                        let q = self.intrinsic1("llvm.trunc.f64", q)?;
+                        let m = self
+                            .b
+                            .build_float_mul(q, bv, "m")
+                            .map_err(|e| e.to_string())?;
+                        let r = self
+                            .b
+                            .build_float_sub(av, m, "r")
+                            .map_err(|e| e.to_string())?;
+                        self.intrinsic2("llvm.copysign.f64", r, av)?.into()
+                    } else {
+                        self.f64_rem(av, bv)?.into()
+                    }
+                }
+                I::NegF64(a) => self
+                    .b
+                    .build_float_neg(self.getf(a)?, "fneg")
+                    .map_err(|e| e.to_string())?
+                    .into(),
+                I::CmpLtF64(a, b) => self
+                    .fcmp(FloatPredicate::OLT, self.getf(a)?, self.getf(b)?)?
+                    .into(),
+                I::CmpGtF64(a, b) => self
+                    .fcmp(FloatPredicate::OGT, self.getf(a)?, self.getf(b)?)?
+                    .into(),
+                I::CmpLeF64(a, b) => self
+                    .fcmp(FloatPredicate::OLE, self.getf(a)?, self.getf(b)?)?
+                    .into(),
+                I::CmpGeF64(a, b) => self
+                    .fcmp(FloatPredicate::OGE, self.getf(a)?, self.getf(b)?)?
+                    .into(),
+                I::Unbox(a) => self.getf(a)?.into(),
+                I::Box(a) => self.boxed(a)?.into(),
+                I::GuardNum(s) | I::GuardBool(s) | I::GuardClass(s, _) | I::GuardProtocol(s, _) => {
+                    self.get(s)?
+                }
+                I::MathUnaryF64(op, a) => {
+                    use crate::mir::MathUnaryOp::*;
+                    let x = self.getf(a)?;
+                    let r = match op {
+                        Floor => self.intrinsic1("llvm.floor.f64", x)?,
+                        Ceil => self.intrinsic1("llvm.ceil.f64", x)?,
+                        Sqrt => self.intrinsic1("llvm.sqrt.f64", x)?,
+                        Abs => self.intrinsic1("llvm.fabs.f64", x)?,
+                        Trunc => self.intrinsic1("llvm.trunc.f64", x)?,
+                        Round => self.intrinsic1("llvm.rint.f64", x)?,
+                        Fract => {
+                            let fl = self.intrinsic1("llvm.floor.f64", x)?;
+                            self.b
+                                .build_float_sub(x, fl, "fract")
+                                .map_err(|e| e.to_string())?
+                        }
+                        Sign => {
+                            let zero = self.cf64(0.0);
+                            let pos = self.fcmp(FloatPredicate::OGT, x, zero)?;
+                            let neg = self.fcmp(FloatPredicate::OLT, x, zero)?;
+                            let pz = self
+                                .b
+                                .build_select(pos, self.cf64(1.0), zero, "pz")
+                                .map_err(|e| e.to_string())?
+                                .into_float_value();
+                            self.b
+                                .build_select(neg, self.cf64(-1.0), pz, "sign")
+                                .map_err(|e| e.to_string())?
+                                .into_float_value()
+                        }
+                        Sin => self.intrinsic1("llvm.sin.f64", x)?,
+                        Cos => self.intrinsic1("llvm.cos.f64", x)?,
+                        Tan => self.libm1("tan", x)?,
+                        Asin => self.libm1("asin", x)?,
+                        Acos => self.libm1("acos", x)?,
+                        Atan => self.libm1("atan", x)?,
+                        Log => self.intrinsic1("llvm.log.f64", x)?,
+                        Log2 => self.intrinsic1("llvm.log2.f64", x)?,
+                        Exp => self.intrinsic1("llvm.exp.f64", x)?,
+                        Cbrt => self.libm1("cbrt", x)?,
+                    };
+                    r.into()
+                }
+                I::MathBinaryF64(op, a, b) => {
+                    use crate::mir::MathBinaryOp::*;
+                    let x = self.getf(a)?;
+                    let y = self.getf(b)?;
+                    let r = match op {
+                        Min => self.intrinsic2("llvm.minimum.f64", x, y)?,
+                        Max => self.intrinsic2("llvm.maximum.f64", x, y)?,
+                        Pow => self.intrinsic2("llvm.pow.f64", x, y)?,
+                        Atan2 => self.libm2("atan2", x, y)?,
+                    };
+                    r.into()
+                }
+            };
+            Ok(Some(v))
+        }
+
+        fn helper2(
+            &mut self,
+            name: &str,
+            a: &ValueId,
+            b: &ValueId,
+        ) -> Result<IntValue<'ctx>, String> {
+            let x = self.boxed(a)?;
+            let y = self.boxed(b)?;
+            self.call_helper(name, &[x, y])
+        }
+
+        /// Integer fast path for `a % b`, `fmod` otherwise.
+        fn f64_rem(
+            &mut self,
+            av: FloatValue<'ctx>,
+            bv: FloatValue<'ctx>,
+        ) -> Result<FloatValue<'ctx>, String> {
+            let fast = self.new_block("remf");
+            let slow = self.new_block("rems");
+            let merge = self.new_block("remm");
+            let ai = self.intrinsic_fptosi_sat(av)?;
+            let bi = self.intrinsic_fptosi_sat(bv)?;
+            let a_back = self
+                .b
+                .build_signed_int_to_float(ai, self.f64t(), "ab")
+                .map_err(|e| e.to_string())?;
+            let b_back = self
+                .b
+                .build_signed_int_to_float(bi, self.f64t(), "bb")
+                .map_err(|e| e.to_string())?;
+            let a_int = self.fcmp(FloatPredicate::OEQ, a_back, av)?;
+            let b_int = self.fcmp(FloatPredicate::OEQ, b_back, bv)?;
+            let limit = self.cf64(9007199254740992.0);
+            let a_abs = self.intrinsic1("llvm.fabs.f64", av)?;
+            let b_abs = self.intrinsic1("llvm.fabs.f64", bv)?;
+            let a_small = self.fcmp(FloatPredicate::OLT, a_abs, limit)?;
+            let b_small = self.fcmp(FloatPredicate::OLT, b_abs, limit)?;
+            let b_nz = self.icmp(IntPredicate::NE, bi, self.c64(0))?;
+            let ok = self.and(a_int, b_int)?;
+            let ok = self.and(ok, a_small)?;
+            let ok = self.and(ok, b_small)?;
+            let ok = self.and(ok, b_nz)?;
+            self.cbr(ok, fast, slow)?;
+            self.b.position_at_end(fast);
+            let r = self
+                .b
+                .build_int_signed_rem(ai, bi, "irem")
+                .map_err(|e| e.to_string())?;
+            let rf = self
+                .b
+                .build_signed_int_to_float(r, self.f64t(), "rf")
+                .map_err(|e| e.to_string())?;
+            let rf = self.intrinsic2("llvm.copysign.f64", rf, av)?;
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let sr = self.libm2("fmod", av, bv)?;
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(self.f64t().into(), &[(rf.into(), fast), (sr.into(), slow)])?
+                .into_float_value())
+        }
+
+        fn intrinsic_fptosi_sat(&mut self, x: FloatValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let intr = Intrinsic::find("llvm.fptosi.sat").ok_or("no fptosi.sat")?;
+            let decl = intr
+                .get_declaration(self.sh.module, &[self.i64t().into(), self.f64t().into()])
+                .ok_or("no fptosi.sat declaration")?;
+            let call = self
+                .b
+                .build_call(decl, &[x.into()], "sat")
+                .map_err(|e| e.to_string())?;
+            Ok(call.try_as_basic_value().basic().unwrap().into_int_value())
+        }
+
+        /// Boxed arithmetic or comparison with the inline f64 fast path.
+        fn boxed_binop(
+            &mut self,
+            a: &ValueId,
+            b: &ValueId,
+            op: BinOp,
+            slow_fn: &str,
+        ) -> Result<IntValue<'ctx>, String> {
+            let la = self.boxed(a)?;
+            let lb = self.boxed(b)?;
+            let check_b = self.new_block("chk");
+            let fast = self.new_block("fast");
+            let slow = self.new_block("slow");
+            let merge = self.new_block("merge");
+            let a_nan = self.is_nan_boxed(la)?;
+            self.cbr(a_nan, slow, check_b)?;
+            self.b.position_at_end(check_b);
+            let b_nan = self.is_nan_boxed(lb)?;
+            self.cbr(b_nan, slow, fast)?;
+            self.b.position_at_end(fast);
+            let fa = self.f64_of(la)?;
+            let fb = self.f64_of(lb)?;
+            let fast_v = match op {
+                BinOp::Add => self.bits(
+                    self.b
+                        .build_float_add(fa, fb, "fadd")
+                        .map_err(|e| e.to_string())?,
+                )?,
+                BinOp::Sub => self.bits(
+                    self.b
+                        .build_float_sub(fa, fb, "fsub")
+                        .map_err(|e| e.to_string())?,
+                )?,
+                BinOp::Mul => self.bits(
+                    self.b
+                        .build_float_mul(fa, fb, "fmul")
+                        .map_err(|e| e.to_string())?,
+                )?,
+                BinOp::Div => self.bits(
+                    self.b
+                        .build_float_div(fa, fb, "fdiv")
+                        .map_err(|e| e.to_string())?,
+                )?,
+                BinOp::Rem => {
+                    let r = self.f64_rem(fa, fb)?;
+                    self.bits(r)?
+                }
+                BinOp::Cmp(p) => {
+                    let c = self.fcmp(p, fa, fb)?;
+                    self.box_bool(c)?
+                }
+            };
+            let fast_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let slow_v = self.call_helper(slow_fn, &[la, lb])?;
+            let slow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(
+                    self.i64t().into(),
+                    &[(fast_v.into(), fast_end), (slow_v.into(), slow_end)],
+                )?
+                .into_int_value())
+        }
+
+        // ── Calls ──────────────────────────────────────────────────────
+
+        fn wren_call(
+            &mut self,
+            receiver: IntValue<'ctx>,
+            method_val: IntValue<'ctx>,
+            args: &[IntValue<'ctx>],
+        ) -> Result<IntValue<'ctx>, String> {
+            if args.len() > 8 {
+                let (_, buf) = self.stack_buf(args.len())?;
+                for (i, a) in args.iter().enumerate() {
+                    self.store64(buf, (i * 8) as i64, *a)?;
+                }
+                let count = self.c64(args.len() as u64);
+                return self.call_helper("wren_call_dynamic", &[receiver, method_val, count, buf]);
+            }
+            let name = format!("wren_call_{}", args.len());
+            let mut a = vec![receiver, method_val];
+            a.extend_from_slice(args);
+            self.call_helper(&name, &a)
+        }
+
+        fn method_bits(
+            &self,
+            method: crate::intern::SymbolId,
+            ic_idx: Option<usize>,
+        ) -> IntValue<'ctx> {
+            let mut bits = method.index() as u64;
+            if let Some(i) = ic_idx.filter(|_| env_jit_callsite_ic()) {
+                bits |= ((i as u64) + 1) << 32;
+            }
+            self.c64(bits)
+        }
+
+        fn known_call_nocheck(
+            &mut self,
+            func_id: u32,
+            method: crate::intern::SymbolId,
+            r: IntValue<'ctx>,
+            args: &[IntValue<'ctx>],
+        ) -> Result<IntValue<'ctx>, String> {
+            let packed = (func_id as u64) | ((method.index() as u64) << 32);
+            let name = format!("wren_known_call_{}_nocheck", args.len());
+            let mut a = vec![self.c64(packed), r];
+            a.extend_from_slice(args);
+            self.call_helper(&name, &a)
+        }
+
+        /// Inline a single-block callee body; `None` when the body cannot
+        /// be inlined here.
+        fn inline_body(
+            &mut self,
+            callee: &Arc<MirFunction>,
+            r: IntValue<'ctx>,
+            args: &[IntValue<'ctx>],
+        ) -> Result<Option<IntValue<'ctx>>, String> {
+            let block = &callee.blocks[0];
+            let mut callee_args = vec![r];
+            callee_args.extend_from_slice(args);
+            let saved_vals = std::mem::take(&mut self.vals);
+            let saved_bools = std::mem::take(&mut self.raw_bools);
+            let saved_types =
+                std::mem::replace(&mut self.value_types, infer_osr_value_types(callee));
+            let saved_recv = self.receiver.replace(r);
+            self.inline_depth += 1;
+            let mut result: Result<Option<IntValue<'ctx>>, String> = Ok(None);
+            let mut failed = false;
+            for (vid, inst) in &block.instructions {
+                match inst {
+                    Instruction::BlockParam(idx) => match callee_args.get(*idx as usize) {
+                        Some(v) => {
+                            self.vals.insert(*vid, (*v).into());
+                        }
+                        None => {
+                            failed = true;
+                            break;
+                        }
+                    },
+                    _ => match self.lower_instruction(*vid, inst) {
+                        Ok(Some(v)) => {
+                            self.vals.insert(*vid, v);
+                            if is_raw_bool(inst) {
+                                self.raw_bools.insert(*vid);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    },
+                }
+            }
+            if result.is_ok() && !failed {
+                result = match &block.terminator {
+                    Terminator::Return(v) => self.boxed(v).map(Some),
+                    Terminator::ReturnNull => Ok(Some(self.c64(TAG_NULL))),
+                    _ => Ok(None),
+                };
+            }
+            self.inline_depth -= 1;
+            self.receiver = saved_recv;
+            self.value_types = saved_types;
+            self.raw_bools = saved_bools;
+            self.vals = saved_vals;
+            result
+        }
+
+        fn lower_call(
+            &mut self,
+            receiver: &ValueId,
+            method: crate::intern::SymbolId,
+            args: &[ValueId],
+        ) -> Result<IntValue<'ctx>, String> {
+            let r = self.boxed(receiver)?;
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for a in args {
+                arg_vals.push(self.boxed(a)?);
+            }
+            if args.len() > 8 {
+                let m = self.c64(method.index() as u64);
+                return self.wren_call(r, m, &arg_vals);
+            }
+            let ic_idx = if self.inline_depth == 0 {
+                let i = self.call_site_idx;
+                self.call_site_idx += 1;
+                Some(i)
+            } else {
+                None
+            };
+
+            // Class-hierarchy devirtualisation: one guarded direct call
+            // per known implementation.
+            if let Some(cha) = self.sh.cha_by_method {
+                if args.len() <= 4 {
+                    let impls: Vec<(usize, u32, usize)> =
+                        cha.get(&method).cloned().unwrap_or_default();
+                    if !impls.is_empty() {
+                        let merge = self.new_block("cham");
+                        let slow = self.new_block("chas");
+                        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
+                            Vec::new();
+                        let (_, recv_class) = self.class_load_guarded(r, slow)?;
+                        for (class_ptr, fid, _) in &impls {
+                            let next = self.new_block("chan");
+                            let fast = self.new_block("chaf");
+                            let hit = self.icmp(
+                                IntPredicate::EQ,
+                                recv_class,
+                                self.c64(*class_ptr as u64),
+                            )?;
+                            self.cbr(hit, fast, next)?;
+                            self.b.position_at_end(fast);
+                            let body = self.sh.inline_bodies.and_then(|b| b.get(fid)).cloned();
+                            let mut done = false;
+                            if let Some(callee) = body {
+                                if let Some(v) = self.inline_body(&callee, r, &arg_vals)? {
+                                    incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                                    self.br(merge)?;
+                                    done = true;
+                                }
+                            }
+                            if !done {
+                                if args.len() <= 3 {
+                                    let v = self.known_call_nocheck(*fid, method, r, &arg_vals)?;
+                                    incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                                    self.br(merge)?;
+                                } else {
+                                    self.br(next)?;
+                                }
+                            }
+                            self.b.position_at_end(next);
+                        }
+                        self.br(slow)?;
+                        self.b.position_at_end(slow);
+                        let m = self.c64(method.index() as u64);
+                        let sv = self.wren_call(r, m, &arg_vals)?;
+                        incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                        self.br(merge)?;
+                        self.b.position_at_end(merge);
+                        return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
+                    }
+                }
+            }
+
+            // Monomorphic getter from the inline cache.
+            let ic = ic_idx.and_then(|i| self.sh.callsite_ic_ptrs.and_then(|ics| ics.get(i)));
+            let _ = self.sh.callsite_ic_live_ptrs;
+            if let Some(ic) = ic {
+                if ic.kind == 5 && ic.class != 0 {
+                    let fast = self.new_block("icf");
+                    let slow = self.new_block("ics");
+                    let merge = self.new_block("icm");
+                    let (obj, recv_class) = self.class_load_guarded(r, slow)?;
+                    let hit = self.icmp(IntPredicate::EQ, recv_class, self.c64(ic.class as u64))?;
+                    self.cbr(hit, fast, slow)?;
+                    self.b.position_at_end(fast);
+                    let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
+                    let fv = self.load64(fields, (ic.func_id as i64) * VALUE_SIZE as i64)?;
+                    self.br(merge)?;
+                    self.b.position_at_end(slow);
+                    let m = self.method_bits(method, ic_idx);
+                    let sv = self.wren_call(r, m, &arg_vals)?;
+                    let slow_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    return Ok(self
+                        .phi(
+                            self.i64t().into(),
+                            &[(fv.into(), fast), (sv.into(), slow_end)],
+                        )?
+                        .into_int_value());
+                }
+            }
+            let m = self.method_bits(method, ic_idx);
+            self.wren_call(r, m, &arg_vals)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn lower_known_call(
+            &mut self,
+            func_id: u32,
+            method: crate::intern::SymbolId,
+            expected_class: usize,
+            inline_getter_field: Option<u16>,
+            pure_leaf: bool,
+            receiver: &ValueId,
+            args: &[ValueId],
+        ) -> Result<IntValue<'ctx>, String> {
+            let r = self.boxed(receiver)?;
+            let mut arg_vals = Vec::with_capacity(args.len());
+            for a in args {
+                arg_vals.push(self.boxed(a)?);
+            }
+            let m = self.c64(method.index() as u64);
+
+            if let Some(bodies) = self.sh.inline_bodies {
+                if expected_class != 0 && args.len() <= 4 {
+                    if let Some(callee) = bodies.get(&func_id).cloned() {
+                        let fast = self.new_block("kif");
+                        let slow = self.new_block("kis");
+                        let merge = self.new_block("kim");
+                        let (_, recv_class) = self.class_load_guarded(r, slow)?;
+                        let hit = self.icmp(
+                            IntPredicate::EQ,
+                            recv_class,
+                            self.c64(expected_class as u64),
+                        )?;
+                        self.cbr(hit, fast, slow)?;
+                        self.b.position_at_end(fast);
+                        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
+                            Vec::new();
+                        match self.inline_body(&callee, r, &arg_vals)? {
+                            Some(v) => {
+                                incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                                self.br(merge)?;
+                            }
+                            None => self.br(slow)?,
+                        }
+                        self.b.position_at_end(slow);
+                        let sv = self.wren_call(r, m, &arg_vals)?;
+                        incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                        self.br(merge)?;
+                        self.b.position_at_end(merge);
+                        return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
+                    }
+                }
+            }
+
+            if env_pure_leaf_direct()
+                && inline_getter_field.is_none()
+                && pure_leaf
+                && expected_class != 0
+                && args.len() <= 4
+            {
+                if let Some(base) = self.sh.jit_code_base {
+                    let fast = self.new_block("plf");
+                    let slow = self.new_block("pls");
+                    let call_bb = self.new_block("plc");
+                    let merge = self.new_block("plm");
+                    let (_, recv_class) = self.class_load_guarded(r, slow)?;
+                    let hit = self.icmp(
+                        IntPredicate::EQ,
+                        recv_class,
+                        self.c64(expected_class as u64),
+                    )?;
+                    self.cbr(hit, fast, slow)?;
+                    self.b.position_at_end(fast);
+                    let slot_addr = unsafe { base.add(func_id as usize) } as u64;
+                    let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
+                    let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
+                    self.cbr(has, call_bb, slow)?;
+                    self.b.position_at_end(call_bb);
+                    let ty = self.helper_type(1 + args.len());
+                    let ptr = self
+                        .b
+                        .build_int_to_ptr(jit_ptr, self.ptrt(), "jp")
+                        .map_err(|e| e.to_string())?;
+                    let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
+                    a.extend(arg_vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+                    let call = self
+                        .b
+                        .build_indirect_call(ty, ptr, &a, "direct")
+                        .map_err(|e| e.to_string())?;
+                    let fv = call.try_as_basic_value().basic().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(slow);
+                    let sv = self.wren_call(r, m, &arg_vals)?;
+                    let slow_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    return Ok(self
+                        .phi(self.i64t().into(), &[(fv, call_bb), (sv.into(), slow_end)])?
+                        .into_int_value());
+                }
+            }
+
+            if let Some(field) = inline_getter_field {
+                let fast = self.new_block("gf");
+                let slow = self.new_block("gs");
+                let merge = self.new_block("gm");
+                let (obj, recv_class) = self.class_load_guarded(r, slow)?;
+                let hit = self.icmp(
+                    IntPredicate::EQ,
+                    recv_class,
+                    self.c64(expected_class as u64),
+                )?;
+                self.cbr(hit, fast, slow)?;
+                self.b.position_at_end(fast);
+                let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
+                let fv = self.load64(fields, (field as i64) * VALUE_SIZE as i64)?;
+                self.br(merge)?;
+                self.b.position_at_end(slow);
+                let sv = self.wren_call(r, m, &arg_vals)?;
+                let slow_end = self.b.get_insert_block().unwrap();
+                self.br(merge)?;
+                self.b.position_at_end(merge);
+                return Ok(self
+                    .phi(
+                        self.i64t().into(),
+                        &[(fv.into(), fast), (sv.into(), slow_end)],
+                    )?
+                    .into_int_value());
+            }
+
+            if expected_class != 0 && args.len() <= 3 {
+                let fast = self.new_block("kf");
+                let slow = self.new_block("ks");
+                let merge = self.new_block("km");
+                let (_, recv_class) = self.class_load_guarded(r, slow)?;
+                let hit = self.icmp(
+                    IntPredicate::EQ,
+                    recv_class,
+                    self.c64(expected_class as u64),
+                )?;
+                self.cbr(hit, fast, slow)?;
+                self.b.position_at_end(fast);
+                let fv = self.known_call_nocheck(func_id, method, r, &arg_vals)?;
+                let fast_end = self.b.get_insert_block().unwrap();
+                self.br(merge)?;
+                self.b.position_at_end(slow);
+                let sv = self.wren_call(r, m, &arg_vals)?;
+                let slow_end = self.b.get_insert_block().unwrap();
+                self.br(merge)?;
+                self.b.position_at_end(merge);
+                return Ok(self
+                    .phi(
+                        self.i64t().into(),
+                        &[(fv.into(), fast_end), (sv.into(), slow_end)],
+                    )?
+                    .into_int_value());
+            }
+
+            if args.len() <= 3 {
+                let packed = (func_id as u64) | ((method.index() as u64) << 32);
+                let name = format!("wren_known_call_{}", args.len());
+                let mut a = vec![self.c64(packed), r];
+                a.extend_from_slice(&arg_vals);
+                return self.call_helper(&name, &a);
+            }
+            self.wren_call(r, m, &arg_vals)
+        }
+    }
+
+    enum BinOp {
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Rem,
+        Cmp(FloatPredicate),
+    }
+
+    fn is_raw_bool(inst: &Instruction) -> bool {
+        matches!(
+            inst,
+            Instruction::CmpLtF64(..)
+                | Instruction::CmpGtF64(..)
+                | Instruction::CmpLeF64(..)
+                | Instruction::CmpGeF64(..)
+                | Instruction::ClassIs(..)
+                | Instruction::ObjectIs(..)
+                | Instruction::ClosureFnIs(..)
+                | Instruction::CmpLtI64(..)
+                | Instruction::CmpGtI64(..)
+                | Instruction::CmpLeI64(..)
+                | Instruction::CmpGeI64(..)
+        )
+    }
+}
