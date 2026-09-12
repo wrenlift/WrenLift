@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789228251,"nonce":"ExDZMM3QaeFqGH9Ww5awpNHkob0=","message":"Landed in 63bfcb9. The formatter was four divergent copies of Rust's Display; all replaced by one %.14g implementation and checked against wren_cli on 26 cases.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1789228251,"nonce":"VrRD1xaHm4LV6ViX28Oqgfpt/fk=","status":2}]}
