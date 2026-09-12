@@ -220,6 +220,12 @@ impl<'a> RangeLoop<'a> {
         //    Use boxed CmpLt (not CmpLtF64) because iter_param is NaN-boxed.
         //    TypeSpecialize will convert to CmpLtF64 on the Optimized tier.
         func.blocks[cond_bi].instructions[not_pos].1 = Instruction::CmpLt(iter_param, to_vid);
+        // The interpreter's own iterator holds `false` once the range is
+        // exhausted; an OSR entry at this header must decline that value
+        // rather than compare it.
+        if !func.speculated_num_params.contains(&iter_param) {
+            func.speculated_num_params.push(iter_param);
+        }
 
         // Swap CondBranch targets (CmpLtF64 is true when we should CONTINUE, not exit)
         func.blocks[cond_bi].terminator = Terminator::CondBranch {

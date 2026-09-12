@@ -194,8 +194,9 @@ cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", r
 # AOT entry point parses target triples at the top of the build
 # pipeline so we depend on it directly behind the `aot` feature.
 target-lexicon = { version = "0.13", optional = true }
-# LLVM 21, the same pin as Ash so its lowering patterns carry over.
-inkwell = { version = "0.8.0", features = ["llvm21-1-prefer-static"], optional = true }
+# LLVM 21, the same pin as Ash so its lowering patterns carry over;
+# linked against the shared library where one is installed.
+inkwell = { version = "0.8.0", features = ["llvm21-1-prefer-dynamic"], optional = true }
 # Tier-up / promotion broker. Pinned to 0.3 — version 0.3 brought in
 # the OsrEntry / swap_compiled_with_osr APIs that `src/runtime/tier.rs`
 # relies on for OSR-aware installs. Pulls in `std::thread` so it sits

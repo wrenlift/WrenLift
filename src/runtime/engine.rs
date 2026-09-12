@@ -439,13 +439,9 @@ fn insert_speculative_guards(mir: &mut MirFunction, profile: Option<&TypeProfile
             PROFILE_BOOL => {
                 guards.push((mir.new_value(), Instruction::GuardBool(*vid)));
             }
-            PROFILE_UNSEEN if profile.is_none() => {
-                // No profile at all → blind speculation (legacy)
-                guards.push((mir.new_value(), Instruction::GuardNum(*vid)));
-            }
-            _ => {
-                // Object, Mixed, Null, String, or Unseen-with-profile → no guard
-            }
+            // Object, Mixed, Null, String, or never observed: no guard.
+            // Guards are enforced, so a guess would only deopt.
+            _ => {}
         }
     }
 
@@ -2744,8 +2740,9 @@ impl ExecutionEngine {
         profile: Option<&TypeProfile>,
         speculate: bool,
     ) -> Arc<MirFunction> {
+        let _ = tier;
         let mut out = (**mir).clone();
-        if speculate && (profile.is_some() || tier == CompileTier::Optimized) {
+        if speculate && profile.is_some() {
             insert_speculative_guards(&mut out, profile);
         }
         run_jit_opt_pipeline(&mut out, interner);

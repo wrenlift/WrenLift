@@ -1441,12 +1441,27 @@ pub mod llvm {
                             .into()
                     }
                 }
+                I::SubscriptGet { receiver, args } if args.len() == 1 => {
+                    let r = self.boxed(receiver)?;
+                    let idx = self.boxed(&args[0])?;
+                    self.typed_array_get(r, idx)?.into()
+                }
                 I::SubscriptGet { receiver, args } => {
                     let mut a = vec![self.boxed(receiver)?];
                     for x in args {
                         a.push(self.boxed(x)?);
                     }
                     self.call_helper("wren_subscript_get", &a)?.into()
+                }
+                I::SubscriptSet {
+                    receiver,
+                    args,
+                    value,
+                } if args.len() == 1 => {
+                    let r = self.boxed(receiver)?;
+                    let idx = self.boxed(&args[0])?;
+                    let v = self.boxed(value)?;
+                    self.typed_array_set(r, idx, v)?.into()
                 }
                 I::SubscriptSet {
                     receiver,
@@ -1711,6 +1726,199 @@ pub mod llvm {
                 }
             };
             Ok(Some(v))
+        }
+
+        /// Branch to `slow` unless `r` is a typed array and `idx` a Num
+        /// within its count; on the returned block, `(obj_ptr, index,
+        /// data, kind)` are ready.
+        fn typed_array_probe(
+            &mut self,
+            r: IntValue<'ctx>,
+            idx: IntValue<'ctx>,
+            slow: BasicBlock<'ctx>,
+        ) -> Result<
+            (
+                IntValue<'ctx>,
+                IntValue<'ctx>,
+                IntValue<'ctx>,
+                IntValue<'ctx>,
+            ),
+            String,
+        > {
+            let high = self
+                .b
+                .build_right_shift(r, self.c64(48), false, "tag")
+                .map_err(|e| e.to_string())?;
+            let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(0xFFFC))?;
+            let obj_bb = self.new_block("tao");
+            self.cbr(is_obj, obj_bb, slow)?;
+            self.b.position_at_end(obj_bb);
+            let obj = self.and(r, self.c64(PTR_MASK))?;
+            let ty = self.load8(obj, HEADER_OBJ_TYPE as i64)?;
+            let is_ta = self.icmp(IntPredicate::EQ, ty, self.c64(OBJ_TYPE_TYPED_ARRAY as u64))?;
+            let ta_bb = self.new_block("ta");
+            self.cbr(is_ta, ta_bb, slow)?;
+            self.b.position_at_end(ta_bb);
+            let idx_f = self.f64_of(idx)?;
+            let idx_i = self
+                .b
+                .build_float_to_signed_int(idx_f, self.i64t(), "idx")
+                .map_err(|e| e.to_string())?;
+            let count_p = self.addr(obj, TYPED_ARRAY_COUNT as i64)?;
+            let count32 = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), count_p, "count")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let count = self
+                .b
+                .build_int_z_extend(count32, self.i64t(), "count64")
+                .map_err(|e| e.to_string())?;
+            let in_range = self.icmp(IntPredicate::ULT, idx_i, count)?;
+            let ok_bb = self.new_block("tai");
+            self.cbr(in_range, ok_bb, slow)?;
+            self.b.position_at_end(ok_bb);
+            let data = self.load64(obj, TYPED_ARRAY_DATA as i64)?;
+            let kind = self.load8(obj, TYPED_ARRAY_KIND as i64)?;
+            Ok((obj, idx_i, data, kind))
+        }
+
+        fn element_addr(
+            &mut self,
+            data: IntValue<'ctx>,
+            idx: IntValue<'ctx>,
+            size: u64,
+        ) -> Result<PointerValue<'ctx>, String> {
+            let off = self
+                .b
+                .build_int_mul(idx, self.c64(size), "off")
+                .map_err(|e| e.to_string())?;
+            let a = self
+                .b
+                .build_int_add(data, off, "ea")
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_int_to_ptr(a, self.ptrt(), "ep")
+                .map_err(|e| e.to_string())
+        }
+
+        /// `r[idx]` with the typed-array element kinds inline and
+        /// everything else through the helper.
+        fn typed_array_get(
+            &mut self,
+            r: IntValue<'ctx>,
+            idx: IntValue<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let slow = self.new_block("sgs");
+            let merge = self.new_block("sgm");
+            let (_, i, data, kind) = self.typed_array_probe(r, idx, slow)?;
+            let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+            let ctx = self.sh.ctx;
+            let kinds: [(u8, u64); 4] = [
+                (TA_KIND_F64, 8),
+                (TA_KIND_F32, 4),
+                (TA_KIND_I32, 4),
+                (TA_KIND_U8, 1),
+            ];
+            for (k, size) in kinds {
+                let hit = self.icmp(IntPredicate::EQ, kind, self.c64(k as u64))?;
+                let yes = self.new_block("sgk");
+                let next = self.new_block("sgn");
+                self.cbr(hit, yes, next)?;
+                self.b.position_at_end(yes);
+                let p = self.element_addr(data, i, size)?;
+                let f: FloatValue<'ctx> = match k {
+                    TA_KIND_F64 => self
+                        .b
+                        .build_load(self.f64t(), p, "e")
+                        .map_err(|e| e.to_string())?
+                        .into_float_value(),
+                    TA_KIND_F32 => {
+                        let v = self
+                            .b
+                            .build_load(ctx.f32_type(), p, "e")
+                            .map_err(|e| e.to_string())?
+                            .into_float_value();
+                        self.b
+                            .build_float_ext(v, self.f64t(), "ext")
+                            .map_err(|e| e.to_string())?
+                    }
+                    TA_KIND_I32 => {
+                        let v = self
+                            .b
+                            .build_load(ctx.i32_type(), p, "e")
+                            .map_err(|e| e.to_string())?
+                            .into_int_value();
+                        self.b
+                            .build_signed_int_to_float(v, self.f64t(), "i2f")
+                            .map_err(|e| e.to_string())?
+                    }
+                    _ => {
+                        let v = self
+                            .b
+                            .build_load(ctx.i8_type(), p, "e")
+                            .map_err(|e| e.to_string())?
+                            .into_int_value();
+                        self.b
+                            .build_unsigned_int_to_float(v, self.f64t(), "u2f")
+                            .map_err(|e| e.to_string())?
+                    }
+                };
+                let bits = self.bits(f)?;
+                incoming.push((bits.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+                self.b.position_at_end(next);
+            }
+            self.br(slow)?;
+            self.b.position_at_end(slow);
+            let sv = self.call_helper("wren_subscript_get", &[r, idx])?;
+            incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
+        }
+
+        /// `r[idx] = v` with f32/f64 typed-array stores inline and
+        /// everything else through the helper.
+        fn typed_array_set(
+            &mut self,
+            r: IntValue<'ctx>,
+            idx: IntValue<'ctx>,
+            v: IntValue<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let slow = self.new_block("sss");
+            let merge = self.new_block("ssm");
+            let (_, i, data, kind) = self.typed_array_probe(r, idx, slow)?;
+            let is_box = self.is_nan_boxed(v)?;
+            let num_bb = self.new_block("ssn");
+            self.cbr(is_box, slow, num_bb)?;
+            self.b.position_at_end(num_bb);
+            let vf = self.f64_of(v)?;
+            let is_f64 = self.icmp(IntPredicate::EQ, kind, self.c64(TA_KIND_F64 as u64))?;
+            let f64_bb = self.new_block("ss64");
+            let chk32 = self.new_block("ssc");
+            self.cbr(is_f64, f64_bb, chk32)?;
+            self.b.position_at_end(f64_bb);
+            let p = self.element_addr(data, i, 8)?;
+            self.b.build_store(p, vf).map_err(|e| e.to_string())?;
+            self.br(merge)?;
+            self.b.position_at_end(chk32);
+            let is_f32 = self.icmp(IntPredicate::EQ, kind, self.c64(TA_KIND_F32 as u64))?;
+            let f32_bb = self.new_block("ss32");
+            self.cbr(is_f32, f32_bb, slow)?;
+            self.b.position_at_end(f32_bb);
+            let p = self.element_addr(data, i, 4)?;
+            let v32 = self
+                .b
+                .build_float_trunc(vf, self.sh.ctx.f32_type(), "f32")
+                .map_err(|e| e.to_string())?;
+            self.b.build_store(p, v32).map_err(|e| e.to_string())?;
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            self.call_helper("wren_subscript_set", &[r, idx, v])?;
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(v)
         }
 
         /// Branch on `fails` to a cold block that re-executes the call in
