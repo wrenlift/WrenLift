@@ -113,3 +113,60 @@ jobs:
 
       - name: Format check
         run: cargo fmt -- --check
+
+  # The LLVM top tier is off the default feature set; this job builds
+  # it against the same LLVM 21 the code is pinned to and runs the
+  # suites that exercise promotion.
+  llvm-tier:
+    name: LLVM tier (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-llvm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-llvm-
+
+      - name: Install LLVM 21
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gpg software-properties-common \
+            libzstd-dev zlib1g-dev libxml2-dev libtinfo-dev libedit-dev libffi-dev
+          wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21 all
+          llvm-config-21 --version
+
+      - name: Build
+        run: cargo build --release --features llvm --bin wlift
+
+      - name: Unit tests
+        run: cargo test --release --features llvm --lib
+
+      - name: E2E tests
+        run: cargo test --release --features llvm --test e2e
+
+      - name: Clippy
+        run: cargo clippy --release --features llvm -- -D warnings
+
+      - name: Benchmarks on the LLVM tier
+        run: |
+          for b in fib method_call nbody binary_trees delta_blue; do
+            printf '%s: ' "$b"
+            ./target/release/wlift --mode tiered bench/$b.wren | grep elapsed
+          done
