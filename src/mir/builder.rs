@@ -1140,14 +1140,18 @@ impl<'a> MirBuilder<'a> {
                 }
 
                 let sig = self.method_sig_with_parens(method.0, arg_vals.len(), *has_parens);
+                // Inside a static method, `Class.m(...)` and the implicit
+                // `m(...)` both dispatch on the class object, so both
+                // are the same direct self call.
                 let is_static_self_call = self.current_method_is_static
                     && self.current_method_sig == Some(sig)
-                    && receiver.as_ref().is_some_and(|recv_expr| {
-                        matches!(
+                    && match receiver.as_ref() {
+                        None => true,
+                        Some(recv_expr) => matches!(
                             &recv_expr.0,
                             Expr::Ident(sym) if Some(*sym) == self.current_class_name
-                        )
-                    });
+                        ),
+                    };
                 if is_static_self_call {
                     return self.emit(Instruction::CallStaticSelf { args: arg_vals });
                 }
