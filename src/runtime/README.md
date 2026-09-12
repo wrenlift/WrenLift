@@ -55,12 +55,18 @@ Method dispatch is O(1) via `HashMap<SymbolId, Method>` lookup, where `SymbolId`
 ## Garbage Collector
 
 The default collector (`gc_immix.rs`, `--gc immix`, `WLIFT_GC=immix`) is a
-non-moving mark-sweep over Immix geometry: 32 KiB blocks of 128-byte lines
-in demand-mapped 32 MiB chunks. Objects up to one line bump-allocate and
-never straddle a line; larger objects own whole lines. Object starts and
-span sizes live in side tables, so any address inside an allocation
-resolves to its start. Heap tracing is precise through `trace_object`;
-native stacks (the running one from a callee-saved register spill to the
+non-moving mark-sweep whose memory comes through the runtime seam
+(`rt.rs`): a versioned `#[repr(C)]` table of function-pointer slots for
+allocation, address resolution, the per-cycle liveness claim, the stack
+scan, the trigger and the sweep. A host installs its own memory with
+`wlift_rt_install` before the first Immix VM exists; otherwise every slot
+is wren_lift's block allocator (`gc_immix_heap.rs`), Immix geometry:
+32 KiB blocks of 128-byte lines in demand-mapped 32 MiB chunks. Objects
+up to one line bump-allocate and never straddle a line; larger objects
+own whole lines. Object starts and span sizes live in side tables, so
+any address inside an allocation resolves to its start. Heap tracing is
+precise through `for_each_child`, whichever memory is underneath; native
+stacks (the running one from a callee-saved register spill to the
 thread's stack top, every suspended krio fiber from its saved sp) are
 scanned conservatively, so compiled code needs no stack maps and Rust
 helpers need no root pushes. Any allocation helper is a safepoint in

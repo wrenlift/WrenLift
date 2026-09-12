@@ -472,8 +472,8 @@ impl GcAllocator for MarkSweepGc {
         self.bytes_since_gc >= self.gc_threshold
     }
 
-    fn stats(&self) -> &GcStats {
-        &self.stats
+    fn stats(&self) -> GcStats {
+        self.stats
     }
 }
 

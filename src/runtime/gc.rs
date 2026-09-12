@@ -524,7 +524,7 @@ impl Default for GcConfig {
 // Statistics
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GcStats {
     pub minor_collections: u32,
     pub major_collections: u32,
@@ -2023,19 +2023,21 @@ const MAX_VALID_HEAP_ADDR: usize = 1 << 52;
 #[cfg(target_pointer_width = "32")]
 const MAX_VALID_HEAP_ADDR: usize = usize::MAX;
 
-fn is_valid_obj_ptr(header: *mut ObjHeader) -> bool {
+pub(super) fn is_valid_obj_ptr(header: *mut ObjHeader) -> bool {
     let addr = header as usize;
     (MIN_VALID_HEAP_ADDR..MAX_VALID_HEAP_ADDR).contains(&addr)
 }
 
+/// The object `val` refers to, if it is one and its address is plausible.
+#[inline(always)]
+pub(super) fn object_of(val: Value) -> Option<*mut ObjHeader> {
+    let header = val.as_object()? as *mut ObjHeader;
+    is_valid_obj_ptr(header).then_some(header)
+}
+
 pub(super) fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
-    if val.is_object() {
-        if let Some(ptr) = val.as_object() {
-            let header = ptr as *mut ObjHeader;
-            if is_valid_obj_ptr(header) {
-                mark_gray(header, gray_stack);
-            }
-        }
+    if let Some(header) = object_of(val) {
+        mark_gray(header, gray_stack);
     }
 }
 
@@ -2066,20 +2068,31 @@ pub(super) fn process_gray_stack(gray_stack: &mut Vec<*mut ObjHeader>) {
 
 /// Trace all object references from a single object.
 unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
-    // Reject obviously-corrupt headers before dereferencing. Same
-    // bracket as `is_valid_obj_ptr` — covers both low-int corruption
-    // (collect_minor 0x4 fault) and high-garbage / PAC-signed
-    // pointers (collect_major 0x2ada... fault).
+    for_each_child(header, &mut |child| mark_gray(child, gray_stack));
+}
+
+#[inline(always)]
+fn child_ptr<F: FnMut(*mut ObjHeader)>(ptr: *mut ObjHeader, f: &mut F) {
+    if !ptr.is_null() && is_valid_obj_ptr(ptr) {
+        f(ptr);
+    }
+}
+
+#[inline(always)]
+fn child_value<F: FnMut(*mut ObjHeader)>(val: Value, f: &mut F) {
+    if let Some(header) = object_of(val) {
+        f(header);
+    }
+}
+
+/// Call `f` with every object `header` refers to: its class, then its
+/// fields' objects. Null and implausible pointers are skipped, so a
+/// corrupt slot costs a leaked reference rather than a fault.
+pub(super) unsafe fn for_each_child<F: FnMut(*mut ObjHeader)>(header: *mut ObjHeader, f: &mut F) {
     if !is_valid_obj_ptr(header) {
         return;
     }
-    if !(*header).class.is_null() && is_valid_obj_ptr((*header).class as *mut ObjHeader) {
-        mark_gray((*header).class as *mut ObjHeader, gray_stack);
-    } else if !(*header).class.is_null() {
-        // Class pointer set but corrupt — skip the mark but keep
-        // going so the rest of this header's children still get
-        // traced.
-    }
+    child_ptr((*header).class as *mut ObjHeader, f);
 
     match (*header).obj_type {
         ObjType::String
@@ -2092,108 +2105,85 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
         ObjType::List => {
             let list = &*(header as *mut ObjList);
             for &val in list.as_slice() {
-                mark_value(val, gray_stack);
+                child_value(val, f);
             }
         }
 
         ObjType::Map => {
             let map = &*(header as *mut ObjMap);
             for (key, &val) in &map.entries {
-                mark_value(key.value(), gray_stack);
-                mark_value(val, gray_stack);
+                child_value(key.value(), f);
+                child_value(val, f);
             }
         }
 
         ObjType::Closure => {
             let closure = &*(header as *mut ObjClosure);
-            if !closure.function.is_null() {
-                mark_gray(closure.function as *mut ObjHeader, gray_stack);
-            }
+            child_ptr(closure.function as *mut ObjHeader, f);
             for &uv in &closure.upvalues {
-                if !uv.is_null() {
-                    mark_gray(uv as *mut ObjHeader, gray_stack);
-                }
+                child_ptr(uv as *mut ObjHeader, f);
             }
         }
 
         ObjType::Upvalue => {
             let uv = &*(header as *mut ObjUpvalue);
-            mark_value(uv.closed, gray_stack);
+            child_value(uv.closed, f);
         }
 
         ObjType::Fiber => {
             let fiber = &*(header as *mut ObjFiber);
             for &val in &fiber.stack {
-                mark_value(val, gray_stack);
+                child_value(val, f);
             }
             for frame in &fiber.frames {
-                if !frame.closure.is_null() {
-                    mark_gray(frame.closure as *mut ObjHeader, gray_stack);
-                }
+                child_ptr(frame.closure as *mut ObjHeader, f);
             }
-            // Trace MIR interpreter frames (SSA value maps, closures, classes).
             for frame in &fiber.mir_frames {
-                for val in &frame.values {
-                    mark_value(*val, gray_stack);
+                for &val in &frame.values {
+                    child_value(val, f);
                 }
                 if let Some(closure) = frame.closure {
-                    if !closure.is_null() {
-                        mark_gray(closure as *mut ObjHeader, gray_stack);
-                    }
+                    child_ptr(closure as *mut ObjHeader, f);
                 }
                 if let Some(class) = frame.defining_class {
-                    if !class.is_null() {
-                        mark_gray(class as *mut ObjHeader, gray_stack);
-                    }
+                    child_ptr(class as *mut ObjHeader, f);
                 }
             }
-            // AOT state-machine frames hold live-across-suspension
-            // values + cross-fn-call args (saved by the caller's
-            // CrossFnCallInit before invoking the child poll fn).
-            // These are roots for the duration of the suspension —
-            // without tracing them, an ObjList stashed into a slot
-            // before `fn.call(...)` becomes stale (under moving GC)
-            // or sweeped (under marksweep) once the callee triggers
-            // a collection, and the resume reads a freed pointer.
+            // AOT frames hold values live across a suspension and the
+            // arguments of a cross-function call in flight.
             for frame in &fiber.aot_frames {
                 for &val in &frame.saved_values {
-                    mark_value(val, gray_stack);
+                    child_value(val, f);
                 }
             }
-            if !fiber.caller.is_null() {
-                mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
-            }
-            mark_value(fiber.error, gray_stack);
-            mark_value(fiber.context_map, gray_stack);
+            child_ptr(fiber.caller as *mut ObjHeader, f);
+            child_value(fiber.error, f);
+            child_value(fiber.context_map, f);
             if let Some(v) = fiber.jit_resume_value {
-                mark_value(v, gray_stack);
+                child_value(v, f);
             }
             #[cfg(feature = "host")]
             {
-                mark_value(fiber.krio_return_value, gray_stack);
+                child_value(fiber.krio_return_value, f);
                 for &val in &fiber.krio_jit_roots {
-                    mark_value(val, gray_stack);
+                    child_value(val, f);
                 }
             }
         }
 
         ObjType::Class => {
             let class = &*(header as *mut ObjClass);
-            if !class.superclass.is_null() {
-                mark_gray(class.superclass as *mut ObjHeader, gray_stack);
-            }
+            child_ptr(class.superclass as *mut ObjHeader, f);
             for method in class.methods.iter().flatten() {
                 match method {
                     Method::Closure(ptr) | Method::Constructor(ptr) => {
-                        if !ptr.is_null() {
-                            mark_gray(*ptr as *mut ObjHeader, gray_stack);
-                        }
+                        child_ptr(*ptr as *mut ObjHeader, f);
                     }
                     Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_) => {}
                 }
             }
             for &val in class.static_fields.values() {
-                mark_value(val, gray_stack);
+                child_value(val, f);
             }
         }
 
@@ -2201,7 +2191,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
             let inst = &*(header as *mut ObjInstance);
             if !inst.fields.is_null() {
                 for i in 0..inst.num_fields as usize {
-                    mark_value(*inst.fields.add(i), gray_stack);
+                    child_value(*inst.fields.add(i), f);
                 }
             }
         }
@@ -2209,7 +2199,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
         ObjType::Module => {
             let module = &*(header as *mut ObjModule);
             for &val in &module.variables {
-                mark_value(val, gray_stack);
+                child_value(val, f);
             }
         }
     }
@@ -2688,8 +2678,8 @@ impl super::gc_trait::GcAllocator for Gc {
         self.should_collect()
     }
     #[inline(always)]
-    fn stats(&self) -> &GcStats {
-        &self.stats
+    fn stats(&self) -> GcStats {
+        self.stats
     }
 }
 

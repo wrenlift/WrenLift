@@ -57,7 +57,8 @@ pub trait GcAllocator {
 
     // -- Statistics ---------------------------------------------------------
 
-    fn stats(&self) -> &GcStats;
+    /// A snapshot of the counters.
+    fn stats(&self) -> GcStats;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ impl GcImpl {
         }
     }
     #[inline(always)]
-    pub fn stats(&self) -> &GcStats {
+    pub fn stats(&self) -> GcStats {
         gc_dispatch!(self, stats)
     }
 
@@ -412,7 +413,7 @@ impl GcAllocator for GcImpl {
         gc_dispatch!(self, should_collect)
     }
     #[inline(always)]
-    fn stats(&self) -> &GcStats {
+    fn stats(&self) -> GcStats {
         gc_dispatch!(self, stats)
     }
 }

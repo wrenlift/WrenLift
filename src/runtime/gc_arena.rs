@@ -178,8 +178,8 @@ impl GcAllocator for ArenaGc {
         false // Never collect.
     }
 
-    fn stats(&self) -> &GcStats {
-        &self.stats
+    fn stats(&self) -> GcStats {
+        self.stats
     }
 }
 
