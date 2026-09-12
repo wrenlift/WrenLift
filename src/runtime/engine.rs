@@ -1345,6 +1345,59 @@ impl ExecutionEngine {
     /// that doesn't match, which on benchmarks like delta_blue
     /// regresses 3-5%. A multi-class dispatch tree (mirroring
     /// AOT-CHA's emit) is the proper fix and will land separately.
+    /// Re-order a bytecode-ordered inline-cache snapshot to the call
+    /// order of an optimised MIR. Both the bytecode emitter and the
+    /// backends number call sites by walking blocks in order, but the
+    /// JIT compiles a clone whose passes drop, add and move calls, so
+    /// positions no longer agree. A call's destination value id does
+    /// survive optimisation, so entries are matched on it; calls the
+    /// optimiser introduced get an empty entry.
+    fn align_callsite_ics(
+        authoritative: &MirFunction,
+        optimised: &MirFunction,
+        ics: Vec<CallSiteIC>,
+        live: Vec<usize>,
+        hints: Option<Vec<crate::codegen::DevirtHint>>,
+    ) -> (Vec<CallSiteIC>, Vec<usize>, Option<Vec<crate::codegen::DevirtHint>>) {
+        use crate::mir::Instruction;
+        let mut by_dst: HashMap<crate::mir::ValueId, usize> = HashMap::new();
+        let mut idx = 0usize;
+        for block in &authoritative.blocks {
+            for (dst, inst) in &block.instructions {
+                if matches!(inst, Instruction::Call { .. } | Instruction::SuperCall { .. }) {
+                    by_dst.insert(*dst, idx);
+                    idx += 1;
+                }
+            }
+        }
+        let mut out_ics = Vec::new();
+        let mut out_live = Vec::new();
+        let mut out_hints = hints.as_ref().map(|_| Vec::new());
+        for block in &optimised.blocks {
+            for (dst, inst) in &block.instructions {
+                if matches!(inst, Instruction::Call { .. } | Instruction::SuperCall { .. }) {
+                    match by_dst.get(dst) {
+                        Some(&i) if i < ics.len() => {
+                            out_ics.push(ics[i]);
+                            out_live.push(live.get(i).copied().unwrap_or(0));
+                            if let (Some(out), Some(h)) = (out_hints.as_mut(), hints.as_ref()) {
+                                out.push(h.get(i).copied().unwrap_or_default());
+                            }
+                        }
+                        _ => {
+                            out_ics.push(CallSiteIC::default());
+                            out_live.push(0);
+                            if let Some(out) = out_hints.as_mut() {
+                                out.push(Default::default());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (out_ics, out_live, out_hints)
+    }
+
     fn fill_ic_with_cha(
         &self,
         mir: &crate::mir::MirFunction,
@@ -2301,6 +2354,15 @@ impl ExecutionEngine {
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
+        let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
+            match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
+                (Some(ics), Some(live)) => {
+                    let (a, b, h) =
+                        Self::align_callsite_ics(&mir, &compile_mir, ics, live, devirt_hints);
+                    (Some(a), Some(b), h)
+                }
+                _ => (None, None, None),
+            };
         let jit_code_base = Some(self.jit_code.as_ptr());
         let callee_purity = Some(self.compute_callee_purity_map());
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
@@ -2487,6 +2549,15 @@ impl ExecutionEngine {
             }
             let compile_mir =
                 Self::build_compile_mir(&mir, tier, &interner_clone, profile.as_ref());
+            let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
+                match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
+                    (Some(ics), Some(live)) => {
+                        let (a, b, h) =
+                            Self::align_callsite_ics(&mir, &compile_mir, ics, live, devirt_hints);
+                        (Some(a), Some(b), h)
+                    }
+                    _ => (None, None, None),
+                };
             if std::env::var("WLIFT_JIT_DUMP").is_ok() {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
