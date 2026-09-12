@@ -1216,9 +1216,9 @@ pub fn live_in_sets(func: &MirFunction) -> LiveSets {
                     }
                 }
             }
-            for w in 0..words {
+            for (w, out_w) in out.iter().enumerate() {
                 let idx = b * words + w;
-                let next = gens[idx] | (out[w] & !defs[idx]);
+                let next = gens[idx] | (out_w & !defs[idx]);
                 if next != live[idx] {
                     live[idx] = next;
                     changed = true;

@@ -1282,17 +1282,23 @@ pub fn jit_state() -> *mut JitThread {
     JIT.with(|j| j.get())
 }
 
+/// A loop header left through an OSR exit and the (register, value)
+/// pairs the interpreter restores before resuming there.
+pub type OsrExitRecord = (u32, Vec<(u32, Value)>);
+
 thread_local! {
-    /// The loop header a compiled body left through an OSR exit, with
-    /// (register, value) pairs the interpreter restores before resuming.
-    static OSR_EXIT: std::cell::RefCell<Option<(u32, Vec<(u32, Value)>)>> = const { std::cell::RefCell::new(None) };
+    static OSR_EXIT: std::cell::RefCell<Option<OsrExitRecord>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Compiled code leaving a cold loop: `buf` holds `n` (register, value)
 /// pairs of the header's live-ins. Returns the internal undefined
 /// sentinel the OSR caller checks for.
+///
+/// # Safety
+/// `buf` must point at `2 * n` readable u64s; compiled code passes its
+/// own stack buffer.
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_osr_exit(header: u64, buf: *const u64, n: u64) -> u64 {
+pub unsafe extern "C" fn wren_osr_exit(header: u64, buf: *const u64, n: u64) -> u64 {
     let vals: Vec<(u32, Value)> = (0..n as usize)
         .map(|i| unsafe {
             (
@@ -1306,7 +1312,7 @@ pub extern "C" fn wren_osr_exit(header: u64, buf: *const u64, n: u64) -> u64 {
 }
 
 /// Take the pending OSR exit record, if a compiled body just left one.
-pub fn take_osr_exit() -> Option<(u32, Vec<(u32, Value)>)> {
+pub fn take_osr_exit() -> Option<OsrExitRecord> {
     OSR_EXIT.with(|e| e.borrow_mut().take())
 }
 

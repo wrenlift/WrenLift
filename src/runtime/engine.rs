@@ -2487,7 +2487,7 @@ impl ExecutionEngine {
         }
         let probes = self.cold_osr_probes.entry((id.0, block.0)).or_insert(0);
         *probes += 1;
-        if *probes % 256 == 0 {
+        if probes.is_multiple_of(256) {
             self.request_tier_up(id, interner);
         }
         true
