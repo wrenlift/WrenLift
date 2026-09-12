@@ -121,24 +121,34 @@ pub enum TopTierCeiling {
     High,
 }
 
-pub fn top_tier_ceiling(mir: &MirFunction) -> TopTierCeiling {
+/// `field_access_site(i)` says whether the `i`-th call site (in block
+/// order, `Call` and `SuperCall` only) resolves to a trivial getter or
+/// setter, which the tiers lower to a field access rather than a call.
+pub fn top_tier_ceiling(
+    mir: &MirFunction,
+    field_access_site: &dyn Fn(usize) -> bool,
+) -> TopTierCeiling {
     use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
     use crate::mir::Instruction;
-    let is_call = |i: &Instruction| {
-        matches!(
-            i,
-            Instruction::Call { .. }
-                | Instruction::CallKnownFunc { .. }
-                | Instruction::CallStaticSelf { .. }
-                | Instruction::SuperCall { .. }
-        )
-    };
     let instrs: usize = mir.blocks.iter().map(|b| b.instructions.len()).sum();
-    let calls: usize = mir
-        .blocks
-        .iter()
-        .map(|b| b.instructions.iter().filter(|(_, i)| is_call(i)).count())
-        .sum();
+    let mut site = 0usize;
+    let mut calls = 0usize;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            match inst {
+                Instruction::Call { .. } | Instruction::SuperCall { .. } => {
+                    if !field_access_site(site) {
+                        calls += 1;
+                    }
+                    site += 1;
+                }
+                Instruction::CallKnownFunc { .. } | Instruction::CallStaticSelf { .. } => {
+                    calls += 1;
+                }
+                _ => {}
+            }
+        }
+    }
     if mir.blocks.is_empty() {
         return TopTierCeiling::None;
     }
@@ -3041,6 +3051,38 @@ impl ExecutionEngine {
         count >= self.top_tier_queue_at() && count >= self.promote_retry_at[idx]
     }
 
+    /// The top tier's ceiling for `id`, with call sites the inline
+    /// caches resolve to trivial getters and setters counted as field
+    /// accesses.
+    fn ceiling(&mut self, id: FuncId, mir: &MirFunction) -> TopTierCeiling {
+        let ics = self.callsite_ic_data_for_compile(id).map(|(s, _)| s);
+        let field_access = |site: usize| -> bool {
+            let Some(ics) = ics.as_ref() else {
+                return false;
+            };
+            let Some(ic) = ics.get(site) else {
+                return false;
+            };
+            if ic.kind == 5 {
+                return true;
+            }
+            if ic.func_id == 0 || ic.class == 0 {
+                return false;
+            }
+            let callee = ic.func_id as usize;
+            self.trivial_getter_fields
+                .get(callee)
+                .map(|f| f.is_some())
+                .unwrap_or(false)
+                || self
+                    .trivial_setter_fields
+                    .get(callee)
+                    .map(|f| f.is_some())
+                    .unwrap_or(false)
+        };
+        top_tier_ceiling(mir, &field_access)
+    }
+
     /// Baseline code's own entry count crossing a sampling point.
     #[cfg(feature = "host")]
     pub fn native_tick(&mut self, id: FuncId, interner: &crate::intern::Interner) {
@@ -3074,8 +3116,9 @@ impl ExecutionEngine {
         if settled {
             cell.tick_after(u32::MAX);
         } else if self.compiling_tier[idx].is_some() {
-            // Compile in flight: come back to install it.
-            cell.tick_after(4096);
+            // Compile in flight: the finished compile brings the tick
+            // forward itself; this is the fallback.
+            cell.tick_after(1 << 20);
         } else {
             let at = self.promote_retry_at[idx]
                 .max(self.top_tier_queue_at())
@@ -3400,7 +3443,7 @@ impl ExecutionEngine {
         let mir = Arc::clone(body.mir());
         let top_tier_on = crate::codegen::top_tier() != crate::codegen::TopTier::Off;
         let worth_top_tier = top_tier_on
-            && (!promotion_gate_enabled() || top_tier_ceiling(&mir) == TopTierCeiling::High);
+            && (!promotion_gate_enabled() || self.ceiling(id, &mir) == TopTierCeiling::High);
         if tier == CompileTier::Optimized {
             if !top_tier_on {
                 return;
@@ -3477,6 +3520,14 @@ impl ExecutionEngine {
             .insert(idx, cold.keys().copied().collect());
         let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
+        // The finished compile brings the baseline code's next tick
+        // forward so the install lands at its next entry or outermost
+        // iteration instead of at the interpreter's next safepoint.
+        let tier_cell_addr = if tier == CompileTier::Optimized {
+            self.tier_cells[idx].as_ref() as *const TierCell as usize
+        } else {
+            0
+        };
         let modvars_cell = self.modvars_cell_addr(id);
         let callee_purity = self.compute_callee_purity_map();
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
@@ -3622,6 +3673,15 @@ impl ExecutionEngine {
                 _ => (std::ptr::null_mut(), Vec::new()),
             };
             let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
+            if tier_cell_addr != 0 {
+                // SAFETY: the cell is boxed for the engine's lifetime and
+                // only ever read through atomics on other threads; the
+                // compiled code's own countdown update is a plain
+                // read-modify-write, so this store can lose to it, costing
+                // one more iteration before the tick.
+                let cell = unsafe { &*(tier_cell_addr as *const TierCell) };
+                cell.tick_after(1);
+            }
             beadie::OsrCompileResult {
                 entry: native_ptr,
                 osr,

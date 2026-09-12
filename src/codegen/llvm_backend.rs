@@ -862,15 +862,18 @@ pub mod llvm {
                 let mut vars: Vec<ValueId> = layout.external_args.clone();
                 vars.extend(osr_rematerializable_defs(mir, layout.target_block).into_keys());
                 for vid in vars {
-                    if self.slots.contains_key(&vid) {
-                        continue;
+                    // A block parameter already has a slot, but a block
+                    // the entry switch reaches directly is no longer
+                    // dominated by the parameter's block, so every block
+                    // reads it from the slot.
+                    if !self.slots.contains_key(&vid) {
+                        let lt = slot_type(vid, &self);
+                        let slot = self
+                            .b
+                            .build_alloca(lt, &format!("o{}", vid.0))
+                            .map_err(|e| e.to_string())?;
+                        self.slots.insert(vid, (slot, lt));
                     }
-                    let lt = slot_type(vid, &self);
-                    let slot = self
-                        .b
-                        .build_alloca(lt, &format!("o{}", vid.0))
-                        .map_err(|e| e.to_string())?;
-                    self.slots.insert(vid, (slot, lt));
                     self.osr_vars.insert(vid);
                 }
             }
