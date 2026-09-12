@@ -1222,12 +1222,17 @@ fn run_fiber_with_stop_depth(
         // Recomputed on each `'fiber_loop` iteration so inline
         // call/return into a different module picks up the right
         // slot table.
-        let module_vars_ptr: *mut Vec<Value> = vm
+        let module_entry_ptr: *mut super::engine::ModuleEntry = vm
             .engine
             .modules
             .get_mut(module_name.as_str())
-            .map(|m| &mut m.vars as *mut Vec<Value>)
+            .map(|m| m as *mut super::engine::ModuleEntry)
             .unwrap_or(std::ptr::null_mut());
+        let module_vars_ptr: *mut Vec<Value> = if module_entry_ptr.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { &mut (*module_entry_ptr).vars as *mut Vec<Value> }
+        };
 
         // Set JIT context for the current frame so JIT-compiled
         // functions dispatched from the IC fast path see the active
@@ -1497,8 +1502,11 @@ fn run_fiber_with_stop_depth(
                     let v = get_reg(&values, val_reg);
                     if !module_vars_ptr.is_null() {
                         let vars = unsafe { &mut *module_vars_ptr };
-                        while vars.len() <= slot {
-                            vars.push(Value::null());
+                        if vars.len() <= slot {
+                            while vars.len() <= slot {
+                                vars.push(Value::null());
+                            }
+                            unsafe { (*module_entry_ptr).sync_cell() };
                         }
                         vars[slot] = v;
                     }
@@ -3979,11 +3987,7 @@ pub fn eval_in_vm(
     let module_name = "__eval__".to_string();
     vm.engine.modules.insert(
         module_name.clone(),
-        crate::runtime::engine::ModuleEntry {
-            top_level: func_id,
-            vars: std::mem::take(module_vars),
-            var_names: Vec::new(),
-        },
+        crate::runtime::engine::ModuleEntry::new(func_id, std::mem::take(module_vars), Vec::new()),
     );
 
     // Get bytecode to determine register count

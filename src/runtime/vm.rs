@@ -1844,11 +1844,7 @@ impl VM {
         }
         self.engine.modules.insert(
             module_key.clone(),
-            super::engine::ModuleEntry {
-                top_level: func_id,
-                vars: module_vars,
-                var_names: var_names.clone(),
-            },
+            super::engine::ModuleEntry::new(func_id, module_vars, var_names.clone()),
         );
         // Baseline mtime for the SIGUSR1 watcher. Only meaningful for
         // user modules whose canonical name is an absolute path.
@@ -2131,6 +2127,7 @@ impl VM {
                         entry.vars.push(Value::null());
                     }
                     entry.vars[idx] = class_val;
+                    entry.sync_cell();
                 }
             }
         }
@@ -2945,11 +2942,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "meta".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["Meta".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["Meta".to_string()]),
                 );
                 true
             }
@@ -2958,11 +2951,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "random".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["Random".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["Random".to_string()]),
                 );
                 true
             }
@@ -2972,11 +2961,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "fs".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["FS".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["FS".to_string()]),
                 );
                 true
             }
@@ -2986,11 +2971,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "os".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["OS".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["OS".to_string()]),
                 );
                 true
             }
@@ -2999,11 +2980,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "time".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["TimeCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["TimeCore".to_string()]),
                 );
                 true
             }
@@ -3013,11 +2990,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "hash".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["HashCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["HashCore".to_string()]),
                 );
                 true
             }
@@ -3027,11 +3000,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "crypto".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["CryptoCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["CryptoCore".to_string()]),
                 );
                 true
             }
@@ -3041,11 +3010,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "zip".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["ZipCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["ZipCore".to_string()]),
                 );
                 true
             }
@@ -3055,11 +3020,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "socket".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["SocketCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["SocketCore".to_string()]),
                 );
                 true
             }
@@ -3068,11 +3029,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "io".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["IoCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["IoCore".to_string()]),
                 );
                 true
             }
@@ -3082,11 +3039,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "http".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["HttpCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["HttpCore".to_string()]),
                 );
                 true
             }
@@ -3096,11 +3049,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "proc".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["ProcCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["ProcCore".to_string()]),
                 );
                 true
             }
@@ -3109,11 +3058,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "regex".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["RegexCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["RegexCore".to_string()]),
                 );
                 true
             }
@@ -3122,11 +3067,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "uuid".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["UuidCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["UuidCore".to_string()]),
                 );
                 true
             }
@@ -3135,11 +3076,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "toml".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["TomlCore".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["TomlCore".to_string()]),
                 );
                 true
             }
@@ -3148,11 +3085,7 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "hatch".to_string(),
-                    super::engine::ModuleEntry {
-                        top_level: super::engine::FuncId(u32::MAX),
-                        vars: vec![class_value],
-                        var_names: vec!["Hatch".to_string()],
-                    },
+                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["Hatch".to_string()]),
                 );
                 true
             }
@@ -4981,11 +4914,7 @@ impl VM {
         let eval_module_name = format!("__eval_{}__", module_name);
         self.engine.modules.insert(
             eval_module_name.clone(),
-            super::engine::ModuleEntry {
-                top_level: func_id,
-                vars: eval_vars,
-                var_names: eval_var_names,
-            },
+            super::engine::ModuleEntry::new(func_id, eval_vars, eval_var_names),
         );
 
         let fiber = self.gc.alloc_fiber();
@@ -5179,11 +5108,7 @@ impl VM {
         // against.
         self.engine.modules.insert(
             module_key,
-            super::engine::ModuleEntry {
-                top_level: func_id,
-                vars: compiled_vars,
-                var_names: compiled_var_names,
-            },
+            super::engine::ModuleEntry::new(func_id, compiled_vars, compiled_var_names),
         );
         let fn_name = self.interner.intern("<compiled>");
         let fn_ptr = self.gc.alloc_fn(fn_name, 0, 0, func_id.0);

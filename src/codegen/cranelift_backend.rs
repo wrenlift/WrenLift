@@ -925,6 +925,23 @@ pub mod cl {
         *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some())
     }
 
+    thread_local! {
+        /// Address of the compiling function's module variable cell
+        /// (`engine::ModuleVarsCell`), set by the engine around each JIT
+        /// compile on this thread. Zero means "unknown, use the helper".
+        static JIT_MODVARS_CELL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Set the module variable cell JIT lowering bakes for this thread's
+    /// next compile; pass 0 to clear.
+    pub fn set_jit_modvars_cell(addr: usize) {
+        JIT_MODVARS_CELL.with(|c| c.set(addr));
+    }
+
+    fn jit_modvars_cell() -> usize {
+        JIT_MODVARS_CELL.with(|c| c.get())
+    }
+
     #[inline]
     fn env_pure_leaf_direct() -> bool {
         use std::sync::OnceLock;
@@ -3436,7 +3453,7 @@ pub mod cl {
 
     /// Describes what the fast-path of an inline boxed binary operation does.
     enum InlineBinOp {
-        /// f64 arithmetic: "fadd", "fsub", "fmul", "fdiv"
+        /// f64 arithmetic: "fadd", "fsub", "fmul", "fdiv", "frem"
         Arith(&'static str),
         /// f64 comparison producing TAG_TRUE / TAG_FALSE
         Cmp(FloatCC),
@@ -3448,6 +3465,67 @@ pub mod cl {
     ///            bitcast back (arith) or produce TAG_TRUE/TAG_FALSE (cmp).
     /// Slow path: call the runtime function.
     #[allow(clippy::type_complexity)] // Runtime-fn resolver closure: one-shot type used only here.
+    /// Wren's `%` on two f64s: C fmod, a truncated remainder with the
+    /// dividend's sign. Integral operands below 2^53 take an exact
+    /// integer remainder inline; anything else goes to libm so large
+    /// quotients and fractions stay exact.
+    fn emit_f64_rem(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        av: Value,
+        bv: Value,
+    ) -> Result<Value, String> {
+        let fast = builder.create_block();
+        let slow = builder.create_block();
+        let merge = builder.create_block();
+        builder.append_block_param(merge, types::F64);
+
+        let ai = builder.ins().fcvt_to_sint_sat(types::I64, av);
+        let bi = builder.ins().fcvt_to_sint_sat(types::I64, bv);
+        let a_back = builder.ins().fcvt_from_sint(types::F64, ai);
+        let b_back = builder.ins().fcvt_from_sint(types::F64, bi);
+        let a_int = builder.ins().fcmp(FloatCC::Equal, a_back, av);
+        let b_int = builder.ins().fcmp(FloatCC::Equal, b_back, bv);
+        let limit = builder.ins().f64const(9007199254740992.0);
+        let a_abs = builder.ins().fabs(av);
+        let b_abs = builder.ins().fabs(bv);
+        let a_small = builder.ins().fcmp(FloatCC::LessThan, a_abs, limit);
+        let b_small = builder.ins().fcmp(FloatCC::LessThan, b_abs, limit);
+        let zero = builder.ins().iconst(types::I64, 0);
+        let b_nz = builder.ins().icmp(IntCC::NotEqual, bi, zero);
+        let ok1 = builder.ins().band(a_int, b_int);
+        let ok2 = builder.ins().band(a_small, b_small);
+        let ok3 = builder.ins().band(ok1, ok2);
+        let ok = builder.ins().band(ok3, b_nz);
+        builder.ins().brif(ok, fast, &[], slow, &[]);
+
+        builder.switch_to_block(fast);
+        builder.seal_block(fast);
+        let r = builder.ins().srem(ai, bi);
+        let rf = builder.ins().fcvt_from_sint(types::F64, r);
+        // A zero remainder keeps the dividend's sign, as fmod does.
+        let rf = builder.ins().fcopysign(rf, av);
+        builder.ins().jump(merge, &[BlockArg::Value(rf)]);
+
+        builder.switch_to_block(slow);
+        builder.seal_block(slow);
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(types::F64));
+        sig.params.push(AbiParam::new(types::F64));
+        sig.returns.push(AbiParam::new(types::F64));
+        let fid = module
+            .declare_function("fmod", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        let fref = module.declare_func_in_func(fid, builder.func);
+        let call = builder.ins().call(fref, &[av, bv]);
+        let slow_r = builder.inst_results(call)[0];
+        builder.ins().jump(merge, &[BlockArg::Value(slow_r)]);
+
+        builder.switch_to_block(merge);
+        builder.seal_block(merge);
+        Ok(builder.block_params(merge)[0])
+    }
+
     fn emit_inline_boxed_binop(
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,
@@ -3496,6 +3574,7 @@ pub mod cl {
                     "fsub" => builder.ins().fsub(fa, fb),
                     "fmul" => builder.ins().fmul(fa, fb),
                     "fdiv" => builder.ins().fdiv(fa, fb),
+                    "frem" => emit_f64_rem(builder, module, fa, fb)?,
                     _ => unreachable!(),
                 };
                 builder.ins().bitcast(types::I64, MemFlags::new(), fresult)
@@ -3659,9 +3738,17 @@ pub mod cl {
                 )
             }
             Instruction::Mod(a, b) => {
-                let f = get_runtime_fn(module, builder, "wren_num_mod", 2)?;
-                let result = builder.ins().call(f, &[get(a), get(b)]);
-                Ok(Some(builder.inst_results(result)[0]))
+                let la = get(a);
+                let lb = get(b);
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Arith("frem"),
+                    "wren_num_mod",
+                )
             }
             Instruction::Neg(a) => {
                 // Inline numeric fast path: if `a` is a number, fneg
@@ -3864,6 +3951,36 @@ pub mod cl {
                         (*idx as i32) * 8,
                     );
                     Ok(Some(result))
+                } else if jit_modvars_cell() != 0 {
+                    // Three loads through the module's stable cell; an
+                    // index past the current length reads null, as the
+                    // helper does.
+                    let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
+                    let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                    let len = builder.ins().load(types::I64, MemFlags::trusted(), cell, 8);
+                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                    let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, idx_val, len);
+                    let hit = builder.create_block();
+                    let miss = builder.create_block();
+                    let merge = builder.create_block();
+                    builder.append_block_param(merge, types::I64);
+                    builder.ins().brif(in_range, hit, &[], miss, &[]);
+                    builder.switch_to_block(hit);
+                    builder.seal_block(hit);
+                    let v = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        base,
+                        (*idx as i32) * 8,
+                    );
+                    builder.ins().jump(merge, &[BlockArg::Value(v)]);
+                    builder.switch_to_block(miss);
+                    builder.seal_block(miss);
+                    let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                    builder.ins().jump(merge, &[BlockArg::Value(null)]);
+                    builder.switch_to_block(merge);
+                    builder.seal_block(merge);
+                    Ok(Some(builder.block_params(merge)[0]))
                 } else {
                     let f = get_runtime_fn(module, builder, "wren_get_module_var", 1)?;
                     let idx_val = builder.ins().iconst(types::I64, *idx as i64);
@@ -3881,6 +3998,34 @@ pub mod cl {
                         .store(MemFlags::trusted(), store_val, base, (*idx as i32) * 8);
                     // SetModuleVar's MIR contract: result is the
                     // stored value (mirrors the helper's return).
+                    Ok(Some(store_val))
+                } else if jit_modvars_cell() != 0 {
+                    // In-range stores go straight to the vector; an
+                    // index past the current length takes the helper,
+                    // which owns growth.
+                    let store_val = get(val);
+                    let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
+                    let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                    let len = builder.ins().load(types::I64, MemFlags::trusted(), cell, 8);
+                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                    let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, idx_val, len);
+                    let hit = builder.create_block();
+                    let miss = builder.create_block();
+                    let merge = builder.create_block();
+                    builder.ins().brif(in_range, hit, &[], miss, &[]);
+                    builder.switch_to_block(hit);
+                    builder.seal_block(hit);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), store_val, base, (*idx as i32) * 8);
+                    builder.ins().jump(merge, &[]);
+                    builder.switch_to_block(miss);
+                    builder.seal_block(miss);
+                    let f = get_runtime_fn(module, builder, "wren_set_module_var", 2)?;
+                    builder.ins().call(f, &[idx_val, store_val]);
+                    builder.ins().jump(merge, &[]);
+                    builder.switch_to_block(merge);
+                    builder.seal_block(merge);
                     Ok(Some(store_val))
                 } else {
                     let f = get_runtime_fn(module, builder, "wren_set_module_var", 2)?;
@@ -5847,61 +5992,9 @@ pub mod cl {
             Instruction::MulF64(a, b) => Ok(Some(builder.ins().fmul(get(a), get(b)))),
             Instruction::DivF64(a, b) => Ok(Some(builder.ins().fdiv(get(a), get(b)))),
             Instruction::ModF64(a, b) => {
-                // Wren's `%` is C fmod: truncated remainder with the
-                // dividend's sign. Integral operands below 2^53 take an
-                // exact integer remainder inline; anything else goes to
-                // libm so large quotients and fractions stay exact.
                 let av = get(a);
                 let bv = get(b);
-                let fast = builder.create_block();
-                let slow = builder.create_block();
-                let merge = builder.create_block();
-                builder.append_block_param(merge, types::F64);
-
-                let ai = builder.ins().fcvt_to_sint_sat(types::I64, av);
-                let bi = builder.ins().fcvt_to_sint_sat(types::I64, bv);
-                let a_back = builder.ins().fcvt_from_sint(types::F64, ai);
-                let b_back = builder.ins().fcvt_from_sint(types::F64, bi);
-                let a_int = builder.ins().fcmp(FloatCC::Equal, a_back, av);
-                let b_int = builder.ins().fcmp(FloatCC::Equal, b_back, bv);
-                let limit = builder.ins().f64const(9007199254740992.0);
-                let a_abs = builder.ins().fabs(av);
-                let b_abs = builder.ins().fabs(bv);
-                let a_small = builder.ins().fcmp(FloatCC::LessThan, a_abs, limit);
-                let b_small = builder.ins().fcmp(FloatCC::LessThan, b_abs, limit);
-                let zero = builder.ins().iconst(types::I64, 0);
-                let b_nz = builder.ins().icmp(IntCC::NotEqual, bi, zero);
-                let ok1 = builder.ins().band(a_int, b_int);
-                let ok2 = builder.ins().band(a_small, b_small);
-                let ok3 = builder.ins().band(ok1, ok2);
-                let ok = builder.ins().band(ok3, b_nz);
-                builder.ins().brif(ok, fast, &[], slow, &[]);
-
-                builder.switch_to_block(fast);
-                builder.seal_block(fast);
-                let r = builder.ins().srem(ai, bi);
-                let rf = builder.ins().fcvt_from_sint(types::F64, r);
-                // A zero remainder keeps the dividend's sign, as fmod does.
-                let rf = builder.ins().fcopysign(rf, av);
-                builder.ins().jump(merge, &[BlockArg::Value(rf)]);
-
-                builder.switch_to_block(slow);
-                builder.seal_block(slow);
-                let mut sig = module.make_signature();
-                sig.params.push(AbiParam::new(types::F64));
-                sig.params.push(AbiParam::new(types::F64));
-                sig.returns.push(AbiParam::new(types::F64));
-                let fid = module
-                    .declare_function("fmod", Linkage::Import, &sig)
-                    .map_err(|e| e.to_string())?;
-                let fref = module.declare_func_in_func(fid, builder.func);
-                let call = builder.ins().call(fref, &[av, bv]);
-                let slow_r = builder.inst_results(call)[0];
-                builder.ins().jump(merge, &[BlockArg::Value(slow_r)]);
-
-                builder.switch_to_block(merge);
-                builder.seal_block(merge);
-                Ok(Some(builder.block_params(merge)[0]))
+                Ok(Some(emit_f64_rem(builder, module, av, bv)?))
             }
             Instruction::NegF64(a) => Ok(Some(builder.ins().fneg(get(a)))),
 

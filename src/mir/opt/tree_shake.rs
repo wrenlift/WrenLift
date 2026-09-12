@@ -195,11 +195,7 @@ mod tests {
         let top_level = engine.register_function(top_level_mir);
         engine.modules.insert(
             "main".to_string(),
-            ModuleEntry {
-                top_level,
-                vars: Vec::new(),
-                var_names: Vec::new(),
-            },
+            ModuleEntry::new(top_level, Vec::new(), Vec::new()),
         );
 
         // A function that nothing refers to.
@@ -236,11 +232,7 @@ mod tests {
 
         engine.modules.insert(
             "main".to_string(),
-            ModuleEntry {
-                top_level,
-                vars: Vec::new(),
-                var_names: Vec::new(),
-            },
+            ModuleEntry::new(top_level, Vec::new(), Vec::new()),
         );
 
         let report = analyse(&engine);

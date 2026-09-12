@@ -725,6 +725,20 @@ pub struct CodeRange {
     pub metadata: Arc<NativeFrameMetadata>,
 }
 
+/// Stable view of a module's variable storage for compiled code.
+///
+/// JIT bodies bake the cell's address and load the array pointer and
+/// length through it, so a module variable access is three loads and
+/// a bounds check instead of a helper call. The cell is leaked, one
+/// per module entry, and zeroed when its entry drops so a stale body
+/// reads null rather than freed memory. Every mutation of the vector
+/// that may reallocate must be followed by `ModuleEntry::sync_cell`.
+#[repr(C)]
+pub struct ModuleVarsCell {
+    pub ptr: std::sync::atomic::AtomicPtr<u64>,
+    pub len: std::sync::atomic::AtomicUsize,
+}
+
 /// Per-module execution state.
 pub struct ModuleEntry {
     /// The top-level function for this module.
@@ -733,6 +747,44 @@ pub struct ModuleEntry {
     pub vars: Vec<super::value::Value>,
     /// Variable names corresponding to each slot (for C API lookup).
     pub var_names: Vec<String>,
+    /// See [`ModuleVarsCell`].
+    pub cell: &'static ModuleVarsCell,
+}
+
+impl ModuleEntry {
+    pub fn new(top_level: FuncId, vars: Vec<super::value::Value>, var_names: Vec<String>) -> Self {
+        let cell: &'static ModuleVarsCell = Box::leak(Box::new(ModuleVarsCell {
+            ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            len: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let entry = ModuleEntry {
+            top_level,
+            vars,
+            var_names,
+            cell,
+        };
+        entry.sync_cell();
+        entry
+    }
+
+    /// Publish the vector's current buffer to compiled code. Call after
+    /// any push, resize or replacement of `vars`.
+    pub fn sync_cell(&self) {
+        use std::sync::atomic::Ordering;
+        // Length first so a reader never sees a new length with the old
+        // pointer; the pointer store makes both current.
+        self.cell.len.store(0, Ordering::Release);
+        self.cell
+            .ptr
+            .store(self.vars.as_ptr() as *mut u64, Ordering::Release);
+        self.cell.len.store(self.vars.len(), Ordering::Release);
+    }
+}
+
+impl Drop for ModuleEntry {
+    fn drop(&mut self) {
+        self.cell.len.store(0, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Result of interpreting Wren source.
@@ -1276,7 +1328,10 @@ impl ExecutionEngine {
             .iter()
             .filter(|(_, inst)| !matches!(inst, Instruction::BlockParam(_)))
             .count();
-        if n_real > 8 {
+        // Small enough that splicing it at every monomorphic site
+        // costs less than the call it replaces; a straight-line
+        // arithmetic method with a few temporaries fits.
+        if n_real > 32 {
             return false;
         }
         for (_, inst) in &block.instructions {
@@ -1989,6 +2044,17 @@ impl ExecutionEngine {
         }
     }
 
+    /// Address of the module variable cell for `id`'s defining module,
+    /// or 0 when the module is not recorded.
+    fn modvars_cell_addr(&self, id: FuncId) -> usize {
+        self.func_modules
+            .get(id.0 as usize)
+            .and_then(|m| m.as_ref())
+            .and_then(|name| self.modules.get(name.as_str()))
+            .map(|e| e.cell as *const ModuleVarsCell as usize)
+            .unwrap_or(0)
+    }
+
     fn build_compile_mir(
         mir: &Arc<MirFunction>,
         tier: CompileTier,
@@ -2401,8 +2467,10 @@ impl ExecutionEngine {
             eprintln!("{}", compile_mir.pretty_print(interner));
         }
         let target = Self::native_target();
-        let compiled =
-            match crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
+        let modvars_cell = self.modvars_cell_addr(id);
+        crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
+        let compiled_result =
+            crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
                 interner,
@@ -2414,7 +2482,9 @@ impl ExecutionEngine {
                 callee_purity,
                 inline_bodies,
                 cha_for_codegen,
-            ) {
+            );
+        crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
+        let compiled = match compiled_result {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
             };
@@ -2541,6 +2611,7 @@ impl ExecutionEngine {
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
+        let modvars_cell = self.modvars_cell_addr(id);
         let callee_purity = self.compute_callee_purity_map();
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
             Some(self.compute_inline_bodies())
@@ -2588,6 +2659,7 @@ impl ExecutionEngine {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
+            crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -2600,8 +2672,9 @@ impl ExecutionEngine {
                 Some(callee_purity.clone()),
                 inline_bodies.clone(),
                 cha_for_codegen.clone(),
-            )
-            .map_err(|e| {
+            );
+            crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
+            let result = result.map_err(|e| {
                 if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
                     eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
                 }
