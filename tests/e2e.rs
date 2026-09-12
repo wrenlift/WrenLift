@@ -123,7 +123,7 @@ System.print(a / b)
 System.print(a % b)
 System.print(-a)
 "#,
-        "13\n7\n30\n3.3333333333333335\n1\n-10",
+        "13\n7\n30\n3.3333333333333\n1\n-10",
     );
 }
 

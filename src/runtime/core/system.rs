@@ -26,11 +26,7 @@ fn format_object(ctx: &dyn NativeContext, value: Value) -> String {
         "null".to_string()
     } else if value.is_num() {
         let n = value.as_num().unwrap();
-        if n == n.trunc() && n.is_finite() && n.abs() < 1e15 {
-            format!("{}", n as i64)
-        } else {
-            format!("{}", n)
-        }
+        crate::runtime::value::num_to_wren_string(n)
     } else if value.is_bool() {
         (if value.as_bool().unwrap() {
             "true"

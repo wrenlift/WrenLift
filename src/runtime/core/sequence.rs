@@ -306,10 +306,7 @@ fn seq_reduce_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 pub(crate) fn value_to_string(ctx: &mut dyn NativeContext, value: Value) -> String {
     if let Some(n) = value.as_num() {
-        if n == n.trunc() && !n.is_infinite() && n.abs() < 1e15 {
-            return format!("{}", n as i64);
-        }
-        return format!("{}", n);
+        return crate::runtime::value::num_to_wren_string(n);
     }
     if value.is_null() {
         return "null".to_string();

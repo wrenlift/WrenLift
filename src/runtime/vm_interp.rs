@@ -5233,11 +5233,7 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
             "false".to_string()
         }
     } else if let Some(n) = value.as_num() {
-        if n == n.floor() && n.abs() < 1e15 && !n.is_infinite() {
-            format!("{}", n as i64)
-        } else {
-            format!("{}", n)
-        }
+        crate::runtime::value::num_to_wren_string(n)
     } else if value.is_object() {
         let ptr = value.as_object().unwrap();
         let header = unsafe { &*(ptr as *const ObjHeader) };

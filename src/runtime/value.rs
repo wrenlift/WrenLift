@@ -565,3 +565,67 @@ mod tests {
         }
     }
 }
+
+/// Format a number the way the reference implementation does: C's `%.14g`,
+/// with `nan`, `infinity` and `-infinity` spelled out and the sign of zero
+/// kept.
+pub fn num_to_wren_string(n: f64) -> String {
+    if n.is_nan() {
+        return "nan".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "infinity" } else { "-infinity" }.to_string();
+    }
+    const PREC: usize = 14;
+    // `%g` picks the style from the exponent the value has *after* rounding to
+    // PREC significant digits, which is what `{:e}` at PREC-1 decimals yields.
+    let sci = format!("{:.*e}", PREC - 1, n);
+    let (mantissa, exp) = sci.split_once('e').expect("exp format");
+    let exp: i32 = exp.parse().expect("exp digits");
+    if exp >= -4 && exp < PREC as i32 {
+        let fixed = format!("{:.*}", (PREC as i32 - 1 - exp) as usize, n);
+        strip_fraction_zeros(&fixed).to_string()
+    } else {
+        let m = strip_fraction_zeros(mantissa);
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{}{:02}", m, sign, exp.abs())
+    }
+}
+
+fn strip_fraction_zeros(s: &str) -> &str {
+    if !s.contains('.') {
+        return s;
+    }
+    let s = s.trim_end_matches('0');
+    s.strip_suffix('.').unwrap_or(s)
+}
+
+#[cfg(test)]
+mod num_fmt_tests {
+    use super::num_to_wren_string as f;
+
+    #[test]
+    fn matches_reference_percent_14g() {
+        assert_eq!(f(-0.0), "-0");
+        assert_eq!(f(0.0), "0");
+        assert_eq!(f(100.0), "100");
+        assert_eq!(f(2.5), "2.5");
+        assert_eq!(f(-2.5), "-2.5");
+        assert_eq!(f(0.1 + 0.2), "0.3");
+        assert_eq!(f(1.0 / 3.0), "0.33333333333333");
+        assert_eq!(f(1e15), "1e+15");
+        assert_eq!(f(1e14 + 0.5), "1e+14");
+        assert_eq!(f(99999999999999.0), "99999999999999");
+        assert_eq!(f(123456789012345678.0), "1.2345678901235e+17");
+        assert_eq!(f(1e-7), "1e-07");
+        assert_eq!(f(0.000001), "1e-06");
+        assert_eq!(f(0.0001), "0.0001");
+        assert_eq!(f(3.14159265358979), "3.1415926535898");
+        assert_eq!(f(1e100), "1e+100");
+        assert_eq!(f(-1e-300), "-1e-300");
+        assert_eq!(f(f64::INFINITY), "infinity");
+        assert_eq!(f(f64::NEG_INFINITY), "-infinity");
+        assert_eq!(f(f64::NAN), "nan");
+        assert_eq!(f(9.99999999999995e14), "1e+15");
+    }
+}

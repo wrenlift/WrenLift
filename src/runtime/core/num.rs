@@ -444,12 +444,7 @@ fn num_sign(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn num_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let n = args[0].as_num().unwrap();
-    let s = if n == n.trunc() && !n.is_infinite() && !n.is_nan() {
-        format!("{}", n as i64)
-    } else {
-        format!("{}", n)
-    };
-    ctx.alloc_string(s)
+    ctx.alloc_string(crate::runtime::value::num_to_wren_string(n))
 }
 
 fn num_truncate(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
