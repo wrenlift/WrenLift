@@ -7,6 +7,8 @@ pub mod gc_immix;
 pub mod gc_marksweep;
 pub mod gc_ringbuf;
 pub mod gc_trait;
+pub mod live_regs;
+pub mod stack_scan;
 pub mod object;
 pub mod object_layout;
 pub mod value;

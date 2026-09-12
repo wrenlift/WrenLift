@@ -197,6 +197,12 @@ pub struct ImmixGc {
     block_bases: Vec<usize>,
     /// Blocks holding allocations (or handed out as a region).
     in_use: Vec<bool>,
+    /// Blocks that hold at least one line-owning allocation; gates the
+    /// interior-pointer walk-back.
+    has_span: Vec<bool>,
+    /// (chunk base, first block number) sorted by base, for address
+    /// lookups.
+    chunk_index: Vec<(usize, u32)>,
     /// Free block numbers; popped from the end.
     free_blocks: Vec<u32>,
     /// One byte per quantum: 0 not a start, 1..=8 small object size in
@@ -221,6 +227,9 @@ pub struct ImmixGc {
     last_collect: Instant,
     polls: Cell<u32>,
     object_count: usize,
+    /// A sweep freed a class, closure, function or module, so
+    /// address-keyed caches must be dropped.
+    freed_code_objects: bool,
 }
 
 impl Default for ImmixGc {
@@ -235,6 +244,8 @@ impl ImmixGc {
             chunks: Vec::new(),
             block_bases: Vec::new(),
             in_use: Vec::new(),
+            has_span: Vec::new(),
+            chunk_index: Vec::new(),
             free_blocks: Vec::new(),
             objects: Vec::new(),
             alloc_sizes: Vec::new(),
@@ -250,6 +261,7 @@ impl ImmixGc {
             last_collect: Instant::now(),
             polls: Cell::new(0),
             object_count: 0,
+            freed_code_objects: false,
         }
     }
 
@@ -282,7 +294,10 @@ impl ImmixGc {
         for i in 0..BLOCKS_PER_CHUNK {
             self.block_bases.push(chunk.base + i * BLOCK_SIZE);
             self.in_use.push(false);
+            self.has_span.push(false);
         }
+        self.chunk_index.push((chunk.base, first));
+        self.chunk_index.sort_unstable();
         self.objects
             .resize(self.block_bases.len() * QUANTA_PER_BLOCK, 0);
         self.alloc_sizes
@@ -390,6 +405,7 @@ impl ImmixGc {
                 self.objects[q] = SPAN_OBJECT;
                 let l = self.line_index(b, p);
                 self.alloc_sizes[l] = lines as u32;
+                self.has_span[b as usize] = true;
                 return p as *mut u8;
             }
             // Prefer a recycled run that fits; otherwise a fresh block.
@@ -498,6 +514,141 @@ impl ImmixGc {
         self.external_since_gc += bytes;
     }
 
+    /// True once since the last call if a sweep freed an object that
+    /// inline caches or the method cache may point at.
+    pub fn take_freed_code_objects(&mut self) -> bool {
+        std::mem::replace(&mut self.freed_code_objects, false)
+    }
+
+    /// Block number holding `addr`, if it is inside the heap.
+    #[inline]
+    fn block_containing(&self, addr: usize) -> Option<u32> {
+        let i = self.chunk_index.partition_point(|&(base, _)| base <= addr);
+        if i == 0 {
+            return None;
+        }
+        let (base, first) = self.chunk_index[i - 1];
+        if addr >= base + CHUNK_BYTES {
+            return None;
+        }
+        Some(first + ((addr - base) / BLOCK_SIZE) as u32)
+    }
+
+    /// Start of the allocation containing `addr`, if any. Walks back
+    /// within the line for a small object, then across lines for a
+    /// span when the block holds one.
+    pub fn containing_allocation(&self, addr: usize) -> Option<*mut ObjHeader> {
+        let b = self.block_containing(addr)?;
+        if !self.in_use[b as usize] {
+            return None;
+        }
+        let base = self.block_bases[b as usize];
+        let off = addr - base;
+        let q = off / QUANTUM;
+        let line_first_q = q - q % QUANTA_PER_LINE;
+        let q0 = b as usize * QUANTA_PER_BLOCK;
+        let mut i = q;
+        loop {
+            let code = self.objects[q0 + i];
+            if code != 0 {
+                let quanta = self.alloc_quanta(b as usize, i, code);
+                return if q < i + quanta {
+                    Some((base + i * QUANTUM) as *mut ObjHeader)
+                } else {
+                    None
+                };
+            }
+            if i == line_first_q {
+                break;
+            }
+            i -= 1;
+        }
+        if !self.has_span[b as usize] {
+            return None;
+        }
+        let line = off / LINE_SIZE;
+        let l0 = b as usize * LINES_PER_BLOCK;
+        let mut l = line;
+        loop {
+            let n = self.alloc_sizes[l0 + l] as usize;
+            if n != 0 {
+                let start_q = l * QUANTA_PER_LINE;
+                return if self.objects[q0 + start_q] == SPAN_OBJECT && line < l + n {
+                    Some((base + start_q * QUANTUM) as *mut ObjHeader)
+                } else {
+                    None
+                };
+            }
+            if l == 0 {
+                return None;
+            }
+            l -= 1;
+        }
+    }
+
+    /// Mark everything a word range might point at: raw addresses and
+    /// NaN-boxed object payloads that land inside an allocation.
+    fn scan_range_conservative(
+        &self,
+        lo: usize,
+        hi: usize,
+        gray_stack: &mut Vec<*mut ObjHeader>,
+    ) {
+        let word = std::mem::size_of::<usize>();
+        let mut p = lo.next_multiple_of(word);
+        while p + word <= hi {
+            let w = unsafe { std::ptr::read_volatile(p as *const usize) };
+            let mut candidate = self.containing_allocation(w);
+            if candidate.is_none() && word == 8 {
+                let v = Value::from_bits(w as u64);
+                if v.is_object() {
+                    if let Some(obj) = v.as_object() {
+                        candidate = self.containing_allocation(obj as usize);
+                    }
+                }
+            }
+            if let Some(h) = candidate {
+                mark_value(Value::object(h as *mut u8), gray_stack);
+            }
+            p += word;
+        }
+    }
+
+    /// Collect with precise `roots` plus conservative word scans of
+    /// `ranges` (native stack windows, register spills).
+    pub fn collect_with_ranges(&mut self, roots: &[Value], ranges: &[(usize, usize)]) {
+        let start = Instant::now();
+        let mut gray_stack: Vec<*mut ObjHeader> = Vec::with_capacity(1024);
+        for &root in roots {
+            mark_value(root, &mut gray_stack);
+        }
+        for &(lo, hi) in ranges {
+            if lo < hi {
+                self.scan_range_conservative(lo, hi, &mut gray_stack);
+            }
+        }
+        process_gray_stack(&mut gray_stack);
+        self.finish_collection(start);
+    }
+
+    fn finish_collection(&mut self, start: Instant) {
+        // The current regions are swept like any other lines; a fresh
+        // region is taken on the next allocation.
+        self.small = Region::default();
+        self.medium = Region::default();
+
+        let live = self.sweep();
+        self.live_bytes = live;
+        let floor = trigger_floor_bytes();
+        let ceiling = TRIGGER_CEILING.max(live).max(floor);
+        self.trigger_threshold = (live.saturating_mul(growth_factor())).clamp(floor, ceiling);
+        self.bytes_since_gc = 0;
+        self.external_since_gc = 0;
+        self.last_collect = Instant::now();
+        self.stats.major_collections += 1;
+        self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
+    }
+
     fn unlink_intern(&mut self, header: *mut ObjHeader) {
         unsafe {
             if (*header).obj_type != ObjType::String {
@@ -553,6 +704,12 @@ impl ImmixGc {
                         line_live[l / 64] |= 1u64 << (l % 64);
                     }
                 } else {
+                    if matches!(
+                        unsafe { (*header).obj_type },
+                        ObjType::Class | ObjType::Closure | ObjType::Fn | ObjType::Module
+                    ) {
+                        self.freed_code_objects = true;
+                    }
                     self.unlink_intern(header);
                     unsafe { drop_in_place_by_type(header) };
                     self.objects[q0 + q] = 0;
@@ -566,6 +723,7 @@ impl ImmixGc {
             }
             if !any_live {
                 self.in_use[b] = false;
+                self.has_span[b] = false;
                 self.free_blocks.push(b as u32);
                 continue;
             }
@@ -707,28 +865,12 @@ impl GcAllocator for ImmixGc {
 
     fn collect(&mut self, roots: &mut [Value]) {
         let start = Instant::now();
-
         let mut gray_stack: Vec<*mut ObjHeader> = Vec::with_capacity(1024);
         for &root in roots.iter() {
             mark_value(root, &mut gray_stack);
         }
         process_gray_stack(&mut gray_stack);
-
-        // The current regions are swept like any other lines; a fresh
-        // region is taken on the next allocation.
-        self.small = Region::default();
-        self.medium = Region::default();
-
-        let live = self.sweep();
-        self.live_bytes = live;
-        let floor = trigger_floor_bytes();
-        let ceiling = TRIGGER_CEILING.max(live).max(floor);
-        self.trigger_threshold = (live.saturating_mul(growth_factor())).clamp(floor, ceiling);
-        self.bytes_since_gc = 0;
-        self.external_since_gc = 0;
-        self.last_collect = Instant::now();
-        self.stats.major_collections += 1;
-        self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
+        self.finish_collection(start);
     }
 
     fn should_collect(&self) -> bool {
@@ -846,6 +988,51 @@ mod tests {
             !gc.intern_table.contains_key(&bye_hash),
             "dead interned string still in the table"
         );
+    }
+
+    #[test]
+    fn interior_pointers_resolve_to_their_allocation() {
+        let mut gc = ImmixGc::new();
+        let small = gc.alloc_range(0.0, 1.0, false) as usize;
+        let fiber = gc.alloc_fiber() as usize;
+        let size = std::mem::size_of::<ObjRange>();
+        for off in [0, 8, size - 1] {
+            assert_eq!(gc.containing_allocation(small + off).map(|h| h as usize), Some(small));
+        }
+        let fsize = std::mem::size_of::<ObjFiber>();
+        for off in [0, 200, fsize - 1] {
+            assert_eq!(gc.containing_allocation(fiber + off).map(|h| h as usize), Some(fiber));
+        }
+        // A span owns its reserved lines end to end; addresses outside
+        // the heap resolve to nothing.
+        let span_end = fiber + fsize.div_ceil(LINE_SIZE) * LINE_SIZE;
+        assert_eq!(gc.containing_allocation(span_end - 1).map(|h| h as usize), Some(fiber));
+        assert_eq!(gc.containing_allocation(0x1000), None);
+        assert_eq!(gc.containing_allocation(small.wrapping_sub(1)).map(|h| h as usize), None);
+    }
+
+    #[test]
+    fn conservative_scan_keeps_boxed_raw_and_interior_words() {
+        let mut gc = ImmixGc::new();
+        let boxed = gc.alloc_list() as *mut ObjHeader;
+        let raw = gc.alloc_map() as *mut ObjHeader;
+        let interior = gc.alloc_fiber() as *mut ObjHeader;
+        let dead = gc.alloc_string("dead".to_string()) as *mut ObjHeader;
+        let words: [usize; 4] = [
+            Value::object(boxed as *mut u8).to_bits() as usize,
+            raw as usize,
+            interior as usize + 100,
+            0xdead_beef,
+        ];
+        let lo = words.as_ptr() as usize;
+        let hi = lo + std::mem::size_of_val(&words);
+        gc.collect_with_ranges(&[], &[(lo, hi)]);
+        let mut live = Vec::new();
+        gc.for_each_object(|h| live.push(h));
+        assert!(live.contains(&boxed));
+        assert!(live.contains(&raw));
+        assert!(live.contains(&interior));
+        assert!(!live.contains(&dead));
     }
 
     #[test]

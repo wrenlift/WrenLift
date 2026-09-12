@@ -1372,6 +1372,7 @@ pub fn execute_threaded(
         vm,
         return_value: None,
     };
+    let _live_regs = crate::runtime::live_regs::LiveRegsGuard::register(&state.regs);
 
     // Load arguments into registers (BlockParam slots)
     for (i, arg) in args.iter().enumerate() {

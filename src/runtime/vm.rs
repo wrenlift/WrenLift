@@ -3795,6 +3795,10 @@ impl VM {
             }
         }
 
+        // 3b. Register files interpreter activations currently hold
+        //     outside their frames.
+        super::live_regs::collect_live_values(&mut roots);
+
         // 4. Current fiber (GC traces its mir_frames/caller chain internally)
         let fiber_idx = roots.len();
         if !self.fiber.is_null() {
@@ -3825,7 +3829,13 @@ impl VM {
         // root set alongside shadow roots. After GC, updated values are
         // written back directly to the spill slots on the native stack.
         let native_stack_start = roots.len();
-        let (stack_roots, stack_slot_addrs) = self.scan_native_stack_roots();
+        let (stack_roots, stack_slot_addrs) = if self.gc.is_immix() {
+            // Conservative scan below covers native frames; nothing to
+            // write back because nothing moves.
+            (Vec::new(), Vec::new())
+        } else {
+            self.scan_native_stack_roots()
+        };
         let native_stack_count = stack_roots.len();
         roots.extend(stack_roots);
 
@@ -3909,7 +3919,14 @@ impl VM {
         }
 
         // Collect
-        self.gc.collect(&mut roots);
+        if self.gc.is_immix() {
+            let ranges = self.conservative_stack_ranges();
+            if let GcImpl::Immix(gc) = &mut self.gc {
+                gc.collect_with_ranges(&roots, &ranges);
+            }
+        } else {
+            self.gc.collect(&mut roots);
+        }
 
         // Write back updated values (GC may have forwarded nursery pointers)
         self.api_stack.copy_from_slice(&roots[..api_len]);
@@ -4071,6 +4088,66 @@ impl VM {
         if std::env::var("WLIFT_AOT_FP_FIXUP").as_deref() != Ok("0") {
             self.conservative_fp_chain_forward_fixup();
         }
+    }
+
+    /// Native stack windows for the conservative scan: the running
+    /// stack from a register spill up to its top, every suspended
+    /// krio fiber from its saved sp, and each stack a running fiber
+    /// was resumed from, starting at that resume point.
+    #[cfg(all(unix, feature = "host"))]
+    fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
+        let mut spill = [0usize; super::stack_scan::SPILL_WORDS];
+        super::stack_scan::spill_callee_saved(&mut spill);
+        let probe = (spill.as_ptr() as usize).min(super::stack_scan::approx_sp());
+        let host_top = super::stack_scan::thread_stack_top();
+        if host_top == 0 {
+            return Vec::new();
+        }
+        // (lo, hi, start): start is the lowest live address, 0 = unknown.
+        let mut stacks: Vec<(usize, usize, usize)> = vec![(0, host_top, 0)];
+        let mut resume_points: Vec<usize> = Vec::new();
+        self.gc.for_each_fiber(|f| unsafe {
+            let Some(k) = (*f).krio_fiber.as_deref() else {
+                return;
+            };
+            if k.is_done() {
+                return;
+            }
+            let (lo, len) = k.stack_range();
+            let lo = lo as usize;
+            let caller_sp = k.caller_sp() as usize;
+            if caller_sp != 0 {
+                // Running: its own window starts at the probe or at a
+                // child's resume point; the stack it came from is
+                // suspended at caller_sp.
+                stacks.push((lo, lo + len, 0));
+                resume_points.push(caller_sp);
+            } else {
+                stacks.push((lo, lo + len, k.saved_sp() as usize));
+            }
+        });
+        let owner = |stacks: &Vec<(usize, usize, usize)>, addr: usize| {
+            stacks
+                .iter()
+                .position(|&(lo, hi, _)| addr >= lo && addr < hi)
+                .unwrap_or(0)
+        };
+        for sp in resume_points {
+            let i = owner(&stacks, sp);
+            stacks[i].2 = sp;
+        }
+        let i = owner(&stacks, probe);
+        stacks[i].2 = probe;
+        stacks
+            .into_iter()
+            .filter(|&(_, _, start)| start != 0)
+            .map(|(_, hi, start)| (start, hi))
+            .collect()
+    }
+
+    #[cfg(not(all(unix, feature = "host")))]
+    fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
+        Vec::new()
     }
 
     /// See call site in `collect_garbage` for the design rationale.
@@ -4361,7 +4438,7 @@ impl NativeContext for VM {
         // code (where Cranelift stack maps take over) doesn't reap
         // it. No-op in JIT / interpreter mode (finish_alloc gates
         // on `aot_gc_enabled()`).
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn intern_string(&mut self, s: String) -> Value {
@@ -4370,32 +4447,32 @@ impl NativeContext for VM {
             (*obj).header.class = self.string_class;
         }
         let v = Value::object(obj as *mut u8);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value {
         let v = self.new_list(elements);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value {
         let v = self.new_range(from, to, inclusive);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn alloc_map(&mut self) -> Value {
         let v = self.new_map();
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value {
         let v = self.new_typed_array(count, kind);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> Value {
         let v = self.new_simd(kind, lanes);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
     fn runtime_error(&mut self, msg: String) {
@@ -4514,6 +4591,7 @@ impl NativeContext for VM {
     }
 
     fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value> {
+        let _no_collect = crate::codegen::runtime_fns::CollectSuppressGuard::new();
         // Special-case: calling a closure/function via call(...)
         // Pass only the call arguments (not the closure receiver) — closures
         // don't have a "self" block param; their block params map directly to

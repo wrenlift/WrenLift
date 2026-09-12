@@ -1388,6 +1388,55 @@ pub fn aot_gc_enabled() -> bool {
     AOT_GC_ENABLED.with(|c| c.get())
 }
 
+thread_local! {
+    /// Depth of native callbacks in progress. While non-zero the
+    /// conservative collector does not collect from allocation
+    /// helpers: a native may hold values in a Rust `Vec` across the
+    /// callback, which no scan reaches.
+    static COLLECT_SUPPRESS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Suppresses allocation-time collection until dropped.
+pub struct CollectSuppressGuard(());
+
+impl CollectSuppressGuard {
+    pub fn new() -> Self {
+        COLLECT_SUPPRESS.with(|c| c.set(c.get() + 1));
+        CollectSuppressGuard(())
+    }
+}
+
+impl Default for CollectSuppressGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CollectSuppressGuard {
+    fn drop(&mut self) {
+        COLLECT_SUPPRESS.with(|c| c.set(c.get() - 1));
+    }
+}
+
+#[inline(always)]
+fn collect_suppressed() -> bool {
+    COLLECT_SUPPRESS.with(|c| c.get() != 0)
+}
+
+/// `finish_alloc` for values allocated by a native: natives may keep
+/// earlier allocations in Rust heap memory, so under the conservative
+/// collector they are never a safepoint.
+///
+/// # Safety
+/// `vm` must be the current thread's running VM.
+#[inline]
+pub unsafe fn finish_alloc_native(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
+    if vm.gc.is_immix() {
+        return val.to_bits();
+    }
+    finish_alloc(vm, val)
+}
+
 #[inline(always)]
 pub fn set_aot_gc_enabled(v: bool) {
     AOT_GC_ENABLED.with(|c| c.set(v));
@@ -1426,6 +1475,22 @@ pub fn set_aot_gc_enabled(v: bool) {
 /// `vm` must be the current thread's running VM.
 #[inline]
 pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
+    // Under the conservative collector any allocation is a safepoint
+    // in every tier: native frames are scanned, not mapped, so the
+    // value needs no root entry. It is pinned in this frame across
+    // the collection.
+    if vm.gc.is_immix() {
+        if !collect_suppressed() && vm.gc.should_collect() {
+            let pinned = std::hint::black_box(val);
+            vm.collect_garbage();
+            if vm.gc.take_freed_code_objects() {
+                vm.method_cache.invalidate();
+                vm.engine.invalidate_inline_caches();
+            }
+            return std::hint::black_box(&pinned).to_bits();
+        }
+        return val.to_bits();
+    }
     if !aot_gc_enabled() {
         return val.to_bits();
     }
@@ -1437,8 +1502,10 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
         // to freed/forwarded objects. Without invalidation, a
         // subsequent dispatch path reads stale data (or follows a
         // pointer into reused memory) and segfaults.
-        vm.method_cache.invalidate();
-        vm.engine.invalidate_inline_caches();
+        if vm.gc.take_freed_code_objects() {
+            vm.method_cache.invalidate();
+            vm.engine.invalidate_inline_caches();
+        }
     }
     // Read back the (possibly forwarded) value and return it,
     // leaving the root in place for the AOT function's lifetime.

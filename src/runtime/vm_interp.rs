@@ -953,6 +953,9 @@ fn run_fiber_with_stop_depth(
                 frame.return_dst,
             )
         };
+        // Registers stay visible to a collection triggered from a
+        // helper this activation calls while they are out of the frame.
+        let _live_regs = super::live_regs::LiveRegsGuard::register(&values);
 
         // AOT-stub fast path: a function registered via
         // `engine.register_aot_function` has empty MIR + a non-null
@@ -1343,8 +1346,10 @@ fn run_fiber_with_stop_depth(
                         }
                     }
                     vm.collect_garbage();
-                    vm.method_cache.invalidate();
-                    vm.engine.invalidate_inline_caches();
+                    if vm.gc.take_freed_code_objects() {
+                        vm.method_cache.invalidate();
+                        vm.engine.invalidate_inline_caches();
+                    }
                     vm.engine.poll_compilations();
                     vm.engine.drain_compile_queue(&vm.interner);
                     fiber = vm.fiber;

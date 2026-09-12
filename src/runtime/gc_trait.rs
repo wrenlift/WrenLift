@@ -293,6 +293,23 @@ impl GcImpl {
     /// The callback runs synchronously while we hold a `&self`
     /// borrow on the GC, so the closure mustn't trigger an
     /// allocation or another GC pass.
+    /// True when the collector scans native stacks conservatively and
+    /// never moves objects.
+    #[inline(always)]
+    pub fn is_immix(&self) -> bool {
+        matches!(self, GcImpl::Immix(_))
+    }
+
+    /// Whether address-keyed caches (method cache, inline caches) must
+    /// be dropped after the last collection. Collectors that cannot
+    /// say answer yes.
+    pub fn take_freed_code_objects(&mut self) -> bool {
+        match self {
+            GcImpl::Immix(gc) => gc.take_freed_code_objects(),
+            _ => true,
+        }
+    }
+
     pub fn for_each_fiber<F: FnMut(*mut super::object::ObjFiber)>(&self, f: F) {
         gc_dispatch!(self, for_each_fiber, f)
     }
