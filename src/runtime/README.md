@@ -52,6 +52,26 @@ All `Obj*` structs are `#[repr(C)]` with `ObjHeader` as the first field, enablin
 
 Method dispatch is O(1) via `HashMap<SymbolId, Method>` lookup, where `SymbolId` is an interned integer symbol handle.
 
+## Garbage Collector
+
+The default collector (`gc_immix.rs`, `--gc immix`, `WLIFT_GC=immix`) is a
+non-moving mark-sweep over Immix geometry: 32 KiB blocks of 128-byte lines
+in demand-mapped 32 MiB chunks. Objects up to one line bump-allocate and
+never straddle a line; larger objects own whole lines. Object starts and
+span sizes live in side tables, so any address inside an allocation
+resolves to its start. Heap tracing is precise through `trace_object`;
+native stacks (the running one from a callee-saved register spill to the
+thread's stack top, every suspended krio fiber from its saved sp) are
+scanned conservatively, so compiled code needs no stack maps and Rust
+helpers need no root pushes. Any allocation helper is a safepoint in
+every tier; natives are never one. Instance fields are allocated inline
+behind the header. Free blocks beyond a small float are returned to the
+OS after a quiet collection. Knobs: `WLIFT_GC_HEAP_MB`,
+`WLIFT_GC_TRIGGER_MB`, `WLIFT_GC_GROWTH`, `WLIFT_GC_STRESS`.
+
+The generational collector below remains selectable with
+`--gc generational`.
+
 ## Generational Garbage Collector
 
 Two-generation collector with bump-allocated nursery and mark-sweep old generation.

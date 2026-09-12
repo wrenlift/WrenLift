@@ -59,10 +59,10 @@ stackifier, bypassing machine IR entirely.
 
 ## Runtime
 
-The runtime uses NaN-boxed 64-bit values, a generational
-semi-space garbage collector with bump-pointer nursery allocation,
-and an object model with O(1) method dispatch via interned symbol
-IDs.
+The runtime uses NaN-boxed 64-bit values, a non-moving Immix-style
+garbage collector (block/line bump allocation, precise heap tracing,
+conservative native stack scanning), and an object model with O(1)
+method dispatch via interned symbol IDs.
 
 ### Tiered execution
 

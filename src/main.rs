@@ -144,7 +144,7 @@ struct Cli {
     #[arg(long)]
     opt_threshold: Option<u32>,
 
-    /// Garbage collector strategy (default: WLIFT_GC env var, else generational).
+    /// Garbage collector strategy (default: WLIFT_GC env var, else immix).
     #[arg(long, value_enum)]
     gc: Option<GcMode>,
 
@@ -162,13 +162,13 @@ struct Cli {
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum GcMode {
-    /// Generational nursery + old gen mark-sweep (default).
+    /// Generational nursery + old gen mark-sweep.
     Generational,
     /// Allocate-only, free on drop. Best for short-lived scripts / benchmarks.
     Arena,
     /// Simple non-generational mark-sweep.
     MarkSweep,
-    /// Block/line bump allocation with non-moving mark-sweep.
+    /// Block/line bump allocation with non-moving mark-sweep (default).
     Immix,
 }
 
@@ -231,7 +231,7 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
             GcMode::Immix => GcStrategy::Immix,
         })
         .or_else(GcStrategy::from_env)
-        .unwrap_or(GcStrategy::Generational);
+        .unwrap_or_default();
     let (load_module_fn, resolve_module_fn) = match source_dir {
         Some(dir) => {
             let (l, r) = make_module_io(dir);

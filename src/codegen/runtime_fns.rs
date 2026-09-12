@@ -1479,6 +1479,10 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
     // in every tier: native frames are scanned, not mapped, so the
     // value needs no root entry. It is pinned in this frame across
     // the collection.
+    // wasm32 JIT frames keep values in locals no scan reaches, so
+    // allocation stays a non-safepoint there until the shadow stack
+    // lands.
+    #[cfg(not(target_arch = "wasm32"))]
     if vm.gc.is_immix() {
         if !collect_suppressed() && vm.gc.should_collect() {
             let pinned = std::hint::black_box(val);
@@ -1489,6 +1493,10 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
             }
             return std::hint::black_box(&pinned).to_bits();
         }
+        return val.to_bits();
+    }
+    #[cfg(target_arch = "wasm32")]
+    if vm.gc.is_immix() {
         return val.to_bits();
     }
     if !aot_gc_enabled() {
@@ -1857,6 +1865,7 @@ pub fn allow_nonleaf_native(
             crate::runtime::gc_trait::GcStrategy::Generational => {
                 nonleaf_moving_gc_safe(vm, func_id)
             }
+            crate::runtime::gc_trait::GcStrategy::Immix => true,
             _ => nonleaf_shadow_safe(vm, func_id),
         };
         trace_nonleaf_gate(vm, func_id, allow_nonleaf_native);
@@ -1870,6 +1879,8 @@ pub fn allow_root_nonleaf_native(
 ) -> bool {
     let allow_root_nonleaf_native = match vm.config.gc_strategy {
         crate::runtime::gc_trait::GcStrategy::Generational => nonleaf_moving_gc_safe(vm, func_id),
+        // Conservative scanning covers every native frame.
+        crate::runtime::gc_trait::GcStrategy::Immix => true,
         _ => nonleaf_shadow_safe(vm, func_id),
     };
     trace_nonleaf_gate(vm, func_id, allow_root_nonleaf_native);

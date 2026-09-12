@@ -4,9 +4,11 @@
 /// selected at runtime without infecting the entire codebase with generics.
 ///
 /// Available implementations:
-/// - `Gc` (default): generational nursery + old gen mark-sweep
+/// - `ImmixGc` (default): block/line bump allocation, non-moving
+///   mark-sweep, conservative native stack scanning
+/// - `Gc`: generational nursery + old gen mark-sweep
 /// - `ArenaGc`: allocate-only, free on drop (short-lived scripts, benchmarks)
-/// - `SemispaceGc`: copying collector with excellent locality
+/// - `MarkSweepGc`: simple non-generational mark-sweep
 use super::gc::GcStats;
 use super::gc_arena::ArenaGc;
 use super::gc_immix::ImmixGc;
@@ -85,14 +87,15 @@ pub enum GcImpl {
 /// `WLIFT_GC` env var (generational | arena | marksweep | immix).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GcStrategy {
-    /// Generational nursery + old gen mark-sweep (default).
-    #[default]
+    /// Generational nursery + old gen mark-sweep.
     Generational,
     /// Allocate-only, free on drop. For benchmarks / short-lived scripts.
     Arena,
     /// Simple non-generational mark-sweep.
     MarkSweep,
-    /// Block/line bump allocation with non-moving mark-sweep.
+    /// Block/line bump allocation with non-moving mark-sweep and
+    /// conservative native stack scanning (default).
+    #[default]
     Immix,
 }
 
