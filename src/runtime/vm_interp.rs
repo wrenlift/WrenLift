@@ -1081,6 +1081,9 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
     let mut steps: usize = 0;
     // Back-edge counter: sampled for tier-up polling on hot loops.
     let mut backedge_counter: u32 = 0;
+    // (module name Rc pointer, module count) → module entry.
+    let mut module_cache: ((usize, usize), *mut super::engine::ModuleEntry) =
+        ((0, 0), std::ptr::null_mut());
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
@@ -1381,16 +1384,25 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
         }
 
         // Cache raw pointer to module vars — eliminates HashMap lookup per
-        // GetModuleVar/SetModuleVar (was 42% of runtime in method_call).
-        // Recomputed on each `'fiber_loop` iteration so inline
-        // call/return into a different module picks up the right
-        // slot table.
-        let module_entry_ptr: *mut super::engine::ModuleEntry = vm
-            .engine
-            .modules
-            .get_mut(module_name.as_str())
-            .map(|m| m as *mut super::engine::ModuleEntry)
-            .unwrap_or(std::ptr::null_mut());
+        // GetModuleVar/SetModuleVar. The module name is an Rc shared by
+        // every frame of that module, so the lookup is repeated only when
+        // the pointer changes or a module was added (which can rehash the
+        // table and move entries).
+        let module_entry_ptr: *mut super::engine::ModuleEntry = {
+            let key = (Rc::as_ptr(&module_name) as usize, vm.engine.modules.len());
+            if module_cache.0 == key {
+                module_cache.1
+            } else {
+                let ptr = vm
+                    .engine
+                    .modules
+                    .get_mut(module_name.as_str())
+                    .map(|m| m as *mut super::engine::ModuleEntry)
+                    .unwrap_or(std::ptr::null_mut());
+                module_cache = (key, ptr);
+                ptr
+            }
+        };
         let module_vars_ptr: *mut Vec<Value> = if module_entry_ptr.is_null() {
             std::ptr::null_mut()
         } else {
