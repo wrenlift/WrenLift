@@ -2028,7 +2028,7 @@ fn is_valid_obj_ptr(header: *mut ObjHeader) -> bool {
     addr >= MIN_VALID_HEAP_ADDR && addr < MAX_VALID_HEAP_ADDR
 }
 
-fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
+pub(super) fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
     if val.is_object() {
         if let Some(ptr) = val.as_object() {
             let header = ptr as *mut ObjHeader;
@@ -2052,7 +2052,7 @@ fn mark_gray(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
     }
 }
 
-fn process_gray_stack(gray_stack: &mut Vec<*mut ObjHeader>) {
+pub(super) fn process_gray_stack(gray_stack: &mut Vec<*mut ObjHeader>) {
     while let Some(obj) = gray_stack.pop() {
         if !is_valid_obj_ptr(obj) {
             continue;
@@ -2516,7 +2516,7 @@ fn object_size(header: *mut ObjHeader) -> usize {
 }
 
 /// Drop owned Rust types in-place (for nursery objects — arena memory freed separately).
-unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
+pub(super) unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
     if (*header).obj_type == ObjType::String {
         let s = &*(header as *const ObjString);
         trace_str_buf_event("DROP-N", header, s.value.as_ptr(), s.value.len());

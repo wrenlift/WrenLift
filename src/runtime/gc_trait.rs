@@ -9,6 +9,7 @@
 /// - `SemispaceGc`: copying collector with excellent locality
 use super::gc::GcStats;
 use super::gc_arena::ArenaGc;
+use super::gc_immix::ImmixGc;
 use super::gc_marksweep::MarkSweepGc;
 use super::object::*;
 use super::value::Value;
@@ -76,9 +77,12 @@ pub enum GcImpl {
     Arena(ArenaGc),
     /// Mark-sweep: simple non-generational stop-the-world collector.
     MarkSweep(MarkSweepGc),
+    /// Immix geometry: block/line bump allocation, non-moving mark-sweep.
+    Immix(ImmixGc),
 }
 
-/// Which GC strategy to use. Selectable via CLI `--gc` flag.
+/// Which GC strategy to use. Selectable via CLI `--gc` flag or the
+/// `WLIFT_GC` env var (generational | arena | marksweep | immix).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GcStrategy {
     /// Generational nursery + old gen mark-sweep (default).
@@ -88,6 +92,23 @@ pub enum GcStrategy {
     Arena,
     /// Simple non-generational mark-sweep.
     MarkSweep,
+    /// Block/line bump allocation with non-moving mark-sweep.
+    Immix,
+}
+
+impl GcStrategy {
+    /// Strategy named by `WLIFT_GC`, if set and recognised. Safe to
+    /// run with any value; unknown names fall back to the default.
+    pub fn from_env() -> Option<Self> {
+        let v = std::env::var("WLIFT_GC").ok()?;
+        match v.trim().to_ascii_lowercase().as_str() {
+            "generational" => Some(GcStrategy::Generational),
+            "arena" => Some(GcStrategy::Arena),
+            "marksweep" | "mark-sweep" => Some(GcStrategy::MarkSweep),
+            "immix" => Some(GcStrategy::Immix),
+            _ => None,
+        }
+    }
 }
 
 /// Macro to dispatch a method call to the inner GC implementation.
@@ -97,6 +118,7 @@ macro_rules! gc_dispatch {
             GcImpl::Generational(gc) => gc.$method($($arg),*),
             GcImpl::Arena(gc) => gc.$method($($arg),*),
             GcImpl::MarkSweep(gc) => gc.$method($($arg),*),
+            GcImpl::Immix(gc) => gc.$method($($arg),*),
         }
     };
 }
@@ -108,6 +130,7 @@ impl GcImpl {
             GcStrategy::Generational => GcImpl::Generational(super::gc::Gc::new()),
             GcStrategy::Arena => GcImpl::Arena(ArenaGc::new()),
             GcStrategy::MarkSweep => GcImpl::MarkSweep(MarkSweepGc::new()),
+            GcStrategy::Immix => GcImpl::Immix(ImmixGc::new()),
         }
     }
 
@@ -198,8 +221,10 @@ impl GcImpl {
     /// drive `should_collect`.
     #[inline(always)]
     pub fn track_external(&mut self, bytes: usize) {
-        if let GcImpl::Generational(gc) = self {
-            gc.track_external(bytes);
+        match self {
+            GcImpl::Generational(gc) => gc.track_external(bytes),
+            GcImpl::Immix(gc) => gc.track_external(bytes),
+            _ => {}
         }
     }
     #[inline(always)]

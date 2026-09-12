@@ -144,9 +144,9 @@ struct Cli {
     #[arg(long)]
     opt_threshold: Option<u32>,
 
-    /// Garbage collector strategy.
-    #[arg(long, value_enum, default_value_t = GcMode::Generational)]
-    gc: GcMode,
+    /// Garbage collector strategy (default: WLIFT_GC env var, else generational).
+    #[arg(long, value_enum)]
+    gc: Option<GcMode>,
 
     /// Enable SIGUSR1-driven in-process hot reload.
     ///
@@ -168,6 +168,8 @@ enum GcMode {
     Arena,
     /// Simple non-generational mark-sweep.
     MarkSweep,
+    /// Block/line bump allocation with non-moving mark-sweep.
+    Immix,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -220,11 +222,16 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
         ExecutionMode::Interpreter => 1_000_000_000,
         _ => 10_000_000_000, // tiered/jit: 10x headroom since JIT code doesn't count steps
     });
-    let gc_strategy = match cli.gc {
-        GcMode::Generational => GcStrategy::Generational,
-        GcMode::Arena => GcStrategy::Arena,
-        GcMode::MarkSweep => GcStrategy::MarkSweep,
-    };
+    let gc_strategy = cli
+        .gc
+        .map(|g| match g {
+            GcMode::Generational => GcStrategy::Generational,
+            GcMode::Arena => GcStrategy::Arena,
+            GcMode::MarkSweep => GcStrategy::MarkSweep,
+            GcMode::Immix => GcStrategy::Immix,
+        })
+        .or_else(GcStrategy::from_env)
+        .unwrap_or(GcStrategy::Generational);
     let (load_module_fn, resolve_module_fn) = match source_dir {
         Some(dir) => {
             let (l, r) = make_module_io(dir);
