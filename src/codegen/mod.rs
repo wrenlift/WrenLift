@@ -2084,7 +2084,9 @@ impl ExecutableFunction {
 
 /// Which backend the optimised tier uses. `WLIFT_TIER1=off|cranelift|llvm`;
 /// the default is llvm when built with the `llvm` feature and the GC scans
-/// native frames conservatively, cranelift otherwise. Safe to set at any time.
+/// native frames conservatively, and off otherwise: a second Cranelift
+/// compile of the same body returns nothing the baseline lacks. Safe to
+/// set at any time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopTier {
     Off,
@@ -2101,7 +2103,7 @@ pub fn top_tier() -> TopTier {
         {
             TopTier::Llvm
         } else {
-            TopTier::Cranelift
+            TopTier::Off
         };
         match std::env::var("WLIFT_TIER1").as_deref() {
             Ok("off") | Ok("0") => TopTier::Off,
