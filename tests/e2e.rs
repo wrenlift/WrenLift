@@ -1277,7 +1277,6 @@ for (m in h.moves) System.print(m)
 // ===========================================================================
 
 #[test]
-#[ignore] // Fiber.isDone returns false after fiber completes, causing infinite loop
 fn e2e_fiber_range_generator() {
     assert_output(
         r#"
@@ -2298,7 +2297,6 @@ System.print(list.count)
 }
 
 #[test]
-#[ignore = "debugging non-leaf tiered locals across loop-carried calls"]
 fn e2e_tiered_nonleaf_loop_preserves_object_local() {
     let source = r#"
 class Keeper {
@@ -2356,7 +2354,6 @@ for (i in 0...20) {
 }
 
 #[test]
-#[ignore = "debugging change()-shaped non-leaf tiered local corruption"]
 fn e2e_tiered_nonleaf_change_shape_preserves_receiver() {
     let source = r#"
 class Variable {
@@ -2437,7 +2434,6 @@ for (i in 0...20) {
 }
 
 #[test]
-#[ignore = "debugging list iteration inside non-leaf tiered methods"]
 fn e2e_tiered_nonleaf_plan_execute_list_iteration() {
     let source = r#"
 class Variable {
@@ -2517,7 +2513,6 @@ for (i in 0...20) {
 }
 
 #[test]
-#[ignore = "debugging inherited-method dispatch in non-leaf tiered mode"]
 fn e2e_tiered_nonleaf_inherited_destroy_after_loop() {
     let source = r#"
 class Constraint {
@@ -3247,7 +3242,6 @@ fn e2e_delta_blue() {
 }
 
 #[test]
-#[ignore = "debugging tiered promotion regressions in delta_blue"]
 fn e2e_delta_blue_projection_tiered_promotion_smoke() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3281,7 +3275,6 @@ fn e2e_delta_blue_projection_tiered_promotion_smoke() {
 }
 
 #[test]
-#[ignore = "debugging tiered promotion regressions in delta_blue"]
 fn e2e_delta_blue_tiered_stress_smoke() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3318,7 +3311,6 @@ fn e2e_delta_blue_tiered_stress_smoke() {
 }
 
 #[test]
-#[ignore = "debugging full delta_blue under generational tiered promotion"]
 fn e2e_delta_blue_generational_tiered_full_default_threshold() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3354,7 +3346,6 @@ fn e2e_delta_blue_generational_tiered_full_default_threshold() {
 }
 
 #[test]
-#[ignore = "debugging full delta_blue under generational tiered execution"]
 fn e2e_delta_blue_generational_tiered_full_threshold_one() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3390,7 +3381,6 @@ fn e2e_delta_blue_generational_tiered_full_threshold_one() {
 }
 
 #[test]
-#[ignore = "debugging full non-leaf tiered execution under mark-sweep GC"]
 fn e2e_delta_blue_mark_sweep_tiered_projection_smoke() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3425,7 +3415,6 @@ fn e2e_delta_blue_mark_sweep_tiered_projection_smoke() {
 }
 
 #[test]
-#[ignore = "debugging full non-leaf tiered execution under mark-sweep GC"]
 fn e2e_delta_blue_mark_sweep_tiered_stress_smoke() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3463,7 +3452,6 @@ fn e2e_delta_blue_mark_sweep_tiered_stress_smoke() {
 }
 
 #[test]
-#[ignore = "debugging full delta_blue under mark-sweep tiered execution"]
 fn e2e_delta_blue_mark_sweep_tiered_full() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
@@ -3552,7 +3540,6 @@ for (i in 0...10) {
 }
 
 #[test]
-#[ignore = "debugging repeated where-sequence reassignment under mark-sweep tiered execution"]
 fn e2e_tiered_mark_sweep_repeated_where_sequence_reassignment() {
     let source = r#"
 class Holder {
@@ -3610,7 +3597,6 @@ for (i in 0...40) {
 }
 
 #[test]
-#[ignore = "debugging chainTest -> projectionTest value drift under tiered non-leaf execution"]
 fn e2e_delta_blue_chain_then_projection_debug_values() {
     let mut source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
