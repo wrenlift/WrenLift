@@ -12,6 +12,7 @@ pub mod licm;
 pub mod purity;
 pub mod range_loop;
 pub mod sra;
+pub mod sroa_loop;
 pub mod tree_shake;
 
 use std::collections::HashMap;

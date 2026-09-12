@@ -1924,6 +1924,11 @@ pub struct NativeOsrEntry {
     /// Parallel to `live_in_regs`: the compiled body assumed this
     /// live-in is a Num, so the transfer must decline otherwise.
     pub live_in_num: Vec<bool>,
+    /// Parallel to `live_in_regs`: when set, the register holds an
+    /// object and the live-in is that object's field, because scalar
+    /// replacement split the parameter the interpreter still carries
+    /// as an object.
+    pub live_in_field: Vec<Option<u16>>,
 }
 
 unsafe impl Send for NativeOsrEntry {}

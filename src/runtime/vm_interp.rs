@@ -442,7 +442,20 @@ fn try_enter_loop_osr(
     // drifted from the bytecode's, so decline rather than guess.
     let mut osr_args = SmallVec::<[Value; 8]>::new();
     for (i, &reg) in entry.live_in_regs.iter().enumerate() {
-        let value = values.get(reg as usize).copied();
+        let mut value = values.get(reg as usize).copied();
+        // A split parameter: the register holds the object, the entry
+        // wants one of its fields.
+        if let Some(Some(field)) = entry.live_in_field.get(i).copied() {
+            value = value.and_then(|v| {
+                let ptr = v.as_object()?;
+                let header = ptr as *const ObjHeader;
+                if unsafe { (*header).obj_type } != ObjType::Instance {
+                    return None;
+                }
+                let inst = unsafe { &*(ptr as *const ObjInstance) };
+                inst.get_field(field as usize)
+            });
+        }
         let needs_num = entry.live_in_num.get(i).copied().unwrap_or(false);
         match value {
             Some(v) if needs_num && !v.is_num() => {

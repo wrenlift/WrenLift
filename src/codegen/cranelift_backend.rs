@@ -1313,6 +1313,7 @@ pub mod cl {
                 ptr: module.get_finalized_function(def.func_id),
                 live_in_regs: def.live_in_regs,
                 live_in_num: def.live_in_num,
+                live_in_field: def.live_in_field,
             })
             .collect();
 
@@ -1403,6 +1404,7 @@ pub mod cl {
         func_id: cranelift_module::FuncId,
         live_in_regs: Vec<u32>,
         live_in_num: Vec<bool>,
+        live_in_field: Vec<Option<u16>>,
     }
 
     #[derive(Clone)]
@@ -1528,11 +1530,14 @@ pub mod cl {
                 target_block,
                 param_count: layout.param_count,
                 func_id,
+                // A live-in that scalar replacement split out of an
+                // object parameter is read from that object's field.
                 live_in_regs: layout
                     .external_args
                     .iter()
-                    .map(|v| v.0)
-                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| p.0))
+                    .copied()
+                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .map(|v| mir.scalar_param_sources.get(&v).map(|(o, _)| o.0).unwrap_or(v.0))
                     .collect(),
                 live_in_num: layout
                     .external_args
@@ -1540,6 +1545,13 @@ pub mod cl {
                     .copied()
                     .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
                     .map(|v| mir.speculated_num_params.contains(&v))
+                    .collect(),
+                live_in_field: layout
+                    .external_args
+                    .iter()
+                    .copied()
+                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .map(|v| mir.scalar_param_sources.get(&v).map(|(_, f)| *f))
                     .collect(),
             });
         }

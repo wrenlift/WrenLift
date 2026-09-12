@@ -1852,6 +1852,7 @@ impl ExecutionEngine {
                 ptr: entry.ptr,
                 live_in_regs: entry.live_in_regs.clone(),
                 live_in_num: entry.live_in_num.clone(),
+                live_in_field: entry.live_in_field.clone(),
             });
         }
         None
@@ -2053,6 +2054,144 @@ impl ExecutionEngine {
             .and_then(|name| self.modules.get(name.as_str()))
             .map(|e| e.cell as *const ModuleVarsCell as usize)
             .unwrap_or(0)
+    }
+
+    /// Shape of the class held by module variable `idx` of `module`
+    /// for scalar replacement, or None when the class is not eligible:
+    /// the slot is reassigned somewhere in the module, the value is not
+    /// a class, or the class has no trivial constructor.
+    fn scalar_class_for_modvar(
+        &self,
+        interner: &crate::intern::Interner,
+        module: &str,
+        idx: u32,
+    ) -> Option<Arc<crate::mir::opt::sroa_loop::ScalarClass>> {
+        use crate::mir::opt::sroa_loop::{trivial_ctor_field_map, trivial_getter_field, ScalarClass};
+        use crate::mir::Instruction;
+        use crate::runtime::object::{Method, ObjClass, ObjHeader, ObjType};
+        // A class slot is written once by the VM at install; any
+        // SetModuleVar on it in the module's own code makes the baked
+        // class unsound.
+        for (fid, m) in self.func_modules.iter().enumerate() {
+            let Some(m) = m else { continue };
+            if m.as_str() != module {
+                continue;
+            }
+            let Some(body) = self.functions.get(fid) else { continue };
+            for block in &body.mir().blocks {
+                for (_, inst) in &block.instructions {
+                    if let Instruction::SetModuleVar(slot, _) = inst {
+                        if *slot as u32 == idx {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        let entry = self.modules.get(module)?;
+        let value = *entry.vars.get(idx as usize)?;
+        if std::env::var_os("WLIFT_SROA_TRACE").is_some() {
+            eprintln!("sroa-trace: module {} slot {} is_object={}", module, idx, value.is_object());
+        }
+        let ptr = value.as_object()?;
+        let header = ptr as *const ObjHeader;
+        if unsafe { (*header).obj_type } != ObjType::Class {
+            return None;
+        }
+        let class = unsafe { &*(ptr as *const ObjClass) };
+        let num_fields = class.num_fields as usize;
+        let mut ctors = std::collections::HashMap::new();
+        let mut getters = std::collections::HashMap::new();
+        for (sym_idx, slot) in class.methods.iter().enumerate() {
+            let Some(method) = slot else { continue };
+            let sym = crate::intern::SymbolId::from_raw(sym_idx as u32);
+            match method {
+                Method::Constructor(closure) => {
+                    if closure.is_null() {
+                        continue;
+                    }
+                    let fn_id = unsafe { (*(**closure).function).fn_id };
+                    let Some(mir) = self.get_mir(FuncId(fn_id)) else { continue };
+                    let Some(map) = trivial_ctor_field_map(&mir) else { continue };
+                    let nargs = mir.arity.saturating_sub(1) as usize;
+                    let mut per_arg: Vec<Option<usize>> = vec![None; nargs];
+                    let mut ok = true;
+                    for (field, arg) in map {
+                        if field >= num_fields || arg >= nargs {
+                            ok = false;
+                            break;
+                        }
+                        per_arg[arg] = Some(field);
+                    }
+                    // Constructors are bound under `static:<sig>`; call
+                    // sites use the plain signature.
+                    let plain = interner
+                        .resolve(sym)
+                        .strip_prefix("static:")
+                        .and_then(|p| interner.lookup(p))
+                        .unwrap_or(sym);
+                    if ok {
+                        ctors.insert(plain, per_arg);
+                    }
+                }
+                Method::Closure(closure) => {
+                    if closure.is_null() {
+                        continue;
+                    }
+                    let fn_id = unsafe { (*(**closure).function).fn_id };
+                    let Some(mir) = self.get_mir(FuncId(fn_id)) else { continue };
+                    if let Some(field) = trivial_getter_field(&mir) {
+                        if field < num_fields {
+                            getters.insert(sym, field);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if std::env::var_os("WLIFT_SROA_TRACE").is_some() {
+            eprintln!(
+                "sroa-trace: class at slot {} fields={} ctors={} getters={}",
+                idx,
+                num_fields,
+                ctors.len(),
+                getters.len()
+            );
+        }
+        if ctors.is_empty() {
+            return None;
+        }
+        Some(Arc::new(ScalarClass {
+            num_fields,
+            ctors,
+            getters,
+        }))
+    }
+
+    /// Clone of `mir` with loop-carried objects of trivial classes
+    /// replaced by scalars, or the original when nothing applies.
+    fn scalar_replaced(
+        &self,
+        id: FuncId,
+        mir: &Arc<MirFunction>,
+        interner: &crate::intern::Interner,
+    ) -> Arc<MirFunction> {
+        if std::env::var_os("WLIFT_DISABLE_SROA").is_some() {
+            return Arc::clone(mir);
+        }
+        let Some(module) = self.func_modules.get(id.0 as usize).and_then(|m| m.clone()) else {
+            return Arc::clone(mir);
+        };
+        let resolver = |idx: u32| self.scalar_class_for_modvar(interner, module.as_str(), idx);
+        let mut clone = (**mir).clone();
+        if std::env::var_os("WLIFT_SROA_TRACE").is_some() {
+            eprintln!("sroa-trace: FuncId({}) module {}", id.0, module);
+        }
+        if crate::mir::opt::sroa_loop::scalar_replace_loop_objects(&mut clone, &resolver) {
+            Arc::new(clone)
+        } else {
+            Arc::clone(mir)
+        }
     }
 
     fn build_compile_mir(
@@ -2428,7 +2567,8 @@ impl ExecutionEngine {
                 stats.compile_attempts += 1;
             }
         }
-        let compile_mir = Self::build_compile_mir(&mir, tier, interner, profile.as_ref());
+        let sroa_mir = self.scalar_replaced(id, &mir, interner);
+        let compile_mir = Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref());
         let (mut callsite_ic_ptrs, callsite_ic_live_ptrs) = self
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
@@ -2575,6 +2715,7 @@ impl ExecutionEngine {
             return;
         };
         let mir = Arc::clone(body.mir());
+        let sroa_mir = self.scalar_replaced(id, &mir, interner);
         let profile = self.get_type_profile(id).cloned();
         let trace_name = self
             .functions
@@ -2645,7 +2786,7 @@ impl ExecutionEngine {
                 );
             }
             let compile_mir =
-                Self::build_compile_mir(&mir, tier, &interner_clone, profile.as_ref());
+                Self::build_compile_mir(&sroa_mir, tier, &interner_clone, profile.as_ref());
             let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
                 match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
                     (Some(ics), Some(live)) => {

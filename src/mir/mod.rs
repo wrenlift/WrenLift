@@ -773,6 +773,12 @@ pub struct MirFunction {
     /// Compile-time only; never part of a serialised bundle.
     #[serde(skip)]
     pub speculated_num_params: Vec<ValueId>,
+    /// Block parameters introduced by scalar replacement, mapped to the
+    /// object parameter they split and the field they carry. Lets an
+    /// OSR entry rebuild them from the object the interpreter holds.
+    /// Compile-time only.
+    #[serde(skip)]
+    pub scalar_param_sources: std::collections::HashMap<ValueId, (ValueId, u16)>,
 }
 
 impl MirFunction {
@@ -786,6 +792,7 @@ impl MirFunction {
             next_block: 0,
             span_map: std::collections::HashMap::new(),
             speculated_num_params: Vec::new(),
+            scalar_param_sources: std::collections::HashMap::new(),
         }
     }
 

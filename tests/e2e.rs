@@ -4393,3 +4393,63 @@ fn e2e_hatch_manifest_applies_native_search_paths_and_overrides() {
         Some(&std::path::PathBuf::from("/opt/custom/libdb.dylib"))
     );
 }
+
+/// Scalar replacement of a loop-carried object: the compiled body must
+/// agree with the interpreter whether the object is replaced (getters
+/// only) or must stay an allocation (it escapes).
+#[test]
+fn e2e_tiered_scalar_replaced_loop_object_matches_interpreter() {
+    let source = r#"
+class Vec2 {
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
+  x { _x }
+  y { _y }
+  norm2 { _x * _x + _y * _y }
+}
+class Bench {
+  static walk(n) {
+    var p = Vec2.new(0.5, 0.25)
+    var acc = 0
+    var i = 0
+    while (i < n) {
+      p = Vec2.new(p.x * 0.5 + 1, p.y * 0.5 + 2)
+      acc = acc + p.x + p.y
+      i = i + 1
+    }
+    return acc
+  }
+  static escapes(n) {
+    var kept = []
+    var p = Vec2.new(1, 2)
+    var i = 0
+    while (i < n) {
+      p = Vec2.new(p.x + 1, p.y + 1)
+      if (i % 1000 == 0) kept.add(p)
+      i = i + 1
+    }
+    var s = 0
+    for (q in kept) s = s + q.norm2
+    return s
+  }
+}
+System.print(Bench.walk(20000))
+System.print(Bench.escapes(20000))
+"#;
+    let (result, output, _) = run(source);
+    assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+    let expected = {
+        let config = VMConfig {
+            execution_mode: ExecutionMode::Interpreter,
+            ..Default::default()
+        };
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let r = vm.interpret("main", source);
+        assert!(matches!(r, InterpretResult::Success), "{:?}", r);
+        vm.take_output()
+    };
+    assert_eq!(output.trim(), expected.trim());
+}
