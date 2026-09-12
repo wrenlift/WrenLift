@@ -179,10 +179,13 @@ impl<'a> MirBuilder<'a> {
         for stmt in module {
             self.lower_stmt(stmt);
         }
-        if matches!(
-            self.func.block(self.current_block).terminator,
-            Terminator::Unreachable
-        ) {
+        self.func.trim_dead_tail();
+        if self.current_block.0 < self.func.next_block
+            && matches!(
+                self.func.block(self.current_block).terminator,
+                Terminator::Unreachable
+            )
+        {
             self.func.block_mut(self.current_block).terminator = Terminator::ReturnNull;
         }
         self.func.compute_predecessors();
@@ -206,10 +209,13 @@ impl<'a> MirBuilder<'a> {
             self.variables.insert(name, stored);
         }
         self.lower_stmt(body);
-        if matches!(
-            self.func.block(self.current_block).terminator,
-            Terminator::Unreachable
-        ) {
+        self.func.trim_dead_tail();
+        if self.current_block.0 < self.func.next_block
+            && matches!(
+                self.func.block(self.current_block).terminator,
+                Terminator::Unreachable
+            )
+        {
             self.func.block_mut(self.current_block).terminator = Terminator::ReturnNull;
         }
         self.func.compute_predecessors();
@@ -1612,15 +1618,19 @@ fn compile_closure_body(
     // An expression body returns its value; a block body returns null
     // unless it returned already.
     let implicit = builder.lower_body(body);
-    if matches!(
-        builder.func.block(builder.current_block).terminator,
-        Terminator::Unreachable
-    ) {
+    builder.func.trim_dead_tail();
+    if builder.current_block.0 < builder.func.next_block
+        && matches!(
+            builder.func.block(builder.current_block).terminator,
+            Terminator::Unreachable
+        )
+    {
         builder.func.block_mut(builder.current_block).terminator = match implicit {
             Some(val) => Terminator::Return(val),
             None => Terminator::ReturnNull,
         };
     }
+    builder.func.compute_predecessors();
 
     let closures = builder.closures;
     (builder.func, closures)
@@ -1974,10 +1984,13 @@ fn compile_class(
         // Lower the body: an expression body returns its value, a block
         // body returns null, a constructor returns `this`.
         let implicit = builder.lower_body(method.body.as_ref().unwrap());
-        if matches!(
-            builder.func.block(builder.current_block).terminator,
-            Terminator::Unreachable
-        ) {
+        builder.func.trim_dead_tail();
+        if builder.current_block.0 < builder.func.next_block
+            && matches!(
+                builder.func.block(builder.current_block).terminator,
+                Terminator::Unreachable
+            )
+        {
             builder.func.block_mut(builder.current_block).terminator = if is_constructor {
                 Terminator::Return(this_val)
             } else {

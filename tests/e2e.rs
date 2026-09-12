@@ -4815,3 +4815,45 @@ System.print(1 / K.negProd())
         assert_eq!(output.trim(), expected, "{:?}", mode);
     }
 }
+
+#[test]
+fn e2e_tiered_osr_entered_loop_runs_every_iteration() {
+    // Nine toggles per iteration and an odd count make the final value
+    // depend on the iteration count, which the reference benchmark's
+    // even count hides. An OSR entry that skips iterations shows here.
+    let src = r#"
+class Toggle {
+  construct new(startState) { _state = startState }
+  value { _state }
+  activate {
+    _state = !_state
+    return this
+  }
+}
+var n = 100001
+var val = true
+var toggle = Toggle.new(val)
+for (i in 0...n) {
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+  val = toggle.activate.value
+}
+System.print(val)
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let (result, output, errors) = run_collecting_errors(src, mode);
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}",
+            mode,
+            errors
+        );
+        assert_eq!(output.trim(), "false", "{:?}", mode);
+    }
+}
