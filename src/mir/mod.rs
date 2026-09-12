@@ -770,6 +770,8 @@ pub struct MirFunction {
     /// Block parameters the type specialiser assumed to be Num on the
     /// strength of their in-function edges. An OSR entry feeding one
     /// of these from the interpreter must check the value first.
+    /// Compile-time only; never part of a serialised bundle.
+    #[serde(skip)]
     pub speculated_num_params: Vec<ValueId>,
 }
 
