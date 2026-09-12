@@ -2076,6 +2076,9 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::IsType(a, sym) => {
                 self.emit_runtime_call_with_imm(func, dst, "wren_is_type", *a, sym.index() as i64)?;
             }
+            Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
+                return Err("speculation guards are not lowered to wasm".into());
+            }
             Instruction::SubscriptGet { receiver, args } => {
                 let name = subscript_get_helper_name(args.len()).ok_or_else(|| {
                     format!(

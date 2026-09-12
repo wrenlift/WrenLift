@@ -412,6 +412,15 @@ pub enum Instruction {
     Move(ValueId),
     /// A block parameter (receives value from predecessors).
     BlockParam(u16),
+    // -- Speculation guards (appended last: serialised bundles number
+    // variants by position) -------------------------------------------------
+    /// Raw Bool: the value is an object whose class is this pointer.
+    /// Planted by the call inliner; JIT-only.
+    ClassIs(ValueId, usize),
+    /// Raw Bool: the value is exactly this object. JIT-only.
+    ObjectIs(ValueId, usize),
+    /// Raw Bool: the value is a closure of this `ObjFn` pointer. JIT-only.
+    ClosureFnIs(ValueId, usize),
 }
 
 impl Instruction {
@@ -500,7 +509,10 @@ impl Instruction {
 
             Instruction::GuardClass(a, _)
             | Instruction::GuardProtocol(a, _)
-            | Instruction::IsType(a, _) => vec![*a],
+            | Instruction::IsType(a, _)
+            | Instruction::ClassIs(a, _)
+            | Instruction::ObjectIs(a, _)
+            | Instruction::ClosureFnIs(a, _) => vec![*a],
 
             Instruction::GetField(recv, _) => vec![*recv],
             Instruction::SetField(recv, _, val) => vec![*recv, *val],
@@ -1046,13 +1058,8 @@ pub fn osr_rematerializable_defs(
 /// Values used by a loop/header region but defined outside it, excluding
 /// constants that can be rematerialized. The order is deterministic and is
 /// part of the bytecode-to-native OSR ABI.
-pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<ValueId> {
-    // Classic backward liveness over the whole function: a value is
-    // live-in at the target if some path from the target uses it
-    // before redefining it. That includes values defined inside the
-    // loop region on an earlier trip around an enclosing loop (a range
-    // built in the outer body and consumed by the inner header), which
-    // a reachability-only rule misclassifies as internal.
+/// Classic backward liveness: the values live on entry to each block.
+pub fn live_in_sets(func: &MirFunction) -> Vec<HashSet<ValueId>> {
     let n = func.blocks.len();
     let mut gens: Vec<HashSet<ValueId>> = Vec::with_capacity(n);
     let mut defs: Vec<HashSet<ValueId>> = Vec::with_capacity(n);
@@ -1101,6 +1108,16 @@ pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<Valu
             }
         }
     }
+    live_in
+}
+
+pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<ValueId> {
+    // A value is live-in at the target if some path from the target
+    // uses it before redefining it. That includes values defined inside
+    // the loop region on an earlier trip around an enclosing loop (a
+    // range built in the outer body and consumed by the inner header),
+    // which a reachability-only rule misclassifies as internal.
+    let live_in = live_in_sets(func);
     let Some(target_block) = func.blocks.get(target.0 as usize) else {
         return Vec::new();
     };
@@ -1285,6 +1302,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
 
         Instruction::StringConcat(parts) => format!("str_concat [{}]", fmt_val_list(parts)),
         Instruction::ToString(a) => format!("to_string {}", a),
+        Instruction::ClassIs(a, class) => format!("class_is {}, {:#x}", a, class),
+        Instruction::ObjectIs(a, obj) => format!("object_is {}, {:#x}", a, obj),
+        Instruction::ClosureFnIs(a, f) => format!("closure_fn_is {}, {:#x}", a, f),
 
         Instruction::IsType(a, sym) => {
             format!("is_type {}, %{}", a, interner.resolve(*sym))

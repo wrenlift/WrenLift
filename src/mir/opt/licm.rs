@@ -68,15 +68,16 @@ impl MirPass for Licm {
 // Loop detection at MIR level
 // ---------------------------------------------------------------------------
 
-struct Loop {
-    header: BlockId,
+pub(crate) struct Loop {
+    pub(crate) header: BlockId,
     #[allow(dead_code)]
-    latch: BlockId,
-    body: Vec<BlockId>,
+    pub(crate) latch: BlockId,
+    /// Every block of the loop, header included.
+    pub(crate) body: Vec<BlockId>,
 }
 
 /// Reverse post-order traversal of MIR blocks.
-fn compute_rpo(func: &MirFunction) -> Vec<BlockId> {
+pub(crate) fn compute_rpo(func: &MirFunction) -> Vec<BlockId> {
     let n = func.blocks.len();
     let mut visited = vec![false; n];
     let mut post_order = Vec::with_capacity(n);
@@ -104,7 +105,7 @@ fn compute_rpo(func: &MirFunction) -> Vec<BlockId> {
 }
 
 /// Cooper-Harvey-Kennedy iterative dominator algorithm for MIR blocks.
-fn compute_dominators(func: &MirFunction, rpo: &[BlockId]) -> Vec<usize> {
+pub(crate) fn compute_dominators(func: &MirFunction, rpo: &[BlockId]) -> Vec<usize> {
     let n = func.blocks.len();
     let undef = usize::MAX;
     let mut idom = vec![undef; n];
@@ -170,7 +171,7 @@ fn compute_dominators(func: &MirFunction, rpo: &[BlockId]) -> Vec<usize> {
 }
 
 /// Check if block `a` dominates block `b`.
-fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
+pub(crate) fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
     let mut cur = b;
     loop {
         if cur == a {
@@ -187,7 +188,7 @@ fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
 /// union of each individual loop body; the latch is left as one of the
 /// original latches (not used downstream — LICM only reads the header and
 /// body).
-fn merge_loops_by_header(loops: &[Loop]) -> Vec<Loop> {
+pub(crate) fn merge_loops_by_header(loops: &[Loop]) -> Vec<Loop> {
     let mut by_header: HashMap<BlockId, (BlockId, HashSet<BlockId>)> = HashMap::new();
     for lp in loops {
         let entry = by_header
@@ -215,7 +216,7 @@ fn merge_loops_by_header(loops: &[Loop]) -> Vec<Loop> {
 }
 
 /// Detect natural loops via back edges.
-fn detect_loops(func: &MirFunction, idom: &[usize]) -> Vec<Loop> {
+pub(crate) fn detect_loops(func: &MirFunction, idom: &[usize]) -> Vec<Loop> {
     let mut loops = Vec::new();
 
     for block in &func.blocks {

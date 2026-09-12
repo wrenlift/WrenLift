@@ -1596,7 +1596,10 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::CmpLeF64(..)
                 | Instruction::CmpGeF64(..)
                 | Instruction::Not(_)
-                | Instruction::IsType(..) => MirType::Bool,
+                | Instruction::IsType(..)
+                | Instruction::ClassIs(..)
+                | Instruction::ObjectIs(..)
+                | Instruction::ClosureFnIs(..) => MirType::Bool,
                 Instruction::BitAnd(..)
                 | Instruction::BitOr(..)
                 | Instruction::BitXor(..)
@@ -4332,6 +4335,9 @@ impl<'a> LowerCtx<'a> {
                     args: vec![la],
                     ret: Some(dst),
                 });
+            }
+            Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
+                panic!("speculation guards are lowered by the Cranelift backend only")
             }
             // -- IsType: inline tag checks for primitives, class ptr for objects --
             Instruction::IsType(a, sym) => {

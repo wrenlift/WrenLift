@@ -254,6 +254,10 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
         &dce,
     ];
     opt::run_to_fixpoint(mir, &passes, 10);
+    // WLIFT_DISABLE_UNBOX_PARAMS keeps loop-carried Nums boxed; safe to run with.
+    if std::env::var_os("WLIFT_DISABLE_UNBOX_PARAMS").is_none() {
+        crate::mir::opt::unbox_params::UnboxParams.run(mir);
+    }
 }
 
 /// Insert speculative type guards for function parameters based on runtime
@@ -419,6 +423,15 @@ fn mir_calls_method_named(
 /// direct-yield refusal into a transitive one — if `f` calls
 /// `g.method`, and any function named `method` may itself yield, `f`
 /// is also unsafe to JIT.
+fn mir_touches_module_vars(mir: &MirFunction) -> bool {
+    use crate::mir::Instruction;
+    mir.blocks.iter().any(|b| {
+        b.instructions.iter().any(|(_, i)| {
+            matches!(i, Instruction::GetModuleVar(_) | Instruction::SetModuleVar(..))
+        })
+    })
+}
+
 fn mir_calls_any_tainted_method(
     mir: &MirFunction,
     tainted: &std::collections::HashSet<crate::intern::SymbolId>,
@@ -2194,6 +2207,143 @@ impl ExecutionEngine {
         }
     }
 
+    /// Callees the inline cache resolved for the caller's call sites,
+    /// keyed by the call's destination value, restricted to bodies the
+    /// MIR inliner may splice: same module (or no module-variable
+    /// access), and nothing the JIT refuses to compile.
+    fn known_call_sites(
+        &self,
+        caller: FuncId,
+        mir: &MirFunction,
+        ics: &[CallSiteIC],
+        interner: &crate::intern::Interner,
+    ) -> HashMap<crate::mir::ValueId, crate::mir::opt::inline_calls::KnownCallee> {
+        use crate::mir::opt::inline_calls::{CalleeGuard, KnownCallee};
+        use crate::mir::Instruction;
+        let mut sites = HashMap::new();
+        let tainted = self.compute_may_yield_methods(interner);
+        let caller_module = self.func_modules.get(caller.0 as usize).cloned().flatten();
+        let mut ic_idx = 0usize;
+        for block in &mir.blocks {
+            for (dst, inst) in &block.instructions {
+                let method = match inst {
+                    Instruction::Call { method, .. } => Some(*method),
+                    Instruction::SuperCall { .. } => None,
+                    _ => continue,
+                };
+                let ic = ics.get(ic_idx).copied();
+                ic_idx += 1;
+                let (Some(method), Some(ic)) = (method, ic) else {
+                    continue;
+                };
+                if std::env::var_os("WLIFT_INLINE_TRACE").is_some() {
+                    eprintln!(
+                        "inline-trace: FuncId({}) site {} kind={} class={:#x} func_id={}",
+                        caller.0, dst, ic.kind, ic.class, ic.func_id
+                    );
+                }
+                if ic.class == 0 {
+                    continue;
+                }
+                let callee = FuncId(ic.func_id as u32);
+                if callee == caller {
+                    continue;
+                }
+                let guard = match ic.kind {
+                    7 => CalleeGuard::ClosureFn(ic.class),
+                    // Method kinds use function id 0 as "unset".
+                    1 | 2 | 6 if ic.func_id != 0 => {
+                        // A class receiving a static call is cached under its
+                        // own pointer, so the guard is identity.
+                        let class = ic.class as *const crate::runtime::object::ObjClass;
+                        let name = interner.resolve(method).to_string();
+                        let static_sym = interner.lookup(&format!("static:{}", name));
+                        let is_static = static_sym
+                            .and_then(|sym| unsafe { (*class).find_method(sym) })
+                            .map(|m| match m {
+                                crate::runtime::object::Method::Closure(c) => {
+                                    let fn_id = unsafe { (*(**c).function).fn_id };
+                                    fn_id == ic.func_id as u32
+                                }
+                                _ => false,
+                            })
+                            .unwrap_or(false);
+                        if is_static {
+                            CalleeGuard::Object(ic.class)
+                        } else {
+                            CalleeGuard::Class(ic.class)
+                        }
+                    }
+                    _ => continue,
+                };
+                let Some(body) = self.get_mir(callee) else {
+                    continue;
+                };
+                if !crate::mir::opt::inline_calls::inlinable_body(&body) {
+                    continue;
+                }
+                // The backend already splices small bodies behind a guard;
+                // MIR inlining earns its keep only where the caller's types
+                // can reach arithmetic in the body.
+                if !crate::mir::opt::inline_calls::body_has_arithmetic(&body) {
+                    continue;
+                }
+                let callee_module = self.func_modules.get(callee.0 as usize).cloned().flatten();
+                if callee_module != caller_module && mir_touches_module_vars(&body) {
+                    continue;
+                }
+                if mir_calls_jit_unsafe_fiber_method(&body, interner)
+                    || mir_calls_any_tainted_method(&body, &tainted)
+                {
+                    continue;
+                }
+                sites.insert(*dst, KnownCallee { guard, body });
+            }
+        }
+        sites
+    }
+
+    /// The compile clone with known calls inlined. `WLIFT_DISABLE_MIR_INLINE`
+    /// turns it off; safe to run with.
+    fn inline_known(
+        &self,
+        caller: FuncId,
+        mir: &MirFunction,
+        clone: Arc<MirFunction>,
+        ics: Option<&[CallSiteIC]>,
+        interner: &crate::intern::Interner,
+    ) -> Arc<MirFunction> {
+        if std::env::var_os("WLIFT_DISABLE_MIR_INLINE").is_some() {
+            return clone;
+        }
+        // Comma-separated caller ids to leave alone; a bisection aid.
+        if let Ok(skip) = std::env::var("WLIFT_MIR_INLINE_SKIP") {
+            if skip.split(',').any(|s| s.trim() == caller.0.to_string()) {
+                return clone;
+            }
+        }
+        let Some(ics) = ics else {
+            return clone;
+        };
+        let sites = self.known_call_sites(caller, mir, ics, interner);
+        if sites.is_empty() {
+            return clone;
+        }
+        let mut out = (*clone).clone();
+        if crate::mir::opt::inline_calls::inline_known_calls(&mut out, &sites) {
+            if std::env::var_os("WLIFT_INLINE_TRACE").is_some() {
+                eprintln!(
+                    "inline-trace: FuncId({}) inlined {} site(s)",
+                    caller.0,
+                    sites.len()
+                );
+            }
+            Arc::new(out)
+        } else {
+            clone
+        }
+    }
+
     fn build_compile_mir(
         mir: &Arc<MirFunction>,
         tier: CompileTier,
@@ -2568,7 +2718,6 @@ impl ExecutionEngine {
             }
         }
         let sroa_mir = self.scalar_replaced(id, &mir, interner);
-        let compile_mir = Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref());
         let (mut callsite_ic_ptrs, callsite_ic_live_ptrs) = self
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
@@ -2583,6 +2732,9 @@ impl ExecutionEngine {
             }
             Some(Arc::new(cha))
         };
+        let sroa_mir =
+            self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
+        let compile_mir = Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref());
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
@@ -2751,6 +2903,8 @@ impl ExecutionEngine {
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
+        let sroa_mir =
+            self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let modvars_cell = self.modvars_cell_addr(id);
         let callee_purity = self.compute_callee_purity_map();

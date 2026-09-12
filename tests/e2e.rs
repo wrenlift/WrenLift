@@ -4525,3 +4525,111 @@ System.print("done")
         );
     }
 }
+
+#[test]
+fn e2e_tiered_inlined_known_calls_match_interpreter() {
+    // Guarded inlining with loop versioning: receivers and closures
+    // that change after warm-up, multi-block callees, implicit null
+    // returns, breaks, nested loops, loop live-outs, errors raised
+    // inside an inlined body, and a site outside any loop.
+    let src = r#"class A {
+  construct new() { _k = 1 }
+  step(acc, i) { (acc * 3 + i + _k) % 1000003 }
+  pick(x) {
+    if (x > 5) return x * 2
+    return x - 1
+  }
+  noret(x) {
+    _k = x
+    return null
+  }
+  k { _k }
+}
+class B is A {
+  construct new() { super() }
+  step(acc, i) { (acc * 5 + i) % 1000003 }
+}
+class C {
+  static sf(a, b) { a * 2 + b }
+  static boom(x) { x + "s" }
+}
+// 1. receiver switches mid-loop after warm-up
+var objs = [A.new(), B.new()]
+var acc = 0
+var i = 0
+var last = null
+while (i < 3000) {
+  var o = objs[i < 2000 ? 0 : 1]
+  acc = o.step(acc, i)
+  last = o
+  i = i + 1
+}
+System.print("1: %(acc) %(i) %(last is B)")
+// 2. closure switches mid-loop
+var f1 = Fn.new { |a, b| a + b }
+var f2 = Fn.new { |a, b| a - b }
+var s = 0
+for (j in 0...3000) {
+  var f = j < 2500 ? f1 : f2
+  s = f.call(s, j)
+}
+System.print("2: %(s)")
+// 3. static call site with class receiver switching
+class D { static sf(a, b) { a - b } }
+var t = 0
+for (j in 0...3000) {
+  var cls = j % 2 == 0 ? C : D
+  t = cls.sf(t, 1) % 97
+}
+System.print("3: %(t)")
+// 4. multi-block callee, implicit null return, break, nested loops, live-outs
+var a = A.new()
+var total = 0
+var seen = 0
+for (x in 0...200) {
+  var inner = 0
+  for (y in 0...50) {
+    inner = inner + a.pick(y)
+    if (inner > 10000) break
+  }
+  total = total + inner
+  seen = x
+  var r = a.noret(x)
+  if (r != null) System.print("bad")
+}
+System.print("4: %(total) %(seen) %(a.k)")
+// 5. runtime error inside an inlined callee under try, after warm-up
+var u = 0
+for (j in 0...2000) u = C.sf(u, 1) % 1009
+var fb = Fiber.new {
+  var w = 0
+  for (j in 0...500) w = C.sf(w, j)
+  C.boom(w)
+}
+fb.try()
+System.print("5: %(u) %(fb.error)")
+// 6. site outside any loop
+System.print("6: %(a.pick(9)) %(a.pick(2)) %(C.sf(3, 4))")
+"#;
+    let (result, expected, _) = run_with_config(
+        src,
+        VMConfig {
+            execution_mode: ExecutionMode::Interpreter,
+            ..VMConfig::default()
+        },
+    );
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(
+        expected.trim(),
+        "1: 499414 3000 true\n2: 1749000\n3: 0\n4: 485800 199 199\n5: 452 Right operand must be a number.\n6: 18 1 10"
+    );
+    let (result, output, _) = run_with_config(
+        src,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            ..VMConfig::default()
+        },
+    );
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(output, expected);
+}

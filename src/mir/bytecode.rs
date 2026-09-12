@@ -161,7 +161,8 @@ pub struct CallSiteIC {
     pub closure: *const u8,
     /// Cached func_id for quick bytecode lookup (kinds 2/3) or field index (kind 5).
     pub func_id: u64,
-    /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native, 5 = getter.
+    /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native, 5 = getter,
+    /// 7 = closure call (`class` holds the `ObjFn` pointer).
     pub kind: u64,
 }
 
@@ -484,6 +485,9 @@ impl<'a> Encoder<'a> {
                 self.emit_reg(*a);
                 self.emit_u8(proto.0);
                 self.emit_u8(0); // pad
+            }
+            Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
+                unreachable!("speculation guards exist only in JIT compile clones")
             }
             Instruction::IsType(a, sym) => {
                 self.emit_op(Op::IsType);

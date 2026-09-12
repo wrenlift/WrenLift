@@ -2500,6 +2500,24 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         let header = ptr as *const ObjHeader;
                         if unsafe { (*header).obj_type } == ObjType::Closure {
                             let closure_ptr = ptr as *mut ObjClosure;
+                            // Kind 7: the site's last closure, keyed by its
+                            // function so the compiler can guard on that.
+                            if vm.engine.mode != ExecutionMode::Interpreter {
+                                let function = unsafe { (*closure_ptr).function };
+                                let ic_table = unsafe { &mut *bc.ic_table.get() };
+                                if let Some(ic) = ic_table.get_mut(ic_idx) {
+                                    if ic.kind == 0 || (ic.kind == 7 && ic.class != function as usize)
+                                    {
+                                        *ic = crate::mir::bytecode::CallSiteIC {
+                                            class: function as usize,
+                                            jit_ptr: std::ptr::null(),
+                                            closure: closure_ptr as *const u8,
+                                            func_id: unsafe { (*function).fn_id } as u64,
+                                            kind: 7,
+                                        };
+                                    }
+                                }
+                            }
                             let arg_vals =
                                 build_arg_vals(recv_val, code, arg_regs_pc, argc, &values);
                             dispatch_closure_bc(

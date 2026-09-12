@@ -78,6 +78,35 @@ pub mod cl {
     /// any Value; non-object receivers (Numbers, Null, Bool, ...)
     /// take the not-object branch instead of dereferencing garbage
     /// at HEADER_CLASS.
+    /// Whether AArch64 `fmov` encodes the value as an immediate
+    /// (zero, or ±(16..=31)/16 × 2^(-3..=4)); x86-64 folds the rest
+    /// cheaply enough that the same rule is used for both.
+    fn f64_is_fmov_immediate(n: f64) -> bool {
+        if n == 0.0 {
+            return true;
+        }
+        let bits = n.to_bits();
+        let frac = bits & ((1u64 << 52) - 1);
+        if frac & ((1u64 << 48) - 1) != 0 {
+            return false;
+        }
+        let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+        (-3..=4).contains(&exp)
+    }
+
+    fn const_f64_of(mir: &MirFunction, vid: ValueId) -> Option<f64> {
+        mir.blocks.iter().find_map(|b| {
+            b.instructions.iter().find_map(|(d, i)| match i {
+                Instruction::ConstF64(c) if *d == vid => Some(*c),
+                _ => None,
+            })
+        })
+    }
+
+    fn is_positive_power_of_two(c: f64) -> bool {
+        c > 0.0 && c.is_finite() && (c.to_bits() & ((1u64 << 52) - 1)) == 0 && c >= f64::MIN_POSITIVE
+    }
+
     fn emit_class_load_guarded(
         builder: &mut FunctionBuilder,
         recv: cranelift_codegen::ir::Value,
@@ -1582,13 +1611,22 @@ pub mod cl {
     fn osr_entry_layout(mir: &MirFunction, target: BlockId) -> Option<OsrEntryLayout> {
         let target_idx = target.0 as usize;
         let target_block = mir.blocks.get(target_idx)?;
+        // Live-ins arrive boxed; the entry unboxes a parameter carried
+        // as f64. Any other f64 live-in has no interpreter register.
         if target_block
             .params
             .iter()
-            .any(|(_, ty)| !matches!(ty, MirType::Value))
+            .any(|(_, ty)| !matches!(ty, MirType::Value | MirType::F64))
         {
             return None;
         }
+        let f64_params: HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter())
+            .filter(|(_, t)| *t == MirType::F64)
+            .map(|(p, _)| *p)
+            .collect();
 
         let value_types = infer_osr_value_types(mir);
         let external_args = osr_external_live_values(mir, target);
@@ -1596,7 +1634,7 @@ pub mod cl {
             !matches!(
                 value_types.get(vid.0 as usize).copied(),
                 Some(MirType::Value)
-            )
+            ) && !f64_params.contains(vid)
         }) {
             return None;
         }
@@ -1724,7 +1762,10 @@ pub mod cl {
                     | Instruction::CmpLeF64(..)
                     | Instruction::CmpGeF64(..)
                     | Instruction::Not(_)
-                    | Instruction::IsType(..) => MirType::Bool,
+                    | Instruction::IsType(..)
+                    | Instruction::ClassIs(..)
+                    | Instruction::ObjectIs(..)
+                    | Instruction::ClosureFnIs(..) => MirType::Bool,
                     Instruction::GuardNum(src)
                     | Instruction::GuardBool(src)
                     | Instruction::Move(src)
@@ -2251,6 +2292,14 @@ pub mod cl {
         // them, the region's own definition redefines them, and the
         // frontend merges the two at the header.
         let mut osr_vars: HashMap<ValueId, cranelift_frontend::Variable> = HashMap::new();
+        // Block parameters carried as raw f64.
+        let f64_params: std::collections::HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter())
+            .filter(|(_, t)| *t == MirType::F64)
+            .map(|(p, _)| *p)
+            .collect();
         if let Some(ref layout) = osr_entry {
             let reachable = osr_reachable_blocks(mir, layout.target_block);
             let mut region_defs: std::collections::HashSet<ValueId> =
@@ -2262,7 +2311,12 @@ pub mod cl {
             }
             for vid in &layout.external_args {
                 if region_defs.contains(vid) {
-                    let var = builder.declare_var(types::I64);
+                    let ty = if f64_params.contains(vid) {
+                        types::F64
+                    } else {
+                        types::I64
+                    };
+                    let var = builder.declare_var(ty);
                     if mark_stack_map && is_wren_value(*vid, &value_types) {
                         builder.declare_var_needs_stack_map(var);
                     }
@@ -2281,6 +2335,11 @@ pub mod cl {
                     .ins()
                     .load(types::I64, MemFlags::trusted(), args_ptr, slot * VALUE_SIZE);
                 slot += 1;
+                let v = if f64_params.contains(vid) {
+                    builder.ins().bitcast(types::F64, MemFlags::new(), v)
+                } else {
+                    v
+                };
                 val_map.insert(*vid, v);
                 if let Some(var) = osr_vars.get(vid) {
                     builder.def_var(*var, v);
@@ -3180,6 +3239,9 @@ pub mod cl {
                         | Instruction::CmpGtF64(..)
                         | Instruction::CmpLeF64(..)
                         | Instruction::CmpGeF64(..)
+                        | Instruction::ClassIs(..)
+                        | Instruction::ObjectIs(..)
+                        | Instruction::ClosureFnIs(..)
                 );
                 let result = lower_instruction(
                     inst,
@@ -3686,7 +3748,27 @@ pub mod cl {
                 Ok(Some(builder.ins().iconst(types::I64, bits)))
             }
             Instruction::ConstNull => Ok(Some(builder.ins().iconst(types::I64, TAG_NULL as i64))),
-            Instruction::ConstF64(n) => Ok(Some(builder.ins().f64const(*n))),
+            Instruction::ConstF64(n) => {
+                if f64_is_fmov_immediate(*n) {
+                    return Ok(Some(builder.ins().f64const(*n)));
+                }
+                // A constant the optimiser would otherwise rebuild from
+                // integer moves at every use is loaded from a data slot
+                // instead, so it stays hoisted out of loops.
+                let mut desc = cranelift_module::DataDescription::new();
+                desc.define(n.to_bits().to_le_bytes().to_vec().into_boxed_slice());
+                let data_id = module
+                    .declare_anonymous_data(false, false)
+                    .map_err(|e| e.to_string())?;
+                module
+                    .define_data(data_id, &desc)
+                    .map_err(|e| e.to_string())?;
+                let gv = module.declare_data_in_func(data_id, builder.func);
+                let addr = builder.ins().symbol_value(types::I64, gv);
+                let mut flags = MemFlags::trusted();
+                flags.set_readonly();
+                Ok(Some(builder.ins().load(types::F64, flags, addr, 0)))
+            }
             Instruction::ConstI64(n) => Ok(Some(builder.ins().iconst(types::I64, *n))),
 
             Instruction::BlockParam(_) => {
@@ -5991,6 +6073,83 @@ pub mod cl {
             }
 
             // === Type checks ===
+            // Raw i8 results: an object test, then the class (or the
+            // closure's function) compared against the baked pointer.
+            Instruction::ClassIs(a, class_ptr) => {
+                let v = get(a);
+                let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+                let high = builder.ins().band(v, tag_obj);
+                let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+                let object_block = builder.create_block();
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, types::I8);
+                let no = builder.ins().iconst(types::I8, 0);
+                builder
+                    .ins()
+                    .brif(is_obj, object_block, &[], merge_block, &[BlockArg::Value(no)]);
+                builder.switch_to_block(object_block);
+                let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                let obj_ptr = builder.ins().band(v, ptr_mask);
+                let class = builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+                let expected = builder.ins().iconst(types::I64, *class_ptr as i64);
+                let hit = builder.ins().icmp(IntCC::Equal, class, expected);
+                builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
+                builder.switch_to_block(merge_block);
+                Ok(Some(builder.block_params(merge_block)[0]))
+            }
+            Instruction::ObjectIs(a, obj_ptr) => {
+                let v = get(a);
+                let expected = builder
+                    .ins()
+                    .iconst(types::I64, (TAG_OBJ | (*obj_ptr as u64 & PTR_MASK)) as i64);
+                Ok(Some(builder.ins().icmp(IntCC::Equal, v, expected)))
+            }
+            Instruction::ClosureFnIs(a, fn_ptr) => {
+                let v = get(a);
+                let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+                let high = builder.ins().band(v, tag_obj);
+                let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+                let object_block = builder.create_block();
+                let closure_block = builder.create_block();
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, types::I8);
+                let no = builder.ins().iconst(types::I8, 0);
+                builder
+                    .ins()
+                    .brif(is_obj, object_block, &[], merge_block, &[BlockArg::Value(no)]);
+                builder.switch_to_block(object_block);
+                let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                let obj_ptr = builder.ins().band(v, ptr_mask);
+                let obj_type =
+                    builder
+                        .ins()
+                        .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
+                let closure_tag = builder
+                    .ins()
+                    .iconst(types::I64, crate::runtime::object::ObjType::Closure as i64);
+                let is_closure = builder.ins().icmp(IntCC::Equal, obj_type, closure_tag);
+                builder.ins().brif(
+                    is_closure,
+                    closure_block,
+                    &[],
+                    merge_block,
+                    &[BlockArg::Value(no)],
+                );
+                builder.switch_to_block(closure_block);
+                let function = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    CLOSURE_FUNCTION,
+                );
+                let expected = builder.ins().iconst(types::I64, *fn_ptr as i64);
+                let hit = builder.ins().icmp(IntCC::Equal, function, expected);
+                builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
+                builder.switch_to_block(merge_block);
+                Ok(Some(builder.block_params(merge_block)[0]))
+            }
             Instruction::IsType(a, class_sym) => {
                 let f = get_runtime_fn(module, builder, "wren_is_type", 2)?;
                 let class_val = builder.ins().iconst(types::I64, class_sym.index() as i64);
@@ -6006,6 +6165,18 @@ pub mod cl {
             Instruction::ModF64(a, b) => {
                 let av = get(a);
                 let bv = get(b);
+                // A positive power-of-two divisor: `a - trunc(a / b) * b`
+                // is exact for every finite `a` because each step only
+                // moves or clears the low bits of `a`; the sign of a zero
+                // result follows the dividend as fmod's does.
+                if let Some(c) = const_f64_of(_mir, *b).filter(|c| is_positive_power_of_two(*c)) {
+                    let inv = builder.ins().f64const(1.0 / c);
+                    let q = builder.ins().fmul(av, inv);
+                    let q = builder.ins().trunc(q);
+                    let m = builder.ins().fmul(q, bv);
+                    let r = builder.ins().fsub(av, m);
+                    return Ok(Some(builder.ins().fcopysign(r, av)));
+                }
                 Ok(Some(emit_f64_rem(builder, module, av, bv)?))
             }
             Instruction::NegF64(a) => Ok(Some(builder.ins().fneg(get(a)))),

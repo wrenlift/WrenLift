@@ -327,6 +327,9 @@ pub fn eval_pure_instruction(
         Instruction::StringConcat(_) => Err(InterpError::Unsupported("StringConcat".into())),
         Instruction::ToString(_) => Err(InterpError::Unsupported("ToString".into())),
         Instruction::IsType(_, _) => Err(InterpError::Unsupported("IsType".into())),
+        Instruction::ClassIs(_, _) | Instruction::ObjectIs(_, _) | Instruction::ClosureFnIs(_, _) => {
+            Err(InterpError::Unsupported("speculation guard".into()))
+        }
         Instruction::SubscriptGet { .. } => Err(InterpError::Unsupported("SubscriptGet".into())),
         Instruction::SubscriptSet { .. } => Err(InterpError::Unsupported("SubscriptSet".into())),
         Instruction::GetStaticField(_) => Err(InterpError::Unsupported("GetStaticField".into())),

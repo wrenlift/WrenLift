@@ -8,12 +8,14 @@ pub mod dce;
 pub mod devirt;
 pub mod escape;
 pub mod inline;
+pub mod inline_calls;
 pub mod licm;
 pub mod purity;
 pub mod range_loop;
 pub mod sra;
 pub mod sroa_loop;
 pub mod tree_shake;
+pub mod unbox_params;
 
 use std::collections::HashMap;
 
@@ -90,7 +92,21 @@ fn resolve(v: ValueId, map: &HashMap<ValueId, ValueId>) -> ValueId {
     current
 }
 
-fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
+/// Chain-following replacement (v1→v2, v2→v3 resolves v1 to v3).
+pub(crate) fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
+    map_inst_operands(inst, &|v| resolve(v, map));
+}
+
+/// Single-step replacement, for maps whose values may also be keys.
+pub(crate) fn remap_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
+    map_inst_operands(inst, &|v| map.get(&v).copied().unwrap_or(v));
+}
+
+pub(crate) fn remap_term(term: &mut Terminator, map: &HashMap<ValueId, ValueId>) {
+    map_term_operands(term, &|v| map.get(&v).copied().unwrap_or(v));
+}
+
+fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
     use Instruction::*;
     match inst {
         // No operands
@@ -109,13 +125,14 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         | Move(a)
         | ToString(a)
         | MathUnaryF64(_, a) => {
-            *a = resolve(*a, map);
+            *a = f(*a);
         }
-        GuardClass(a, _) | GuardProtocol(a, _) | IsType(a, _) => {
-            *a = resolve(*a, map);
+        GuardClass(a, _) | GuardProtocol(a, _) | IsType(a, _) | ClassIs(a, _)
+        | ObjectIs(a, _) | ClosureFnIs(a, _) => {
+            *a = f(*a);
         }
         GetField(recv, _) => {
-            *recv = resolve(*recv, map);
+            *recv = f(*recv);
         }
 
         // Two operands
@@ -145,63 +162,63 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         | Shl(a, b)
         | Shr(a, b)
         | MathBinaryF64(_, a, b) => {
-            *a = resolve(*a, map);
-            *b = resolve(*b, map);
+            *a = f(*a);
+            *b = f(*b);
         }
 
         // Special multi-operand
         SetField(recv, _, val) => {
-            *recv = resolve(*recv, map);
-            *val = resolve(*val, map);
+            *recv = f(*recv);
+            *val = f(*val);
         }
         SetModuleVar(_, val) | SetUpvalue(_, val) => {
-            *val = resolve(*val, map);
+            *val = f(*val);
         }
         Call { receiver, args, .. } | CallKnownFunc { receiver, args, .. } => {
-            *receiver = resolve(*receiver, map);
+            *receiver = f(*receiver);
             for arg in args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
         }
         CallStaticSelf { args } => {
             for arg in args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
         }
         SuperCall { args, .. } => {
             for arg in args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
         }
         MakeClosure { upvalues, .. } => {
             for uv in upvalues.iter_mut() {
-                *uv = resolve(*uv, map);
+                *uv = f(*uv);
             }
         }
         MakeList(elems) => {
             for elem in elems.iter_mut() {
-                *elem = resolve(*elem, map);
+                *elem = f(*elem);
             }
         }
         MakeMap(pairs) => {
             for (k, v) in pairs.iter_mut() {
-                *k = resolve(*k, map);
-                *v = resolve(*v, map);
+                *k = f(*k);
+                *v = f(*v);
             }
         }
         MakeRange(from, to, _) => {
-            *from = resolve(*from, map);
-            *to = resolve(*to, map);
+            *from = f(*from);
+            *to = f(*to);
         }
         StringConcat(parts) => {
             for part in parts.iter_mut() {
-                *part = resolve(*part, map);
+                *part = f(*part);
             }
         }
         SubscriptGet { receiver, args } => {
-            *receiver = resolve(*receiver, map);
+            *receiver = f(*receiver);
             for arg in args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
         }
         SubscriptSet {
@@ -209,26 +226,30 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
             args,
             value,
         } => {
-            *receiver = resolve(*receiver, map);
+            *receiver = f(*receiver);
             for arg in args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
-            *value = resolve(*value, map);
+            *value = f(*value);
         }
         Instruction::GetStaticField(_) => {}
         Instruction::SetStaticField(_, val) => {
-            *val = resolve(*val, map);
+            *val = f(*val);
         }
     }
 }
 
-fn replace_in_term(term: &mut Terminator, map: &HashMap<ValueId, ValueId>) {
+pub(crate) fn replace_in_term(term: &mut Terminator, map: &HashMap<ValueId, ValueId>) {
+    map_term_operands(term, &|v| resolve(v, map));
+}
+
+fn map_term_operands(term: &mut Terminator, f: &dyn Fn(ValueId) -> ValueId) {
     match term {
-        Terminator::Return(v) => *v = resolve(*v, map),
+        Terminator::Return(v) => *v = f(*v),
         Terminator::ReturnNull | Terminator::Unreachable => {}
         Terminator::Branch { args, .. } => {
             for arg in args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
         }
         Terminator::CondBranch {
@@ -237,12 +258,12 @@ fn replace_in_term(term: &mut Terminator, map: &HashMap<ValueId, ValueId>) {
             false_args,
             ..
         } => {
-            *condition = resolve(*condition, map);
+            *condition = f(*condition);
             for arg in true_args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
             for arg in false_args.iter_mut() {
-                *arg = resolve(*arg, map);
+                *arg = f(*arg);
             }
         }
     }
