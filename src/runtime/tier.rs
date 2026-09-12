@@ -255,6 +255,13 @@ impl TierManager {
         };
         match bead.state() {
             BeadState::Compiled => bead.swap_compiled_with_osr(code, osr).is_some(),
+            // The broker's compile closure hands its result to the
+            // engine before the broker installs it. Installing here
+            // would flip the bead to Compiled first, the broker's
+            // own install would then fail its state transition and
+            // recover by demoting the bead, and the OSR table would
+            // be lost. The broker carries the same table; let it land.
+            BeadState::Compiling => true,
             _ => {
                 if !bead.eager_install(code) {
                     return false;
