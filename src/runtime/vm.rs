@@ -6740,7 +6740,7 @@ System.print(result)
             r#"
 var x = 100
 var outer = Fn.new {
-  Fn.new { x }
+  return Fn.new { x }
 }
 var inner = outer.call()
 System.print(inner.call())

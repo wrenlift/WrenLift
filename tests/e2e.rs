@@ -3503,7 +3503,7 @@ var holder = Holder.new([1, 2, 3, 4])
 for (i in 0...10) {
   holder.constraints = holder.constraints.where { |x|
     System.gc()
-    x > 0
+    return x > 0
   }
   var total = 0
   for (value in holder.constraints) {
@@ -4632,4 +4632,48 @@ System.print("6: %(a.pick(9)) %(a.pick(2)) %(C.sf(3, 4))")
     );
     assert!(matches!(result, InterpretResult::Success));
     assert_eq!(output, expected);
+}
+
+#[test]
+fn e2e_block_body_implicit_value() {
+    // An expression body returns its expression. A block body returns
+    // its tail expression statement (a WrenLift extension; the
+    // reference returns null) and nothing else: a declaration or a
+    // control-flow statement at the end yields null.
+    let src = r#"
+class A {
+  construct new() { _k = 0 }
+  one(x) { _k = x }
+  two(x) {
+    x + 1
+  }
+  three(x) {
+    var y = x
+  }
+  four(x) {
+    if (x > 0) x
+  }
+  five(x) {
+    var y = x
+    y * 2
+  }
+}
+var a = A.new()
+System.print(a.one(3))
+System.print(a.two(3))
+System.print(a.three(3))
+System.print(a.four(3))
+System.print(a.five(3))
+var f = Fn.new { |x|
+  var t = x
+}
+System.print(f.call(3))
+var g = Fn.new { |x| x + 1 }
+System.print(g.call(3))
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let (result, output, _) = run_collecting_errors(src, mode);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", mode);
+        assert_eq!(output.trim(), "3\n4\nnull\nnull\n6\nnull\n4", "{:?}", mode);
+    }
 }

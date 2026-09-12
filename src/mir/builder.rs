@@ -307,6 +307,53 @@ impl<'a> MirBuilder<'a> {
 
     // -- Statement lowering -------------------------------------------------
 
+    /// Lower a function body and return its implicit value: an
+    /// expression body yields its expression, and a block body yields
+    /// its last statement when that is an expression (a WrenLift
+    /// extension the package ecosystem relies on; the reference returns
+    /// null there). Any other tail yields nothing.
+    fn lower_body(&mut self, body: &Spanned<Stmt>) -> Option<ValueId> {
+        match &body.0 {
+            Stmt::Expr(e) => Some(self.lower_expr(e)),
+            Stmt::Block(stmts) => {
+                let (init, tail) = match stmts.split_last() {
+                    Some((last, init)) if matches!(last.0, Stmt::Expr(_)) => (init, Some(last)),
+                    _ => (stmts.as_slice(), None),
+                };
+                self.block_shadows.push(Vec::new());
+                for s in init {
+                    self.lower_stmt(s);
+                }
+                let value = match tail {
+                    Some((Stmt::Expr(e), _)) => Some(self.lower_expr(e)),
+                    _ => None,
+                };
+                self.pop_block_scope();
+                value
+            }
+            _ => {
+                self.lower_stmt(body);
+                None
+            }
+        }
+    }
+
+    /// Restore the variables a block scope shadowed and drop its locals.
+    fn pop_block_scope(&mut self) {
+        if let Some(shadows) = self.block_shadows.pop() {
+            for (name, old_val) in shadows.into_iter().rev() {
+                match old_val {
+                    Some(v) => {
+                        self.variables.insert(name, v);
+                    }
+                    None => {
+                        self.variables.remove(&name);
+                    }
+                }
+            }
+        }
+    }
+
     fn lower_stmt(&mut self, stmt: &Spanned<Stmt>) {
         match &stmt.0 {
             Stmt::Expr(expr) => {
@@ -356,19 +403,7 @@ impl<'a> MirBuilder<'a> {
                 for s in stmts {
                     self.lower_stmt(s);
                 }
-                // Restore shadowed variables and remove block-locals.
-                if let Some(shadows) = self.block_shadows.pop() {
-                    for (name, old_val) in shadows.into_iter().rev() {
-                        match old_val {
-                            Some(v) => {
-                                self.variables.insert(name, v);
-                            }
-                            None => {
-                                self.variables.remove(&name);
-                            }
-                        }
-                    }
-                }
+                self.pop_block_scope();
             }
 
             Stmt::If {
@@ -1574,35 +1609,17 @@ fn compile_closure_body(
         builder.variables.insert(name, stored);
     }
 
-    // Lower body
-    builder.lower_stmt(body);
-
-    // If body is a single expression statement, make it the return value
+    // An expression body returns its value; a block body returns null
+    // unless it returned already.
+    let implicit = builder.lower_body(body);
     if matches!(
         builder.func.block(builder.current_block).terminator,
         Terminator::Unreachable
     ) {
-        // Check if last instruction produced a value we can return
-        // Also check block params (for &&/|| merge blocks)
-        let last_val = builder
-            .func
-            .block(builder.current_block)
-            .instructions
-            .last()
-            .map(|(id, _)| *id)
-            .or_else(|| {
-                builder
-                    .func
-                    .block(builder.current_block)
-                    .params
-                    .last()
-                    .map(|(id, _)| *id)
-            });
-        if let Some(val) = last_val {
-            builder.func.block_mut(builder.current_block).terminator = Terminator::Return(val);
-        } else {
-            builder.func.block_mut(builder.current_block).terminator = Terminator::ReturnNull;
-        }
+        builder.func.block_mut(builder.current_block).terminator = match implicit {
+            Some(val) => Terminator::Return(val),
+            None => Terminator::ReturnNull,
+        };
     }
 
     let closures = builder.closures;
@@ -1954,43 +1971,21 @@ fn compile_class(
             builder.variables.insert(name, stored);
         }
 
-        // Lower the body
-        builder.lower_stmt(method.body.as_ref().unwrap());
-
-        // Ensure method returns something
+        // Lower the body: an expression body returns its value, a block
+        // body returns null, a constructor returns `this`.
+        let implicit = builder.lower_body(method.body.as_ref().unwrap());
         if matches!(
             builder.func.block(builder.current_block).terminator,
             Terminator::Unreachable
         ) {
-            if is_constructor {
-                // Constructors return 'this'
-                builder.func.block_mut(builder.current_block).terminator =
-                    Terminator::Return(this_val);
+            builder.func.block_mut(builder.current_block).terminator = if is_constructor {
+                Terminator::Return(this_val)
             } else {
-                // Return last expression value if available (e.g. getters)
-                // Check instructions first, then block params (for &&/|| merge blocks)
-                let last_val = builder
-                    .func
-                    .block(builder.current_block)
-                    .instructions
-                    .last()
-                    .map(|(id, _)| *id)
-                    .or_else(|| {
-                        builder
-                            .func
-                            .block(builder.current_block)
-                            .params
-                            .last()
-                            .map(|(id, _)| *id)
-                    });
-                if let Some(val) = last_val {
-                    builder.func.block_mut(builder.current_block).terminator =
-                        Terminator::Return(val);
-                } else {
-                    builder.func.block_mut(builder.current_block).terminator =
-                        Terminator::ReturnNull;
+                match implicit {
+                    Some(val) => Terminator::Return(val),
+                    None => Terminator::ReturnNull,
                 }
-            }
+            };
         }
         builder.func.compute_predecessors();
 

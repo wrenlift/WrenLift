@@ -653,7 +653,7 @@ impl Parser {
             None
         } else {
             self.skip_newlines();
-            Some(self.block()?)
+            Some(self.body()?)
         };
 
         let end = self.previous_span().end;
@@ -1008,6 +1008,42 @@ impl Parser {
         let end = expr.1.end;
         self.expect_statement_end();
         Some((Stmt::Return(Some(expr)), start..end))
+    }
+
+    /// A method body. No newline after the brace means an expression
+    /// body whose value is returned; otherwise a statement block that
+    /// returns null unless it says otherwise. A single-line body that is
+    /// not an expression is accepted as a block.
+    fn body(&mut self) -> Option<Spanned<Stmt>> {
+        let start = self.current_span().start;
+        self.expect(&Token::LeftBrace, "expected '{'");
+        if !self.check(&Token::Newline) && !self.check(&Token::RightBrace) {
+            let saved = self.pos;
+            let saved_errors = self.errors.len();
+            if let Some(expr) = self.expression() {
+                self.skip_newlines();
+                if self.check(&Token::RightBrace) {
+                    self.advance();
+                    let expr_span = expr.1.clone();
+                    return Some((Stmt::Expr(expr), expr_span));
+                }
+            }
+            self.pos = saved;
+            self.errors.truncate(saved_errors);
+        }
+        self.skip_newlines();
+        let mut stmts = Vec::new();
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            if let Some(stmt) = self.declaration() {
+                stmts.push(stmt);
+            } else {
+                self.advance();
+            }
+            self.skip_newlines();
+        }
+        self.expect(&Token::RightBrace, "expected '}'");
+        let end = self.previous_span().end;
+        Some((Stmt::Block(stmts), start..end))
     }
 
     fn block(&mut self) -> Option<Spanned<Stmt>> {
@@ -1854,6 +1890,7 @@ impl Parser {
 
         // Peek past the `{` and newlines
         self.advance(); // consume `{`
+        let block_form = self.check(&Token::Newline);
         self.skip_newlines();
 
         // Empty braces: empty map literal (in expression position, `{}` is a Map)
@@ -1883,12 +1920,13 @@ impl Parser {
         // Otherwise it's a closure body (no params) — discard probe errors.
         self.pos = probe_pos;
         self.errors.truncate(probe_errors);
-        self.parse_closure_body(start, Vec::new())
+        self.parse_closure_body(start, Vec::new(), block_form)
     }
 
     fn closure_expr(&mut self) -> Option<Spanned<Expr>> {
         let start = self.current_span().start;
         self.expect(&Token::LeftBrace, "expected '{'");
+        let mut block_form = self.check(&Token::Newline);
         self.skip_newlines();
 
         let mut params = Vec::new();
@@ -1910,16 +1948,20 @@ impl Parser {
                 }
             }
             self.expect(&Token::Pipe, "expected '|' after parameters");
+            block_form = self.check(&Token::Newline);
             self.skip_newlines();
         }
 
-        self.parse_closure_body(start, params)
+        self.parse_closure_body(start, params, block_form)
     }
 
+    /// `block_form`: a newline followed the brace (or the parameter
+    /// list), so the body is a statement block rather than an expression.
     fn parse_closure_body(
         &mut self,
         start: usize,
         params: Vec<Spanned<SymbolId>>,
+        block_form: bool,
     ) -> Option<Spanned<Expr>> {
         self.skip_newlines();
 
@@ -1936,28 +1978,31 @@ impl Parser {
             ));
         }
 
-        // Try single expression (if next token after expr is `}`)
-        let saved = self.pos;
-        let saved_errors = self.errors.len();
-        if let Some(expr) = self.expression() {
-            self.skip_newlines();
-            if self.check(&Token::RightBrace) {
-                self.advance();
-                let end = self.previous_span().end;
-                let expr_span = expr.1.clone();
-                return Some((
-                    Expr::Closure {
-                        params,
-                        body: Box::new((Stmt::Expr(expr), expr_span)),
-                    },
-                    start..end,
-                ));
+        // No newline after the brace (or the parameter list): an
+        // expression body whose value the closure returns.
+        if !block_form {
+            let saved = self.pos;
+            let saved_errors = self.errors.len();
+            if let Some(expr) = self.expression() {
+                self.skip_newlines();
+                if self.check(&Token::RightBrace) {
+                    self.advance();
+                    let end = self.previous_span().end;
+                    let expr_span = expr.1.clone();
+                    return Some((
+                        Expr::Closure {
+                            params,
+                            body: Box::new((Stmt::Expr(expr), expr_span)),
+                        },
+                        start..end,
+                    ));
+                }
             }
+            // Not an expression: accept it as a block.
+            self.pos = saved;
+            self.errors.truncate(saved_errors);
         }
 
-        // Multi-statement body — discard errors from failed single-expr probe.
-        self.pos = saved;
-        self.errors.truncate(saved_errors);
         let mut stmts = Vec::new();
         while !self.check(&Token::RightBrace) && !self.is_at_end() {
             self.skip_newlines();
