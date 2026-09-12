@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":5,"timestamp":1789224841,"nonce":"H7FUGSMosnbNidcCaLDe5uxINlk=","added":["perf","area:codegen"],"removed":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789224903,"nonce":"oZ2tKh10dhF+Jl9dQ4fsqw8eZhk=","message":"Closed without action: --mode jit compiles everything up front and is expected to carry that cost; tiered is the comparison lane.","files":null}]}
