@@ -4090,10 +4090,14 @@ impl VM {
         }
     }
 
-    /// Native stack windows for the conservative scan: the running
-    /// stack from a register spill up to its top, every suspended
-    /// krio fiber from its saved sp, and each stack a running fiber
-    /// was resumed from, starting at that resume point.
+    /// Native stack windows for the conservative scan. The running
+    /// chain starts at krio's current fiber and follows each resume
+    /// point outward to the host stack: the innermost stack is live
+    /// from the register spill, every other chain member from the
+    /// point its child was resumed at. Fibers off the chain are
+    /// suspended and live from their saved sp. krio keeps a stale
+    /// `caller_sp` after a yield, so membership is decided by the
+    /// chain walk, never by that field alone.
     #[cfg(all(unix, feature = "host"))]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         let mut spill = [0usize; super::stack_scan::SPILL_WORDS];
@@ -4103,9 +4107,8 @@ impl VM {
         if host_top == 0 {
             return Vec::new();
         }
-        // (lo, hi, start): start is the lowest live address, 0 = unknown.
-        let mut stacks: Vec<(usize, usize, usize)> = vec![(0, host_top, 0)];
-        let mut resume_points: Vec<usize> = Vec::new();
+        // (id, lo, hi, saved_sp, caller_sp) per live krio fiber.
+        let mut fibers: Vec<(u64, usize, usize, usize, usize)> = Vec::new();
         self.gc.for_each_fiber(|f| unsafe {
             let Some(k) = (*f).krio_fiber.as_deref() else {
                 return;
@@ -4115,34 +4118,46 @@ impl VM {
             }
             let (lo, len) = k.stack_range();
             let lo = lo as usize;
-            let caller_sp = k.caller_sp() as usize;
-            if caller_sp != 0 {
-                // Running: its own window starts at the probe or at a
-                // child's resume point; the stack it came from is
-                // suspended at caller_sp.
-                stacks.push((lo, lo + len, 0));
-                resume_points.push(caller_sp);
-            } else {
-                stacks.push((lo, lo + len, k.saved_sp() as usize));
-            }
+            fibers.push((
+                k.id(),
+                lo,
+                lo + len,
+                k.saved_sp() as usize,
+                k.caller_sp() as usize,
+            ));
         });
-        let owner = |stacks: &Vec<(usize, usize, usize)>, addr: usize| {
-            stacks
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(fibers.len() + 1);
+        let mut on_chain = vec![false; fibers.len()];
+        // Walk the running chain from the innermost fiber outward.
+        let mut start = probe;
+        let mut cur = krio_fiber::current_fiber_id()
+            .and_then(|id| fibers.iter().position(|f| f.0 == id));
+        while let Some(i) = cur {
+            on_chain[i] = true;
+            let (_, lo, hi, _, caller_sp) = fibers[i];
+            let s = if start >= lo && start < hi { start } else { lo };
+            ranges.push((s, hi));
+            start = caller_sp;
+            cur = fibers
                 .iter()
-                .position(|&(lo, hi, _)| addr >= lo && addr < hi)
-                .unwrap_or(0)
-        };
-        for sp in resume_points {
-            let i = owner(&stacks, sp);
-            stacks[i].2 = sp;
+                .position(|&(_, lo, hi, _, _)| caller_sp >= lo && caller_sp < hi);
+            if let Some(j) = cur {
+                if on_chain[j] {
+                    break;
+                }
+            }
         }
-        let i = owner(&stacks, probe);
-        stacks[i].2 = probe;
-        stacks
-            .into_iter()
-            .filter(|&(_, _, start)| start != 0)
-            .map(|(_, hi, start)| (start, hi))
-            .collect()
+        // Whatever the chain resumed from last is the host stack.
+        let host_start = if start >= host_top { probe } else { start };
+        ranges.push((host_start, host_top));
+        for (i, &(_, lo, hi, saved_sp, _)) in fibers.iter().enumerate() {
+            if on_chain[i] || saved_sp == 0 {
+                continue;
+            }
+            let s = if saved_sp >= lo && saved_sp < hi { saved_sp } else { lo };
+            ranges.push((s, hi));
+        }
+        ranges
     }
 
     #[cfg(not(all(unix, feature = "host")))]
