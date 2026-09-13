@@ -176,6 +176,23 @@ impl MethodCache {
 /// Sentinel value for uninitialized register slots.
 const UNDEF: Value = Value::UNDEFINED;
 
+/// `WLIFT_TRACE_ROOT_NATIVE`: log every native the root loop hands off to
+/// and back from. Safe; verbose. Cached like the flags above, since the
+/// check sits on the root loop's call path.
+#[inline]
+fn trace_root_native_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&ON, "WLIFT_TRACE_ROOT_NATIVE")
+}
+
+/// `WLIFT_TRACE_OBJ=1`: dump the receiver bits behind a deopt on `Object`.
+/// Safe; verbose. Cached the same way.
+#[inline]
+fn trace_obj_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WLIFT_TRACE_OBJ").as_deref() == Ok("1"))
+}
+
 #[inline]
 fn call_native_with_frame_sync(
     vm: &mut VM,
@@ -364,7 +381,7 @@ fn try_run_root_frame_native(
 ) -> Result<RootNative, RuntimeError> {
     #[inline(always)]
     fn trace_root_native(msg: impl FnOnce() -> String) {
-        if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
+        if trace_root_native_on() {
             eprintln!("{}", msg());
         }
     }
@@ -1496,7 +1513,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
             }
             if let RootNative::Returned(return_val) = ran {
                 fiber = vm.fiber;
-                if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
+                if trace_root_native_on() {
                     let frame_count = if fiber.is_null() {
                         0
                     } else {
@@ -3366,9 +3383,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             // dump too so we can post-mortem the
                             // exact bits that triggered the deopt.
                             if class_name == "Object" {
-                                let trace = std::env::var("WLIFT_TRACE_OBJ")
-                                    .map(|v| v == "1")
-                                    .unwrap_or(false);
+                                let trace = trace_obj_on();
                                 if trace {
                                     let bits = recv_val.to_bits();
                                     let class_ptr = vm.class_of(recv_val);
