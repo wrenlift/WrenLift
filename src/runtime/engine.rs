@@ -117,6 +117,17 @@ impl Drop for Promoter {
     }
 }
 
+/// `WLIFT_RESULT_SPEC=0` stops the top tier guarding call results the
+/// inline caches only ever saw as Num. Safe to run with either way.
+fn result_speculation_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WLIFT_RESULT_SPEC")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// `WLIFT_PROMOTE_GATE=0` proposes every hot function to the top tier;
 /// unset keeps the worth gate. Safe to run with either way.
 fn promotion_gate_enabled() -> bool {
@@ -800,6 +811,15 @@ pub struct ExecutionEngine {
     /// Functions a speculative guard failed in; their compiles carry
     /// no speculation from then on.
     speculation_failed: Vec<bool>,
+    /// The closure and defining class each method was bound with, so
+    /// a failed mid-body guard can resume the method in the
+    /// interpreter. Null for functions that are not class methods.
+    pub method_binding: Vec<(
+        *mut crate::runtime::object::ObjClosure,
+        *mut crate::runtime::object::ObjClass,
+    )>,
+    /// Mid-body guards that failed and resumed the interpreter.
+    pub deopt_exits: u32,
     /// Native code replaced by a recompile. Frames may still be running
     /// it, so it is kept for the engine's lifetime.
     retired_code: Vec<ExecutableFunction>,
@@ -1060,6 +1080,8 @@ impl ExecutionEngine {
             promote_retry_at: Vec::new(),
             promote_refused: Vec::new(),
             speculation_failed: Vec::new(),
+            method_binding: Vec::new(),
+            deopt_exits: 0,
             retired_code: Vec::new(),
             #[cfg(feature = "host")]
             promoter: None,
@@ -1125,6 +1147,8 @@ impl ExecutionEngine {
         self.promote_retry_at.push(0);
         self.promote_refused.push(false);
         self.speculation_failed.push(false);
+        self.method_binding
+            .push((std::ptr::null_mut(), std::ptr::null_mut()));
         self.bc_cache.push(std::ptr::null());
         #[cfg(feature = "host")]
         self.threaded_code.push(None); // None = not yet checked
@@ -2725,6 +2749,196 @@ impl ExecutionEngine {
         true
     }
 
+    /// The compile clone with a `GuardNumAt` after every call whose
+    /// inline cache only ever produced a Num, where the interpreter can
+    /// take over if the guard fails: the function is a bound method,
+    /// the bytecode records the offset past the call, and every
+    /// register live there is a value the clone still defines.
+    fn speculate_call_results(
+        &mut self,
+        id: FuncId,
+        authoritative: &MirFunction,
+        mir: Arc<MirFunction>,
+    ) -> Arc<MirFunction> {
+        use crate::mir::bytecode::RESULT_NUM;
+        use crate::mir::{live_in_sets, DeoptReg, DeoptSource, Instruction, ValueId};
+        use std::collections::HashSet;
+        let idx = id.0 as usize;
+        if self
+            .method_binding
+            .get(idx)
+            .map(|(c, _)| c.is_null())
+            .unwrap_or(true)
+        {
+            return mir;
+        }
+        let Some(bc) = self.ensure_bytecode(id) else {
+            return mir;
+        };
+        let resume_after_call = unsafe { &(*bc).resume_after_call };
+        let result_kinds: Vec<u8> = unsafe { (*(*bc).result_kinds.get()).clone() };
+        let live_in = live_in_sets(authoritative);
+        let mut sites: Vec<(ValueId, u32, Vec<ValueId>)> = Vec::new();
+        for block in &authoritative.blocks {
+            for (i, (dst, inst)) in block.instructions.iter().enumerate() {
+                if !matches!(inst, Instruction::Call { .. }) {
+                    continue;
+                }
+                let seen = result_kinds.get(dst.0 as usize).copied().unwrap_or(0);
+                if seen != RESULT_NUM {
+                    continue;
+                }
+                let Some(&pc) = resume_after_call.get(dst) else {
+                    continue;
+                };
+                let mut live: HashSet<ValueId> = HashSet::new();
+                for succ in block.terminator.successors() {
+                    live.extend(live_in.iter(succ.0 as usize));
+                }
+                live.extend(block.terminator.operands());
+                for (later_dst, later) in block.instructions[i + 1..].iter().rev() {
+                    live.remove(later_dst);
+                    live.extend(later.operands());
+                }
+                live.insert(*dst);
+                let mut live: Vec<ValueId> = live.into_iter().collect();
+                live.sort_by_key(|v| v.0);
+                sites.push((*dst, pc, live));
+            }
+        }
+        if sites.is_empty() {
+            return mir;
+        }
+        let defined: HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.params
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .chain(b.instructions.iter().map(|(v, _)| *v))
+            })
+            .collect();
+        // A range the interpreter iterates is rebuilt from its bounds
+        // at the exit, so the compiled body need not keep it.
+        let ranges: HashMap<ValueId, (ValueId, ValueId, bool)> = authoritative
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::MakeRange(from, to, inclusive) => Some((*v, (*from, *to, *inclusive))),
+                _ => None,
+            })
+            .collect();
+        let source_of = |v: ValueId| -> Option<DeoptSource> {
+            if let Some(&(from, to, inclusive)) = ranges.get(&v) {
+                if defined.contains(&from) && defined.contains(&to) {
+                    return Some(DeoptSource::Range {
+                        from,
+                        to,
+                        inclusive,
+                    });
+                }
+            }
+            defined.contains(&v).then_some(DeoptSource::Value(v))
+        };
+        // A result nothing reads (a setter used as a statement) needs
+        // no guard.
+        let used: HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.instructions
+                    .iter()
+                    .flat_map(|(_, inst)| inst.operands())
+                    .chain(b.terminator.operands())
+            })
+            .collect();
+        let mut out = (*mir).clone();
+        let mut placed: Vec<(usize, usize, Instruction, ValueId)> = Vec::new();
+        for (dst, pc, live) in sites {
+            if !used.contains(&dst) {
+                continue;
+            }
+            let live: Option<Vec<DeoptReg>> = live
+                .iter()
+                .map(|v| source_of(*v).map(|source| DeoptReg { reg: v.0, source }))
+                .collect();
+            let Some(live) = live else {
+                continue;
+            };
+            let Some((bi, pos)) = out.blocks.iter().enumerate().find_map(|(bi, b)| {
+                b.instructions
+                    .iter()
+                    .position(|(v, inst)| *v == dst && matches!(inst, Instruction::Call { .. }))
+                    .map(|pos| (bi, pos))
+            }) else {
+                continue;
+            };
+            let guard = Instruction::GuardNumAt {
+                value: dst,
+                pc,
+                live,
+            };
+            placed.push((bi, pos, guard, dst));
+        }
+        // Arguments the baseline only ever saw as Num take an entry
+        // guard, which the entry deopt can re-run the call for.
+        let already_guarded: HashSet<ValueId> = out.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|(_, inst)| match inst {
+                Instruction::GuardNum(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        let mut entry_guards: Vec<Instruction> = Vec::new();
+        for (vid, inst) in &out.blocks[0].instructions {
+            if let Instruction::BlockParam(idx) = inst {
+                if *idx > 0
+                    && !already_guarded.contains(vid)
+                    && result_kinds.get(vid.0 as usize).copied() == Some(RESULT_NUM)
+                {
+                    entry_guards.push(Instruction::GuardNum(*vid));
+                    if !out.speculated_num_params.contains(vid) {
+                        out.speculated_num_params.push(*vid);
+                    }
+                }
+            }
+        }
+        if placed.is_empty() && entry_guards.is_empty() {
+            return mir;
+        }
+        // Later positions first so earlier inserts do not shift them.
+        placed.sort_by_key(|p| std::cmp::Reverse((p.0, p.1)));
+        let count = placed.len();
+        for (bi, pos, guard, dst) in placed {
+            let g = out.new_value();
+            out.blocks[bi].instructions.insert(pos + 1, (g, guard));
+            if !out.speculated_num_params.contains(&dst) {
+                out.speculated_num_params.push(dst);
+            }
+        }
+        let insert_at = out.blocks[0]
+            .instructions
+            .iter()
+            .position(|(_, inst)| !matches!(inst, Instruction::BlockParam(_)))
+            .unwrap_or(out.blocks[0].instructions.len());
+        for (i, guard) in entry_guards.into_iter().enumerate() {
+            let g = out.new_value();
+            out.blocks[0].instructions.insert(insert_at + i, (g, guard));
+        }
+        if tier_trace_enabled() {
+            eprintln!(
+                "tier-trace: [{:.2}ms] result speculation FuncId({}) guards={}",
+                trace_clock_ms(),
+                id.0,
+                count
+            );
+        }
+        Arc::new(out)
+    }
+
     /// The compile clone with known calls inlined. `WLIFT_DISABLE_MIR_INLINE`
     /// turns it off; safe to run with.
     fn inline_known(
@@ -3034,7 +3248,12 @@ impl ExecutionEngine {
             }
             Some(FuncBody::Native { .. }) => {
                 self.tier.tick(id);
-                let count = self.tier.invocations(id);
+                // Only the baseline code's own ticks count towards the
+                // top tier: its result profile is what the top tier
+                // speculates on, so it must have run first.
+                let count = self.tier_cells[idx]
+                    .total
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 self.propose_top_tier(idx, count)
             }
             _ => false,
@@ -3186,6 +3405,24 @@ impl ExecutionEngine {
 
     /// Outermost loop headers of `mir`, the points baseline code polls
     /// for a transfer into the top tier.
+    /// Every loop header of `mir`.
+    fn loop_headers(mir: &MirFunction) -> std::collections::HashSet<crate::mir::BlockId> {
+        use crate::mir::opt::licm::{
+            compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
+        };
+        if mir.blocks.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let mut with_preds = mir.clone();
+        with_preds.compute_predecessors();
+        let rpo = compute_rpo(&with_preds);
+        let idom = compute_dominators(&with_preds, &rpo);
+        merge_loops_by_header(&detect_loops(&with_preds, &idom))
+            .iter()
+            .map(|lp| lp.header)
+            .collect()
+    }
+
     fn retier_headers(mir: &MirFunction) -> std::collections::HashSet<crate::mir::BlockId> {
         use crate::mir::opt::licm::{
             compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
@@ -3496,6 +3733,11 @@ impl ExecutionEngine {
                 func_id: id.0,
                 cell: self.tier_cells[idx].as_ref() as *const TierCell as usize,
                 retier_headers: Self::retier_headers(&mir),
+                tick_headers: Self::loop_headers(&mir),
+                result_kinds: self
+                    .ensure_bytecode(id)
+                    .map(|bc| unsafe { (*(*bc).result_kinds.get()).as_ptr() as usize })
+                    .unwrap_or(0),
             })
         } else {
             None
@@ -3544,6 +3786,12 @@ impl ExecutionEngine {
         self.pending_cold_osr
             .insert(idx, cold.keys().copied().collect());
         let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
+        let sroa_mir =
+            if tier == CompileTier::Optimized && speculate && result_speculation_enabled() {
+                self.speculate_call_results(id, &mir, sroa_mir)
+            } else {
+                sroa_mir
+            };
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         // The finished compile brings the baseline code's next tick
         // forward so the install lands at its next entry or outermost

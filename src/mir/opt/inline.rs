@@ -133,6 +133,17 @@ impl MirPass for TypeSpecialize {
                         known_nums.insert(*src);
                         new_instructions.push((*val_id, inst.clone()));
                     }
+                    // A mid-body guard on a value already known to be
+                    // Num (its call became an intrinsic) cannot fail.
+                    Instruction::GuardNumAt { value, .. } if known_nums.contains(value) => {
+                        known_nums.insert(*val_id);
+                        changed = true;
+                    }
+                    Instruction::GuardNumAt { value, .. } => {
+                        known_nums.insert(*val_id);
+                        known_nums.insert(*value);
+                        new_instructions.push((*val_id, inst.clone()));
+                    }
                     Instruction::Move(src) if known_nums.contains(src) => {
                         // Propagate known-Num through moves.
                         known_nums.insert(*val_id);
@@ -309,7 +320,7 @@ fn infer_loop_carried_nums(func: &MirFunction) -> HashSet<ValueId> {
                     }
                     let is_num = match inst {
                         Instruction::ConstNum(_) | Instruction::Box(_) => true,
-                        Instruction::GuardNum(_) => true,
+                        Instruction::GuardNum(_) | Instruction::GuardNumAt { .. } => true,
                         Instruction::Move(a) | Instruction::Neg(a) => known.contains(a),
                         Instruction::Add(a, b)
                         | Instruction::Sub(a, b)
@@ -322,7 +333,9 @@ fn infer_loop_carried_nums(func: &MirFunction) -> HashSet<ValueId> {
                         known.insert(*vid);
                         grew = true;
                     }
-                    if let Instruction::GuardNum(src) = inst {
+                    if let Instruction::GuardNum(src) | Instruction::GuardNumAt { value: src, .. } =
+                        inst
+                    {
                         if known.insert(*src) {
                             grew = true;
                         }

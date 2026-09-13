@@ -5630,6 +5630,111 @@ fn deopt_impl(func_id: u32, args: &[u64]) -> u64 {
     dispatch_call(recv, name.index() as u64, &values)
 }
 
+/// The deopt buffer is a word stream: a tag word, then the words of
+/// the register's source. Bit 32 of the tag marks a range rebuilt from
+/// its two bound words, bit 33 its inclusiveness; the low 32 bits are
+/// the register.
+const DEOPT_RANGE: u64 = 1 << 32;
+const DEOPT_INCLUSIVE: u64 = 1 << 33;
+
+/// The tag word of `r` in a deopt buffer.
+pub fn deopt_tag(r: &crate::mir::DeoptReg) -> u64 {
+    match r.source {
+        crate::mir::DeoptSource::Value(_) => r.reg as u64,
+        crate::mir::DeoptSource::Range { inclusive, .. } => {
+            r.reg as u64 | DEOPT_RANGE | if inclusive { DEOPT_INCLUSIVE } else { 0 }
+        }
+    }
+}
+
+/// Words `r` takes in a deopt buffer, tag included.
+pub fn deopt_words(r: &crate::mir::DeoptReg) -> usize {
+    1 + r.source.operands().len()
+}
+
+/// A mid-body speculation in `func_id` failed: resume the interpreter
+/// at bytecode offset `pc` with the registers described by the `n`
+/// words in `buf` and return the function's result.
+///
+/// # Safety
+/// `buf` must point at `n` readable u64s laid out as `deopt_tag` and
+/// `deopt_words` describe; compiled code passes its own stack buffer.
+#[cfg(feature = "host")]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *const u64) -> u64 {
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+    let words: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
+    let root_len_before = jit_roots_snapshot_len();
+    let mut regs: Vec<(u32, Value)> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let tag = words[i];
+        let reg = tag as u32;
+        if tag & DEOPT_RANGE != 0 {
+            let from = f64::from_bits(words[i + 1]);
+            let to = f64::from_bits(words[i + 2]);
+            let range_ptr = vm.gc.alloc_range(from, to, tag & DEOPT_INCLUSIVE != 0);
+            unsafe {
+                (*range_ptr).header.class = vm.range_class;
+            }
+            let val = Value::object(range_ptr as *mut u8);
+            push_jit_root(val);
+            regs.push((reg, val));
+            i += 3;
+        } else {
+            regs.push((reg, Value::from_bits(words[i + 1])));
+            i += 2;
+        }
+    }
+    let id = crate::runtime::engine::FuncId(func_id as u32);
+    if env_flag(&TIER_TRACE, "WLIFT_TIER_TRACE") {
+        eprintln!(
+            "tier-trace: [{:.2}ms] deopt FuncId({}) at pc={} live={}",
+            crate::runtime::engine::trace_clock_ms(),
+            func_id,
+            pc,
+            n
+        );
+    }
+    let _decision = vm.engine.tier.record_bailout(id, 0, 0);
+    vm.engine.note_speculation_failed(id, &vm.interner);
+    vm.engine.deopt_exits += 1;
+    // The running closure when the dispatcher recorded one for this
+    // function, else the one the method was bound with.
+    let ctx = read_jit_ctx();
+    let ctx_closure = ctx.closure as *mut ObjClosure;
+    let (closure, defining_class) = if !ctx_closure.is_null()
+        && unsafe { (*(*ctx_closure).function).fn_id } == func_id as u32
+    {
+        (
+            ctx_closure,
+            ctx.defining_class as *mut crate::runtime::object::ObjClass,
+        )
+    } else {
+        match vm.engine.method_binding.get(func_id as usize) {
+            Some(&(c, d)) if !c.is_null() => (c, d),
+            _ => {
+                vm.has_error = true;
+                vm.last_error = Some(format!(
+                    "deoptimisation of FuncId({}) found no closure to resume",
+                    func_id
+                ));
+                return Value::null().to_bits();
+            }
+        }
+    };
+    let result = vm
+        .resume_method_sync(closure, defining_class, id, pc as u32, &regs)
+        .map(|v| v.to_bits())
+        .unwrap_or(Value::null().to_bits());
+    jit_roots_restore_len(root_len_before);
+    result
+}
+
 /// Deopt `func_id` with its `n` entry arguments in `buf`.
 ///
 /// # Safety
@@ -6168,6 +6273,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Guard deoptimization (arity-specific)
         #[cfg(feature = "host")]
         "wren_deopt_n" => Some(wren_deopt_n as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_deopt_at" => Some(wren_deopt_at as *const () as usize),
         // Subscript
         "wren_subscript_get" => Some(wren_subscript_get as *const () as usize),
         "wren_subscript_set" => Some(wren_subscript_set as *const () as usize),

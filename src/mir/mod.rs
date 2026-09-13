@@ -439,6 +439,55 @@ pub enum Instruction {
     I64ToF64(ValueId),
     /// Whether a boxed value is a Num (raw bool). JIT compile clones only.
     IsNum(ValueId),
+    /// `GuardNum` on a value produced mid-body: when it fails, the
+    /// interpreter resumes at bytecode offset `pc` with each `live`
+    /// register in place. JIT compile clones only.
+    GuardNumAt {
+        value: ValueId,
+        pc: u32,
+        live: Vec<DeoptReg>,
+    },
+}
+
+/// What a register holds when compiled code hands a function back to
+/// the interpreter mid-body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeoptSource {
+    /// A value the compiled body still has.
+    Value(ValueId),
+    /// A range the compiled body no longer allocates, rebuilt from its
+    /// bounds.
+    Range {
+        from: ValueId,
+        to: ValueId,
+        inclusive: bool,
+    },
+}
+
+/// A register of the interpreter's frame and where its value comes
+/// from at a deopt point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeoptReg {
+    pub reg: u32,
+    pub source: DeoptSource,
+}
+
+impl DeoptSource {
+    pub fn operands(&self) -> Vec<ValueId> {
+        match self {
+            DeoptSource::Value(v) => vec![*v],
+            DeoptSource::Range { from, to, .. } => vec![*from, *to],
+        }
+    }
+    pub fn map(&mut self, f: &dyn Fn(ValueId) -> ValueId) {
+        match self {
+            DeoptSource::Value(v) => *v = f(*v),
+            DeoptSource::Range { from, to, .. } => {
+                *from = f(*from);
+                *to = f(*to);
+            }
+        }
+    }
 }
 
 impl Instruction {
@@ -450,6 +499,7 @@ impl Instruction {
             Instruction::SetField(..)
                 | Instruction::SetModuleVar(..)
                 | Instruction::GuardNum(..)
+                | Instruction::GuardNumAt { .. }
                 | Instruction::GuardBool(..)
                 | Instruction::GuardClass(..)
                 | Instruction::GuardProtocol(..)
@@ -548,6 +598,11 @@ impl Instruction {
             | Instruction::NegI64(a)
             | Instruction::I64ToF64(a)
             | Instruction::IsNum(a) => vec![*a],
+            Instruction::GuardNumAt { value, live, .. } => {
+                let mut ops = vec![*value];
+                ops.extend(live.iter().flat_map(|r| r.source.operands()));
+                ops
+            }
             Instruction::AddI64(a, b)
             | Instruction::SubI64(a, b)
             | Instruction::MulI64(a, b)
@@ -1447,6 +1502,28 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CmpGeI64(a, b) => format!("icmp_i64.ge {}, {}", a, b),
         Instruction::I64ToF64(a) => format!("i64_to_f64 {}", a),
         Instruction::IsNum(a) => format!("is_num {}", a),
+        Instruction::GuardNumAt { value, pc, live } => format!(
+            "guard.num.at {} pc={} live=[{}]",
+            value,
+            pc,
+            live.iter()
+                .map(|r| match r.source {
+                    DeoptSource::Value(v) => format!("r{}={}", r.reg, v),
+                    DeoptSource::Range {
+                        from,
+                        to,
+                        inclusive,
+                    } => format!(
+                        "r{}={}{}{}",
+                        r.reg,
+                        from,
+                        if inclusive { ".." } else { "..." },
+                        to
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Instruction::ClosureFnIs(a, f) => format!("closure_fn_is {}, {:#x}", a, f),
 
         Instruction::IsType(a, sym) => {
@@ -1832,6 +1909,7 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 | Instruction::BandI64(..)
                 | Instruction::NegI64(_) => MirType::I64,
                 Instruction::I64ToF64(_) => MirType::F64,
+                Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
                 Instruction::GuardNum(src)
                 | Instruction::GuardBool(src)
                 | Instruction::Move(src)

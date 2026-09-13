@@ -299,6 +299,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         CmpGeI64(..) => 78,
         I64ToF64(..) => 79,
         IsNum(..) => 80,
+        GuardNumAt { .. } => 35,
     }
 }
 

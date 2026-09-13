@@ -4952,6 +4952,67 @@ System.print(fsum)
 }
 
 #[test]
+fn e2e_top_tier_result_speculation_deopts_mid_body() {
+    // The top tier guards call results the baseline only ever saw as
+    // Num. When a getter later returns a string, the guard fails after
+    // this iteration's store to `_a` has happened, so the interpreter
+    // must resume just past the call rather than re-run the method.
+    // The warm-up is long enough for the top-tier compile to land.
+    let src = r#"
+class Cell {
+  construct new(v) { _v = v }
+  v { _v }
+  v=(x) { _v = x }
+}
+class Acc {
+  construct new() {
+    _a = Cell.new(1)
+    _b = Cell.new(2)
+  }
+  step(n) {
+    var total = 0
+    for (i in 0...n) {
+      _a.v = _a.v + i
+      var x = _b.v
+      total = total + x.toString.count
+    }
+    return total
+  }
+  switchB(v) { _b.v = v }
+  a { _a.v }
+}
+var acc = Acc.new()
+var sum = 0
+for (k in 0...40000) sum = sum + acc.step(20)
+acc.switchB("str")
+var r = acc.step(3)
+System.print("%(sum) %(r) %(acc.a)")
+"#;
+    let run = |mode: ExecutionMode| {
+        let config = VMConfig {
+            execution_mode: mode,
+            jit_threshold: 20,
+            opt_threshold: 40,
+            ..VMConfig::default()
+        };
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", src);
+        let output = vm.take_output();
+        (result, output, vm.engine.deopt_exits)
+    };
+    let (r0, expected, _) = run(ExecutionMode::Interpreter);
+    assert!(matches!(r0, InterpretResult::Success));
+    assert_eq!(expected.trim(), "800000 9 7600004");
+    let (r1, output, deopts) = run(ExecutionMode::Tiered);
+    assert!(matches!(r1, InterpretResult::Success));
+    assert_eq!(output, expected);
+    if wren_lift::codegen::top_tier() != wren_lift::codegen::TopTier::Off {
+        assert_eq!(deopts, 1, "the guard on `_b.v` fires exactly once");
+    }
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,

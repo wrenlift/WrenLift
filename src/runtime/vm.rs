@@ -2006,6 +2006,13 @@ impl VM {
                 unsafe {
                     (*closure_ptr).header.class = self.fn_class;
                 }
+                if let Some(slot) = self
+                    .engine
+                    .method_binding
+                    .get_mut(method_func_id.0 as usize)
+                {
+                    *slot = (closure_ptr, class_ptr);
+                }
 
                 let sig_sym = self.interner.intern(&method_mir.signature);
                 let bind_sym = if method_mir.is_static || method_mir.is_constructor {
@@ -5587,6 +5594,104 @@ impl VM {
         crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
         self.release_sync_fiber(live_temp_fiber);
 
+        self.reraise(result)
+    }
+
+    /// Resume `func_id` in the interpreter at bytecode offset `pc`
+    /// with the `(register, value)` pairs of `regs` in place, and run
+    /// it to its return. Compiled code calls this when a mid-body
+    /// speculation fails; the caller's native frame returns the value.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn resume_method_sync(
+        &mut self,
+        closure_ptr: *mut ObjClosure,
+        defining_class: *mut crate::runtime::object::ObjClass,
+        func_id: crate::runtime::engine::FuncId,
+        pc: u32,
+        regs: &[(u32, Value)],
+    ) -> Option<Value> {
+        use crate::mir::BlockId;
+
+        let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+        crate::codegen::runtime_fns::push_jit_root(Value::object(closure_ptr as *mut u8));
+        crate::codegen::runtime_fns::push_jit_root(if defining_class.is_null() {
+            Value::null()
+        } else {
+            Value::object(defining_class as *mut u8)
+        });
+        for &(_, v) in regs {
+            crate::codegen::runtime_fns::push_jit_root(v);
+        }
+        let bc = match self.engine.ensure_bytecode(func_id) {
+            Some(bc) => unsafe { &*bc },
+            None => {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return None;
+            }
+        };
+        let Some(live_closure) = crate::codegen::runtime_fns::jit_root_at(root_len_before)
+            .as_object()
+            .map(|p| p as *mut ObjClosure)
+        else {
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return None;
+        };
+        let live_defining_class = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1)
+            .as_object()
+            .map(|p| p as *mut crate::runtime::object::ObjClass);
+        let mut values = vec![Value::UNDEFINED; bc.register_count as usize];
+        for (i, &(reg, _)) in regs.iter().enumerate() {
+            let v = crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
+            let r = reg as usize;
+            if r >= values.len() {
+                values.resize(r + 1, Value::UNDEFINED);
+            }
+            values[r] = v;
+        }
+        let mod_name = self
+            .engine
+            .func_module(func_id)
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()));
+        let frame = MirCallFrame {
+            func_id,
+            current_block: BlockId(0),
+            ip: 0,
+            pc,
+            values,
+            module_name: mod_name,
+            return_dst: None,
+            closure: Some(live_closure),
+            defining_class: live_defining_class,
+            bc_ptr: std::ptr::null(),
+        };
+
+        let current_fiber = self.fiber;
+        if !current_fiber.is_null() {
+            let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
+            if stop_depth >= self.config.max_call_depth {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return None;
+            }
+            unsafe {
+                (*current_fiber).mir_frames.push(frame);
+            }
+            let result = super::vm_interp::run_fiber_until_depth(self, stop_depth);
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return self.reraise(result);
+        }
+
+        let temp_fiber = self.acquire_sync_fiber();
+        unsafe {
+            (*temp_fiber).header.class = self.fiber_class;
+            (*temp_fiber).mir_frames.push(frame);
+        }
+        self.fiber = temp_fiber;
+        let result = super::vm_interp::run_fiber(self);
+        let live_temp_fiber = self.fiber;
+        self.fiber = std::ptr::null_mut();
+        crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+        self.release_sync_fiber(live_temp_fiber);
         self.reraise(result)
     }
 

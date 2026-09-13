@@ -324,6 +324,7 @@ fn find_invariants(
                 if matches!(
                     inst,
                     Instruction::GuardNum(_)
+                        | Instruction::GuardNumAt { .. }
                         | Instruction::GuardBool(_)
                         | Instruction::GuardClass(_, _)
                 ) {

@@ -273,7 +273,7 @@ pub fn eval_pure_instruction(
         }
 
         // -- Guards (lenient: accepts both boxed and unboxed forms) --
-        Instruction::GuardNum(a) => {
+        Instruction::GuardNumAt { value: a, .. } | Instruction::GuardNum(a) => {
             let v = get(*a)?;
             match v {
                 InterpValue::Boxed(val) if val.is_num() => Ok(v),

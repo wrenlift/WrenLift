@@ -40,7 +40,7 @@ pub mod cl {
     use crate::intern::Interner;
     use crate::mir::{
         osr_external_live_values, osr_reachable_blocks, osr_rematerializable_defs, BlockId,
-        Instruction, MirFunction, MirType, Terminator, ValueId,
+        DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
     };
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -108,6 +108,21 @@ pub mod cl {
             && c.is_finite()
             && (c.to_bits() & ((1u64 << 52) - 1)) == 0
             && c >= f64::MIN_POSITIVE
+    }
+
+    /// Or the kind of `result` into the result profile byte at `slot`.
+    fn emit_note_call_result(builder: &mut FunctionBuilder, slot: usize, result: Value) {
+        use crate::mir::bytecode::{RESULT_NUM, RESULT_OTHER};
+        let p = builder.ins().iconst(types::I64, slot as i64);
+        let seen = builder.ins().load(types::I8, MemFlags::trusted(), p, 0);
+        let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+        let masked = builder.ins().band(result, qnan);
+        let is_num = builder.ins().icmp(IntCC::NotEqual, masked, qnan);
+        let num_bit = builder.ins().iconst(types::I8, RESULT_NUM as i64);
+        let other_bit = builder.ins().iconst(types::I8, RESULT_OTHER as i64);
+        let bit = builder.ins().select(is_num, num_bit, other_bit);
+        let seen = builder.ins().bor(seen, bit);
+        builder.ins().store(MemFlags::trusted(), seen, p, 0);
     }
 
     fn emit_class_load_guarded(
@@ -997,12 +1012,17 @@ pub mod cl {
     /// when the count reaches the cell's next tick, and poll the cell's
     /// re-tier word at each header in `retier_headers` (outermost loops
     /// only), handing the header's live-ins to `wren_retier` when the
-    /// word is set.
+    /// word is set. Every loop header in `tick_headers` counts too, so
+    /// a body that lives in one long outer loop still reaches its
+    /// proposal. Every call's result kind is or'd into the byte at
+    /// `result_kinds + register` when that base is non-zero.
     #[derive(Clone, Default)]
     pub struct TierHook {
         pub func_id: u32,
         pub cell: usize,
         pub retier_headers: HashSet<BlockId>,
+        pub tick_headers: HashSet<BlockId>,
+        pub result_kinds: usize,
     }
 
     thread_local! {
@@ -1215,12 +1235,20 @@ pub mod cl {
                 .iter()
                 .any(|(_, inst)| matches!(inst, Instruction::GuardNum(_)))
         });
+        // A mid-body guard needs the boxed register file the inner
+        // f64 body does not carry.
+        let has_mid_body_guards = mir.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|(_, inst)| matches!(inst, Instruction::GuardNumAt { .. }))
+        });
         let has_self_calls = mir.blocks.iter().any(|b| {
             b.instructions
                 .iter()
                 .any(|(_, inst)| matches!(inst, Instruction::CallStaticSelf { .. }))
         });
-        let use_f64_inner = has_num_guards && has_self_calls && param_count > 0;
+        let use_f64_inner =
+            has_num_guards && has_self_calls && param_count > 0 && !has_mid_body_guards;
 
         let mut sig = module.make_signature();
         for _ in 0..param_count {
@@ -2073,6 +2101,7 @@ pub mod cl {
             "wren_tier_tick",
             "wren_retier",
             "wren_deopt_n",
+            "wren_deopt_at",
         ];
 
         for name in &names {
@@ -3278,13 +3307,21 @@ pub mod cl {
                     }
                 }
             }
+            if let Some(hook) = tier_hook
+                .as_ref()
+                .filter(|h| h.cell != 0 && h.tick_headers.contains(&bid))
+            {
+                emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+            }
             if let (Some(hook), Some((buf, live))) = (
                 &tier_hook,
                 retier_polls
                     .get(&bid)
                     .filter(|(_, live)| live.iter().all(|v| val_map.contains_key(v))),
             ) {
-                emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+                if !hook.tick_headers.contains(&bid) {
+                    emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+                }
                 let cell = builder.ins().iconst(types::I64, hook.cell as i64);
                 let word = builder
                     .ins()
@@ -3408,6 +3445,20 @@ pub mod cl {
                                 // global `mark_stack_map`).
                                 if mark_stack_map {
                                     builder.declare_value_needs_stack_map(entry_params[idx]);
+                                }
+                                // A promotable baseline body profiles
+                                // its arguments the way it does call
+                                // results; the receiver is never a Num.
+                                if idx > 0 {
+                                    if let Some(hook) =
+                                        tier_hook.as_ref().filter(|h| h.result_kinds != 0)
+                                    {
+                                        emit_note_call_result(
+                                            builder,
+                                            hook.result_kinds + vid.0 as usize,
+                                            entry_params[idx],
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -3629,9 +3680,24 @@ pub mod cl {
                     aot_config,
                     inline_bodies.as_ref(),
                     cha_by_method.as_ref(),
+                    Some((&raw_bools, &exit_value_types)),
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
+                    // A promotable baseline body profiles what each
+                    // call returns for the top tier to speculate on.
+                    if let Some(ref hook) = tier_hook {
+                        if hook.result_kinds != 0
+                            && matches!(
+                                inst,
+                                Instruction::Call { .. }
+                                    | Instruction::CallKnownFunc { .. }
+                                    | Instruction::SuperCall { .. }
+                            )
+                        {
+                            emit_note_call_result(builder, hook.result_kinds + vid.0 as usize, val);
+                        }
+                    }
                     if let Some(var) = osr_vars.get(&vid) {
                         builder.def_var(*var, val);
                     }
@@ -3957,19 +4023,7 @@ pub mod cl {
             let Some(&v) = val_map.get(vid) else {
                 return Err(format!("snapshot live-in {:?} undefined", vid));
             };
-            let boxed = match value_types.get(vid.0 as usize) {
-                Some(MirType::F64) => builder.ins().bitcast(types::I64, MemFlags::new(), v),
-                Some(MirType::I64) => {
-                    let f = builder.ins().fcvt_from_sint(types::F64, v);
-                    builder.ins().bitcast(types::I64, MemFlags::new(), f)
-                }
-                Some(MirType::Bool) if raw_bools.contains(vid) => {
-                    let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
-                    let f = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                    builder.ins().select(v, t, f)
-                }
-                _ => v,
-            };
+            let boxed = box_for_snapshot(builder, v, *vid, raw_bools, value_types);
             let reg = builder.ins().iconst(types::I64, vid.0 as i64);
             builder
                 .ins()
@@ -3978,6 +4032,96 @@ pub mod cl {
                 .ins()
                 .stack_store(types::I64, boxed, buf, (i * 16 + 8) as i32);
         }
+        Ok(())
+    }
+
+    /// `v` as a NaN-boxed word whatever representation `vid` is
+    /// carried in.
+    fn box_for_snapshot(
+        builder: &mut FunctionBuilder,
+        v: Value,
+        vid: ValueId,
+        raw_bools: &HashSet<ValueId>,
+        value_types: &[MirType],
+    ) -> Value {
+        match value_types.get(vid.0 as usize) {
+            Some(MirType::F64) => builder.ins().bitcast(types::I64, MemFlags::new(), v),
+            Some(MirType::I64) => {
+                let f = builder.ins().fcvt_from_sint(types::F64, v);
+                builder.ins().bitcast(types::I64, MemFlags::new(), f)
+            }
+            Some(MirType::Bool) if raw_bools.contains(&vid) => {
+                let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+                let f = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                builder.ins().select(v, t, f)
+            }
+            _ => v,
+        }
+    }
+
+    /// A mid-body guard: when `fails`, store the `live` registers in
+    /// the word layout `wren_deopt_at` reads and hand the function to
+    /// it; it resumes the interpreter at `pc` and returns the
+    /// function's result.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn emit_guard_deopt_at(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        fails: Value,
+        func_id: u32,
+        pc: u32,
+        live: &[DeoptReg],
+        val_map: &HashMap<ValueId, Value>,
+        raw_bools: &HashSet<ValueId>,
+        value_types: &[MirType],
+    ) -> Result<(), String> {
+        let deopt_block = builder.create_block();
+        let cont_block = builder.create_block();
+        builder.set_cold_block(deopt_block);
+        builder.ins().brif(fails, deopt_block, &[], cont_block, &[]);
+        builder.switch_to_block(deopt_block);
+        let words = live
+            .iter()
+            .map(crate::codegen::runtime_fns::deopt_words)
+            .sum::<usize>();
+        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            (words.max(1) * 8) as u32,
+            3,
+        ));
+        let mut at = 0i32;
+        for r in live {
+            let tag = builder
+                .ins()
+                .iconst(types::I64, crate::codegen::runtime_fns::deopt_tag(r) as i64);
+            builder.ins().stack_store(types::I64, tag, slot, at * 8);
+            let sources = r.source.operands();
+            for (k, vid) in sources.iter().enumerate() {
+                let Some(&v) = val_map.get(vid) else {
+                    return Err(format!("deopt live value {:?} undefined", vid));
+                };
+                let boxed = box_for_snapshot(builder, v, *vid, raw_bools, value_types);
+                builder
+                    .ins()
+                    .stack_store(types::I64, boxed, slot, (at + 1 + k as i32) * 8);
+            }
+            at += 1 + sources.len() as i32;
+        }
+        let buf = builder.ins().stack_addr(types::I64, slot, 0);
+        let fid = builder.ins().iconst(types::I64, func_id as i64);
+        let pc = builder.ins().iconst(types::I64, pc as i64);
+        let n = builder.ins().iconst(types::I64, words as i64);
+        let f = get_runtime_fn(module, builder, "wren_deopt_at", 4)?;
+        let call = builder.ins().call(f, &[fid, pc, n, buf]);
+        let result = builder.inst_results(call)[0];
+        builder.ins().return_(&[result]);
+        builder.switch_to_block(cont_block);
         Ok(())
     }
 
@@ -4175,6 +4319,7 @@ pub mod cl {
             &std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
         cha_by_method: Option<&std::sync::Arc<crate::runtime::engine::ChaMap>>,
+        deopt_state: Option<(&HashSet<ValueId>, &[MirType])>,
     ) -> Result<Option<Value>, String> {
         // Investigation mode — convert undefined-value to a graceful
         // Err so the broker thread survives, letting other functions
@@ -5029,6 +5174,7 @@ pub mod cl {
                                                     aot_config,
                                                     None,
                                                     None,
+                                                    None,
                                                 )?;
                                                 if let Some(v) = res {
                                                     callee_vals.insert(*vid, v);
@@ -5404,6 +5550,7 @@ pub mod cl {
                                             f64_self_id,
                                             Some(callee_args[0]),
                                             aot_config,
+                                            None,
                                             None,
                                             None,
                                         )?;
@@ -6763,6 +6910,31 @@ pub mod cl {
                 let masked = builder.ins().band(v, qnan);
                 let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
                 emit_guard_deopt(builder, module, get_runtime_fn, is_box, jit_func_id())?;
+                Ok(Some(v))
+            }
+            Instruction::GuardNumAt { value, pc, live } => {
+                let v = get(value);
+                if aot_config.is_some() {
+                    return Ok(Some(v));
+                }
+                let Some((raw_bools, value_types)) = deopt_state else {
+                    return Err("mid-body guard inside an inlined body".into());
+                };
+                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                let masked = builder.ins().band(v, qnan);
+                let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                emit_guard_deopt_at(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    is_box,
+                    jit_func_id(),
+                    *pc,
+                    live,
+                    val_map,
+                    raw_bools,
+                    value_types,
+                )?;
                 Ok(Some(v))
             }
             Instruction::GuardBool(src) => {

@@ -166,6 +166,10 @@ pub struct CallSiteIC {
     pub kind: u64,
 }
 
+/// Bits of a call's entry in `BytecodeFunction::result_kinds`.
+pub const RESULT_NUM: u8 = 1;
+pub const RESULT_OTHER: u8 = 2;
+
 pub const CALLSITE_IC_CLASS: i32 = 0;
 pub const CALLSITE_IC_JIT_PTR: i32 = 8;
 pub const CALLSITE_IC_CLOSURE: i32 = 16;
@@ -203,6 +207,8 @@ impl Clone for BytecodeFunction {
             register_count: self.register_count,
             param_offsets: self.param_offsets.clone(),
             osr_points: self.osr_points.clone(),
+            resume_after_call: self.resume_after_call.clone(),
+            result_kinds: std::cell::UnsafeCell::new(unsafe { &*self.result_kinds.get() }.clone()),
             ic_table: std::cell::UnsafeCell::new(unsafe { &*self.ic_table.get() }.clone()),
         }
     }
@@ -243,6 +249,15 @@ pub struct BytecodeFunction {
     pub osr_points: Vec<OsrPoint>,
     /// Inline cache table for call sites (mutable through Arc via UnsafeCell).
     pub ic_table: std::cell::UnsafeCell<Vec<CallSiteIC>>,
+    /// The offset just past each call, by the call's destination
+    /// register: where compiled code that speculated on the call's
+    /// result resumes the interpreter when the speculation fails.
+    pub resume_after_call: HashMap<ValueId, u32>,
+    /// `RESULT_NUM` / `RESULT_OTHER` bits per register, or'd in by
+    /// baseline code at every call it lowers. A call that only ever
+    /// produced a Num may be speculated on by the top tier. Written
+    /// by compiled code through a raw pointer; one byte per register.
+    pub result_kinds: std::cell::UnsafeCell<Vec<u8>>,
 }
 
 /// Metadata for a bytecode back-edge that may later transfer into native OSR.
@@ -295,6 +310,7 @@ struct Encoder<'a> {
     patches: Vec<PatchSite>,
     osr_points: Vec<PendingOsrPoint>,
     call_site_count: u16,
+    resume_after_call: HashMap<ValueId, u32>,
 }
 
 impl<'a> Encoder<'a> {
@@ -309,6 +325,7 @@ impl<'a> Encoder<'a> {
             patches: Vec::new(),
             osr_points: Vec::new(),
             call_site_count: 0,
+            resume_after_call: HashMap::new(),
         }
     }
 
@@ -443,6 +460,7 @@ impl<'a> Encoder<'a> {
             Instruction::Move(a) => self.emit_unary(Op::Move, dst, *a),
             Instruction::ToString(a) => self.emit_unary(Op::ToStringOp, dst, *a),
             Instruction::GuardNum(a) => self.emit_unary(Op::GuardNum, dst, *a),
+            Instruction::GuardNumAt { value, .. } => self.emit_unary(Op::GuardNum, dst, *value),
             Instruction::GuardBool(a) => self.emit_unary(Op::GuardBool, dst, *a),
 
             // -- 7B binary: op + dst + lhs + rhs --
@@ -602,6 +620,7 @@ impl<'a> Encoder<'a> {
                 for a in args {
                     self.emit_reg(*a);
                 }
+                self.resume_after_call.insert(dst, self.code.len() as u32);
             }
             Instruction::CallKnownFunc {
                 func_id,
@@ -903,6 +922,8 @@ impl<'a> Encoder<'a> {
                 CallSiteIC::default();
                 self.call_site_count as usize
             ]),
+            resume_after_call: self.resume_after_call,
+            result_kinds: std::cell::UnsafeCell::new(vec![0; self.mir.next_value as usize]),
         }
     }
 }

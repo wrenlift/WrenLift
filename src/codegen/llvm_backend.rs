@@ -40,8 +40,8 @@ pub mod llvm {
     use crate::codegen::NativeOsrEntry;
     use crate::intern::Interner;
     use crate::mir::{
-        osr_reachable_blocks, osr_rematerializable_defs, BlockId, Instruction, MirFunction,
-        MirType, Terminator, ValueId,
+        osr_reachable_blocks, osr_rematerializable_defs, BlockId, DeoptReg, DeoptSource,
+        Instruction, MirFunction, MirType, Terminator, ValueId,
     };
     use crate::runtime::object_layout::*;
 
@@ -897,7 +897,10 @@ pub mod llvm {
         ) -> Result<(IntValue<'ctx>, IntValue<'ctx>), String> {
             let (is_obj, ptr, recv_class) = self.class_of(r)?;
             let same = self.icmp(IntPredicate::EQ, recv_class, self.c64(class))?;
-            let hit = self.b.build_and(is_obj, same, "hit").map_err(|e| e.to_string())?;
+            let hit = self
+                .b
+                .build_and(is_obj, same, "hit")
+                .map_err(|e| e.to_string())?;
             let null_obj = self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
             let safe = self
                 .b
@@ -1749,6 +1752,12 @@ pub mod llvm {
                     self.guard_deopt(fails)?;
                     v.into()
                 }
+                I::GuardNumAt { value, pc, live } => {
+                    let v = self.boxed(value)?;
+                    let fails = self.is_nan_boxed(v)?;
+                    self.guard_deopt_at(fails, *pc, live)?;
+                    v.into()
+                }
                 I::GuardBool(s) => {
                     let v = self.boxed(s)?;
                     let t = self.icmp(IntPredicate::EQ, v, self.c64(TAG_TRUE))?;
@@ -2116,6 +2125,60 @@ pub mod llvm {
             let fid = self.c64(jit_func_id() as u64);
             let n = self.c64(params.len() as u64);
             let result = self.call_helper("wren_deopt_n", &[fid, n, buf])?;
+            self.b
+                .build_return(Some(&result))
+                .map_err(|e| e.to_string())?;
+            self.b.position_at_end(cont);
+            Ok(())
+        }
+
+        /// A mid-body guard: when `fails`, store `live` in the word
+        /// layout `wren_deopt_at` reads and return whatever it computes
+        /// by resuming the interpreter at `pc`.
+        fn guard_deopt_at(
+            &mut self,
+            fails: IntValue<'ctx>,
+            pc: u32,
+            live: &[DeoptReg],
+        ) -> Result<(), String> {
+            if self.inline_depth > 0 {
+                bail!("mid-body guard inside an inlined body");
+            }
+            let deopt = self.new_block("deopt_at");
+            let cont = self.new_block("cont");
+            self.cbr(fails, deopt, cont)?;
+            self.b.position_at_end(deopt);
+            let words = live
+                .iter()
+                .map(crate::codegen::runtime_fns::deopt_words)
+                .sum::<usize>();
+            let (_, buf) = self.stack_buf(words)?;
+            let mut at = 0i64;
+            for r in live {
+                self.store64(
+                    buf,
+                    at * 8,
+                    self.c64(crate::codegen::runtime_fns::deopt_tag(r)),
+                )?;
+                match r.source {
+                    DeoptSource::Value(v) => {
+                        let v = self.boxed(&v)?;
+                        self.store64(buf, at * 8 + 8, v)?;
+                        at += 2;
+                    }
+                    DeoptSource::Range { from, to, .. } => {
+                        let f = self.boxed(&from)?;
+                        let t = self.boxed(&to)?;
+                        self.store64(buf, at * 8 + 8, f)?;
+                        self.store64(buf, at * 8 + 16, t)?;
+                        at += 3;
+                    }
+                }
+            }
+            let fid = self.c64(jit_func_id() as u64);
+            let pcv = self.c64(pc as u64);
+            let n = self.c64(words as u64);
+            let result = self.call_helper("wren_deopt_at", &[fid, pcv, n, buf])?;
             self.b
                 .build_return(Some(&result))
                 .map_err(|e| e.to_string())?;

@@ -1319,7 +1319,9 @@ impl<'a> MirWasmEmitter<'a> {
             }
 
             // -- Guards (pass-through for now) --
-            Instruction::GuardNum(a) | Instruction::GuardBool(a) => {
+            Instruction::GuardNum(a)
+            | Instruction::GuardNumAt { value: a, .. }
+            | Instruction::GuardBool(a) => {
                 func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
