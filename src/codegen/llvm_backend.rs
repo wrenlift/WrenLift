@@ -2577,7 +2577,7 @@ pub mod llvm {
             known: Option<(u16, u64)>,
         ) -> Result<IntValue<'ctx>, String> {
             use crate::runtime::gc_immix_heap::{
-                BUMP_BASE, BUMP_CUR, BUMP_LIMIT, BUMP_OBJECTS, BUMP_PLAIN_FLAG, BUMP_Q0,
+                BUMP_CODES, BUMP_CUR, BUMP_LIMIT, BUMP_PLAIN_FLAG,
             };
             let bump = crate::codegen::jit_bump_region();
             let known_size = known
@@ -2652,26 +2652,14 @@ pub mod llvm {
             self.cbr(room, fast, slow)?;
             self.b.position_at_end(fast);
             self.store64(bump_v, BUMP_CUR as i64, np)?;
-            let objects = self.load64(bump_v, BUMP_OBJECTS as i64)?;
-            let base = self.load64(bump_v, BUMP_BASE as i64)?;
-            let q0 = self.load64(bump_v, BUMP_Q0 as i64)?;
-            let rel = self
-                .b
-                .build_int_sub(p, base, "rel")
-                .map_err(|e| e.to_string())?;
+            let codes = self.load64(bump_v, BUMP_CODES as i64)?;
             let q = self
                 .b
-                .build_int_add(
-                    q0,
-                    self.b
-                        .build_right_shift(rel, self.c64(4), false, "q")
-                        .map_err(|e| e.to_string())?,
-                    "qi",
-                )
+                .build_right_shift(p, self.c64(4), false, "q")
                 .map_err(|e| e.to_string())?;
             let code_p = self.addr(
                 self.b
-                    .build_int_add(objects, q, "cp")
+                    .build_int_add(codes, q, "cp")
                     .map_err(|e| e.to_string())?,
                 0,
             )?;

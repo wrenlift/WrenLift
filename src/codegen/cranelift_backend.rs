@@ -126,9 +126,7 @@ pub mod cl {
         ) -> Result<cranelift_codegen::ir::FuncRef, String>,
         class_val: Value,
     ) -> Result<Value, String> {
-        use crate::runtime::gc_immix_heap::{
-            BUMP_BASE, BUMP_CUR, BUMP_LIMIT, BUMP_OBJECTS, BUMP_PLAIN_FLAG, BUMP_Q0,
-        };
+        use crate::runtime::gc_immix_heap::{BUMP_CODES, BUMP_CUR, BUMP_LIMIT, BUMP_PLAIN_FLAG};
         let bump = crate::codegen::jit_bump_region();
         let helper = get_runtime_fn(module, builder, "wren_alloc_instance", 1)?;
         if bump == 0 {
@@ -187,19 +185,11 @@ pub mod cl {
         builder
             .ins()
             .store(MemFlags::trusted(), np, bump_v, BUMP_CUR);
-        let objects = builder
+        let codes = builder
             .ins()
-            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_OBJECTS);
-        let base = builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_BASE);
-        let q0 = builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_Q0);
-        let rel = builder.ins().isub(p, base);
-        let rq = builder.ins().ushr_imm_u(rel, 4);
-        let q = builder.ins().iadd(q0, rq);
-        let code_p = builder.ins().iadd(objects, q);
+            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_CODES);
+        let q = builder.ins().ushr_imm_u(p, 4);
+        let code_p = builder.ins().iadd(codes, q);
         let sq = builder.ins().ushr_imm_u(size, 4);
         let code = builder.ins().bor_imm_u(sq, BUMP_PLAIN_FLAG as i64);
         let code8 = builder.ins().ireduce(types::I8, code);

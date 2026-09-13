@@ -211,13 +211,22 @@ pub struct BumpRegion {
     pub q0: usize,
     /// The start-byte table, refreshed whenever the table moves.
     pub objects: *mut u8,
+    /// `objects + q0 - base / 16`, so the start byte of the object at
+    /// `p` is at `codes + p / 16`; compiled code reads only this.
+    pub codes: usize,
+}
+
+impl BumpRegion {
+    fn refresh_codes(&mut self) {
+        self.codes = (self.objects as usize)
+            .wrapping_add(self.q0)
+            .wrapping_sub(self.base / QUANTUM);
+    }
 }
 
 pub const BUMP_CUR: i32 = 0;
 pub const BUMP_LIMIT: i32 = 8;
-pub const BUMP_BASE: i32 = 16;
-pub const BUMP_Q0: i32 = 24;
-pub const BUMP_OBJECTS: i32 = 32;
+pub const BUMP_CODES: i32 = 40;
 /// The start byte compiled code writes for an instance of `q` quanta.
 pub const BUMP_PLAIN_FLAG: u8 = PLAIN;
 
@@ -363,6 +372,7 @@ impl ImmixHeap {
         self.line_drop
             .resize(self.block_bases.len() * LINE_WORDS, 0);
         self.bump.objects = self.objects.as_mut_ptr();
+        self.bump.refresh_codes();
         // Push high blocks first so the lowest address pops next.
         for i in (0..BLOCKS_PER_CHUNK).rev() {
             self.free_blocks.push(first + i as u32);
@@ -482,6 +492,7 @@ impl ImmixHeap {
             self.bump.base = self.block_bases[region.block as usize];
             self.bump.q0 = region.block as usize * QUANTA_PER_BLOCK;
         }
+        self.bump.refresh_codes();
     }
 
     /// The bump region compiled code allocates from.
@@ -1064,6 +1075,23 @@ fn reclaim_pages(_addr: usize, _len: usize) {}
 mod tests {
     use super::*;
     use crate::runtime::object::{ObjHeader, ObjType};
+
+    #[test]
+    fn bump_region_layout_matches_compiled_code() {
+        assert_eq!(std::mem::offset_of!(BumpRegion, cur), BUMP_CUR as usize);
+        assert_eq!(std::mem::offset_of!(BumpRegion, limit), BUMP_LIMIT as usize);
+        assert_eq!(std::mem::offset_of!(BumpRegion, codes), BUMP_CODES as usize);
+        assert_eq!(std::mem::offset_of!(ImmixHeap, bump), 0);
+    }
+
+    #[test]
+    fn bump_codes_addresses_the_start_byte() {
+        let mut heap = ImmixHeap::new();
+        let p = alloc(&mut heap, 48);
+        let bump = unsafe { *heap.bump_region() };
+        let code = unsafe { *((bump.codes.wrapping_add(p as usize / QUANTUM)) as *const u8) };
+        assert_eq!(code & CODE_MASK, 3);
+    }
 
     /// A header-led allocation of `size` bytes, white.
     fn alloc(heap: &mut ImmixHeap, size: usize) -> *mut u8 {
