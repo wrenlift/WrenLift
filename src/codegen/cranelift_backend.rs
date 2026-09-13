@@ -255,7 +255,6 @@ pub mod cl {
     /// `ObjInstance::note_field_kind` does; a class without the bytes
     /// is skipped.
     fn emit_note_field_kind(builder: &mut FunctionBuilder, obj_ptr: Value, idx: u16, value: Value) {
-        use crate::runtime::object::{FIELD_NUM, FIELD_OTHER};
         let class = builder
             .ins()
             .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
@@ -266,21 +265,65 @@ pub mod cl {
         let done = builder.create_block();
         builder.ins().brif(kinds, note, &[], done, &[]);
         builder.switch_to_block(note);
+        emit_store_kind_bit(builder, kinds, idx as i32, value, done);
+        builder.switch_to_block(done);
+    }
+
+    /// `emit_note_field_kind` for an instance of a class known at
+    /// compile time: the byte has a fixed address, and one that already
+    /// records another kind, or the kind being stored, never changes
+    /// again.
+    fn emit_note_field_kind_static(
+        builder: &mut FunctionBuilder,
+        class: usize,
+        idx: u16,
+        value: Value,
+    ) {
+        use crate::runtime::object::FIELD_OTHER;
+        let class = class as *const crate::runtime::object::ObjClass;
+        let kinds = unsafe { (*class).field_kinds_ptr };
+        let len = unsafe { (*class).field_kinds.len() };
+        if kinds.is_null() || idx as usize >= len {
+            return;
+        }
+        // The main thread may be or'ing this byte while the compile
+        // reads it; the compiled code reads it again at run time.
+        let seen = unsafe { std::ptr::read_volatile(kinds.add(idx as usize)) };
+        if seen & FIELD_OTHER != 0 {
+            return;
+        }
+        let p = builder.ins().iconst(types::I64, kinds as i64);
+        let done = builder.create_block();
+        emit_store_kind_bit(builder, p, idx as i32, value, done);
+        builder.switch_to_block(done);
+    }
+
+    /// Or the kind of `value` into the byte at `kinds + idx`, storing
+    /// only when that changes it, then continue in `done`.
+    fn emit_store_kind_bit(
+        builder: &mut FunctionBuilder,
+        kinds: Value,
+        idx: i32,
+        value: Value,
+        done: cranelift_codegen::ir::Block,
+    ) {
+        use crate::runtime::object::{FIELD_NUM, FIELD_OTHER};
         let seen = builder
             .ins()
-            .load(types::I8, MemFlags::trusted(), kinds, idx as i32);
+            .load(types::I8, MemFlags::trusted(), kinds, idx);
         let qnan = builder.ins().iconst(types::I64, QNAN as i64);
         let masked = builder.ins().band(value, qnan);
         let is_num = builder.ins().icmp(IntCC::NotEqual, masked, qnan);
         let num_bit = builder.ins().iconst(types::I8, FIELD_NUM as i64);
         let other_bit = builder.ins().iconst(types::I8, FIELD_OTHER as i64);
         let bit = builder.ins().select(is_num, num_bit, other_bit);
-        let seen = builder.ins().bor(seen, bit);
-        builder
-            .ins()
-            .store(MemFlags::trusted(), seen, kinds, idx as i32);
+        let new = builder.ins().bor(seen, bit);
+        let changed = builder.ins().icmp(IntCC::NotEqual, new, seen);
+        let store = builder.create_block();
+        builder.ins().brif(changed, store, &[], done, &[]);
+        builder.switch_to_block(store);
+        builder.ins().store(MemFlags::trusted(), new, kinds, idx);
         builder.ins().jump(done, &[]);
-        builder.switch_to_block(done);
     }
 
     /// Or the kind of `result` into the result profile byte at `slot`.
@@ -1322,11 +1365,19 @@ pub mod cl {
         Headers(HashSet<BlockId>),
         /// No body; the entries for these headers only.
         EntriesOnly(HashSet<BlockId>),
+        /// The entries for these headers, with a body that runs the
+        /// function in the interpreter: what a body entered only
+        /// through its loops needs first.
+        StubBody(HashSet<BlockId>),
     }
 
     thread_local! {
         static JIT_OSR_SELECT: std::cell::RefCell<OsrSelect> =
             const { std::cell::RefCell::new(OsrSelect::All) };
+        /// The receiver of a body being spliced behind its class check,
+        /// with that class.
+        static INLINE_CLASS: std::cell::Cell<Option<(Value, usize)>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// Set what this thread's next compile produces.
@@ -1626,7 +1677,17 @@ pub mod cl {
             func_name.replace(['(', ')', ',', ' ', '='], "_")
         );
         let osr_select = jit_osr_select();
-        if let OsrSelect::EntriesOnly(headers) = &osr_select {
+        if let OsrSelect::EntriesOnly(headers) | OsrSelect::StubBody(headers) = &osr_select {
+            let stub = if matches!(osr_select, OsrSelect::StubBody(_)) {
+                Some(define_stub_body(
+                    &mut module,
+                    &safe_name,
+                    &sig,
+                    param_count,
+                )?)
+            } else {
+                None
+            };
             let osr_defs = compile_osr_entries(
                 mir,
                 interner,
@@ -1652,9 +1713,13 @@ pub mod cl {
                     live_in_int: def.live_in_int,
                 })
                 .collect();
+            let fn_ptr = match stub {
+                Some(id) => module.get_finalized_function(id),
+                None => std::ptr::null(),
+            };
             return Ok(CraneliftCompiledCode {
                 _module: module,
-                fn_ptr: std::ptr::null(),
+                fn_ptr,
                 osr_entries,
                 code_size: 0,
                 native_meta: None,
@@ -1919,7 +1984,7 @@ pub mod cl {
             .map_err(|e| e.to_string())?;
         let only = match &osr_select {
             OsrSelect::All => None,
-            OsrSelect::Headers(h) | OsrSelect::EntriesOnly(h) => Some(h),
+            OsrSelect::Headers(h) | OsrSelect::EntriesOnly(h) | OsrSelect::StubBody(h) => Some(h),
         };
         let osr_defs = if should_compile_osr_entries(mir, interner) {
             compile_osr_entries(
@@ -2065,6 +2130,62 @@ pub mod cl {
         // Only compile OSR entries if this function has at least one backward
         // branch. Saves code bloat on straight-line methods.
         mir.blocks.iter().any(has_backward_successor)
+    }
+
+    /// A body that hands its arguments to the interpreter.
+    fn define_stub_body(
+        module: &mut dyn Module,
+        safe_name: &str,
+        sig: &cranelift_codegen::ir::Signature,
+        param_count: usize,
+    ) -> Result<cranelift_module::FuncId, String> {
+        let func_id = module
+            .declare_function(safe_name, Linkage::Local, sig)
+            .map_err(|e| e.to_string())?;
+        let mut func = Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+            sig.clone(),
+        );
+        let mut fb_ctx = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let params: Vec<Value> = builder.block_params(entry).to_vec();
+            let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                (param_count.max(1) * 8) as u32,
+                3,
+            ));
+            for (i, p) in params.iter().enumerate() {
+                builder
+                    .ins()
+                    .stack_store(types::I64, *p, slot, (i * 8) as i32);
+            }
+            let buf = builder.ins().stack_addr(types::I64, slot, 0);
+            let fid = builder.ins().iconst(types::I64, jit_func_id() as i64);
+            let n = builder.ins().iconst(types::I64, param_count as i64);
+            let mut helper_sig = module.make_signature();
+            for _ in 0..3 {
+                helper_sig.params.push(AbiParam::new(types::I64));
+            }
+            helper_sig.returns.push(AbiParam::new(types::I64));
+            let helper = module
+                .declare_function("wren_run_interpreted", Linkage::Import, &helper_sig)
+                .map_err(|e| e.to_string())?;
+            let helper = module.declare_func_in_func(helper, builder.func);
+            let call = builder.ins().call(helper, &[fid, n, buf]);
+            let result = builder.inst_results(call)[0];
+            builder.ins().return_(&[result]);
+            builder.seal_all_blocks();
+            builder.finalize(module.target_config());
+        }
+        let mut ctx = Context::for_function(func);
+        module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| e.to_string())?;
+        Ok(func_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2514,6 +2635,7 @@ pub mod cl {
             "wren_retier",
             "wren_deopt_n",
             "wren_deopt_at",
+            "wren_run_interpreted",
         ];
 
         for name in &names {
@@ -2842,6 +2964,8 @@ pub mod cl {
         >,
         cha_by_method: crate::runtime::engine::SharedCha,
     ) -> Result<(), String> {
+        // A splice that failed to lower may have left its receiver here.
+        INLINE_CLASS.set(None);
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
         for (i, _) in mir.blocks.iter().enumerate() {
@@ -5104,7 +5228,12 @@ pub mod cl {
                     .store(MemFlags::trusted(), store_val, fields_ptr, offset);
                 // Only the LLVM tier reads the field kinds.
                 if aot_config.is_none() && crate::codegen::top_tier_is_llvm() {
-                    emit_note_field_kind(builder, obj_ptr, *idx, store_val);
+                    match INLINE_CLASS.get() {
+                        Some((r, class)) if r == recv_val => {
+                            emit_note_field_kind_static(builder, class, *idx, store_val);
+                        }
+                        _ => emit_note_field_kind(builder, obj_ptr, *idx, store_val),
+                    }
                 }
                 // Write barrier; AOT cannot know the binary's collector,
                 // JIT code skips it when no barrier collector is live.
@@ -5652,6 +5781,7 @@ pub mod cl {
                                     }
                                     let callee_block = &callee_mir.blocks[0];
                                     let mut inline_failed = false;
+                                    let outer_class = INLINE_CLASS.replace(Some((r, *class_ptr)));
                                     for (vid, callee_inst) in &callee_block.instructions {
                                         match callee_inst {
                                             Instruction::BlockParam(idx) => {
@@ -5689,6 +5819,7 @@ pub mod cl {
                                             }
                                         }
                                     }
+                                    INLINE_CLASS.set(outer_class);
                                     let return_val = if inline_failed {
                                         None
                                     } else {
@@ -6138,6 +6269,7 @@ pub mod cl {
                             }
                             let callee_block = &callee_mir.blocks[0];
                             let mut inline_failed = false;
+                            let outer_class = INLINE_CLASS.replace(Some((r, *expected_class)));
                             for (vid, callee_inst) in &callee_block.instructions {
                                 match callee_inst {
                                     Instruction::BlockParam(idx) => {
@@ -6177,6 +6309,7 @@ pub mod cl {
                                     }
                                 }
                             }
+                            INLINE_CLASS.set(outer_class);
                             let return_val = if inline_failed {
                                 None
                             } else {

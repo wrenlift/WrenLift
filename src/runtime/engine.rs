@@ -4338,7 +4338,12 @@ impl ExecutionEngine {
                 .into_iter()
                 .filter(|h| all_targets.contains(h))
                 .collect();
-            let select = if staged {
+            // A module body runs once, so its own entry is never taken:
+            // the loop the interpreter is waiting at comes first, with a
+            // body that only hands back to the interpreter.
+            let select = if staged && trace_name_clone == "<module>" && !first.is_empty() {
+                OsrSelect::StubBody(first.clone())
+            } else if staged {
                 OsrSelect::Headers(first.clone())
             } else {
                 OsrSelect::All

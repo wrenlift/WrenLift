@@ -317,16 +317,18 @@ pub mod llvm {
         for (global, addr) in shared.globals.borrow().iter() {
             engine.add_global_mapping(global, *addr as usize);
         }
+        let t_engine = t0.elapsed();
         let fn_ptr = engine
             .get_function_address(&safe_name)
             .map_err(|e| e.to_string())? as *const u8;
         if std::env::var_os("WLIFT_TIER_TRACE").is_some() {
             eprintln!(
-                "tier-trace: llvm {} build={:?} opt={:?} codegen={:?}",
+                "tier-trace: llvm {} build={:?} opt={:?} engine={:?} codegen={:?}",
                 safe_name,
                 t_build,
                 t_opt - t_build,
-                t0.elapsed() - t_opt
+                t_engine - t_opt,
+                t0.elapsed() - t_engine
             );
         }
         let mut osr_entries = Vec::with_capacity(osr_defs.len());

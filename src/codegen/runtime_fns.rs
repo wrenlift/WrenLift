@@ -5657,6 +5657,13 @@ fn deopt_impl(func_id: u32, args: &[u64]) -> u64 {
     // recompile can go through the broker.
     let _decision = vm.engine.tier.record_bailout(id, 0, 0);
     vm.engine.note_speculation_failed(id, &vm.interner);
+    run_interpreted(vm, func_id, args)
+}
+
+/// Run `func_id` on `args` in the interpreter and return its result.
+#[cfg(feature = "host")]
+fn run_interpreted(vm: &mut crate::runtime::vm::VM, func_id: u32, args: &[u64]) -> u64 {
+    let id = crate::runtime::engine::FuncId(func_id);
     let values: Vec<Value> = args.iter().map(|&a| Value::from_bits(a)).collect();
 
     // The running closure when the dispatcher recorded one for this
@@ -5839,6 +5846,22 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
 pub unsafe extern "C" fn wren_deopt_n(func_id: u64, n: u64, buf: *const u64) -> u64 {
     let args: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
     deopt_impl(func_id as u32, &args)
+}
+
+/// The body of a function whose compile so far holds only its loop
+/// entries: run it in the interpreter on the `n` arguments in `buf`.
+///
+/// # Safety
+/// `buf` must point at `n` readable u64s; compiled code passes its own
+/// stack buffer.
+#[cfg(feature = "host")]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_run_interpreted(func_id: u64, n: u64, buf: *const u64) -> u64 {
+    let Some(vm) = (unsafe { vm_ref() }) else {
+        return Value::null().to_bits();
+    };
+    let args: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
+    run_interpreted(vm, func_id as u32, &args)
 }
 
 // ---------------------------------------------------------------------------
@@ -6373,6 +6396,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_deopt_n" => Some(wren_deopt_n as *const () as usize),
         #[cfg(feature = "host")]
         "wren_deopt_at" => Some(wren_deopt_at as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_run_interpreted" => Some(wren_run_interpreted as *const () as usize),
         // Subscript
         "wren_subscript_get" => Some(wren_subscript_get as *const () as usize),
         "wren_subscript_set" => Some(wren_subscript_set as *const () as usize),
