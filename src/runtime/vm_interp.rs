@@ -185,6 +185,32 @@ fn call_native_with_frame_sync(
     func: NativeFn,
     args: &[Value],
 ) -> Value {
+    with_frame_sync(vm, fiber, pc, values, |vm| func(vm, args))
+}
+
+/// `call_native_with_frame_sync` for a host's method, told its context.
+#[inline]
+fn call_host_with_frame_sync(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    pc: u32,
+    values: &mut Vec<Value>,
+    func: crate::runtime::object::HostFn,
+    context: usize,
+    args: &[Value],
+) -> Value {
+    with_frame_sync(vm, fiber, pc, values, |vm| func(vm, context, args))
+}
+
+/// Run `f` with the frame's state saved onto the fiber and restored after.
+#[inline]
+fn with_frame_sync<R>(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    pc: u32,
+    values: &mut Vec<Value>,
+    f: impl FnOnce(&mut VM) -> R,
+) -> R {
     // Save frame state (pc + values) onto the fiber. Required so the
     // native can re-enter the VM (allocations, nested `vm.call_*`,
     // GC scans the saved register file).
@@ -206,7 +232,7 @@ fn call_native_with_frame_sync(
         }
     }
 
-    let result = func(vm, args);
+    let result = f(vm);
 
     unsafe {
         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -2774,6 +2800,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     match method_entry {
                         Some(
                             m @ (Method::Native(_)
+                            | Method::Host(..)
                             | Method::ForeignC(_)
                             | Method::ForeignCDynamic(_)),
                         ) => {
@@ -2784,6 +2811,15 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     pc,
                                     &mut values,
                                     func,
+                                    &arg_vals,
+                                ),
+                                Method::Host(func, context) => call_host_with_frame_sync(
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    context,
                                     &arg_vals,
                                 ),
                                 Method::ForeignC(func) => call_foreign_c_with_frame_sync(
@@ -3542,6 +3578,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         match method_entry {
                             Some(
                                 m @ (Method::Native(_)
+                                | Method::Host(..)
                                 | Method::ForeignC(_)
                                 | Method::ForeignCDynamic(_)),
                             ) => {
@@ -3552,6 +3589,15 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                         pc,
                                         &mut values,
                                         func,
+                                        &arg_vals,
+                                    ),
+                                    Method::Host(func, context) => call_host_with_frame_sync(
+                                        vm,
+                                        fiber,
+                                        pc,
+                                        &mut values,
+                                        func,
+                                        context,
                                         &arg_vals,
                                     ),
                                     Method::ForeignC(func) => call_foreign_c_with_frame_sync(
@@ -3663,6 +3709,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(
                             m @ (Method::Native(_)
+                            | Method::Host(..)
                             | Method::ForeignC(_)
                             | Method::ForeignCDynamic(_)),
                         ) => {
@@ -3673,6 +3720,15 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     pc,
                                     &mut values,
                                     func,
+                                    &all_args,
+                                ),
+                                Method::Host(func, context) => call_host_with_frame_sync(
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    context,
                                     &all_args,
                                 ),
                                 Method::ForeignC(func) => call_foreign_c_with_frame_sync(
@@ -3739,6 +3795,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(
                             m @ (Method::Native(_)
+                            | Method::Host(..)
                             | Method::ForeignC(_)
                             | Method::ForeignCDynamic(_)),
                         ) => {
@@ -3749,6 +3806,15 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     pc,
                                     &mut values,
                                     func,
+                                    &all_args,
+                                ),
+                                Method::Host(func, context) => call_host_with_frame_sync(
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    context,
                                     &all_args,
                                 ),
                                 Method::ForeignC(func) => call_foreign_c_with_frame_sync(
@@ -5460,13 +5526,21 @@ fn try_operator_dispatch(
         found
     };
     match method_entry {
-        Some(m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_))) => {
+        Some(
+            m @ (Method::Native(_)
+            | Method::Host(..)
+            | Method::ForeignC(_)
+            | Method::ForeignCDynamic(_)),
+        ) => {
             let mut arg_vals: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + args.len());
             arg_vals.push(recv);
             arg_vals.extend_from_slice(args);
             let result = match m {
                 Method::Native(func) => {
                     call_native_with_frame_sync(vm, fiber, *pc, values, func, &arg_vals)
+                }
+                Method::Host(func, context) => {
+                    call_host_with_frame_sync(vm, fiber, *pc, values, func, context, &arg_vals)
                 }
                 Method::ForeignC(func) => {
                     call_foreign_c_with_frame_sync(vm, fiber, *pc, values, func, &arg_vals)
