@@ -2836,9 +2836,16 @@ pub mod llvm {
             };
             if let Some(eq) = identity {
                 let same = self.icmp(IntPredicate::EQ, la, lb)?;
-                let (is_obj, ptr, _) = self.class_of(la)?;
-                // The null object carries no flags.
-                let flags = self.load8(ptr, CLASS_FLAGS as i64)?;
+                let (is_obj, _, class) = self.class_of(la)?;
+                // A non-object reads the null object's flags: none.
+                let null_obj =
+                    self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
+                let src = self
+                    .b
+                    .build_select(is_obj, class, null_obj, "flagsrc")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                let flags = self.load8(src, CLASS_FLAGS as i64)?;
                 let has_eq = self.icmp(
                     IntPredicate::NE,
                     self.and(flags, self.c64(CLASS_FLAG_EQ as u64))?,

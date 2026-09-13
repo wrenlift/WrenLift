@@ -5072,6 +5072,48 @@ System.print("%(sum) %(r) %(acc.a)")
 }
 
 #[test]
+fn e2e_top_tier_equality_honours_a_custom_operator() {
+    // `==` and `!=` on a non-Num compare by identity only when the left
+    // operand's class does not define them; the flag lives on the
+    // class, and a null or Num left operand has no class to read.
+    let src = r#"
+class P {
+  construct new(x) { _x = x }
+  x { _x }
+  ==(other) { other is P && _x == other.x }
+  !=(other) { !(this == other) }
+}
+class H {
+  construct new(p) { _p = p }
+  count(q, n) {
+    var acc = 0
+    for (i in 0...n) {
+      if (_p == q) acc = acc + 1
+      if (_p != q) acc = acc + 10
+      if (null == q) acc = acc + 100
+      if (q != 1) acc = acc + 1000
+    }
+    return acc
+  }
+}
+var h = H.new(P.new(7))
+System.print(h.count(P.new(7), 3000000))
+"#;
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(output.trim(), "3003000000");
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,
