@@ -5013,6 +5013,65 @@ System.print("%(sum) %(r) %(acc.a)")
 }
 
 #[test]
+fn e2e_top_tier_class_miss_on_guarded_call_deopts() {
+    // A guarded getter's class check has no slow path: when the
+    // receiver is a different class, even one whose getter also
+    // returns a Num, the interpreter redoes the call itself.
+    let src = r#"
+class Cell {
+  construct new(v) { _v = v }
+  v { _v }
+  v=(x) { _v = x }
+}
+class Twice {
+  construct new(v) { _v = v }
+  v { _v * 2 }
+}
+class Acc {
+  construct new() {
+    _a = Cell.new(1)
+    _b = Cell.new(2)
+  }
+  step(n) {
+    var total = 0
+    for (i in 0...n) {
+      _a.v = _a.v + i
+      total = total + _b.v
+    }
+    return total
+  }
+  switchB(v) { _b = v }
+  a { _a.v }
+}
+var acc = Acc.new()
+var sum = 0
+for (k in 0...400000) sum = sum + acc.step(20)
+acc.switchB(Twice.new(3))
+var r = acc.step(3)
+System.print("%(sum) %(r) %(acc.a)")
+"#;
+    // The warm-up is long enough for the top-tier compile to land and
+    // too long to also run interpreted here; the expected line is the
+    // interpreter's.
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    let deopts = vm.engine.deopt_exits;
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(output.trim(), "16000000 18 76000004");
+    if wren_lift::codegen::top_tier() == wren_lift::codegen::TopTier::Llvm {
+        assert_eq!(deopts, 1, "the class miss on `_b.v` fires exactly once");
+    }
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,

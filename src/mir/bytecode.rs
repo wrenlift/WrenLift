@@ -208,6 +208,7 @@ impl Clone for BytecodeFunction {
             param_offsets: self.param_offsets.clone(),
             osr_points: self.osr_points.clone(),
             resume_after_call: self.resume_after_call.clone(),
+            call_offsets: self.call_offsets.clone(),
             result_kinds: std::cell::UnsafeCell::new(unsafe { &*self.result_kinds.get() }.clone()),
             ic_table: std::cell::UnsafeCell::new(unsafe { &*self.ic_table.get() }.clone()),
         }
@@ -253,6 +254,9 @@ pub struct BytecodeFunction {
     /// register: where compiled code that speculated on the call's
     /// result resumes the interpreter when the speculation fails.
     pub resume_after_call: HashMap<ValueId, u32>,
+    /// The offset of each call, by destination register: where the
+    /// interpreter resumes to redo a call compiled code declined.
+    pub call_offsets: HashMap<ValueId, u32>,
     /// `RESULT_NUM` / `RESULT_OTHER` bits per register, or'd in by
     /// baseline code at every call it lowers. A call that only ever
     /// produced a Num may be speculated on by the top tier. Written
@@ -311,6 +315,7 @@ struct Encoder<'a> {
     osr_points: Vec<PendingOsrPoint>,
     call_site_count: u16,
     resume_after_call: HashMap<ValueId, u32>,
+    call_offsets: HashMap<ValueId, u32>,
 }
 
 impl<'a> Encoder<'a> {
@@ -326,6 +331,7 @@ impl<'a> Encoder<'a> {
             osr_points: Vec::new(),
             call_site_count: 0,
             resume_after_call: HashMap::new(),
+            call_offsets: HashMap::new(),
         }
     }
 
@@ -609,6 +615,7 @@ impl<'a> Encoder<'a> {
                 args,
                 pure_call: _,
             } => {
+                self.call_offsets.insert(dst, self.code.len() as u32);
                 self.emit_op(Op::Call);
                 self.emit_reg(dst);
                 self.emit_reg(*receiver);
@@ -923,6 +930,7 @@ impl<'a> Encoder<'a> {
                 self.call_site_count as usize
             ]),
             resume_after_call: self.resume_after_call,
+            call_offsets: self.call_offsets,
             result_kinds: std::cell::UnsafeCell::new(vec![0; self.mir.next_value as usize]),
         }
     }

@@ -2787,9 +2787,17 @@ impl ExecutionEngine {
             return mir;
         };
         let resume_after_call = unsafe { &(*bc).resume_after_call };
+        let call_offsets = unsafe { &(*bc).call_offsets };
         let result_kinds: Vec<u8> = unsafe { (*(*bc).result_kinds.get()).clone() };
         let live_in = live_in_sets(authoritative);
-        let mut sites: Vec<(ValueId, u32, Vec<ValueId>)> = Vec::new();
+        struct Site {
+            dst: ValueId,
+            pc: u32,
+            live: Vec<ValueId>,
+            call_pc: u32,
+            call_live: Vec<ValueId>,
+        }
+        let mut sites: Vec<Site> = Vec::new();
         for block in &authoritative.blocks {
             for (i, (dst, inst)) in block.instructions.iter().enumerate() {
                 if !matches!(inst, Instruction::Call { .. }) {
@@ -2802,6 +2810,9 @@ impl ExecutionEngine {
                 let Some(&pc) = resume_after_call.get(dst) else {
                     continue;
                 };
+                let Some(&call_pc) = call_offsets.get(dst) else {
+                    continue;
+                };
                 let mut live: HashSet<ValueId> = HashSet::new();
                 for succ in block.terminator.successors() {
                     live.extend(live_in.iter(succ.0 as usize));
@@ -2811,10 +2822,24 @@ impl ExecutionEngine {
                     live.remove(later_dst);
                     live.extend(later.operands());
                 }
+                // The call's own operands, needed to redo it.
+                let mut call_live: Vec<ValueId> = inst
+                    .operands()
+                    .into_iter()
+                    .filter(|v| !live.contains(v))
+                    .collect();
+                call_live.sort_by_key(|v| v.0);
+                call_live.dedup();
                 live.insert(*dst);
                 let mut live: Vec<ValueId> = live.into_iter().collect();
                 live.sort_by_key(|v| v.0);
-                sites.push((*dst, pc, live));
+                sites.push(Site {
+                    dst: *dst,
+                    pc,
+                    live,
+                    call_pc,
+                    call_live,
+                });
             }
         }
         if sites.is_empty() {
@@ -2867,15 +2892,23 @@ impl ExecutionEngine {
             .collect();
         let mut out = (*mir).clone();
         let mut placed: Vec<(usize, usize, Instruction, ValueId)> = Vec::new();
-        for (dst, pc, live) in sites {
+        for Site {
+            dst,
+            pc,
+            live,
+            call_pc,
+            call_live,
+        } in sites
+        {
             if !used.contains(&dst) {
                 continue;
             }
-            let live: Option<Vec<DeoptReg>> = live
-                .iter()
-                .map(|v| source_of(*v).map(|source| DeoptReg { reg: v.0, source }))
-                .collect();
-            let Some(live) = live else {
+            let regs = |ids: &[ValueId]| -> Option<Vec<DeoptReg>> {
+                ids.iter()
+                    .map(|v| source_of(*v).map(|source| DeoptReg { reg: v.0, source }))
+                    .collect()
+            };
+            let (Some(live), Some(call_live)) = (regs(&live), regs(&call_live)) else {
                 continue;
             };
             let Some((bi, pos)) = out.blocks.iter().enumerate().find_map(|(bi, b)| {
@@ -2890,6 +2923,8 @@ impl ExecutionEngine {
                 value: dst,
                 pc,
                 live,
+                call_pc,
+                call_live,
             };
             placed.push((bi, pos, guard, dst));
         }

@@ -6912,7 +6912,9 @@ pub mod cl {
                 emit_guard_deopt(builder, module, get_runtime_fn, is_box, jit_func_id())?;
                 Ok(Some(v))
             }
-            Instruction::GuardNumAt { value, pc, live } => {
+            Instruction::GuardNumAt {
+                value, pc, live, ..
+            } => {
                 let v = get(value);
                 if aot_config.is_some() {
                     return Ok(Some(v));

@@ -604,10 +604,11 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         );
     }
     // Dropping the VM would wait for a top-tier compile still in
-    // flight; the process has nothing left to run it for.
+    // flight, and a plain exit runs the compiler's static destructors
+    // under that thread; the process has nothing left to run it for.
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
-    process::exit(0);
+    unsafe { libc::_exit(0) }
 }
 
 /// Manual pipeline for debug dumps and WASM codegen.

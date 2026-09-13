@@ -27,7 +27,7 @@ pub mod llvm {
     use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, FunctionType};
     use inkwell::values::{
         BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue,
-        PointerValue,
+        MetadataValue, PointerValue,
     };
     use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -400,6 +400,13 @@ pub mod llvm {
         slots: HashMap<ValueId, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
         osr_vars: HashSet<ValueId>,
         vals: HashMap<ValueId, BasicValueEnum<'ctx>>,
+        /// TBAA access tag per instance field index: field arrays are
+        /// separate allocations, so slot `i` of any instance never
+        /// overlaps slot `j != i` of another and loads of one field
+        /// survive stores to another.
+        field_tbaa: HashMap<u16, MetadataValue<'ctx>>,
+        field_tbaa_root: Option<MetadataValue<'ctx>>,
+        miss_exit: Option<(u32, Vec<DeoptReg>)>,
         raw_bools: HashSet<ValueId>,
         value_types: Vec<MirType>,
         call_site_idx: usize,
@@ -446,6 +453,9 @@ pub mod llvm {
                 slots: HashMap::new(),
                 osr_vars: HashSet::new(),
                 vals: HashMap::new(),
+                field_tbaa: HashMap::new(),
+                field_tbaa_root: None,
+                miss_exit: None,
                 raw_bools: HashSet::new(),
                 value_types: infer_osr_value_types(mir),
                 call_site_idx: 0,
@@ -638,6 +648,56 @@ pub mod llvm {
             self.b
                 .build_int_to_ptr(a, self.ptrt(), "p")
                 .map_err(|e| e.to_string())
+        }
+
+        fn field_tag(&mut self, idx: u16) -> MetadataValue<'ctx> {
+            let ctx = self.sh.ctx;
+            let root = *self.field_tbaa_root.get_or_insert_with(|| {
+                ctx.metadata_node(&[ctx.metadata_string("wren fields").into()])
+            });
+            *self.field_tbaa.entry(idx).or_insert_with(|| {
+                let ty = ctx.metadata_node(&[
+                    ctx.metadata_string(&format!("field {idx}")).into(),
+                    root.into(),
+                    ctx.i64_type().const_zero().into(),
+                ]);
+                ctx.metadata_node(&[ty.into(), ty.into(), ctx.i64_type().const_zero().into()])
+            })
+        }
+
+        /// Load instance field `idx` from a fields array.
+        fn field_load(
+            &mut self,
+            fields: IntValue<'ctx>,
+            idx: u16,
+        ) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(fields, idx as i64 * VALUE_SIZE as i64)?;
+            let ld = self
+                .b
+                .build_load(self.i64t(), p, "fld")
+                .map_err(|e| e.to_string())?;
+            let tag = self.field_tag(idx);
+            let kind = self.sh.ctx.get_kind_id("tbaa");
+            ld.as_instruction_value()
+                .ok_or("load is not an instruction")?
+                .set_metadata(tag, kind)
+                .map_err(|e| e.to_string())?;
+            Ok(ld.into_int_value())
+        }
+
+        /// Store instance field `idx` of a fields array.
+        fn field_store(
+            &mut self,
+            fields: IntValue<'ctx>,
+            idx: u16,
+            v: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            let p = self.addr(fields, idx as i64 * VALUE_SIZE as i64)?;
+            let st = self.b.build_store(p, v).map_err(|e| e.to_string())?;
+            let tag = self.field_tag(idx);
+            let kind = self.sh.ctx.get_kind_id("tbaa");
+            st.set_metadata(tag, kind).map_err(|e| e.to_string())?;
+            Ok(())
         }
 
         fn load64(&mut self, base: IntValue<'ctx>, off: i64) -> Result<IntValue<'ctx>, String> {
@@ -1116,8 +1176,37 @@ pub mod llvm {
                     .map_err(|e| e.to_string())?;
                 self.vals.insert(vid, v);
             }
-            for &(vid, ref inst) in &block.instructions {
+            for (i, &(vid, ref inst)) in block.instructions.iter().enumerate() {
+                // A call whose result is guarded next may leave the
+                // function on a class miss instead of calling.
+                self.miss_exit = match block.instructions.get(i + 1) {
+                    Some((
+                        _,
+                        Instruction::GuardNumAt {
+                            value,
+                            live,
+                            call_pc,
+                            call_live,
+                            ..
+                        },
+                    )) if *value == vid
+                        && matches!(
+                            inst,
+                            Instruction::Call { .. } | Instruction::CallKnownFunc { .. }
+                        ) =>
+                    {
+                        let regs: Vec<DeoptReg> = live
+                            .iter()
+                            .filter(|r| r.reg != vid.0)
+                            .chain(call_live.iter())
+                            .copied()
+                            .collect();
+                        Some((*call_pc, regs))
+                    }
+                    _ => None,
+                };
                 let v = self.lower_instruction(vid, inst)?;
+                self.miss_exit = None;
                 if let Some(v) = v {
                     self.vals.insert(vid, v);
                     if is_raw_bool(inst) {
@@ -1310,15 +1399,14 @@ pub mod llvm {
                     let r = self.boxed(recv)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
                     let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
-                    self.load64(fields, (*idx as i64) * VALUE_SIZE as i64)?
-                        .into()
+                    self.field_load(fields, *idx)?.into()
                 }
                 I::SetField(recv, idx, val) => {
                     let r = self.boxed(recv)?;
                     let v = self.boxed(val)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
                     let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
-                    self.store64(fields, (*idx as i64) * VALUE_SIZE as i64, v)?;
+                    self.field_store(fields, *idx, v)?;
                     if crate::runtime::gc_trait::jit_needs_write_barriers() {
                         self.call_helper("wren_write_barrier", &[r, v])?;
                     }
@@ -1752,7 +1840,9 @@ pub mod llvm {
                     self.guard_deopt(fails)?;
                     v.into()
                 }
-                I::GuardNumAt { value, pc, live } => {
+                I::GuardNumAt {
+                    value, pc, live, ..
+                } => {
                     let v = self.boxed(value)?;
                     let fails = self.is_nan_boxed(v)?;
                     self.guard_deopt_at(fails, *pc, live)?;
@@ -2148,6 +2238,14 @@ pub mod llvm {
             let cont = self.new_block("cont");
             self.cbr(fails, deopt, cont)?;
             self.b.position_at_end(deopt);
+            self.deopt_exit(pc, live)?;
+            self.b.position_at_end(cont);
+            Ok(())
+        }
+
+        /// Leave the function from the current block: hand `live` to
+        /// `wren_deopt_at` for offset `pc` and return its result.
+        fn deopt_exit(&mut self, pc: u32, live: &[DeoptReg]) -> Result<(), String> {
             let words = live
                 .iter()
                 .map(crate::codegen::runtime_fns::deopt_words)
@@ -2182,8 +2280,31 @@ pub mod llvm {
             self.b
                 .build_return(Some(&result))
                 .map_err(|e| e.to_string())?;
-            self.b.position_at_end(cont);
             Ok(())
+        }
+
+        /// The class-miss exit a guarded call may take instead of its
+        /// slow path: `(offset of the call, registers live before it)`,
+        /// set while the call just before a `GuardNumAt` is lowered.
+        fn take_miss_exit(&mut self) -> Option<(u32, Vec<DeoptReg>)> {
+            if self.inline_depth > 0 {
+                return None;
+            }
+            self.miss_exit.take()
+        }
+
+        /// A `slow` block that leaves the function through the pending
+        /// miss exit, or `None` when the call must keep its slow path.
+        fn miss_exit_block(&mut self) -> Result<Option<BasicBlock<'ctx>>, String> {
+            let Some((pc, live)) = self.take_miss_exit() else {
+                return Ok(None);
+            };
+            let cur = self.b.get_insert_block().unwrap();
+            let bb = self.new_block("miss");
+            self.b.position_at_end(bb);
+            self.deopt_exit(pc, &live)?;
+            self.b.position_at_end(cur);
+            Ok(Some(bb))
         }
 
         fn helper2(
@@ -2531,12 +2652,17 @@ pub mod llvm {
             if let Some(ic) = ic {
                 if ic.kind == 5 && ic.class != 0 {
                     let fast = self.new_block("icf");
+                    let (hit, fields) = self.instance_check(r, ic.class as u64)?;
+                    if let Some(miss) = self.miss_exit_block()? {
+                        self.cbr(hit, fast, miss)?;
+                        self.b.position_at_end(fast);
+                        return self.field_load(fields, ic.func_id as u16);
+                    }
                     let slow = self.new_block("ics");
                     let merge = self.new_block("icm");
-                    let (hit, fields) = self.instance_check(r, ic.class as u64)?;
                     self.cbr(hit, fast, slow)?;
                     self.b.position_at_end(fast);
-                    let fv = self.load64(fields, (ic.func_id as i64) * VALUE_SIZE as i64)?;
+                    let fv = self.field_load(fields, ic.func_id as u16)?;
                     self.br(merge)?;
                     self.b.position_at_end(slow);
                     let m = self.method_bits(method, ic_idx);
@@ -2737,11 +2863,20 @@ pub mod llvm {
                         let slow = self.new_block("kis");
                         let merge = self.new_block("kim");
                         let (hit, _) = self.instance_check(r, expected_class as u64)?;
-                        self.cbr(hit, fast, slow)?;
+                        let miss = self.miss_exit_block()?;
+                        self.cbr(hit, fast, miss.unwrap_or(slow))?;
                         self.b.position_at_end(fast);
                         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
                             Vec::new();
                         match self.inline_body(&callee, r, &arg_vals)? {
+                            Some(v) if miss.is_some() => {
+                                slow.remove_from_function()
+                                    .map_err(|_| "remove unused block")?;
+                                merge
+                                    .remove_from_function()
+                                    .map_err(|_| "remove unused block")?;
+                                return Ok(v);
+                            }
                             Some(v) => {
                                 incoming.push((v.into(), self.b.get_insert_block().unwrap()));
                                 self.br(merge)?;
@@ -2803,12 +2938,17 @@ pub mod llvm {
 
             if let Some(field) = inline_getter_field {
                 let fast = self.new_block("gf");
+                let (hit, fields) = self.instance_check(r, expected_class as u64)?;
+                if let Some(miss) = self.miss_exit_block()? {
+                    self.cbr(hit, fast, miss)?;
+                    self.b.position_at_end(fast);
+                    return self.field_load(fields, field);
+                }
                 let slow = self.new_block("gs");
                 let merge = self.new_block("gm");
-                let (hit, fields) = self.instance_check(r, expected_class as u64)?;
                 self.cbr(hit, fast, slow)?;
                 self.b.position_at_end(fast);
-                let fv = self.load64(fields, (field as i64) * VALUE_SIZE as i64)?;
+                let fv = self.field_load(fields, field)?;
                 self.br(merge)?;
                 self.b.position_at_end(slow);
                 let sv = self.wren_call(r, m, &arg_vals)?;

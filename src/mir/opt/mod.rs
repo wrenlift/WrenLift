@@ -132,9 +132,14 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
         NegI64(a) | I64ToF64(a) | IsNum(a) => {
             *a = f(*a);
         }
-        GuardNumAt { value, live, .. } => {
+        GuardNumAt {
+            value,
+            live,
+            call_live,
+            ..
+        } => {
             *value = f(*value);
-            for r in live.iter_mut() {
+            for r in live.iter_mut().chain(call_live.iter_mut()) {
                 r.source.map(f);
             }
         }

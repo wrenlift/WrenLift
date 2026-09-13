@@ -439,13 +439,17 @@ pub enum Instruction {
     I64ToF64(ValueId),
     /// Whether a boxed value is a Num (raw bool). JIT compile clones only.
     IsNum(ValueId),
-    /// `GuardNum` on a value produced mid-body: when it fails, the
-    /// interpreter resumes at bytecode offset `pc` with each `live`
-    /// register in place. JIT compile clones only.
+    /// `GuardNum` on the result of the call just before it: when it
+    /// fails, the interpreter resumes at bytecode offset `pc` with each
+    /// `live` register in place. A lowering that cannot take the call's
+    /// fast path may instead resume at `call_pc`, the call itself, with
+    /// `live` less the result plus `call_live`. JIT compile clones only.
     GuardNumAt {
         value: ValueId,
         pc: u32,
         live: Vec<DeoptReg>,
+        call_pc: u32,
+        call_live: Vec<DeoptReg>,
     },
 }
 
@@ -598,9 +602,15 @@ impl Instruction {
             | Instruction::NegI64(a)
             | Instruction::I64ToF64(a)
             | Instruction::IsNum(a) => vec![*a],
-            Instruction::GuardNumAt { value, live, .. } => {
+            Instruction::GuardNumAt {
+                value,
+                live,
+                call_live,
+                ..
+            } => {
                 let mut ops = vec![*value];
                 ops.extend(live.iter().flat_map(|r| r.source.operands()));
+                ops.extend(call_live.iter().flat_map(|r| r.source.operands()));
                 ops
             }
             Instruction::AddI64(a, b)
@@ -1502,7 +1512,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CmpGeI64(a, b) => format!("icmp_i64.ge {}, {}", a, b),
         Instruction::I64ToF64(a) => format!("i64_to_f64 {}", a),
         Instruction::IsNum(a) => format!("is_num {}", a),
-        Instruction::GuardNumAt { value, pc, live } => format!(
+        Instruction::GuardNumAt {
+            value, pc, live, ..
+        } => format!(
             "guard.num.at {} pc={} live=[{}]",
             value,
             pc,
