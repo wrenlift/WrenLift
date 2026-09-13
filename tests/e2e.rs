@@ -5210,6 +5210,15 @@ System.print(total)
                 .is_some_and(|m| vm.interner.resolve(m.name) == "build(_)")
         })
         .expect("build(_) is registered");
+    // The compile runs on another thread; give it time to land, then
+    // a failed compile is the only way the body stays interpreted.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while vm.engine.tier_state(build) == wren_lift::runtime::engine::TierState::Interpreted
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        vm.engine.poll_compilations();
+    }
     assert_ne!(
         vm.engine.tier_state(build),
         wren_lift::runtime::engine::TierState::Interpreted,
