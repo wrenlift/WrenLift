@@ -1424,6 +1424,11 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     result
 }
 
+/// Readable zero words compiled code reads in place of an object
+/// header when the receiver is not an object: its class is null, so a
+/// class check on it always misses without a branch before the load.
+pub static JIT_NULL_OBJECT: [u64; 8] = [0; 8];
+
 static OSR_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static TIER_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 

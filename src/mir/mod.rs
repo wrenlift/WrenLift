@@ -473,6 +473,20 @@ impl Instruction {
         )
     }
 
+    /// Whether an unused result lets the instruction go: everything
+    /// without side effects, and the allocations, whose only effect is
+    /// the object nobody would see.
+    pub fn removable_when_unused(&self) -> bool {
+        !self.has_side_effects()
+            || matches!(
+                self,
+                Instruction::MakeList(..)
+                    | Instruction::MakeMap(..)
+                    | Instruction::MakeRange { .. }
+                    | Instruction::MakeClosure { .. }
+            )
+    }
+
     /// Get the values this instruction reads.
     pub fn operands(&self) -> Vec<ValueId> {
         match self {

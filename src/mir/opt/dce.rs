@@ -69,7 +69,7 @@ fn remove_dead_instructions(func: &mut MirFunction) -> bool {
         let before = block.instructions.len();
         block
             .instructions
-            .retain(|(vid, inst)| used.contains(vid) || inst.has_side_effects());
+            .retain(|(vid, inst)| used.contains(vid) || !inst.removable_when_unused());
         if block.instructions.len() != before {
             changed = true;
         }
@@ -90,7 +90,7 @@ fn compute_used_values(func: &MirFunction) -> HashSet<ValueId> {
     // Seed from side-effecting instructions.
     for block in &func.blocks {
         for (_, inst) in &block.instructions {
-            if inst.has_side_effects() {
+            if !inst.removable_when_unused() {
                 for op in inst.operands() {
                     used.insert(op);
                 }

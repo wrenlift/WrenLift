@@ -299,6 +299,15 @@ pub mod llvm {
             eprintln!("{}", module.print_to_string().to_string());
             eprintln!("=== end ===");
         }
+        // `WLIFT_LLVM_ASM=1` prints the host assembly of every module.
+        if std::env::var_os("WLIFT_LLVM_ASM").is_some() {
+            let buf = machine
+                .write_to_memory_buffer(&module, inkwell::targets::FileType::Assembly)
+                .map_err(|e| e.to_string())?;
+            eprintln!("=== LLVM ASM for {} ===", safe_name);
+            eprintln!("{}", String::from_utf8_lossy(buf.as_slice()));
+            eprintln!("=== end ===");
+        }
 
         let engine = module
             .create_jit_execution_engine(codegen_level())
@@ -639,6 +648,31 @@ pub mod llvm {
                 .map_err(|e| e.to_string())
         }
 
+        /// A load of an object word that never changes while the object
+        /// is alive (its class, its fields pointer). Under a non-moving
+        /// collector LLVM may keep it across stores it cannot
+        /// disambiguate; a moving collector rewrites those words.
+        fn load64_stable(
+            &mut self,
+            base: IntValue<'ctx>,
+            off: i64,
+        ) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(base, off)?;
+            let ld = self
+                .b
+                .build_load(self.i64t(), p, "ld")
+                .map_err(|e| e.to_string())?;
+            if !crate::runtime::gc_trait::jit_needs_write_barriers() {
+                let ctx = self.sh.ctx;
+                let kind = ctx.get_kind_id("invariant.load");
+                ld.as_instruction_value()
+                    .ok_or("load is not an instruction")?
+                    .set_metadata(ctx.metadata_node(&[]), kind)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(ld.into_int_value())
+        }
+
         fn load8(&mut self, base: IntValue<'ctx>, off: i64) -> Result<IntValue<'ctx>, String> {
             let p = self.addr(base, off)?;
             let v = self
@@ -829,8 +863,49 @@ pub mod llvm {
             self.cbr(is_obj, obj, not_object)?;
             self.b.position_at_end(obj);
             let ptr = self.and(recv, self.c64(PTR_MASK))?;
-            let class = self.load64(ptr, HEADER_CLASS as i64)?;
+            let class = self.load64_stable(ptr, HEADER_CLASS as i64)?;
             Ok((ptr, class))
+        }
+
+        /// `(is_object, ptr, class)` of `r` without a branch: a
+        /// non-object reads the null object's zero class instead, so a
+        /// class check is a pure function of `r` and repeated checks on
+        /// one receiver fold into one.
+        fn class_of(
+            &mut self,
+            r: IntValue<'ctx>,
+        ) -> Result<(IntValue<'ctx>, IntValue<'ctx>, IntValue<'ctx>), String> {
+            let high = self.and(r, self.c64(TAG_OBJ))?;
+            let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(TAG_OBJ))?;
+            let masked = self.and(r, self.c64(PTR_MASK))?;
+            let null_obj = self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
+            let ptr = self
+                .b
+                .build_select(is_obj, masked, null_obj, "optr")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let class = self.load64_stable(ptr, HEADER_CLASS as i64)?;
+            Ok((is_obj, ptr, class))
+        }
+
+        /// `(hit, fields)` for a receiver expected to be an instance of
+        /// `class`; `fields` reads the null object when it is not.
+        fn instance_check(
+            &mut self,
+            r: IntValue<'ctx>,
+            class: u64,
+        ) -> Result<(IntValue<'ctx>, IntValue<'ctx>), String> {
+            let (is_obj, ptr, recv_class) = self.class_of(r)?;
+            let same = self.icmp(IntPredicate::EQ, recv_class, self.c64(class))?;
+            let hit = self.b.build_and(is_obj, same, "hit").map_err(|e| e.to_string())?;
+            let null_obj = self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
+            let safe = self
+                .b
+                .build_select(hit, ptr, null_obj, "iptr")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let fields = self.load64_stable(safe, INSTANCE_FIELDS as i64)?;
+            Ok((hit, fields))
         }
 
         // ── Driver ─────────────────────────────────────────────────────
@@ -1231,7 +1306,7 @@ pub mod llvm {
                 I::GetField(recv, idx) => {
                     let r = self.boxed(recv)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
+                    let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
                     self.load64(fields, (*idx as i64) * VALUE_SIZE as i64)?
                         .into()
                 }
@@ -1239,7 +1314,7 @@ pub mod llvm {
                     let r = self.boxed(recv)?;
                     let v = self.boxed(val)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
+                    let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
                     self.store64(fields, (*idx as i64) * VALUE_SIZE as i64, v)?;
                     if crate::runtime::gc_trait::jit_needs_write_barriers() {
                         self.call_helper("wren_write_barrier", &[r, v])?;
@@ -1777,12 +1852,42 @@ pub mod llvm {
             let ta_bb = self.new_block("ta");
             self.cbr(is_ta, ta_bb, slow)?;
             self.b.position_at_end(ta_bb);
+            let idx_i = self.int_index(idx, obj, TYPED_ARRAY_COUNT as i64, slow)?;
+            let data = self.load64(obj, TYPED_ARRAY_DATA as i64)?;
+            let kind = self.load8(obj, TYPED_ARRAY_KIND as i64)?;
+            Ok((obj, idx_i, data, kind))
+        }
+
+        /// `idx` as an i64 when it is an integral Num below the u32
+        /// count at `obj + count_off`; otherwise branch to `slow`.
+        fn int_index(
+            &mut self,
+            idx: IntValue<'ctx>,
+            obj: IntValue<'ctx>,
+            count_off: i64,
+            slow: BasicBlock<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let is_box = self.is_nan_boxed(idx)?;
+            let num_bb = self.new_block("ixn");
+            self.cbr(is_box, slow, num_bb)?;
+            self.b.position_at_end(num_bb);
             let idx_f = self.f64_of(idx)?;
             let idx_i = self
                 .b
                 .build_float_to_signed_int(idx_f, self.i64t(), "idx")
                 .map_err(|e| e.to_string())?;
-            let count_p = self.addr(obj, TYPED_ARRAY_COUNT as i64)?;
+            let back = self
+                .b
+                .build_signed_int_to_float(idx_i, self.f64t(), "idxf")
+                .map_err(|e| e.to_string())?;
+            let integral = self
+                .b
+                .build_float_compare(FloatPredicate::OEQ, back, idx_f, "int")
+                .map_err(|e| e.to_string())?;
+            let int_bb = self.new_block("ixi");
+            self.cbr(integral, int_bb, slow)?;
+            self.b.position_at_end(int_bb);
+            let count_p = self.addr(obj, count_off)?;
             let count32 = self
                 .b
                 .build_load(self.sh.ctx.i32_type(), count_p, "count")
@@ -1793,12 +1898,41 @@ pub mod llvm {
                 .build_int_z_extend(count32, self.i64t(), "count64")
                 .map_err(|e| e.to_string())?;
             let in_range = self.icmp(IntPredicate::ULT, idx_i, count)?;
-            let ok_bb = self.new_block("tai");
+            let ok_bb = self.new_block("ixr");
             self.cbr(in_range, ok_bb, slow)?;
             self.b.position_at_end(ok_bb);
-            let data = self.load64(obj, TYPED_ARRAY_DATA as i64)?;
-            let kind = self.load8(obj, TYPED_ARRAY_KIND as i64)?;
-            Ok((obj, idx_i, data, kind))
+            Ok(idx_i)
+        }
+
+        /// The address of `r[idx]` when `r` is a List and `idx` an
+        /// integral Num within its count; otherwise branch to `other`.
+        fn list_element(
+            &mut self,
+            r: IntValue<'ctx>,
+            idx: IntValue<'ctx>,
+            other: BasicBlock<'ctx>,
+        ) -> Result<PointerValue<'ctx>, String> {
+            let high = self
+                .b
+                .build_right_shift(r, self.c64(48), false, "tag")
+                .map_err(|e| e.to_string())?;
+            let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(0xFFFC))?;
+            let obj_bb = self.new_block("leo");
+            self.cbr(is_obj, obj_bb, other)?;
+            self.b.position_at_end(obj_bb);
+            let obj = self.and(r, self.c64(PTR_MASK))?;
+            let ty = self.load8(obj, HEADER_OBJ_TYPE as i64)?;
+            let is_list = self.icmp(
+                IntPredicate::EQ,
+                ty,
+                self.c64(crate::runtime::object::ObjType::List as u64),
+            )?;
+            let list_bb = self.new_block("lel");
+            self.cbr(is_list, list_bb, other)?;
+            self.b.position_at_end(list_bb);
+            let i = self.int_index(idx, obj, LIST_COUNT as i64, other)?;
+            let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
+            self.element_addr(elements, i, VALUE_SIZE as u64)
         }
 
         fn element_addr(
@@ -1820,8 +1954,8 @@ pub mod llvm {
                 .map_err(|e| e.to_string())
         }
 
-        /// `r[idx]` with the typed-array element kinds inline and
-        /// everything else through the helper.
+        /// `r[idx]` with List elements and the typed-array element kinds
+        /// inline and everything else through the helper.
         fn typed_array_get(
             &mut self,
             r: IntValue<'ctx>,
@@ -1829,8 +1963,18 @@ pub mod llvm {
         ) -> Result<IntValue<'ctx>, String> {
             let slow = self.new_block("sgs");
             let merge = self.new_block("sgm");
-            let (_, i, data, kind) = self.typed_array_probe(r, idx, slow)?;
             let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+            let other = self.new_block("sgo");
+            let p = self.list_element(r, idx, other)?;
+            let v = self
+                .b
+                .build_load(self.i64t(), p, "elem")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+            self.br(merge)?;
+            self.b.position_at_end(other);
+            let (_, i, data, kind) = self.typed_array_probe(r, idx, slow)?;
             let ctx = self.sh.ctx;
             let kinds: [(u8, u64); 4] = [
                 (TA_KIND_F64, 8),
@@ -1896,8 +2040,8 @@ pub mod llvm {
             Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
         }
 
-        /// `r[idx] = v` with f32/f64 typed-array stores inline and
-        /// everything else through the helper.
+        /// `r[idx] = v` with List and f32/f64 typed-array stores inline
+        /// and everything else through the helper.
         fn typed_array_set(
             &mut self,
             r: IntValue<'ctx>,
@@ -1906,6 +2050,14 @@ pub mod llvm {
         ) -> Result<IntValue<'ctx>, String> {
             let slow = self.new_block("sss");
             let merge = self.new_block("ssm");
+            let other = self.new_block("sso");
+            let p = self.list_element(r, idx, other)?;
+            self.b.build_store(p, v).map_err(|e| e.to_string())?;
+            if crate::runtime::gc_trait::jit_needs_write_barriers() {
+                self.call_helper("wren_write_barrier", &[r, v])?;
+            }
+            self.br(merge)?;
+            self.b.position_at_end(other);
             let (_, i, data, kind) = self.typed_array_probe(r, idx, slow)?;
             let is_box = self.is_nan_boxed(v)?;
             let num_bb = self.new_block("ssn");
@@ -2263,15 +2415,19 @@ pub mod llvm {
                         let slow = self.new_block("chas");
                         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
                             Vec::new();
-                        let (_, recv_class) = self.class_load_guarded(r, slow)?;
+                        let (is_obj, _, recv_class) = self.class_of(r)?;
                         for (class_ptr, fid, _) in &impls {
                             let next = self.new_block("chan");
                             let fast = self.new_block("chaf");
-                            let hit = self.icmp(
+                            let same = self.icmp(
                                 IntPredicate::EQ,
                                 recv_class,
                                 self.c64(*class_ptr as u64),
                             )?;
+                            let hit = self
+                                .b
+                                .build_and(is_obj, same, "hit")
+                                .map_err(|e| e.to_string())?;
                             self.cbr(hit, fast, next)?;
                             self.b.position_at_end(fast);
                             let body = self.sh.inline_bodies.and_then(|b| b.get(fid)).cloned();
@@ -2314,11 +2470,9 @@ pub mod llvm {
                     let fast = self.new_block("icf");
                     let slow = self.new_block("ics");
                     let merge = self.new_block("icm");
-                    let (obj, recv_class) = self.class_load_guarded(r, slow)?;
-                    let hit = self.icmp(IntPredicate::EQ, recv_class, self.c64(ic.class as u64))?;
+                    let (hit, fields) = self.instance_check(r, ic.class as u64)?;
                     self.cbr(hit, fast, slow)?;
                     self.b.position_at_end(fast);
-                    let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
                     let fv = self.load64(fields, (ic.func_id as i64) * VALUE_SIZE as i64)?;
                     self.br(merge)?;
                     self.b.position_at_end(slow);
@@ -2519,12 +2673,7 @@ pub mod llvm {
                         let fast = self.new_block("kif");
                         let slow = self.new_block("kis");
                         let merge = self.new_block("kim");
-                        let (_, recv_class) = self.class_load_guarded(r, slow)?;
-                        let hit = self.icmp(
-                            IntPredicate::EQ,
-                            recv_class,
-                            self.c64(expected_class as u64),
-                        )?;
+                        let (hit, _) = self.instance_check(r, expected_class as u64)?;
                         self.cbr(hit, fast, slow)?;
                         self.b.position_at_end(fast);
                         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
@@ -2557,12 +2706,7 @@ pub mod llvm {
                     let slow = self.new_block("pls");
                     let call_bb = self.new_block("plc");
                     let merge = self.new_block("plm");
-                    let (_, recv_class) = self.class_load_guarded(r, slow)?;
-                    let hit = self.icmp(
-                        IntPredicate::EQ,
-                        recv_class,
-                        self.c64(expected_class as u64),
-                    )?;
+                    let (hit, _) = self.instance_check(r, expected_class as u64)?;
                     self.cbr(hit, fast, slow)?;
                     self.b.position_at_end(fast);
                     let slot_addr = unsafe { base.add(func_id as usize) } as u64;
@@ -2598,15 +2742,9 @@ pub mod llvm {
                 let fast = self.new_block("gf");
                 let slow = self.new_block("gs");
                 let merge = self.new_block("gm");
-                let (obj, recv_class) = self.class_load_guarded(r, slow)?;
-                let hit = self.icmp(
-                    IntPredicate::EQ,
-                    recv_class,
-                    self.c64(expected_class as u64),
-                )?;
+                let (hit, fields) = self.instance_check(r, expected_class as u64)?;
                 self.cbr(hit, fast, slow)?;
                 self.b.position_at_end(fast);
-                let fields = self.load64(obj, INSTANCE_FIELDS as i64)?;
                 let fv = self.load64(fields, (field as i64) * VALUE_SIZE as i64)?;
                 self.br(merge)?;
                 self.b.position_at_end(slow);
@@ -2626,12 +2764,7 @@ pub mod llvm {
                 let fast = self.new_block("kf");
                 let slow = self.new_block("ks");
                 let merge = self.new_block("km");
-                let (_, recv_class) = self.class_load_guarded(r, slow)?;
-                let hit = self.icmp(
-                    IntPredicate::EQ,
-                    recv_class,
-                    self.c64(expected_class as u64),
-                )?;
+                let (hit, _) = self.instance_check(r, expected_class as u64)?;
                 self.cbr(hit, fast, slow)?;
                 self.b.position_at_end(fast);
                 let fv = self.known_call_nocheck(func_id, method, r, &arg_vals)?;
