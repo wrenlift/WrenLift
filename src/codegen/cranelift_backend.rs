@@ -1280,8 +1280,32 @@ pub mod cl {
                 .iter()
                 .any(|(_, inst)| matches!(inst, Instruction::CallStaticSelf { .. }))
         });
-        let use_f64_inner =
-            has_num_guards && has_self_calls && param_count > 0 && !has_mid_body_guards;
+        // The inner body carries its parameters raw, which only its
+        // own recursion knows how to pass; any other call would need
+        // them boxed.
+        let has_other_calls = mir.blocks.iter().any(|b| {
+            b.instructions.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    Instruction::Call { .. }
+                        | Instruction::CallKnownFunc { .. }
+                        | Instruction::SuperCall { .. }
+                        | Instruction::SubscriptGet { .. }
+                        | Instruction::SubscriptSet { .. }
+                        | Instruction::MakeClosure { .. }
+                        | Instruction::MakeList(..)
+                        | Instruction::MakeMap(..)
+                        | Instruction::MakeRange { .. }
+                        | Instruction::StringConcat(..)
+                        | Instruction::ToString(..)
+                )
+            })
+        });
+        let use_f64_inner = has_num_guards
+            && has_self_calls
+            && param_count > 0
+            && !has_mid_body_guards
+            && !has_other_calls;
 
         let mut sig = module.make_signature();
         for _ in 0..param_count {
