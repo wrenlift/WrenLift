@@ -175,17 +175,32 @@ pub fn top_tier_ceiling(
     let instrs: usize = mir.blocks.iter().map(|b| b.instructions.len()).sum();
     let mut site = 0usize;
     let mut calls = 0usize;
+    // A body that calls itself iterates through the stack; it is
+    // judged like a loop.
+    let mut recursive = false;
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
-                Instruction::Call { .. } | Instruction::SuperCall { .. } => {
+                Instruction::Call { method, .. } => {
+                    if !field_access_site(site) {
+                        calls += 1;
+                    }
+                    recursive |= *method == mir.name;
+                    site += 1;
+                }
+                Instruction::SuperCall { .. } => {
                     if !field_access_site(site) {
                         calls += 1;
                     }
                     site += 1;
                 }
-                Instruction::CallKnownFunc { .. } | Instruction::CallStaticSelf { .. } => {
+                Instruction::CallKnownFunc { method, .. } => {
                     calls += 1;
+                    recursive |= *method == mir.name;
+                }
+                Instruction::CallStaticSelf { .. } => {
+                    calls += 1;
+                    recursive = true;
                 }
                 _ => {}
             }
@@ -198,7 +213,7 @@ pub fn top_tier_ceiling(
     with_preds.compute_predecessors();
     let rpo = compute_rpo(&with_preds);
     let idom = compute_dominators(&with_preds, &rpo);
-    if detect_loops(&with_preds, &idom).is_empty() {
+    if !recursive && detect_loops(&with_preds, &idom).is_empty() {
         if instrs.saturating_sub(calls) <= 8 {
             return TopTierCeiling::None;
         }
