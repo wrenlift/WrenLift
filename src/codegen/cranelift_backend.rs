@@ -2094,6 +2094,10 @@ pub mod cl {
             "wren_known_call_1_nocheck",
             "wren_known_call_2_nocheck",
             "wren_known_call_3_nocheck",
+            "wren_construct_0",
+            "wren_construct_1",
+            "wren_construct_2",
+            "wren_construct_3",
             "wren_ic_call_0",
             "wren_ic_call_1",
             "wren_ic_call_2",
@@ -4325,6 +4329,45 @@ pub mod cl {
 
         // Slow path: call runtime function
         builder.switch_to_block(slow_block);
+        // Equality on anything but a Num is identity unless the left
+        // operand's class says otherwise, which the helper decides.
+        let identity = match op {
+            InlineBinOp::Cmp(FloatCC::Equal) => Some(true),
+            InlineBinOp::Cmp(FloatCC::NotEqual) => Some(false),
+            _ => None,
+        };
+        if let Some(eq) = identity {
+            let ideq_block = builder.create_block();
+            let call_block = builder.create_block();
+            let obj_block = builder.create_block();
+            let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+            let high = builder.ins().band(la, tag_obj);
+            let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+            builder.ins().brif(is_obj, obj_block, &[], ideq_block, &[]);
+            builder.switch_to_block(obj_block);
+            let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+            let ptr = builder.ins().band(la, mask);
+            let class = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), ptr, HEADER_CLASS);
+            let flags = builder
+                .ins()
+                .load(types::I8, MemFlags::trusted(), class, CLASS_FLAGS);
+            let eq_bit = builder.ins().iconst(types::I8, CLASS_FLAG_EQ as i64);
+            let custom = builder.ins().band(flags, eq_bit);
+            builder.ins().brif(custom, call_block, &[], ideq_block, &[]);
+            builder.switch_to_block(ideq_block);
+            let same = builder.ins().icmp(IntCC::Equal, la, lb);
+            let true_val = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+            let false_val = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+            let r = if eq {
+                builder.ins().select(same, true_val, false_val)
+            } else {
+                builder.ins().select(same, false_val, true_val)
+            };
+            builder.ins().jump(merge_block, &[BlockArg::Value(r)]);
+            builder.switch_to_block(call_block);
+        }
         let f = get_runtime_fn(module, builder, slow_fn, 2)?;
         let call = builder.ins().call(f, &[la, lb]);
         let slow_result = builder.inst_results(call)[0];
@@ -5353,6 +5396,53 @@ pub mod cl {
                 let ic = if aot_config.is_some() { None } else { ic };
 
                 if let Some(ic) = ic {
+                    // A constructor on a resolved class: allocate and run
+                    // the initialiser directly when the receiver is that
+                    // class object.
+                    if ic.kind == 3 && ic.class != 0 && ic.func_id != 0 && args.len() <= 3 {
+                        let fast_block = builder.create_block();
+                        let slow_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, types::I64);
+                        let class_bits = builder
+                            .ins()
+                            .iconst(types::I64, (TAG_OBJ | ic.class as u64) as i64);
+                        let hit = builder.ins().icmp(IntCC::Equal, r, class_bits);
+                        builder.ins().brif(hit, fast_block, &[], slow_block, &[]);
+                        builder.switch_to_block(fast_block);
+                        let packed = ic.func_id | ((method.index() as u64) << 32);
+                        let packed_val = builder.ins().iconst(types::I64, packed as i64);
+                        let arg_vals: Vec<_> = args.iter().map(&get).collect();
+                        let name = [
+                            "wren_construct_0",
+                            "wren_construct_1",
+                            "wren_construct_2",
+                            "wren_construct_3",
+                        ][args.len()];
+                        let f = get_runtime_fn(module, builder, name, 2 + args.len())?;
+                        let mut call_args = vec![packed_val, r];
+                        call_args.extend(arg_vals.iter().copied());
+                        let call = builder.ins().call(f, &call_args);
+                        let fast_result = builder.inst_results(call)[0];
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(fast_result)]);
+                        builder.switch_to_block(slow_block);
+                        let method_val = builder.ins().iconst(types::I64, method.index() as i64);
+                        let slow_result = emit_wren_call(
+                            builder,
+                            module,
+                            get_runtime_fn,
+                            r,
+                            method_val,
+                            &arg_vals,
+                        )?;
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
+                        builder.switch_to_block(merge_block);
+                        return Ok(Some(builder.block_params(merge_block)[0]));
+                    }
                     // Only emit IC fast path for kind=5 (getter inline).
                     // Kind=1 uses the slow path with IC index encoding so
                     // dispatch_call_rooted can use cached method lookups.

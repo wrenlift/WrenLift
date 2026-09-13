@@ -88,6 +88,10 @@ pub fn initialize(vm: &mut VM) {
 
     // Collection classes inherit from Sequence (user classes can too).
     vm.string_class = vm.make_class("String", vm.sequence_class);
+    // Strings compare by content through Object's `==`.
+    unsafe {
+        (*vm.string_class).flags |= crate::runtime::object_layout::CLASS_FLAG_EQ;
+    }
     vm.list_class = vm.make_class("List", vm.sequence_class);
     vm.map_class = vm.make_class("Map", vm.sequence_class);
     vm.range_class = vm.make_class("Range", vm.sequence_class);

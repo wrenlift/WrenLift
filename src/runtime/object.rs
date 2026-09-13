@@ -1315,6 +1315,8 @@ pub struct ObjClass {
     /// `field_kinds.as_mut_ptr()`, at a fixed offset for compiled code;
     /// null when the class keeps no field kinds.
     pub field_kinds_ptr: *mut u8,
+    /// `CLASS_FLAG_*` bits, at a fixed offset for compiled code.
+    pub flags: u8,
     /// Class name.
     pub name: SymbolId,
     /// Superclass (null for Object).
@@ -1571,12 +1573,14 @@ impl ObjClass {
     pub fn new(name: SymbolId, superclass: *mut ObjClass) -> Self {
         let methods;
         let mut protocols = crate::sema::protocol::ProtocolSet::EMPTY;
+        let mut flags = 0u8;
 
-        // Inherit methods and protocols from superclass.
+        // Inherit methods, protocols and flags from superclass.
         if !superclass.is_null() {
             unsafe {
                 methods = (*superclass).methods.clone();
                 protocols = (*superclass).protocols;
+                flags = (*superclass).flags;
             }
         } else {
             methods = Vec::new();
@@ -1585,6 +1589,7 @@ impl ObjClass {
         Self {
             header: ObjHeader::new(ObjType::Class),
             field_kinds_ptr: std::ptr::null_mut(),
+            flags,
             name,
             superclass,
             methods,
@@ -1627,6 +1632,14 @@ impl ObjClass {
     pub fn bind_native(&mut self, name: SymbolId, func: NativeFn) {
         self.ensure_capacity(name);
         self.methods[name.index() as usize] = Some(Method::Native(func));
+    }
+
+    /// Note that `signature` is being bound on this class: equality
+    /// operators make instance equality something other than identity.
+    pub fn note_bound_signature(&mut self, signature: &str) {
+        if signature == "==(_)" || signature == "!=(_)" {
+            self.flags |= crate::runtime::object_layout::CLASS_FLAG_EQ;
+        }
     }
 
     /// Bind a dynamic-plugin foreign method by side-table index.

@@ -21,6 +21,11 @@ pub const HEADER_SIZE: i32 = 24;
 
 /// `*mut u8`: one `FIELD_*` byte per instance field, or null.
 pub const CLASS_FIELD_KINDS: i32 = 24;
+/// u8 of `CLASS_FLAG_*` bits.
+pub const CLASS_FLAGS: i32 = 32;
+/// The class or an ancestor other than Object defines `==` or `!=`, so
+/// equality on its instances is not identity.
+pub const CLASS_FLAG_EQ: u8 = 1;
 
 // -- ObjInstance (40 bytes) --------------------------------------------------
 

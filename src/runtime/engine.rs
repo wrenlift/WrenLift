@@ -1744,18 +1744,61 @@ impl ExecutionEngine {
         (out_ics, out_live, out_hints)
     }
 
+    /// Fill empty call-site caches from what the compile can resolve:
+    /// a method with one implementation across the class hierarchy
+    /// (kind 1), and a constructor called on a class a module variable
+    /// holds right now (kind 3; the site still checks the receiver is
+    /// that class object).
     fn fill_ic_with_cha(
         &self,
+        id: FuncId,
         mir: &crate::mir::MirFunction,
         ic_snapshot: &mut [CallSiteIC],
         cha: &ChaMap,
+        interner: &crate::intern::Interner,
     ) {
         use crate::mir::Instruction;
+        use crate::runtime::object::{Method, ObjClass, ObjHeader, ObjType};
+        let modvars = self
+            .func_module(id)
+            .and_then(|m| self.modules.get(m.as_str()))
+            .map(|e| &e.vars);
+        let modvar_of: HashMap<crate::mir::ValueId, u32> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::GetModuleVar(idx) => Some((*v, *idx as u32)),
+                _ => None,
+            })
+            .collect();
+        let constructor_of =
+            |receiver: &crate::mir::ValueId,
+             method: &SymbolId|
+             -> Option<(usize, u32, *mut crate::runtime::object::ObjClosure)> {
+                let slot = *modvar_of.get(receiver)?;
+                let value = *modvars?.get(slot as usize)?;
+                let ptr = value.as_object()?;
+                if unsafe { (*(ptr as *const ObjHeader)).obj_type } != ObjType::Class {
+                    return None;
+                }
+                let class = unsafe { &*(ptr as *const ObjClass) };
+                let sym = interner.lookup(&format!("static:{}", interner.resolve(*method)))?;
+                match class.methods.get(sym.index() as usize).copied().flatten()? {
+                    Method::Constructor(closure) if !closure.is_null() => {
+                        let fid = unsafe { (*(*closure).function).fn_id };
+                        Some((ptr as usize, fid, closure))
+                    }
+                    _ => None,
+                }
+            };
         let mut ic_idx = 0usize;
         for block in &mir.blocks {
             for (_, inst) in &block.instructions {
                 match inst {
-                    Instruction::Call { method, .. } => {
+                    Instruction::Call {
+                        receiver, method, ..
+                    } => {
                         if let Some(slot) = ic_snapshot.get_mut(ic_idx) {
                             if slot.kind == 0 {
                                 if let Some(impls) = cha.get(method) {
@@ -1766,6 +1809,16 @@ impl ExecutionEngine {
                                         slot.closure = closure_ptr as *const u8;
                                         slot.kind = 1;
                                     }
+                                }
+                            }
+                            if slot.kind == 0 {
+                                if let Some((class_ptr, fid, closure)) =
+                                    constructor_of(receiver, method)
+                                {
+                                    slot.class = class_ptr;
+                                    slot.func_id = fid as u64;
+                                    slot.closure = closure as *const u8;
+                                    slot.kind = 3;
                                 }
                             }
                         }
@@ -3644,7 +3697,7 @@ impl ExecutionEngine {
         } else {
             let cha = self.build_jit_cha();
             if let Some(ref mut ics) = callsite_ic_ptrs {
-                self.fill_ic_with_cha(&mir, ics, &cha);
+                self.fill_ic_with_cha(id, &mir, ics, &cha, interner);
             }
             Some(Arc::new(cha))
         };
@@ -3863,7 +3916,7 @@ impl ExecutionEngine {
         } else {
             let cha = self.build_jit_cha();
             if let Some(ref mut ics) = callsite_ic_ptrs {
-                self.fill_ic_with_cha(&mir, ics, &cha);
+                self.fill_ic_with_cha(id, &mir, ics, &cha, interner);
             }
             Some(Arc::new(cha))
         };

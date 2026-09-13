@@ -4050,54 +4050,131 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
         .get(fid)
         .copied()
         .unwrap_or(std::ptr::null());
-    // Root inbound args: even an alloc-free callee can allocate through
-    // helpers, and on a collection the register-passed receiver and
-    // args go stale, so they are re-read from the root set.
-    let roots = unsafe { &mut (*j).roots };
-    let root_base = roots.len();
-    roots.extend_from_slice(args);
+    // The conservative collector scans this frame, so the arguments
+    // need no root entries; a moving collector re-reads them from the
+    // root set after the call may have collected.
+    let conservative = vm.gc.is_immix();
     let arg_count = args.len();
-    let load_args = |j: *mut JitThread| -> smallvec::SmallVec<[Value; 5]> {
-        let roots = unsafe { &(*j).roots };
-        roots[root_base..root_base + arg_count]
-            .iter()
-            .copied()
-            .collect()
-    };
-
-    let result = (|| {
-        if !jit_ptr.is_null() && arg_count <= 4 {
-            let depth = unsafe { (*j).depth };
-            if depth < MAX_JIT_DEPTH {
-                // A leaf callee never looks up an IC table, so its
-                // current_func_id need not be set.
-                let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
-                let saved_func_id = unsafe { (*j).ctx.current_func_id };
-                if !is_leaf {
-                    unsafe { (*j).ctx.current_func_id = func_id as u64 };
-                }
-                unsafe { (*j).depth = depth + 1 };
-                let collected = load_args(j);
-                let result =
-                    unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &collected) };
-                unsafe {
-                    (*j).depth = depth;
-                    if !is_leaf {
-                        (*j).ctx.current_func_id = saved_func_id;
-                    }
-                }
-                return result;
+    if !jit_ptr.is_null() && arg_count <= 4 {
+        let depth = unsafe { (*j).depth };
+        if depth < MAX_JIT_DEPTH {
+            // A leaf callee never looks up an IC table, so its
+            // current_func_id need not be set.
+            let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
+            let saved_func_id = unsafe { (*j).ctx.current_func_id };
+            if !is_leaf {
+                unsafe { (*j).ctx.current_func_id = func_id as u64 };
             }
+            unsafe { (*j).depth = depth + 1 };
+            let result = if conservative {
+                unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, args) }
+            } else {
+                let roots = unsafe { &mut (*j).roots };
+                let root_base = roots.len();
+                roots.extend_from_slice(args);
+                let collected: smallvec::SmallVec<[Value; 5]> = unsafe { &(*j).roots }
+                    [root_base..root_base + arg_count]
+                    .iter()
+                    .copied()
+                    .collect();
+                let r = unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &collected) };
+                unsafe { (*j).roots.truncate(root_base) };
+                r
+            };
+            unsafe {
+                (*j).depth = depth;
+                if !is_leaf {
+                    (*j).ctx.current_func_id = saved_func_id;
+                }
+            }
+            return result;
         }
+    }
 
-        // Callee not compiled yet → fall back to full dispatch.
-        let collected = load_args(j);
-        let recv = collected.first().copied().unwrap_or(Value::null());
-        let method_sym = crate::intern::SymbolId::from_raw(method_raw);
-        dispatch_call(recv, method_sym.index() as u64, &collected)
-    })();
-    unsafe { (*j).roots.truncate(root_base) };
-    result
+    // Callee not compiled yet → fall back to full dispatch.
+    let recv = args.first().copied().unwrap_or(Value::null());
+    let method_sym = crate::intern::SymbolId::from_raw(method_raw);
+    dispatch_call(recv, method_sym.index() as u64, args)
+}
+
+/// `Class.new(args)` from a call site whose cache resolved the class:
+/// allocate the instance and run the compiled initialiser on it, the
+/// way a method is reached through `wren_known_call_N_nocheck`. Falls
+/// back to full dispatch on the class when the initialiser is not
+/// compiled. `packed` is the initialiser's function id in the low word
+/// and the call's method symbol in the high word.
+fn wren_construct_inner(packed: u64, class_bits: u64, args: &[u64]) -> u64 {
+    let func_id = (packed & 0xFFFF_FFFF) as u32;
+    let method_raw = (packed >> 32) as u32;
+    let j = jit_state();
+    let vm_ptr = unsafe { (*j).ctx.vm } as *mut crate::runtime::vm::VM;
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let fid = func_id as usize;
+    let fid_obj = crate::runtime::engine::FuncId(func_id);
+    let jit_ptr = vm
+        .engine
+        .jit_code
+        .get(fid)
+        .copied()
+        .unwrap_or(std::ptr::null());
+    let depth = unsafe { (*j).depth };
+    let class_val = Value::from_bits(class_bits);
+    let class_ptr = class_val
+        .as_object()
+        .map(|p| p as *mut ObjClass)
+        .unwrap_or(std::ptr::null_mut());
+    if jit_ptr.is_null()
+        || class_ptr.is_null()
+        || args.len() > 3
+        || depth >= MAX_JIT_DEPTH
+        || crate::runtime::gc_trait::jit_needs_write_barriers()
+    {
+        let mut all: smallvec::SmallVec<[Value; 5]> = smallvec::SmallVec::new();
+        all.push(class_val);
+        all.extend(args.iter().map(|a| Value::from_bits(*a)));
+        return dispatch_call(class_val, method_raw as u64, &all);
+    }
+    // The conservative collector scans this frame; the initialiser
+    // runs with the instance and arguments pinned here.
+    let inst = vm.gc.alloc_instance(class_ptr);
+    let inst_bits = unsafe { finish_alloc(vm, Value::object(inst as *mut u8)) };
+    let mut call_args: smallvec::SmallVec<[Value; 5]> = smallvec::SmallVec::new();
+    call_args.push(Value::from_bits(inst_bits));
+    call_args.extend(args.iter().map(|a| Value::from_bits(*a)));
+    let saved_func_id = unsafe { (*j).ctx.current_func_id };
+    let saved_class = unsafe { (*j).ctx.defining_class };
+    unsafe {
+        (*j).ctx.current_func_id = func_id as u64;
+        (*j).ctx.defining_class = class_ptr as *mut u8;
+        (*j).depth = depth + 1;
+    }
+    let _ = unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &call_args) };
+    unsafe {
+        (*j).depth = depth;
+        (*j).ctx.current_func_id = saved_func_id;
+        (*j).ctx.defining_class = saved_class;
+    }
+    inst_bits
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_construct_0(packed: u64, class: u64) -> u64 {
+    wren_construct_inner(packed, class, &[])
+}
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_construct_1(packed: u64, class: u64, a0: u64) -> u64 {
+    wren_construct_inner(packed, class, &[a0])
+}
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_construct_2(packed: u64, class: u64, a0: u64, a1: u64) -> u64 {
+    wren_construct_inner(packed, class, &[a0, a1])
+}
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_construct_3(packed: u64, class: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_construct_inner(packed, class, &[a0, a1, a2])
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
@@ -6231,6 +6308,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_known_call_1_nocheck" => Some(wren_known_call_1_nocheck as *const () as usize),
         "wren_known_call_2_nocheck" => Some(wren_known_call_2_nocheck as *const () as usize),
         "wren_known_call_3_nocheck" => Some(wren_known_call_3_nocheck as *const () as usize),
+        "wren_construct_0" => Some(wren_construct_0 as *const () as usize),
+        "wren_construct_1" => Some(wren_construct_1 as *const () as usize),
+        "wren_construct_2" => Some(wren_construct_2 as *const () as usize),
+        "wren_construct_3" => Some(wren_construct_3 as *const () as usize),
         // Indirect IC dispatch (lightweight JIT-to-JIT calls)
         "wren_ic_call_0" => Some(wren_ic_call_0 as *const () as usize),
         "wren_ic_call_1" => Some(wren_ic_call_1 as *const () as usize),

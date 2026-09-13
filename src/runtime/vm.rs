@@ -1931,6 +1931,11 @@ impl VM {
                         (*existing).superclass = superclass;
                         (*existing).name = class_mir.name;
                         (*existing).is_foreign = false;
+                        (*existing).flags = if superclass.is_null() {
+                            0
+                        } else {
+                            (*superclass).flags
+                        };
                     }
                     existing
                 }
@@ -2027,6 +2032,7 @@ impl VM {
                 };
 
                 unsafe {
+                    (*class_ptr).note_bound_signature(&method_mir.signature);
                     let method = if method_mir.is_constructor {
                         Method::Constructor(closure_ptr)
                     } else {
@@ -2756,6 +2762,11 @@ impl VM {
         let sym = self.interner.intern(signature);
         unsafe {
             (*class).bind_native(sym, func);
+            // Object's own equality is identity, which compiled code
+            // may test without a call; everything else is not.
+            if class != self.object_class {
+                (*class).note_bound_signature(signature);
+            }
         }
     }
 

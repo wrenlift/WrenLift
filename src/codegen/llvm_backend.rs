@@ -2628,16 +2628,49 @@ pub mod llvm {
             let fast_end = self.b.get_insert_block().unwrap();
             self.br(merge)?;
             self.b.position_at_end(slow);
+            let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
+                vec![(fast_v.into(), fast_end)];
+            // Equality on anything but a Num is identity unless the left
+            // operand's class says otherwise, which a helper decides.
+            let identity = match op {
+                BinOp::Cmp(FloatPredicate::OEQ) => Some(true),
+                BinOp::Cmp(FloatPredicate::UNE) => Some(false),
+                _ => None,
+            };
+            if let Some(eq) = identity {
+                let same = self.icmp(IntPredicate::EQ, la, lb)?;
+                let (is_obj, ptr, _) = self.class_of(la)?;
+                // The null object carries no flags.
+                let flags = self.load8(ptr, CLASS_FLAGS as i64)?;
+                let has_eq = self.icmp(
+                    IntPredicate::NE,
+                    self.and(flags, self.c64(CLASS_FLAG_EQ as u64))?,
+                    self.c64(0),
+                )?;
+                let custom = self
+                    .b
+                    .build_and(is_obj, has_eq, "customeq")
+                    .map_err(|e| e.to_string())?;
+                let by_identity = self.new_block("ideq");
+                let call = self.new_block("eqcall");
+                self.cbr(custom, call, by_identity)?;
+                self.b.position_at_end(by_identity);
+                let r = if eq {
+                    same
+                } else {
+                    self.b.build_not(same, "ne").map_err(|e| e.to_string())?
+                };
+                let v = self.box_bool(r)?;
+                incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+                self.b.position_at_end(call);
+            }
             let slow_v = self.call_helper(slow_fn, &[la, lb])?;
             let slow_end = self.b.get_insert_block().unwrap();
+            incoming.push((slow_v.into(), slow_end));
             self.br(merge)?;
             self.b.position_at_end(merge);
-            Ok(self
-                .phi(
-                    self.i64t().into(),
-                    &[(fast_v.into(), fast_end), (slow_v.into(), slow_end)],
-                )?
-                .into_int_value())
+            Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
         }
 
         // ── Calls ──────────────────────────────────────────────────────
@@ -2841,6 +2874,41 @@ pub mod llvm {
             let ic = ic_idx.and_then(|i| self.sh.callsite_ic_ptrs.and_then(|ics| ics.get(i)));
             let _ = self.sh.callsite_ic_live_ptrs;
             if let Some(ic) = ic {
+                // A constructor on a resolved class: allocate and run the
+                // initialiser directly when the receiver is that class.
+                if ic.kind == 3 && ic.class != 0 && ic.func_id != 0 && args.len() <= 3 {
+                    let fast = self.new_block("ctf");
+                    let slow = self.new_block("cts");
+                    let merge = self.new_block("ctm");
+                    let hit =
+                        self.icmp(IntPredicate::EQ, r, self.c64(TAG_OBJ | ic.class as u64))?;
+                    self.cbr(hit, fast, slow)?;
+                    self.b.position_at_end(fast);
+                    let packed = self.c64(ic.func_id | ((method.index() as u64) << 32));
+                    let name = [
+                        "wren_construct_0",
+                        "wren_construct_1",
+                        "wren_construct_2",
+                        "wren_construct_3",
+                    ][args.len()];
+                    let mut call_args = vec![packed, r];
+                    call_args.extend(arg_vals.iter().copied());
+                    let fv = self.call_helper(name, &call_args)?;
+                    let fast_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(slow);
+                    let m = self.method_bits(method, ic_idx);
+                    let sv = self.wren_call(r, m, &arg_vals)?;
+                    let slow_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    return Ok(self
+                        .phi(
+                            self.i64t().into(),
+                            &[(fv.into(), fast_end), (sv.into(), slow_end)],
+                        )?
+                        .into_int_value());
+                }
                 if ic.kind == 5 && ic.class != 0 {
                     let fast = self.new_block("icf");
                     let (hit, fields) = self.instance_check(r, ic.class as u64)?;
