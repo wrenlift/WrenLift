@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":5,"timestamp":1789326758,"nonce":"NJuEBf4FtUl1s44lw7RQQtTPtVg=","added":["perf","area:codegen"],"removed":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789326764,"nonce":"emj/72pur9xLCTPdoJXYr/8goAs=","message":"Kind-note change landed as 6a7193075ac3f767f3bd3991d30c361fb8c23f9f; the issue stays open for the scalar replacement.","files":null}]}
