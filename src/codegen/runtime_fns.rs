@@ -3222,6 +3222,7 @@ fn handle_jit_fiber_action(
 /// again. The compiled body when there is one, through the thread's JIT
 /// state read once; else the interpreter, with the tier ticked so the
 /// body compiles.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn call_found_closure(
     vm: &mut crate::runtime::vm::VM,
     closure: *mut ObjClosure,

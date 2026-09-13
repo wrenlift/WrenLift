@@ -3644,7 +3644,7 @@ mod tests {
     /// has found runs through `call_found_closure` as through a send.
     #[test]
     fn test_host_method_and_found_closure() {
-        use crate::runtime::object::{Method, ObjClass, ObjClosure};
+        use crate::runtime::object::{Method, ObjClass};
         let vm = wrenNewVM(ptr::null());
         let vm_ref = unsafe { &mut *vm };
         vm_ref.output_buffer = Some(String::new());
@@ -3698,7 +3698,7 @@ mod tests {
         for _ in 0..3 {
             let bits = crate::codegen::runtime_fns::call_found_closure(
                 vm_ref,
-                closure as *mut ObjClosure,
+                closure,
                 &[recv, Value::num(21.0)],
                 class,
             );
