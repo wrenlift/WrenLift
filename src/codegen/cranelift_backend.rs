@@ -1148,18 +1148,9 @@ pub mod cl {
         (idx as usize) < cell.len.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Compiled code calls a known compiled callee straight through its
-    /// `jit_code` slot under the conservative collector, which scans the
-    /// native frames a helper would otherwise root; a collector that
-    /// needs barriers, or `WLIFT_DISABLE_DIRECT_CALLS=1`, keeps the
-    /// helper. Safe to run with either way.
     #[inline]
     pub(crate) fn direct_calls_enabled() -> bool {
-        use std::sync::OnceLock;
-        static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            std::env::var_os("WLIFT_DISABLE_DIRECT_CALLS").is_none() && !env_jit_callsite_ic()
-        }) && !crate::runtime::gc_trait::jit_needs_write_barriers()
+        crate::codegen::direct_calls_enabled()
     }
 
     /// Stack maps are now ON by default. JIT-compiled Wren methods

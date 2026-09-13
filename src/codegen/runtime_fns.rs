@@ -432,6 +432,8 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
 
 #[inline(always)]
 unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = ctx;
     // Ensure x20 holds the JitContext pointer for the JIT code.
     #[cfg(target_arch = "aarch64")]
     {

@@ -1616,6 +1616,114 @@ fn fmt_terminator(term: &Terminator) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The representation type of every value: boxed `Value`, raw `F64`,
+/// `I64`, or `Bool` for comparison results; `Void` for ids without a
+/// definition.
+pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
+    let mut value_types = vec![MirType::Void; mir.next_value as usize];
+    for block in &mir.blocks {
+        for &(value, ty) in &block.params {
+            value_types[value.0 as usize] = ty;
+        }
+    }
+    for block in &mir.blocks {
+        for &(dst, ref inst) in &block.instructions {
+            let ty = match inst {
+                Instruction::ConstNum(_)
+                | Instruction::ConstBool(_)
+                | Instruction::ConstNull
+                | Instruction::ConstString(_)
+                | Instruction::Add(..)
+                | Instruction::Sub(..)
+                | Instruction::Mul(..)
+                | Instruction::Div(..)
+                | Instruction::Mod(..)
+                | Instruction::Neg(..)
+                | Instruction::Box(_)
+                | Instruction::GetField(..)
+                | Instruction::GetStaticField(_)
+                | Instruction::GetModuleVar(_)
+                | Instruction::Call { .. }
+                | Instruction::CallKnownFunc { .. }
+                | Instruction::CallStaticSelf { .. }
+                | Instruction::SuperCall { .. }
+                | Instruction::MakeClosure { .. }
+                | Instruction::GetUpvalue(_)
+                | Instruction::MakeList(_)
+                | Instruction::MakeMap(_)
+                | Instruction::MakeRange(..)
+                | Instruction::StringConcat(_)
+                | Instruction::ToString(_)
+                | Instruction::SubscriptGet { .. }
+                | Instruction::BitAnd(..)
+                | Instruction::BitOr(..)
+                | Instruction::BitXor(..)
+                | Instruction::BitNot(_)
+                | Instruction::Shl(..)
+                | Instruction::Shr(..) => MirType::Value,
+                Instruction::ConstF64(_)
+                | Instruction::MathUnaryF64(..)
+                | Instruction::MathBinaryF64(..)
+                | Instruction::AddF64(..)
+                | Instruction::SubF64(..)
+                | Instruction::MulF64(..)
+                | Instruction::DivF64(..)
+                | Instruction::ModF64(..)
+                | Instruction::NegF64(_)
+                | Instruction::Unbox(_) => MirType::F64,
+                Instruction::ConstI64(_) => MirType::I64,
+                Instruction::CmpLt(..)
+                | Instruction::CmpGt(..)
+                | Instruction::CmpLe(..)
+                | Instruction::CmpGe(..)
+                | Instruction::CmpEq(..)
+                | Instruction::CmpNe(..)
+                | Instruction::CmpLtF64(..)
+                | Instruction::CmpGtF64(..)
+                | Instruction::CmpLeF64(..)
+                | Instruction::CmpGeF64(..)
+                | Instruction::Not(_)
+                | Instruction::IsType(..)
+                | Instruction::ClassIs(..)
+                | Instruction::ObjectIs(..)
+                | Instruction::ClosureFnIs(..)
+                | Instruction::CmpLtI64(..)
+                | Instruction::CmpGtI64(..)
+                | Instruction::CmpLeI64(..)
+                | Instruction::CmpGeI64(..)
+                | Instruction::IsNum(_) => MirType::Bool,
+                Instruction::AddI64(..)
+                | Instruction::SubI64(..)
+                | Instruction::MulI64(..)
+                | Instruction::RemI64(..)
+                | Instruction::BandI64(..)
+                | Instruction::NegI64(_) => MirType::I64,
+                Instruction::I64ToF64(_) => MirType::F64,
+                Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
+                Instruction::SlowPathExit { .. } => MirType::Void,
+                Instruction::GuardNum(src)
+                | Instruction::GuardBool(src)
+                | Instruction::Move(src)
+                | Instruction::SetField(_, _, src)
+                | Instruction::SetStaticField(_, src)
+                | Instruction::SetModuleVar(_, src)
+                | Instruction::SetUpvalue(_, src) => value_types[src.0 as usize],
+                Instruction::GuardClass(src, _) | Instruction::GuardProtocol(src, _) => {
+                    value_types[src.0 as usize]
+                }
+                Instruction::SubscriptSet { value, .. } => value_types[value.0 as usize],
+                Instruction::BlockParam(idx) => block
+                    .params
+                    .get(*idx as usize)
+                    .map(|(_, ty)| *ty)
+                    .unwrap_or(MirType::Value),
+            };
+            value_types[dst.0 as usize] = ty;
+        }
+    }
+    value_types
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1851,112 +1959,4 @@ mod tests {
         assert_eq!(f.block(bb1).predecessors, vec![bb0]);
         assert_eq!(f.block(bb1).params.len(), 1);
     }
-}
-
-/// The representation type of every value: boxed `Value`, raw `F64`,
-/// `I64`, or `Bool` for comparison results; `Void` for ids without a
-/// definition.
-pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
-    let mut value_types = vec![MirType::Void; mir.next_value as usize];
-    for block in &mir.blocks {
-        for &(value, ty) in &block.params {
-            value_types[value.0 as usize] = ty;
-        }
-    }
-    for block in &mir.blocks {
-        for &(dst, ref inst) in &block.instructions {
-            let ty = match inst {
-                Instruction::ConstNum(_)
-                | Instruction::ConstBool(_)
-                | Instruction::ConstNull
-                | Instruction::ConstString(_)
-                | Instruction::Add(..)
-                | Instruction::Sub(..)
-                | Instruction::Mul(..)
-                | Instruction::Div(..)
-                | Instruction::Mod(..)
-                | Instruction::Neg(..)
-                | Instruction::Box(_)
-                | Instruction::GetField(..)
-                | Instruction::GetStaticField(_)
-                | Instruction::GetModuleVar(_)
-                | Instruction::Call { .. }
-                | Instruction::CallKnownFunc { .. }
-                | Instruction::CallStaticSelf { .. }
-                | Instruction::SuperCall { .. }
-                | Instruction::MakeClosure { .. }
-                | Instruction::GetUpvalue(_)
-                | Instruction::MakeList(_)
-                | Instruction::MakeMap(_)
-                | Instruction::MakeRange(..)
-                | Instruction::StringConcat(_)
-                | Instruction::ToString(_)
-                | Instruction::SubscriptGet { .. }
-                | Instruction::BitAnd(..)
-                | Instruction::BitOr(..)
-                | Instruction::BitXor(..)
-                | Instruction::BitNot(_)
-                | Instruction::Shl(..)
-                | Instruction::Shr(..) => MirType::Value,
-                Instruction::ConstF64(_)
-                | Instruction::MathUnaryF64(..)
-                | Instruction::MathBinaryF64(..)
-                | Instruction::AddF64(..)
-                | Instruction::SubF64(..)
-                | Instruction::MulF64(..)
-                | Instruction::DivF64(..)
-                | Instruction::ModF64(..)
-                | Instruction::NegF64(_)
-                | Instruction::Unbox(_) => MirType::F64,
-                Instruction::ConstI64(_) => MirType::I64,
-                Instruction::CmpLt(..)
-                | Instruction::CmpGt(..)
-                | Instruction::CmpLe(..)
-                | Instruction::CmpGe(..)
-                | Instruction::CmpEq(..)
-                | Instruction::CmpNe(..)
-                | Instruction::CmpLtF64(..)
-                | Instruction::CmpGtF64(..)
-                | Instruction::CmpLeF64(..)
-                | Instruction::CmpGeF64(..)
-                | Instruction::Not(_)
-                | Instruction::IsType(..)
-                | Instruction::ClassIs(..)
-                | Instruction::ObjectIs(..)
-                | Instruction::ClosureFnIs(..)
-                | Instruction::CmpLtI64(..)
-                | Instruction::CmpGtI64(..)
-                | Instruction::CmpLeI64(..)
-                | Instruction::CmpGeI64(..)
-                | Instruction::IsNum(_) => MirType::Bool,
-                Instruction::AddI64(..)
-                | Instruction::SubI64(..)
-                | Instruction::MulI64(..)
-                | Instruction::RemI64(..)
-                | Instruction::BandI64(..)
-                | Instruction::NegI64(_) => MirType::I64,
-                Instruction::I64ToF64(_) => MirType::F64,
-                Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
-                Instruction::SlowPathExit { .. } => MirType::Void,
-                Instruction::GuardNum(src)
-                | Instruction::GuardBool(src)
-                | Instruction::Move(src)
-                | Instruction::SetField(_, _, src)
-                | Instruction::SetStaticField(_, src)
-                | Instruction::SetModuleVar(_, src)
-                | Instruction::SetUpvalue(_, src) => value_types[src.0 as usize],
-                Instruction::GuardClass(src, _) | Instruction::GuardProtocol(src, _) => {
-                    value_types[src.0 as usize]
-                }
-                Instruction::SubscriptSet { value, .. } => value_types[value.0 as usize],
-                Instruction::BlockParam(idx) => block
-                    .params
-                    .get(*idx as usize)
-                    .map(|(_, ty)| *ty)
-                    .unwrap_or(MirType::Value),
-            };
-            value_types[dst.0 as usize] = ty;
-        }
-    }
-    value_types
 }

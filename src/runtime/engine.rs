@@ -1499,7 +1499,7 @@ impl ExecutionEngine {
         caller: FuncId,
         ic_snapshot: &[CallSiteIC],
     ) -> Vec<crate::codegen::DevirtHint> {
-        let direct_calls = crate::codegen::cranelift_backend::cl::direct_calls_enabled();
+        let direct_calls = crate::codegen::direct_calls_enabled();
         let caller_module = self.func_module(caller);
         ic_snapshot
             .iter()

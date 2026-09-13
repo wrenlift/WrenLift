@@ -2132,6 +2132,21 @@ pub fn top_tier_is_llvm() -> bool {
     top_tier() == TopTier::Llvm
 }
 
+/// Compiled code calls a known compiled callee straight through its
+/// `jit_code` slot under the conservative collector, which scans the
+/// native frames a helper would otherwise root; a collector that needs
+/// barriers, call-site caches passed to the helpers
+/// (`WLIFT_ENABLE_JIT_CALLSITE_IC`), or `WLIFT_DISABLE_DIRECT_CALLS=1`
+/// keep the helper. Safe to run with either way.
+pub fn direct_calls_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var_os("WLIFT_DISABLE_DIRECT_CALLS").is_none()
+            && std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_none()
+    }) && !crate::runtime::gc_trait::jit_needs_write_barriers()
+}
+
 /// Compile a MIR function to native code or WASM for the given target.
 ///
 /// Native pipeline: MIR → lower → regalloc → sentinel fixup → emit.
