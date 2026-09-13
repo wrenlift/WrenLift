@@ -603,6 +603,11 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
             stats.gc_time_ns as f64 / 1e9
         );
     }
+    // Dropping the VM would wait for a top-tier compile still in
+    // flight; the process has nothing left to run it for.
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    process::exit(0);
 }
 
 /// Manual pipeline for debug dumps and WASM codegen.

@@ -76,16 +76,25 @@ impl TierCell {
 struct Promoter {
     tx: Option<mpsc::SyncSender<Box<dyn FnOnce() + Send>>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Set when the engine goes away; jobs still queued are dropped
+    /// unrun.
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "host")]
 impl Promoter {
     fn start() -> Self {
         let (tx, rx) = mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(256);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
         let worker = std::thread::Builder::new()
             .name("wlift-promoter".into())
             .spawn(move || {
                 for job in rx {
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        drop(job);
+                        continue;
+                    }
                     job();
                 }
             })
@@ -93,6 +102,7 @@ impl Promoter {
         Self {
             tx: Some(tx),
             worker: Some(worker),
+            stop,
         }
     }
 
@@ -105,11 +115,12 @@ impl Promoter {
 }
 
 /// A job in flight writes into engine memory (the function's tier cell,
-/// the install channel), so the engine waits for the queue to drain
-/// before its tables go.
+/// the install channel), so the engine waits for it before its tables
+/// go; jobs still queued are dropped unrun.
 #[cfg(feature = "host")]
 impl Drop for Promoter {
     fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
         drop(self.tx.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
