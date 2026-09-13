@@ -552,6 +552,139 @@ pub mod cl {
         Ok(builder.inst_results(call)[0])
     }
 
+    /// `iterate(_)`, `iteratorValue(_)` and `add(_)` on a list, inline:
+    /// the protocol steps a Num index against the count and ends with
+    /// `false`, the value is the element at a Num index within the
+    /// count, and an add with room stores and counts. Anything else
+    /// takes the call. Returns `None` when `method` is not one of them.
+    fn try_lower_list_protocol<G>(
+        interner: &Interner,
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut G,
+        receiver: Value,
+        method: crate::intern::SymbolId,
+        args: &[Value],
+    ) -> Result<Option<Value>, String>
+    where
+        G: FnMut(
+                &mut dyn Module,
+                &mut FunctionBuilder,
+                &str,
+                usize,
+            ) -> Result<cranelift_codegen::ir::FuncRef, String>
+            + ?Sized,
+    {
+        if args.len() != 1 {
+            return Ok(None);
+        }
+        let which = match interner.resolve(method) {
+            "iterate(_)" => 0,
+            "iteratorValue(_)" => 1,
+            "add(_)" if !crate::runtime::gc_trait::jit_needs_write_barriers() => 2,
+            _ => return Ok(None),
+        };
+        let arg = args[0];
+        let slow = builder.create_block();
+        let merge = builder.create_block();
+        builder.append_block_param(merge, types::I64);
+        let obj = emit_guarded_obj_ptr_with_type(
+            builder,
+            receiver,
+            crate::runtime::object::ObjType::List as i32,
+            slow,
+        );
+        let count32 = builder.ins().uload32(MemFlags::trusted(), obj, LIST_COUNT);
+        let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+        let masked = builder.ins().band(arg, qnan);
+        let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+        match which {
+            0 => {
+                let countf = builder.ins().fcvt_from_uint(types::F64, count32);
+                let tag_null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                let is_null = builder.ins().icmp(IntCC::Equal, arg, tag_null);
+                let num_block = builder.create_block();
+                let step_block = builder.create_block();
+                let cand_block = builder.create_block();
+                builder.append_block_param(cand_block, types::F64);
+                let zero = builder.ins().f64const(0.0);
+                builder.ins().brif(
+                    is_null,
+                    cand_block,
+                    &[BlockArg::Value(zero)],
+                    num_block,
+                    &[],
+                );
+                builder.switch_to_block(num_block);
+                builder.ins().brif(is_box, slow, &[], step_block, &[]);
+                builder.switch_to_block(step_block);
+                let f = builder.ins().bitcast(types::F64, MemFlags::new(), arg);
+                let one = builder.ins().f64const(1.0);
+                let next = builder.ins().fadd(f, one);
+                builder.ins().jump(cand_block, &[BlockArg::Value(next)]);
+                builder.switch_to_block(cand_block);
+                let cand = builder.block_params(cand_block)[0];
+                let in_range = builder.ins().fcmp(FloatCC::LessThan, cand, countf);
+                let bits = builder.ins().bitcast(types::I64, MemFlags::new(), cand);
+                let tag_false = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                let res = builder.ins().select(in_range, bits, tag_false);
+                builder.ins().jump(merge, &[BlockArg::Value(res)]);
+            }
+            1 => {
+                let num_block = builder.create_block();
+                let load_block = builder.create_block();
+                builder.ins().brif(is_box, slow, &[], num_block, &[]);
+                builder.switch_to_block(num_block);
+                let f = builder.ins().bitcast(types::F64, MemFlags::new(), arg);
+                let idx = builder.ins().fcvt_to_sint_sat(types::I64, f);
+                let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, idx, count32);
+                builder.ins().brif(in_range, load_block, &[], slow, &[]);
+                builder.switch_to_block(load_block);
+                let elements =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj, LIST_ELEMENTS);
+                let off = builder.ins().ishl_imm_u(idx, 3);
+                let ea = builder.ins().iadd(elements, off);
+                let v = builder.ins().load(types::I64, MemFlags::trusted(), ea, 0);
+                builder.ins().jump(merge, &[BlockArg::Value(v)]);
+            }
+            _ => {
+                let cap32 = builder
+                    .ins()
+                    .uload32(MemFlags::trusted(), obj, LIST_CAPACITY);
+                let room = builder.ins().icmp(IntCC::UnsignedLessThan, count32, cap32);
+                let store_block = builder.create_block();
+                let grow_block = builder.create_block();
+                builder.ins().brif(room, store_block, &[], grow_block, &[]);
+                builder.switch_to_block(grow_block);
+                let f = get_runtime_fn(module, builder, "wren_list_add", 2)?;
+                builder.ins().call(f, &[receiver, arg]);
+                builder.ins().jump(merge, &[BlockArg::Value(receiver)]);
+                builder.switch_to_block(store_block);
+                let elements =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj, LIST_ELEMENTS);
+                let off = builder.ins().ishl_imm_u(count32, 3);
+                let ea = builder.ins().iadd(elements, off);
+                builder.ins().store(MemFlags::trusted(), arg, ea, 0);
+                let next = builder.ins().iadd_imm_u(count32, 1);
+                let next32 = builder.ins().ireduce(types::I32, next);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), next32, obj, LIST_COUNT);
+                builder.ins().jump(merge, &[BlockArg::Value(receiver)]);
+            }
+        }
+        builder.switch_to_block(slow);
+        let method_val = builder.ins().iconst(types::I64, method.index() as i64);
+        let sv = emit_wren_call(builder, module, get_runtime_fn, receiver, method_val, args)?;
+        builder.ins().jump(merge, &[BlockArg::Value(sv)]);
+        builder.switch_to_block(merge);
+        Ok(Some(builder.block_params(merge)[0]))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_lower_simd_intrinsic_call<G>(
         interner: &Interner,
@@ -5062,6 +5195,19 @@ pub mod cl {
                     aot_config,
                 )? {
                     return Ok(Some(simd_result));
+                }
+                if aot_config.is_none() {
+                    if let Some(v) = try_lower_list_protocol(
+                        interner,
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        r,
+                        *method,
+                        &arg_vals,
+                    )? {
+                        return Ok(Some(v));
+                    }
                 }
 
                 // ============================================================
