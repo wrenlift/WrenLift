@@ -821,6 +821,8 @@ pub struct ExecutionEngine {
     /// for the next tier; its entry is compiled with the body, the
     /// other loops' entries after the install.
     hot_header: Vec<Option<crate::mir::BlockId>>,
+    /// Baseline compiles alternate between the broker and the promoter.
+    baseline_spread: u32,
     /// Loop headers whose body had no inline-cache data when the
     /// installed code was compiled, so its call sites are generic. The
     /// interpreter keeps running such a loop and asks for a recompile
@@ -1112,6 +1114,7 @@ impl ExecutionEngine {
             baseline_code: Vec::new(),
             baseline_osr_entries: Vec::new(),
             hot_header: Vec::new(),
+            baseline_spread: 0,
             cold_osr_blocks: Vec::new(),
             pending_cold_osr: HashMap::new(),
             cold_osr_probes: HashMap::new(),
@@ -4307,9 +4310,13 @@ impl ExecutionEngine {
         // through the same channel, where the install swaps the bead's
         // code and OSR table.
         // The broker takes interpreted beads only; the top tier and
-        // recompiles of a compiled bead go through the promoter.
+        // recompiles of a compiled bead go through the promoter. Every
+        // other baseline compile goes there too, so two threads work
+        // through a warm-up's queue.
         let bead_interpreted = self.tier.state(id) == Some(beadie::BeadState::Interpreted);
-        if tier == CompileTier::Optimized || !bead_interpreted {
+        self.baseline_spread = self.baseline_spread.wrapping_add(1);
+        let spread = tier == CompileTier::Baseline && self.baseline_spread.is_multiple_of(2);
+        if tier == CompileTier::Optimized || !bead_interpreted || spread {
             let promoter = self.promoter.get_or_insert_with(Promoter::start);
             if !promoter.submit(Box::new(move || {
                 let _ = compile_fn();

@@ -603,6 +603,10 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
             stats.gc_time_ns as f64 / 1e9
         );
     }
+    // The VM is never dropped below, so its exit-time report runs here.
+    if std::env::var_os("WLIFT_TIER_STATS").is_some() {
+        vm.engine.dump_tier_stats(&vm.interner);
+    }
     // Dropping the VM would wait for a top-tier compile still in
     // flight, and a plain exit runs the compiler's static destructors
     // under that thread; the process has nothing left to run it for.
