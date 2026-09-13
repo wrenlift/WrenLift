@@ -282,7 +282,7 @@ fn try_dispatch_trivial_accessor_fastpath(
             if !fields.is_null() {
                 let value = args[1];
                 unsafe {
-                    *fields.add(fn_ref.trivial_setter_field as usize) = value;
+                    (*instance).set_field_unchecked(fn_ref.trivial_setter_field as usize, value);
                 }
                 vm.gc.write_barrier(receiver_obj as *mut ObjHeader, value);
                 vm.engine.note_runtime_call_stats(|s| {

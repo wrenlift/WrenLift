@@ -1312,6 +1312,9 @@ impl fmt::Debug for ObjFiber {
 #[repr(C)]
 pub struct ObjClass {
     pub header: ObjHeader,
+    /// `field_kinds.as_mut_ptr()`, at a fixed offset for compiled code;
+    /// null when the class keeps no field kinds.
+    pub field_kinds_ptr: *mut u8,
     /// Class name.
     pub name: SymbolId,
     /// Superclass (null for Object).
@@ -1332,7 +1335,20 @@ pub struct ObjClass {
     pub attributes: Vec<crate::mir::AttrEntry>,
     /// Per-method runtime attributes keyed by signature symbol.
     pub method_attributes: HashMap<SymbolId, Vec<crate::mir::AttrEntry>>,
+    /// What every instance's field has held, one byte per field:
+    /// `FIELD_NUM` and `FIELD_OTHER` bits or'd in by every store, with
+    /// `FIELD_OTHER` preset for a field a constructor does not assign
+    /// before the instance can be seen. A byte equal to `FIELD_NUM`
+    /// lets compiled code read the field as a number after checking
+    /// the byte instead of the value.
+    pub field_kinds: Vec<u8>,
 }
+
+/// A store of a Num into the field has been seen.
+pub const FIELD_NUM: u8 = 1;
+/// A store of something else, or an instance may exist with the field
+/// unassigned.
+pub const FIELD_OTHER: u8 = 2;
 
 /// A C-ABI foreign method (`extern "C" fn(*mut VM)`) — the Wren
 /// embedding API shape. Resolved from `#!native` / `#!symbol` at class
@@ -1568,6 +1584,7 @@ impl ObjClass {
 
         Self {
             header: ObjHeader::new(ObjType::Class),
+            field_kinds_ptr: std::ptr::null_mut(),
             name,
             superclass,
             methods,
@@ -1577,7 +1594,18 @@ impl ObjClass {
             static_fields: HashMap::new(),
             attributes: Vec::new(),
             method_attributes: HashMap::new(),
+            field_kinds: Vec::new(),
         }
+    }
+
+    /// Install the field kinds; `kinds` must have one byte per field.
+    pub fn set_field_kinds(&mut self, kinds: Vec<u8>) {
+        self.field_kinds = kinds;
+        self.field_kinds_ptr = if self.field_kinds.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            self.field_kinds.as_mut_ptr()
+        };
     }
 
     /// Ensure the method table is large enough for the given symbol.
@@ -1717,6 +1745,7 @@ impl ObjInstance {
     pub fn set_field(&mut self, index: usize, value: Value) {
         if index < self.num_fields as usize {
             unsafe {
+                self.note_field_kind(index, value);
                 self.fields.add(index).write(value);
             }
         }
@@ -1726,7 +1755,30 @@ impl ObjInstance {
     /// Caller must ensure `index < self.num_fields`.
     #[inline(always)]
     pub unsafe fn set_field_unchecked(&mut self, index: usize, value: Value) {
+        self.note_field_kind(index, value);
         self.fields.add(index).write(value);
+    }
+
+    /// Or the kind of `value` into the class's byte for field `index`.
+    ///
+    /// # Safety
+    /// `index < self.num_fields`, which is the class's field count.
+    #[inline(always)]
+    pub unsafe fn note_field_kind(&self, index: usize, value: Value) {
+        let class = self.header.class;
+        if class.is_null() {
+            return;
+        }
+        let kinds = (*class).field_kinds_ptr;
+        if kinds.is_null() {
+            return;
+        }
+        let bit = if value.is_num() {
+            FIELD_NUM
+        } else {
+            FIELD_OTHER
+        };
+        *kinds.add(index) |= bit;
     }
 }
 

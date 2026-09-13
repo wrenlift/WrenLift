@@ -179,6 +179,7 @@ pub mod llvm {
             main_fn,
             iterate_sym: interner.lookup("iterate(_)"),
             iter_value_sym: interner.lookup("iteratorValue(_)"),
+            globals: std::cell::RefCell::new(Vec::new()),
         };
 
         let mut osr_defs: Vec<OsrDef> = Vec::new();
@@ -312,6 +313,9 @@ pub mod llvm {
         let engine = module
             .create_jit_execution_engine(codegen_level())
             .map_err(|e| e.to_string())?;
+        for (global, addr) in shared.globals.borrow().iter() {
+            engine.add_global_mapping(global, *addr as usize);
+        }
         let fn_ptr = engine
             .get_function_address(&safe_name)
             .map_err(|e| e.to_string())? as *const u8;
@@ -384,6 +388,10 @@ pub mod llvm {
         /// `iterate(_)` and `iteratorValue(_)`, lowered inline for lists.
         iterate_sym: Option<crate::intern::SymbolId>,
         iter_value_sym: Option<crate::intern::SymbolId>,
+        /// Externals the module reads through a global of known size,
+        /// so LLVM may hoist their loads: `(global, address)`, mapped
+        /// into the execution engine before the code is finalised.
+        globals: std::cell::RefCell<Vec<(inkwell::values::GlobalValue<'ctx>, u64)>>,
     }
 
     /// Lowering state for one LLVM function (the body or an OSR entry).
@@ -407,6 +415,15 @@ pub mod llvm {
         field_tbaa: HashMap<u16, MetadataValue<'ctx>>,
         field_tbaa_root: Option<MetadataValue<'ctx>>,
         miss_exit: Option<(u32, Vec<DeoptReg>)>,
+        /// Boxed values known to be Nums; a store of one needs no
+        /// field-kind note.
+        num_values: HashSet<IntValue<'ctx>>,
+        /// A guarded getter whose class keeps its field as Nums: the
+        /// guard that follows checks the class's field-kind byte at
+        /// this address instead of the value.
+        field_invariant: Option<(ValueId, inkwell::values::GlobalValue<'ctx>, u16)>,
+        /// The instruction being lowered, at inline depth zero.
+        cur_vid: ValueId,
         raw_bools: HashSet<ValueId>,
         value_types: Vec<MirType>,
         call_site_idx: usize,
@@ -456,6 +473,9 @@ pub mod llvm {
                 field_tbaa: HashMap::new(),
                 field_tbaa_root: None,
                 miss_exit: None,
+                num_values: HashSet::new(),
+                field_invariant: None,
+                cur_vid: ValueId(u32::MAX),
                 raw_bools: HashSet::new(),
                 value_types: infer_osr_value_types(mir),
                 call_site_idx: 0,
@@ -685,6 +705,107 @@ pub mod llvm {
             Ok(ld.into_int_value())
         }
 
+        /// Or the kind of `v` into the class's byte for field `idx` of
+        /// the instance at `obj`, as `ObjInstance::note_field_kind`
+        /// does; a class without the bytes is skipped.
+        fn note_field_kind(
+            &mut self,
+            obj: IntValue<'ctx>,
+            idx: u16,
+            v: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            use crate::runtime::object::{FIELD_NUM, FIELD_OTHER};
+            let class = self.load64_stable(obj, HEADER_CLASS as i64)?;
+            let kinds = self.load64_stable(class, CLASS_FIELD_KINDS as i64)?;
+            let has = self.icmp(IntPredicate::NE, kinds, self.c64(0))?;
+            let note = self.new_block("fkn");
+            let done = self.new_block("fkd");
+            self.cbr(has, note, done)?;
+            self.b.position_at_end(note);
+            let p = self.addr(kinds, idx as i64)?;
+            let seen = self
+                .b
+                .build_load(self.sh.ctx.i8_type(), p, "seen")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let is_box = self.is_nan_boxed(v)?;
+            let bit = self
+                .b
+                .build_select(
+                    is_box,
+                    self.sh.ctx.i8_type().const_int(FIELD_OTHER as u64, false),
+                    self.sh.ctx.i8_type().const_int(FIELD_NUM as u64, false),
+                    "kind",
+                )
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let seen = self
+                .b
+                .build_or(seen, bit, "seen")
+                .map_err(|e| e.to_string())?;
+            let st = self.b.build_store(p, seen).map_err(|e| e.to_string())?;
+            let tag = self.kinds_tag();
+            st.set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                .map_err(|e| e.to_string())?;
+            self.br(done)?;
+            self.b.position_at_end(done);
+            Ok(())
+        }
+
+        /// When `class` has only ever held Nums in field `idx` and every
+        /// instance starts with one, let the guard on `dst` check the
+        /// class's byte rather than the value.
+        fn note_field_invariant(&mut self, class: usize, idx: u16, dst: ValueId) {
+            if class == 0 {
+                return;
+            }
+            let class = class as *const crate::runtime::object::ObjClass;
+            let kinds = unsafe { (*class).field_kinds_ptr };
+            let len = unsafe { (*class).field_kinds.len() };
+            if kinds.is_null() || idx as usize >= len {
+                return;
+            }
+            // The main thread may be or'ing this byte while the compile
+            // reads it; the compiled check reads it again at run time.
+            let seen = unsafe { std::ptr::read_volatile(kinds.add(idx as usize)) };
+            if seen != crate::runtime::object::FIELD_NUM {
+                return;
+            }
+            // The bytes are read through a global of the array's size
+            // rather than a bare address, which lets LLVM hoist the
+            // checks out of loops; the engine maps it to the array.
+            let name = format!("wren_field_kinds_{:x}", kinds as usize);
+            let global = match self.sh.module.get_global(&name) {
+                Some(g) => g,
+                None => {
+                    let ty = self.sh.ctx.i8_type().array_type(len as u32);
+                    let g = self.sh.module.add_global(ty, None, &name);
+                    g.set_linkage(inkwell::module::Linkage::External);
+                    g.set_alignment(8);
+                    self.sh.globals.borrow_mut().push((g, kinds as u64));
+                    g
+                }
+            };
+            self.field_invariant = Some((dst, global, idx));
+        }
+
+        /// The TBAA tag of field-kind bytes: disjoint from field data,
+        /// so a check survives stores to fields but not stores of a kind.
+        fn kinds_tag(&mut self) -> MetadataValue<'ctx> {
+            let ctx = self.sh.ctx;
+            let root = *self.field_tbaa_root.get_or_insert_with(|| {
+                ctx.metadata_node(&[ctx.metadata_string("wren fields").into()])
+            });
+            *self.field_tbaa.entry(u16::MAX).or_insert_with(|| {
+                let ty = ctx.metadata_node(&[
+                    ctx.metadata_string("field kinds").into(),
+                    root.into(),
+                    ctx.i64_type().const_zero().into(),
+                ]);
+                ctx.metadata_node(&[ty.into(), ty.into(), ctx.i64_type().const_zero().into()])
+            })
+        }
+
         /// Store instance field `idx` of a fields array.
         fn field_store(
             &mut self,
@@ -819,12 +940,18 @@ pub mod llvm {
                             .b
                             .build_signed_int_to_float(i, self.f64t(), "i2f")
                             .map_err(|e| e.to_string())?;
-                        self.bits(f)
+                        let b = self.bits(f)?;
+                        self.num_values.insert(b);
+                        Ok(b)
                     } else {
                         Ok(i)
                     }
                 }
-                BasicValueEnum::FloatValue(f) => self.bits(f),
+                BasicValueEnum::FloatValue(f) => {
+                    let b = self.bits(f)?;
+                    self.num_values.insert(b);
+                    Ok(b)
+                }
                 other => bail!("cannot box {:?}", other),
             }
         }
@@ -1160,7 +1287,10 @@ pub mod llvm {
             let block = &mir.blocks[bi];
             self.call_site_idx = self.block_call_site_base[bi];
             for (p, _) in &block.params {
-                let (slot, ty) = self.slots[p];
+                let (slot, ty) = *self
+                    .slots
+                    .get(p)
+                    .ok_or_else(|| format!("block parameter {:?} has no slot", p))?;
                 let v = self
                     .b
                     .build_load(ty, slot, &format!("v{}", p.0))
@@ -1169,7 +1299,10 @@ pub mod llvm {
             }
             let osr_vars: Vec<ValueId> = self.osr_vars.iter().copied().collect();
             for vid in osr_vars {
-                let (slot, ty) = self.slots[&vid];
+                let (slot, ty) = *self
+                    .slots
+                    .get(&vid)
+                    .ok_or_else(|| format!("OSR live-in {:?} has no slot", vid))?;
                 let v = self
                     .b
                     .build_load(ty, slot, &format!("o{}", vid.0))
@@ -1203,10 +1336,18 @@ pub mod llvm {
                             .collect();
                         Some((*call_pc, regs))
                     }
+                    Some((_, Instruction::SlowPathExit { pc, live })) => Some((*pc, live.clone())),
                     _ => None,
                 };
+                self.cur_vid = vid;
                 let v = self.lower_instruction(vid, inst)?;
                 self.miss_exit = None;
+                if !matches!(
+                    block.instructions.get(i + 1),
+                    Some((_, Instruction::GuardNumAt { value, .. })) if *value == vid
+                ) {
+                    self.field_invariant = None;
+                }
                 if let Some(v) = v {
                     self.vals.insert(vid, v);
                     if is_raw_bool(inst) {
@@ -1323,7 +1464,11 @@ pub mod llvm {
         ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
             use Instruction as I;
             let v: BasicValueEnum<'ctx> = match inst {
-                I::ConstNum(n) => self.c64(n.to_bits()).into(),
+                I::ConstNum(n) => {
+                    let c = self.c64(n.to_bits());
+                    self.num_values.insert(c);
+                    c.into()
+                }
                 I::ConstBool(b) => self.c64(if *b { TAG_TRUE } else { TAG_FALSE }).into(),
                 I::ConstNull => self.c64(TAG_NULL).into(),
                 I::ConstF64(n) => self.cf64(*n).into(),
@@ -1407,6 +1552,9 @@ pub mod llvm {
                     let obj = self.and(r, self.c64(PTR_MASK))?;
                     let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
                     self.field_store(fields, *idx, v)?;
+                    if !self.num_values.contains(&v) {
+                        self.note_field_kind(obj, *idx, v)?;
+                    }
                     if crate::runtime::gc_trait::jit_needs_write_barriers() {
                         self.call_helper("wren_write_barrier", &[r, v])?;
                     }
@@ -1838,14 +1986,51 @@ pub mod llvm {
                     let v = self.boxed(s)?;
                     let fails = self.is_nan_boxed(v)?;
                     self.guard_deopt(fails)?;
+                    self.num_values.insert(v);
                     v.into()
                 }
+                I::SlowPathExit { .. } => return Ok(None),
                 I::GuardNumAt {
                     value, pc, live, ..
                 } => {
                     let v = self.boxed(value)?;
-                    let fails = self.is_nan_boxed(v)?;
+                    let fails = match self.field_invariant.take() {
+                        Some((guarded, global, idx)) if guarded == *value => {
+                            let p = unsafe {
+                                self.b
+                                    .build_in_bounds_gep(
+                                        self.sh.ctx.i8_type(),
+                                        global.as_pointer_value(),
+                                        &[self.sh.ctx.i64_type().const_int(idx as u64, false)],
+                                        "fkp",
+                                    )
+                                    .map_err(|e| e.to_string())?
+                            };
+                            let kind = self
+                                .b
+                                .build_load(self.sh.ctx.i8_type(), p, "fk")
+                                .map_err(|e| e.to_string())?;
+                            let tag = self.kinds_tag();
+                            kind.as_instruction_value()
+                                .ok_or("load is not an instruction")?
+                                .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                                .map_err(|e| e.to_string())?;
+                            self.b
+                                .build_int_compare(
+                                    IntPredicate::NE,
+                                    kind.into_int_value(),
+                                    self.sh
+                                        .ctx
+                                        .i8_type()
+                                        .const_int(crate::runtime::object::FIELD_NUM as u64, false),
+                                    "fkfail",
+                                )
+                                .map_err(|e| e.to_string())?
+                        }
+                        _ => self.is_nan_boxed(v)?,
+                    };
                     self.guard_deopt_at(fails, *pc, live)?;
+                    self.num_values.insert(v);
                     v.into()
                 }
                 I::GuardBool(s) => {
@@ -2060,7 +2245,8 @@ pub mod llvm {
             r: IntValue<'ctx>,
             idx: IntValue<'ctx>,
         ) -> Result<IntValue<'ctx>, String> {
-            let slow = self.new_block("sgs");
+            let exit = self.miss_exit_block()?;
+            let slow = exit.unwrap_or_else(|| self.new_block("sgs"));
             let merge = self.new_block("sgm");
             let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
             let other = self.new_block("sgo");
@@ -2131,10 +2317,12 @@ pub mod llvm {
                 self.b.position_at_end(next);
             }
             self.br(slow)?;
-            self.b.position_at_end(slow);
-            let sv = self.call_helper("wren_subscript_get", &[r, idx])?;
-            incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
-            self.br(merge)?;
+            if exit.is_none() {
+                self.b.position_at_end(slow);
+                let sv = self.call_helper("wren_subscript_get", &[r, idx])?;
+                incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+            }
             self.b.position_at_end(merge);
             Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
         }
@@ -2147,7 +2335,8 @@ pub mod llvm {
             idx: IntValue<'ctx>,
             v: IntValue<'ctx>,
         ) -> Result<IntValue<'ctx>, String> {
-            let slow = self.new_block("sss");
+            let exit = self.miss_exit_block()?;
+            let slow = exit.unwrap_or_else(|| self.new_block("sss"));
             let merge = self.new_block("ssm");
             let other = self.new_block("sso");
             let p = self.list_element(r, idx, other)?;
@@ -2183,9 +2372,11 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?;
             self.b.build_store(p, v32).map_err(|e| e.to_string())?;
             self.br(merge)?;
-            self.b.position_at_end(slow);
-            self.call_helper("wren_subscript_set", &[r, idx, v])?;
-            self.br(merge)?;
+            if exit.is_none() {
+                self.b.position_at_end(slow);
+                self.call_helper("wren_subscript_set", &[r, idx, v])?;
+                self.br(merge)?;
+            }
             self.b.position_at_end(merge);
             Ok(v)
         }
@@ -2656,6 +2847,8 @@ pub mod llvm {
                     if let Some(miss) = self.miss_exit_block()? {
                         self.cbr(hit, fast, miss)?;
                         self.b.position_at_end(fast);
+                        let dst = self.cur_vid;
+                        self.note_field_invariant(ic.class, ic.func_id as u16, dst);
                         return self.field_load(fields, ic.func_id as u16);
                     }
                     let slow = self.new_block("ics");
@@ -2736,7 +2929,8 @@ pub mod llvm {
             method: crate::intern::SymbolId,
             ic_idx: Option<usize>,
         ) -> Result<IntValue<'ctx>, String> {
-            let slow = self.new_block("its");
+            let exit = self.miss_exit_block()?;
+            let slow = exit.unwrap_or_else(|| self.new_block("its"));
             let merge = self.new_block("itm");
             let (_, count) = self.list_probe(r, slow)?;
             let countf = self
@@ -2777,6 +2971,10 @@ pub mod llvm {
                 .into_int_value();
             let fast_end = self.b.get_insert_block().unwrap();
             self.br(merge)?;
+            if exit.is_some() {
+                self.b.position_at_end(merge);
+                return Ok(fast);
+            }
             self.b.position_at_end(slow);
             let m = self.method_bits(method, ic_idx);
             let sv = self.wren_call(r, m, &[iter])?;
@@ -2800,7 +2998,8 @@ pub mod llvm {
             method: crate::intern::SymbolId,
             ic_idx: Option<usize>,
         ) -> Result<IntValue<'ctx>, String> {
-            let slow = self.new_block("ivs");
+            let exit = self.miss_exit_block()?;
+            let slow = exit.unwrap_or_else(|| self.new_block("ivs"));
             let merge = self.new_block("ivm");
             let (obj, count) = self.list_probe(r, slow)?;
             let is_box = self.is_nan_boxed(iter)?;
@@ -2824,6 +3023,10 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?
                 .into_int_value();
             self.br(merge)?;
+            if exit.is_some() {
+                self.b.position_at_end(merge);
+                return Ok(v);
+            }
             self.b.position_at_end(slow);
             let m = self.method_bits(method, ic_idx);
             let sv = self.wren_call(r, m, &[iter])?;
@@ -2875,6 +3078,10 @@ pub mod llvm {
                                 merge
                                     .remove_from_function()
                                     .map_err(|_| "remove unused block")?;
+                                if let Some(field) = inline_getter_field {
+                                    let dst = self.cur_vid;
+                                    self.note_field_invariant(expected_class, field, dst);
+                                }
                                 return Ok(v);
                             }
                             Some(v) => {
@@ -2942,6 +3149,8 @@ pub mod llvm {
                 if let Some(miss) = self.miss_exit_block()? {
                     self.cbr(hit, fast, miss)?;
                     self.b.position_at_end(fast);
+                    let dst = self.cur_vid;
+                    self.note_field_invariant(expected_class, field, dst);
                     return self.field_load(fields, field);
                 }
                 let slow = self.new_block("gs");

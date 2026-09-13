@@ -1319,6 +1319,7 @@ impl<'a> MirWasmEmitter<'a> {
             }
 
             // -- Guards (pass-through for now) --
+            Instruction::SlowPathExit { .. } => {}
             Instruction::GuardNum(a)
             | Instruction::GuardNumAt { value: a, .. }
             | Instruction::GuardBool(a) => {

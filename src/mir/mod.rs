@@ -451,6 +451,14 @@ pub enum Instruction {
         call_pc: u32,
         call_live: Vec<DeoptReg>,
     },
+    /// The instruction just before has an inline fast path: where it
+    /// would otherwise call a helper, it may resume the interpreter at
+    /// bytecode offset `pc`, the instruction itself, with `live` in
+    /// place. JIT compile clones only.
+    SlowPathExit {
+        pc: u32,
+        live: Vec<DeoptReg>,
+    },
 }
 
 /// What a register holds when compiled code hands a function back to
@@ -504,6 +512,7 @@ impl Instruction {
                 | Instruction::SetModuleVar(..)
                 | Instruction::GuardNum(..)
                 | Instruction::GuardNumAt { .. }
+                | Instruction::SlowPathExit { .. }
                 | Instruction::GuardBool(..)
                 | Instruction::GuardClass(..)
                 | Instruction::GuardProtocol(..)
@@ -612,6 +621,9 @@ impl Instruction {
                 ops.extend(live.iter().flat_map(|r| r.source.operands()));
                 ops.extend(call_live.iter().flat_map(|r| r.source.operands()));
                 ops
+            }
+            Instruction::SlowPathExit { live, .. } => {
+                live.iter().flat_map(|r| r.source.operands()).collect()
             }
             Instruction::AddI64(a, b)
             | Instruction::SubI64(a, b)
@@ -1512,6 +1524,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CmpGeI64(a, b) => format!("icmp_i64.ge {}, {}", a, b),
         Instruction::I64ToF64(a) => format!("i64_to_f64 {}", a),
         Instruction::IsNum(a) => format!("is_num {}", a),
+        Instruction::SlowPathExit { pc, live } => {
+            format!("slow.exit pc={} live={}", pc, live.len())
+        }
         Instruction::GuardNumAt {
             value, pc, live, ..
         } => format!(
@@ -1922,6 +1937,7 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 | Instruction::NegI64(_) => MirType::I64,
                 Instruction::I64ToF64(_) => MirType::F64,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
+                Instruction::SlowPathExit { .. } => MirType::Void,
                 Instruction::GuardNum(src)
                 | Instruction::GuardBool(src)
                 | Instruction::Move(src)

@@ -296,8 +296,7 @@ fn op_set_field(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     unsafe {
         let obj_ptr = recv.as_object().unwrap_unchecked();
         let inst = obj_ptr as *mut crate::runtime::object::ObjInstance;
-        let fields = (*inst).fields;
-        *fields.add(idx) = val;
+        (*inst).set_field_unchecked(idx, val);
     }
     // Write barrier: same contract as the JIT direct path
     // (codegen/mod.rs SubscriptSet/SetField) and the bytecode

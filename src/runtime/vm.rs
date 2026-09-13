@@ -1945,6 +1945,10 @@ impl VM {
                 (*class_ptr).header.class = self.class_class;
                 // Total fields = own fields + inherited fields from superclass chain
                 (*class_ptr).num_fields = class_mir.num_fields + inherited_fields;
+                (*class_ptr).set_field_kinds(constructor_field_kinds(
+                    &class_mir,
+                    (class_mir.num_fields + inherited_fields) as usize,
+                ));
                 (*class_ptr).attributes = class_mir.attributes;
             }
 
@@ -6199,6 +6203,53 @@ fn should_eager_compile_entry(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The initial field-kind bytes of a class: a field every constructor
+/// assigns in its entry block before `this` can be seen elsewhere starts
+/// unseen, any other starts `FIELD_OTHER`, since an instance may exist
+/// with it unassigned.
+fn constructor_field_kinds(class: &crate::mir::ClassMir, total_fields: usize) -> Vec<u8> {
+    use crate::mir::Instruction;
+    use crate::runtime::object::FIELD_OTHER;
+    let ctors: Vec<&crate::mir::MethodMir> =
+        class.methods.iter().filter(|m| m.is_constructor).collect();
+    if total_fields == 0 || ctors.is_empty() || class.native_library.is_some() {
+        return vec![FIELD_OTHER; total_fields];
+    }
+    let mut eligible = vec![true; total_fields];
+    for ctor in ctors {
+        let Some(entry) = ctor.mir.blocks.first() else {
+            return vec![FIELD_OTHER; total_fields];
+        };
+        let this = entry.instructions.iter().find_map(|(v, inst)| match inst {
+            Instruction::BlockParam(0) => Some(*v),
+            _ => None,
+        });
+        let mut assigned = vec![false; total_fields];
+        if let Some(this) = this {
+            for (_, inst) in &entry.instructions {
+                match inst {
+                    Instruction::BlockParam(_) => {}
+                    Instruction::SetField(r, idx, val) if *r == this && *val != this => {
+                        if let Some(slot) = assigned.get_mut(*idx as usize) {
+                            *slot = true;
+                        }
+                    }
+                    Instruction::GetField(r, _) if *r == this => {}
+                    _ if inst.operands().contains(&this) => break,
+                    _ => {}
+                }
+            }
+        }
+        for (e, a) in eligible.iter_mut().zip(assigned) {
+            *e &= a;
+        }
+    }
+    eligible
+        .into_iter()
+        .map(|e| if e { 0 } else { FIELD_OTHER })
+        .collect()
+}
 
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]

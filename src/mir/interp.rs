@@ -273,6 +273,7 @@ pub fn eval_pure_instruction(
         }
 
         // -- Guards (lenient: accepts both boxed and unboxed forms) --
+        Instruction::SlowPathExit { .. } => Ok(InterpValue::Boxed(Value::null())),
         Instruction::GuardNumAt { value: a, .. } | Instruction::GuardNum(a) => {
             let v = get(*a)?;
             match v {

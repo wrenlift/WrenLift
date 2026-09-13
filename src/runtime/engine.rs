@@ -2770,6 +2770,7 @@ impl ExecutionEngine {
         id: FuncId,
         authoritative: &MirFunction,
         mir: Arc<MirFunction>,
+        interner: &crate::intern::Interner,
     ) -> Arc<MirFunction> {
         use crate::mir::bytecode::RESULT_NUM;
         use crate::mir::{live_in_sets, DeoptReg, DeoptSource, Instruction, ValueId};
@@ -2796,22 +2797,39 @@ impl ExecutionEngine {
             live: Vec<ValueId>,
             call_pc: u32,
             call_live: Vec<ValueId>,
+            /// A guard on the result, else only the slow-path exit.
+            guard: bool,
         }
+        let iterate = interner.lookup("iterate(_)");
+        let iter_value = interner.lookup("iteratorValue(_)");
         let mut sites: Vec<Site> = Vec::new();
         for block in &authoritative.blocks {
             for (i, (dst, inst)) in block.instructions.iter().enumerate() {
-                if !matches!(inst, Instruction::Call { .. }) {
-                    continue;
-                }
-                let seen = result_kinds.get(dst.0 as usize).copied().unwrap_or(0);
-                if seen != RESULT_NUM {
-                    continue;
-                }
-                let Some(&pc) = resume_after_call.get(dst) else {
-                    continue;
+                let guard = match inst {
+                    Instruction::Call { method, .. } => {
+                        let seen = result_kinds.get(dst.0 as usize).copied().unwrap_or(0);
+                        if seen == RESULT_NUM {
+                            true
+                        } else if Some(*method) == iterate || Some(*method) == iter_value {
+                            // The list protocol has an inline path.
+                            false
+                        } else {
+                            continue;
+                        }
+                    }
+                    Instruction::SubscriptGet { .. } | Instruction::SubscriptSet { .. } => false,
+                    _ => continue,
                 };
                 let Some(&call_pc) = call_offsets.get(dst) else {
                     continue;
+                };
+                let pc = if guard {
+                    let Some(&pc) = resume_after_call.get(dst) else {
+                        continue;
+                    };
+                    pc
+                } else {
+                    call_pc
                 };
                 let mut live: HashSet<ValueId> = HashSet::new();
                 for succ in block.terminator.successors() {
@@ -2839,6 +2857,7 @@ impl ExecutionEngine {
                     live,
                     call_pc,
                     call_live,
+                    guard,
                 });
             }
         }
@@ -2891,16 +2910,17 @@ impl ExecutionEngine {
             })
             .collect();
         let mut out = (*mir).clone();
-        let mut placed: Vec<(usize, usize, Instruction, ValueId)> = Vec::new();
+        let mut placed: Vec<(usize, usize, Instruction, Option<ValueId>)> = Vec::new();
         for Site {
             dst,
             pc,
             live,
             call_pc,
             call_live,
+            guard,
         } in sites
         {
-            if !used.contains(&dst) {
+            if guard && !used.contains(&dst) {
                 continue;
             }
             let regs = |ids: &[ValueId]| -> Option<Vec<DeoptReg>> {
@@ -2914,19 +2934,38 @@ impl ExecutionEngine {
             let Some((bi, pos)) = out.blocks.iter().enumerate().find_map(|(bi, b)| {
                 b.instructions
                     .iter()
-                    .position(|(v, inst)| *v == dst && matches!(inst, Instruction::Call { .. }))
+                    .position(|(v, inst)| {
+                        *v == dst
+                            && matches!(
+                                inst,
+                                Instruction::Call { .. }
+                                    | Instruction::SubscriptGet { .. }
+                                    | Instruction::SubscriptSet { .. }
+                            )
+                    })
                     .map(|pos| (bi, pos))
             }) else {
                 continue;
             };
-            let guard = Instruction::GuardNumAt {
-                value: dst,
-                pc,
-                live,
-                call_pc,
-                call_live,
-            };
-            placed.push((bi, pos, guard, dst));
+            if guard {
+                let guard = Instruction::GuardNumAt {
+                    value: dst,
+                    pc,
+                    live,
+                    call_pc,
+                    call_live,
+                };
+                placed.push((bi, pos, guard, Some(dst)));
+            } else {
+                // Before the instruction its result is not a register
+                // yet; everything else it needs is.
+                let live: Vec<DeoptReg> = live
+                    .into_iter()
+                    .filter(|r| r.reg != dst.0)
+                    .chain(call_live)
+                    .collect();
+                placed.push((bi, pos, Instruction::SlowPathExit { pc, live }, None));
+            }
         }
         // Arguments the baseline only ever saw as Num take an entry
         // guard, which the entry deopt can re-run the call for.
@@ -2961,8 +3000,10 @@ impl ExecutionEngine {
         for (bi, pos, guard, dst) in placed {
             let g = out.new_value();
             out.blocks[bi].instructions.insert(pos + 1, (g, guard));
-            if !out.speculated_num_params.contains(&dst) {
-                out.speculated_num_params.push(dst);
+            if let Some(dst) = dst {
+                if !out.speculated_num_params.contains(&dst) {
+                    out.speculated_num_params.push(dst);
+                }
             }
         }
         let insert_at = out.blocks[0]
@@ -3834,7 +3875,7 @@ impl ExecutionEngine {
         let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
         let sroa_mir =
             if tier == CompileTier::Optimized && speculate && result_speculation_enabled() {
-                self.speculate_call_results(id, &mir, sroa_mir)
+                self.speculate_call_results(id, &mir, sroa_mir, interner)
             } else {
                 sroa_mir
             };

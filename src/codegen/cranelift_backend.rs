@@ -110,6 +110,39 @@ pub mod cl {
             && c >= f64::MIN_POSITIVE
     }
 
+    /// Or the kind of `value` into the class's field-kind byte for
+    /// field `idx` of the instance at `obj_ptr`, as
+    /// `ObjInstance::note_field_kind` does; a class without the bytes
+    /// is skipped.
+    fn emit_note_field_kind(builder: &mut FunctionBuilder, obj_ptr: Value, idx: u16, value: Value) {
+        use crate::runtime::object::{FIELD_NUM, FIELD_OTHER};
+        let class = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+        let kinds = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), class, CLASS_FIELD_KINDS);
+        let note = builder.create_block();
+        let done = builder.create_block();
+        builder.ins().brif(kinds, note, &[], done, &[]);
+        builder.switch_to_block(note);
+        let seen = builder
+            .ins()
+            .load(types::I8, MemFlags::trusted(), kinds, idx as i32);
+        let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+        let masked = builder.ins().band(value, qnan);
+        let is_num = builder.ins().icmp(IntCC::NotEqual, masked, qnan);
+        let num_bit = builder.ins().iconst(types::I8, FIELD_NUM as i64);
+        let other_bit = builder.ins().iconst(types::I8, FIELD_OTHER as i64);
+        let bit = builder.ins().select(is_num, num_bit, other_bit);
+        let seen = builder.ins().bor(seen, bit);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), seen, kinds, idx as i32);
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+    }
+
     /// Or the kind of `result` into the result profile byte at `slot`.
     fn emit_note_call_result(builder: &mut FunctionBuilder, slot: usize, result: Value) {
         use crate::mir::bytecode::{RESULT_NUM, RESULT_OTHER};
@@ -4614,6 +4647,9 @@ pub mod cl {
                 builder
                     .ins()
                     .store(MemFlags::trusted(), store_val, fields_ptr, offset);
+                if aot_config.is_none() {
+                    emit_note_field_kind(builder, obj_ptr, *idx, store_val);
+                }
                 // Write barrier; AOT cannot know the binary's collector,
                 // JIT code skips it when no barrier collector is live.
                 if aot_config.is_some() || crate::runtime::gc_trait::jit_needs_write_barriers() {
@@ -6912,6 +6948,8 @@ pub mod cl {
                 emit_guard_deopt(builder, module, get_runtime_fn, is_box, jit_func_id())?;
                 Ok(Some(v))
             }
+            // The Cranelift top tier keeps its slow paths.
+            Instruction::SlowPathExit { .. } => Ok(None),
             Instruction::GuardNumAt {
                 value, pc, live, ..
             } => {

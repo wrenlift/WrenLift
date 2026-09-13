@@ -17,6 +17,11 @@ pub const HEADER_NEXT: i32 = 8; // *mut ObjHeader
 pub const HEADER_CLASS: i32 = 16; // *mut ObjClass
 pub const HEADER_SIZE: i32 = 24;
 
+// -- ObjClass ------------------------------------------------------------------
+
+/// `*mut u8`: one `FIELD_*` byte per instance field, or null.
+pub const CLASS_FIELD_KINDS: i32 = 24;
+
 // -- ObjInstance (40 bytes) --------------------------------------------------
 
 pub const INSTANCE_NUM_FIELDS: i32 = 24; // u32

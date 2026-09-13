@@ -254,8 +254,8 @@ pub struct BytecodeFunction {
     /// register: where compiled code that speculated on the call's
     /// result resumes the interpreter when the speculation fails.
     pub resume_after_call: HashMap<ValueId, u32>,
-    /// The offset of each call, by destination register: where the
-    /// interpreter resumes to redo a call compiled code declined.
+    /// The offset of each call and subscript, by destination register:
+    /// where the interpreter resumes to redo one compiled code declined.
     pub call_offsets: HashMap<ValueId, u32>,
     /// `RESULT_NUM` / `RESULT_OTHER` bits per register, or'd in by
     /// baseline code at every call it lowers. A call that only ever
@@ -467,6 +467,7 @@ impl<'a> Encoder<'a> {
             Instruction::ToString(a) => self.emit_unary(Op::ToStringOp, dst, *a),
             Instruction::GuardNum(a) => self.emit_unary(Op::GuardNum, dst, *a),
             Instruction::GuardNumAt { value, .. } => self.emit_unary(Op::GuardNum, dst, *value),
+            Instruction::SlowPathExit { .. } => {}
             Instruction::GuardBool(a) => self.emit_unary(Op::GuardBool, dst, *a),
 
             // -- 7B binary: op + dst + lhs + rhs --
@@ -707,6 +708,7 @@ impl<'a> Encoder<'a> {
                 }
             }
             Instruction::SubscriptGet { receiver, args } => {
+                self.call_offsets.insert(dst, self.code.len() as u32);
                 self.emit_op(Op::SubscriptGet);
                 self.emit_reg(dst);
                 self.emit_reg(*receiver);
@@ -720,6 +722,7 @@ impl<'a> Encoder<'a> {
                 args,
                 value,
             } => {
+                self.call_offsets.insert(dst, self.code.len() as u32);
                 self.emit_op(Op::SubscriptSet);
                 self.emit_reg(dst);
                 self.emit_reg(*receiver);
