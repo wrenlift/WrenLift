@@ -2064,7 +2064,11 @@ impl ExecutionEngine {
             }
         }
         match (setter, &block.terminator) {
-            (Some((ret_vid, field_idx)), Terminator::Return(v)) if *v == ret_vid => Some(field_idx),
+            (Some((ret_vid, field_idx)), Terminator::Return(v))
+                if *v == ret_vid || Some(*v) == value_param || Some(*v) == value_alias =>
+            {
+                Some(field_idx)
+            }
             _ => None,
         }
     }
