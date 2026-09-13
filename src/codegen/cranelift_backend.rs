@@ -1510,8 +1510,11 @@ pub mod cl {
             .set("enable_probestack", "false")
             .map_err(|e| format!("Failed to set enable_probestack: {}", e))?;
 
+        // The verifier is a third of a compile; a release build runs it
+        // only under `WLIFT_CL_VERIFY` (safe to run with).
+        let verify = cfg!(debug_assertions) || std::env::var_os("WLIFT_CL_VERIFY").is_some();
         flag_builder
-            .set("enable_verifier", "true")
+            .set("enable_verifier", if verify { "true" } else { "false" })
             .map_err(|e| e.to_string())?;
         let isa = cranelift_native::builder()
             .map_err(|e| e.to_string())?
