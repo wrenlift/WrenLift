@@ -822,7 +822,10 @@ impl<'a> MirBuilder<'a> {
             args: vec![iter_param],
             pure_call: false,
         });
-        self.variables.insert(variable.0, elem_val);
+        // Each iteration binds a fresh variable; a captured one gets
+        // its own box like any other local.
+        let stored = self.box_if_captured(variable.0, elem_val);
+        self.variables.insert(variable.0, stored);
 
         self.break_targets.push((exit_bb, tracked_names.clone()));
         // `continue` branches to latch_bb with [iter_param, ...vars] so

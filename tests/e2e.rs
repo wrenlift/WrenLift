@@ -5218,6 +5218,35 @@ System.print(total)
 }
 
 #[test]
+fn e2e_closure_captures_for_loop_variable_per_iteration() {
+    // A for loop binds a fresh variable each iteration; a closure that
+    // captures it, alongside a body local, keeps that iteration's
+    // value, and the loop's own code still reads it as a plain value.
+    let src = r#"
+var keep = []
+for (round in 0...3) {
+  var n = [round * 10]
+  keep.add(Fn.new { "%(round):%(n[0])" })
+  if (round == 1) keep.add(Fn.new { round })
+}
+var out = []
+for (f in keep) out.add(f.call())
+System.print(out.join(" "))
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            ..VMConfig::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", src);
+        let output = vm.take_output();
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output.trim(), "0:0 1:10 1 2:20");
+    }
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,
