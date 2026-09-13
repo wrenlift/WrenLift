@@ -1466,6 +1466,12 @@ fn sync_flat_shadow_ptr(stack: &mut FlatShadowStack) {
 /// 256 levels ≈ 256-512KB, well within the default 8MB stack.
 pub const MAX_JIT_DEPTH: u32 = 256;
 
+/// Native frames entered through direct calls that are still active;
+/// compiled code counts them itself and takes the helper path past
+/// `MAX_JIT_DEPTH`, whose fallback runs the callee in the interpreter.
+/// Process-wide: a second VM thread only makes the bound stricter.
+pub static JIT_DIRECT_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Read the current JIT native recursion depth.
 #[inline(always)]
 pub fn jit_depth() -> u32 {
@@ -6666,9 +6672,8 @@ pub extern "C" fn wren_ic_ctor_3(cls: u64, closure: u64, a0: u64, a1: u64, a2: u
     wren_ic_ctor_3_inner(cls, closure, a0, a1, a2, 0)
 }
 
-/// Allocate an ObjInstance for a class. Used by inline constructor IC (kind=3).
-/// Takes the class as a NaN-boxed Value (receiver of the constructor call).
-/// Returns the new instance as a NaN-boxed Value.
+/// A fresh instance of the class object in `class_val`, ready for its
+/// initialiser, which compiled code then calls directly.
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
     let class_ptr = Value::from_bits(class_val)
@@ -6680,7 +6685,7 @@ pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
     match unsafe { vm_ref() } {
         Some(vm) => {
             let instance = vm.gc.alloc_instance(class_ptr);
-            Value::object(instance as *mut u8).to_bits()
+            unsafe { finish_alloc(vm, Value::object(instance as *mut u8)) }
         }
         None => Value::null().to_bits(),
     }

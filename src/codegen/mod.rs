@@ -2180,10 +2180,9 @@ pub struct DevirtHint {
     /// If set, the callee is a trivial `{ _field }` getter — inline as
     /// a field load.
     pub getter_field: Option<u16>,
-    /// If true, the callee has no internal method calls — Cranelift can
-    /// emit a pure `call_indirect` to `jit_code[func_id]` with no context
-    /// setup (no current_func_id swap, no depth tracking).
-    pub pure_leaf: bool,
+    /// The callee can be called straight through `jit_code[func_id]`;
+    /// see `CallKnownFunc::direct`.
+    pub direct: bool,
 }
 
 /// Transform monomorphic Call sites using IC snapshot data:
@@ -2237,13 +2236,13 @@ fn devirt_calls_with_ic(
                         let fid = ic.func_id as u32;
                         let hint = devirt_hints.and_then(|h| h.get(ic_idx)).copied();
                         let getter_field = hint.and_then(|h| h.getter_field);
-                        let pure_leaf = hint.map(|h| h.pure_leaf).unwrap_or(false);
+                        let direct = hint.map(|h| h.direct).unwrap_or(false);
                         *inst = Instruction::CallKnownFunc {
                             func_id: fid,
                             method: *method,
                             expected_class: ic.class,
                             inline_getter_field: getter_field,
-                            pure_leaf,
+                            direct,
                             receiver: *receiver,
                             args: std::mem::take(args),
                         };
@@ -4201,7 +4200,7 @@ impl<'a> LowerCtx<'a> {
                 method: _,
                 expected_class: _,
                 inline_getter_field: _,
-                pure_leaf: _,
+                direct: _,
                 receiver: _,
                 args: _,
             } => {

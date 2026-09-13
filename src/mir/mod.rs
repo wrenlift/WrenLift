@@ -348,10 +348,10 @@ pub enum Instruction {
         /// (class check + get_field) instead of a function call.
         /// Valid only for trivial getters of the form `{ _field }`.
         inline_getter_field: Option<u16>,
-        /// If true, the callee has no internal method calls — Cranelift
-        /// can emit a pure `call_indirect` to `jit_code[func_id]` without
-        /// any context setup or FFI round-trip.
-        pure_leaf: bool,
+        /// The callee can be called straight through `jit_code[func_id]`:
+        /// it lives in the caller's module and reads no static field or
+        /// upvalue, so it needs none of the context a helper sets up.
+        direct: bool,
         receiver: ValueId,
         args: Vec<ValueId>,
     },
@@ -1475,7 +1475,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
             method: _,
             expected_class: _,
             inline_getter_field: _,
-            pure_leaf: _,
+            direct: _,
             receiver,
             args,
         } => format!(

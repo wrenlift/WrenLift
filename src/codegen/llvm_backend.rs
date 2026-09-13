@@ -32,7 +32,7 @@ pub mod llvm {
     use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
     use crate::codegen::cranelift_backend::cl::{
-        collect_osr_targets, const_f64_of, env_jit_callsite_ic, env_pure_leaf_direct,
+        collect_osr_targets, const_f64_of, direct_calls_enabled, env_jit_callsite_ic,
         infer_osr_value_types, is_positive_power_of_two, jit_func_id, jit_modvar_in_range,
         jit_modvars_cell, osr_entry_layout, should_compile_osr_entries, OsrEntryLayout, PTR_MASK,
         QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
@@ -1626,7 +1626,7 @@ pub mod llvm {
                     method,
                     expected_class,
                     inline_getter_field,
-                    pure_leaf,
+                    direct,
                     receiver,
                     args,
                 } => self
@@ -1635,7 +1635,7 @@ pub mod llvm {
                         *method,
                         *expected_class,
                         *inline_getter_field,
-                        *pure_leaf,
+                        *direct,
                         receiver,
                         args,
                     )?
@@ -2474,6 +2474,22 @@ pub mod llvm {
             Ok(())
         }
 
+        /// `(slot, value)` of the direct-call depth counter.
+        fn direct_depth(&mut self) -> Result<(PointerValue<'ctx>, IntValue<'ctx>), String> {
+            let addr = &crate::codegen::runtime_fns::JIT_DIRECT_DEPTH
+                as *const std::sync::atomic::AtomicU32 as u64;
+            let p = self
+                .b
+                .build_int_to_ptr(self.c64(addr), self.ptrt(), "depthp")
+                .map_err(|e| e.to_string())?;
+            let d = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), p, "depth")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            Ok((p, d))
+        }
+
         /// The class-miss exit a guarded call may take instead of its
         /// slow path: `(offset of the call, registers live before it)`,
         /// set while the call just before a `GuardNumAt` is lowered.
@@ -2884,6 +2900,61 @@ pub mod llvm {
                         self.icmp(IntPredicate::EQ, r, self.c64(TAG_OBJ | ic.class as u64))?;
                     self.cbr(hit, fast, slow)?;
                     self.b.position_at_end(fast);
+                    let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+                    let helper = self.new_block("cth");
+                    // The initialiser is called straight through its slot
+                    // when it is compiled; the helper otherwise.
+                    match (direct_calls_enabled(), self.sh.jit_code_base) {
+                        (true, Some(base)) => {
+                            let slot_addr = unsafe { base.add(ic.func_id as usize) } as u64;
+                            let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
+                            let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
+                            let depth_bb = self.new_block("ctd");
+                            let call_bb = self.new_block("ctc");
+                            self.cbr(has, depth_bb, helper)?;
+                            self.b.position_at_end(depth_bb);
+                            let (depth_p, depth) = self.direct_depth()?;
+                            let room = self.icmp(
+                                IntPredicate::ULT,
+                                depth,
+                                self.sh.ctx.i32_type().const_int(
+                                    crate::codegen::runtime_fns::MAX_JIT_DEPTH as u64,
+                                    false,
+                                ),
+                            )?;
+                            self.cbr(room, call_bb, helper)?;
+                            self.b.position_at_end(call_bb);
+                            let inst = self.call_helper("wren_alloc_instance", &[r])?;
+                            let deeper = self
+                                .b
+                                .build_int_add(
+                                    depth,
+                                    self.sh.ctx.i32_type().const_int(1, false),
+                                    "d1",
+                                )
+                                .map_err(|e| e.to_string())?;
+                            self.b
+                                .build_store(depth_p, deeper)
+                                .map_err(|e| e.to_string())?;
+                            let ty = self.helper_type(1 + args.len());
+                            let ptr = self
+                                .b
+                                .build_int_to_ptr(jit_ptr, self.ptrt(), "cp")
+                                .map_err(|e| e.to_string())?;
+                            let mut a: Vec<BasicMetadataValueEnum> = vec![inst.into()];
+                            a.extend(arg_vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+                            self.b
+                                .build_indirect_call(ty, ptr, &a, "init")
+                                .map_err(|e| e.to_string())?;
+                            self.b
+                                .build_store(depth_p, depth)
+                                .map_err(|e| e.to_string())?;
+                            incoming.push((inst.into(), self.b.get_insert_block().unwrap()));
+                            self.br(merge)?;
+                        }
+                        _ => self.br(helper)?,
+                    }
+                    self.b.position_at_end(helper);
                     let packed = self.c64(ic.func_id | ((method.index() as u64) << 32));
                     let name = [
                         "wren_construct_0",
@@ -2894,20 +2965,15 @@ pub mod llvm {
                     let mut call_args = vec![packed, r];
                     call_args.extend(arg_vals.iter().copied());
                     let fv = self.call_helper(name, &call_args)?;
-                    let fast_end = self.b.get_insert_block().unwrap();
+                    incoming.push((fv.into(), self.b.get_insert_block().unwrap()));
                     self.br(merge)?;
                     self.b.position_at_end(slow);
                     let m = self.method_bits(method, ic_idx);
                     let sv = self.wren_call(r, m, &arg_vals)?;
-                    let slow_end = self.b.get_insert_block().unwrap();
+                    incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
                     self.br(merge)?;
                     self.b.position_at_end(merge);
-                    return Ok(self
-                        .phi(
-                            self.i64t().into(),
-                            &[(fv.into(), fast_end), (sv.into(), slow_end)],
-                        )?
-                        .into_int_value());
+                    return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
                 }
                 if ic.kind == 5 && ic.class != 0 {
                     let fast = self.new_block("icf");
@@ -3116,7 +3182,7 @@ pub mod llvm {
             method: crate::intern::SymbolId,
             expected_class: usize,
             inline_getter_field: Option<u16>,
-            pure_leaf: bool,
+            direct: bool,
             receiver: &ValueId,
             args: &[ValueId],
         ) -> Result<IntValue<'ctx>, String> {
@@ -3176,9 +3242,9 @@ pub mod llvm {
                 }
             }
 
-            if env_pure_leaf_direct()
+            if direct_calls_enabled()
                 && inline_getter_field.is_none()
-                && pure_leaf
+                && direct
                 && expected_class != 0
                 && args.len() <= 4
             {
@@ -3193,8 +3259,27 @@ pub mod llvm {
                     let slot_addr = unsafe { base.add(func_id as usize) } as u64;
                     let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
                     let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
-                    self.cbr(has, call_bb, slow)?;
+                    let depth_bb = self.new_block("pld");
+                    self.cbr(has, depth_bb, slow)?;
+                    self.b.position_at_end(depth_bb);
+                    let (depth_p, depth) = self.direct_depth()?;
+                    let room = self.icmp(
+                        IntPredicate::ULT,
+                        depth,
+                        self.sh
+                            .ctx
+                            .i32_type()
+                            .const_int(crate::codegen::runtime_fns::MAX_JIT_DEPTH as u64, false),
+                    )?;
+                    self.cbr(room, call_bb, slow)?;
                     self.b.position_at_end(call_bb);
+                    let deeper = self
+                        .b
+                        .build_int_add(depth, self.sh.ctx.i32_type().const_int(1, false), "d1")
+                        .map_err(|e| e.to_string())?;
+                    self.b
+                        .build_store(depth_p, deeper)
+                        .map_err(|e| e.to_string())?;
                     let ty = self.helper_type(1 + args.len());
                     let ptr = self
                         .b
@@ -3207,6 +3292,9 @@ pub mod llvm {
                         .build_indirect_call(ty, ptr, &a, "direct")
                         .map_err(|e| e.to_string())?;
                     let fv = call.try_as_basic_value().basic().unwrap();
+                    self.b
+                        .build_store(depth_p, depth)
+                        .map_err(|e| e.to_string())?;
                     self.br(merge)?;
                     self.b.position_at_end(slow);
                     let sv = self.wren_call(r, m, &arg_vals)?;

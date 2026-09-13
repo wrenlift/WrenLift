@@ -1494,12 +1494,20 @@ impl ExecutionEngine {
     ///   so Cranelift inlines a direct field load.
     /// - If the callee has no internal calls (pure leaf), mark it so
     ///   Cranelift can emit a pure direct call_indirect with zero FFI.
-    fn compute_devirt_hints(&self, ic_snapshot: &[CallSiteIC]) -> Vec<crate::codegen::DevirtHint> {
+    fn compute_devirt_hints(
+        &self,
+        caller: FuncId,
+        ic_snapshot: &[CallSiteIC],
+    ) -> Vec<crate::codegen::DevirtHint> {
+        let direct_calls = crate::codegen::cranelift_backend::cl::direct_calls_enabled();
+        let caller_module = self.func_module(caller);
         ic_snapshot
             .iter()
             .map(|ic| {
                 let mut hint = crate::codegen::DevirtHint::default();
-                if ic.kind != 1 || ic.class == 0 || ic.func_id == 0 {
+                // Kinds 1, 2 and 6 name a closure method; whether it is
+                // compiled yet is decided at the call.
+                if !matches!(ic.kind, 1 | 2 | 6) || ic.class == 0 || ic.func_id == 0 {
                     return hint;
                 }
                 let callee_id = FuncId(ic.func_id as u32);
@@ -1507,7 +1515,9 @@ impl ExecutionEngine {
                     return hint;
                 };
                 hint.getter_field = Self::mir_trivial_getter_field(&mir);
-                hint.pure_leaf = Self::mir_is_pure_leaf(&mir);
+                hint.direct = direct_calls
+                    && self.func_module(callee_id) == caller_module
+                    && Self::mir_is_direct_callee(&mir);
                 hint
             })
             .collect()
@@ -1787,7 +1797,15 @@ impl ExecutionEngine {
                 match class.methods.get(sym.index() as usize).copied().flatten()? {
                     Method::Constructor(closure) if !closure.is_null() => {
                         let fid = unsafe { (*(*closure).function).fn_id };
-                        Some((ptr as usize, fid, closure))
+                        // Compiled code calls the initialiser directly,
+                        // so it must be a direct callee of this function.
+                        let callee = FuncId(fid);
+                        let direct = self.func_module(callee) == self.func_module(id)
+                            && self
+                                .get_mir(callee)
+                                .map(|m| Self::mir_is_direct_callee(&m))
+                                .unwrap_or(false);
+                        direct.then_some((ptr as usize, fid, closure))
                     }
                     _ => None,
                 }
@@ -1967,36 +1985,26 @@ impl ExecutionEngine {
     /// A "pure leaf" function has no internal method calls — Cranelift
     /// can emit a zero-FFI direct `call_indirect` because the callee
     /// doesn't need its own JIT context (current_func_id, etc.).
-    fn mir_is_pure_leaf(mir: &crate::mir::MirFunction) -> bool {
+    /// Whether compiled code may call `mir` straight through its
+    /// `jit_code` slot: a body that reads no static field (which the
+    /// helpers resolve through the dispatcher's defining class) and no
+    /// upvalue (resolved through the dispatcher's closure). Module
+    /// variables are fine when the caller shares the module, which the
+    /// hint checks.
+    fn mir_is_direct_callee(mir: &crate::mir::MirFunction) -> bool {
         use crate::mir::Instruction;
-        for block in &mir.blocks {
-            for (_, inst) in &block.instructions {
-                match inst {
-                    Instruction::Call { .. }
-                    | Instruction::CallKnownFunc { .. }
-                    | Instruction::CallStaticSelf { .. }
-                    | Instruction::SuperCall { .. } => return false,
-                    // Runtime calls that require context (module_vars, etc.)
-                    // — any of these prevent pure_leaf status.
-                    Instruction::GetModuleVar(_)
-                    | Instruction::SetModuleVar(_, _)
-                    | Instruction::GetStaticField(_)
-                    | Instruction::SetStaticField(_, _)
-                    | Instruction::GetUpvalue(_)
-                    | Instruction::SetUpvalue(_, _)
-                    | Instruction::MakeList(_)
-                    | Instruction::MakeMap(_)
-                    | Instruction::MakeRange { .. }
-                    | Instruction::MakeClosure { .. }
-                    | Instruction::StringConcat(_)
-                    | Instruction::ToString(_)
-                    | Instruction::SubscriptGet { .. }
-                    | Instruction::SubscriptSet { .. } => return false,
-                    _ => {}
-                }
-            }
-        }
-        true
+        !mir.blocks.iter().any(|block| {
+            block.instructions.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    Instruction::GetStaticField(_)
+                        | Instruction::SetStaticField(_, _)
+                        | Instruction::GetUpvalue(_)
+                        | Instruction::SetUpvalue(_, _)
+                        | Instruction::SuperCall { .. }
+                )
+            })
+        })
     }
 
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
@@ -3707,7 +3715,7 @@ impl ExecutionEngine {
             Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref(), speculate);
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
-            .map(|ics| self.compute_devirt_hints(ics));
+            .map(|ics| self.compute_devirt_hints(id, ics));
         let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
             match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
                 (Some(ics), Some(live)) => {
@@ -3922,7 +3930,7 @@ impl ExecutionEngine {
         };
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
-            .map(|ics| self.compute_devirt_hints(ics));
+            .map(|ics| self.compute_devirt_hints(id, ics));
         let cold = callsite_ic_ptrs
             .as_deref()
             .map(|ics| Self::cold_loop_headers(&mir, ics))

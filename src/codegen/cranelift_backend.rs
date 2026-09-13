@@ -1148,11 +1148,18 @@ pub mod cl {
         (idx as usize) < cell.len.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Compiled code calls a known compiled callee straight through its
+    /// `jit_code` slot under the conservative collector, which scans the
+    /// native frames a helper would otherwise root; a collector that
+    /// needs barriers, or `WLIFT_DISABLE_DIRECT_CALLS=1`, keeps the
+    /// helper. Safe to run with either way.
     #[inline]
-    pub(crate) fn env_pure_leaf_direct() -> bool {
+    pub(crate) fn direct_calls_enabled() -> bool {
         use std::sync::OnceLock;
         static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some())
+        *CACHED.get_or_init(|| {
+            std::env::var_os("WLIFT_DISABLE_DIRECT_CALLS").is_none() && !env_jit_callsite_ic()
+        }) && !crate::runtime::gc_trait::jit_needs_write_barriers()
     }
 
     /// Stack maps are now ON by default. JIT-compiled Wren methods
@@ -2098,6 +2105,7 @@ pub mod cl {
             "wren_construct_1",
             "wren_construct_2",
             "wren_construct_3",
+            "wren_alloc_instance",
             "wren_ic_call_0",
             "wren_ic_call_1",
             "wren_ic_call_2",
@@ -5413,6 +5421,67 @@ pub mod cl {
                         let packed = ic.func_id | ((method.index() as u64) << 32);
                         let packed_val = builder.ins().iconst(types::I64, packed as i64);
                         let arg_vals: Vec<_> = args.iter().map(&get).collect();
+                        // The initialiser is called straight through its
+                        // slot when it is compiled; the helper otherwise.
+                        let helper_block = builder.create_block();
+                        if let (true, Some(jit_base_ptr)) = (direct_calls_enabled(), jit_code_base)
+                        {
+                            let slot_addr = unsafe { jit_base_ptr.add(ic.func_id as usize) as i64 };
+                            let slot_addr_val = builder.ins().iconst(types::I64, slot_addr);
+                            let jit_ptr =
+                                builder
+                                    .ins()
+                                    .load(types::I64, MemFlags::new(), slot_addr_val, 0);
+                            let depth_block = builder.create_block();
+                            let call_block = builder.create_block();
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            let has_jit = builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
+                            builder
+                                .ins()
+                                .brif(has_jit, depth_block, &[], helper_block, &[]);
+                            builder.switch_to_block(depth_block);
+                            let depth_addr = builder.ins().iconst(
+                                types::I64,
+                                &crate::codegen::runtime_fns::JIT_DIRECT_DEPTH
+                                    as *const std::sync::atomic::AtomicU32
+                                    as i64,
+                            );
+                            let depth =
+                                builder
+                                    .ins()
+                                    .load(types::I32, MemFlags::trusted(), depth_addr, 0);
+                            let room = builder.ins().icmp_imm_u(
+                                IntCC::UnsignedLessThan,
+                                depth,
+                                crate::codegen::runtime_fns::MAX_JIT_DEPTH as i64,
+                            );
+                            builder.ins().brif(room, call_block, &[], helper_block, &[]);
+                            builder.switch_to_block(call_block);
+                            let alloc = get_runtime_fn(module, builder, "wren_alloc_instance", 1)?;
+                            let a = builder.ins().call(alloc, &[r]);
+                            let inst = builder.inst_results(a)[0];
+                            let deeper = builder.ins().iadd_imm_u(depth, 1);
+                            builder
+                                .ins()
+                                .store(MemFlags::trusted(), deeper, depth_addr, 0);
+                            let mut sig = module.make_signature();
+                            sig.params.push(AbiParam::new(types::I64));
+                            for _ in args.iter() {
+                                sig.params.push(AbiParam::new(types::I64));
+                            }
+                            sig.returns.push(AbiParam::new(types::I64));
+                            let sig_ref = builder.import_signature(sig);
+                            let mut call_args = vec![inst];
+                            call_args.extend(arg_vals.iter().copied());
+                            let _ = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
+                            builder
+                                .ins()
+                                .store(MemFlags::trusted(), depth, depth_addr, 0);
+                            builder.ins().jump(merge_block, &[BlockArg::Value(inst)]);
+                        } else {
+                            builder.ins().jump(helper_block, &[]);
+                        }
+                        builder.switch_to_block(helper_block);
                         let name = [
                             "wren_construct_0",
                             "wren_construct_1",
@@ -5588,7 +5657,7 @@ pub mod cl {
                 method,
                 expected_class,
                 inline_getter_field,
-                pure_leaf,
+                direct,
                 receiver,
                 args,
             } => {
@@ -5775,10 +5844,9 @@ pub mod cl {
                 // stack maps for the call_indirect args are wired up;
                 // until then fall through to `wren_known_call_N_nocheck`,
                 // which roots args before dispatching.
-                let pure_leaf_enabled = env_pure_leaf_direct();
-                if pure_leaf_enabled
+                if direct_calls_enabled()
                     && inline_getter_field.is_none()
-                    && *pure_leaf
+                    && *direct
                     && *expected_class != 0
                     && args.len() <= 4
                 {
@@ -5811,12 +5879,36 @@ pub mod cl {
                         // fall to slow path.
                         let zero = builder.ins().iconst(types::I64, 0);
                         let has_jit = builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
+                        let depth_block = builder.create_block();
                         let pure_call_block = builder.create_block();
                         builder
                             .ins()
-                            .brif(has_jit, pure_call_block, &[], slow_block, &[]);
+                            .brif(has_jit, depth_block, &[], slow_block, &[]);
+                        builder.switch_to_block(depth_block);
+                        let depth_addr = builder.ins().iconst(
+                            types::I64,
+                            &crate::codegen::runtime_fns::JIT_DIRECT_DEPTH
+                                as *const std::sync::atomic::AtomicU32
+                                as i64,
+                        );
+                        let depth =
+                            builder
+                                .ins()
+                                .load(types::I32, MemFlags::trusted(), depth_addr, 0);
+                        let room = builder.ins().icmp_imm_u(
+                            IntCC::UnsignedLessThan,
+                            depth,
+                            crate::codegen::runtime_fns::MAX_JIT_DEPTH as i64,
+                        );
+                        builder
+                            .ins()
+                            .brif(room, pure_call_block, &[], slow_block, &[]);
 
                         builder.switch_to_block(pure_call_block);
+                        let deeper = builder.ins().iadd_imm_u(depth, 1);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), deeper, depth_addr, 0);
                         // Direct call signature: (recv, args...) -> i64
                         let mut sig = module.make_signature();
                         sig.params.push(AbiParam::new(types::I64)); // recv
@@ -5831,6 +5923,9 @@ pub mod cl {
                         }
                         let call = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
                         let fast_result = builder.inst_results(call)[0];
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), depth, depth_addr, 0);
                         builder
                             .ins()
                             .jump(merge_block, &[BlockArg::Value(fast_result)]);
