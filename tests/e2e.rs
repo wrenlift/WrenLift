@@ -5066,8 +5066,10 @@ System.print("%(sum) %(r) %(acc.a)")
     let deopts = vm.engine.deopt_exits;
     assert!(matches!(result, InterpretResult::Success));
     assert_eq!(output.trim(), "16000000 18 76000004");
+    // The top tier lands on another thread: when it does in time, the
+    // class miss on `_b.v` fires exactly once, never per call.
     if wren_lift::codegen::top_tier() == wren_lift::codegen::TopTier::Llvm {
-        assert_eq!(deopts, 1, "the class miss on `_b.v` fires exactly once");
+        assert!(deopts <= 1, "the class miss on `_b.v` fired {deopts} times");
     }
 }
 

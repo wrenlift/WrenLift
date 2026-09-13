@@ -80,13 +80,14 @@ impl TierCell {
     }
 }
 
-/// One thread with a bounded queue for top-tier compiles, the shape of
-/// beadie's promotion broker: a full queue rejects the proposal and the
-/// function is re-proposed later.
+/// Threads sharing one bounded queue for top-tier compiles, the shape
+/// of beadie's promotion broker: a full queue rejects the proposal and
+/// the function is re-proposed later. With more than one thread a
+/// large body's compile holds up nothing queued behind it.
 #[cfg(feature = "host")]
 struct Promoter {
     tx: Option<mpsc::SyncSender<Box<dyn FnOnce() + Send>>>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
     /// Set when the engine goes away; jobs still queued are dropped
     /// unrun.
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -95,24 +96,39 @@ struct Promoter {
 #[cfg(feature = "host")]
 impl Promoter {
     fn start() -> Self {
+        Self::start_threads(1)
+    }
+
+    fn start_threads(threads: usize) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(256);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
-        let worker = std::thread::Builder::new()
-            .name("wlift-promoter".into())
-            .spawn(move || {
-                for job in rx {
-                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
-                        drop(job);
-                        continue;
-                    }
-                    job();
-                }
+        let workers = (0..threads.max(1))
+            .map(|_| {
+                let stopped = Arc::clone(&stop);
+                let rx = Arc::clone(&rx);
+                std::thread::Builder::new()
+                    .name("wlift-promoter".into())
+                    .spawn(move || loop {
+                        let job = match rx.lock() {
+                            Ok(rx) => rx.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(job) = job else {
+                            return;
+                        };
+                        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                            drop(job);
+                            continue;
+                        }
+                        job();
+                    })
+                    .expect("spawn promoter thread")
             })
-            .expect("spawn promoter thread");
+            .collect();
         Self {
             tx: Some(tx),
-            worker: Some(worker),
+            workers,
             stop,
         }
     }
@@ -133,11 +149,15 @@ impl Drop for Promoter {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         drop(self.tx.take());
-        if let Some(worker) = self.worker.take() {
+        for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
 }
+
+/// Threads compiling for the top tier.
+#[cfg(feature = "host")]
+const TOP_TIER_THREADS: usize = 2;
 
 /// `WLIFT_RESULT_SPEC=0` stops the top tier guarding call results the
 /// inline caches only ever saw as Num. Safe to run with either way.
@@ -821,8 +841,10 @@ pub struct ExecutionEngine {
     /// for the next tier; its entry is compiled with the body, the
     /// other loops' entries after the install.
     hot_header: Vec<Option<crate::mir::BlockId>>,
-    /// Baseline compiles alternate between the broker and the promoter.
+    /// Baseline compiles alternate between the broker and this worker.
     baseline_spread: u32,
+    #[cfg(feature = "host")]
+    baseline_worker: Option<Promoter>,
     /// Loop headers whose body had no inline-cache data when the
     /// installed code was compiled, so its call sites are generic. The
     /// interpreter keeps running such a loop and asks for a recompile
@@ -1115,6 +1137,8 @@ impl ExecutionEngine {
             baseline_osr_entries: Vec::new(),
             hot_header: Vec::new(),
             baseline_spread: 0,
+            #[cfg(feature = "host")]
+            baseline_worker: None,
             cold_osr_blocks: Vec::new(),
             pending_cold_osr: HashMap::new(),
             cold_osr_probes: HashMap::new(),
@@ -4311,14 +4335,22 @@ impl ExecutionEngine {
         // code and OSR table.
         // The broker takes interpreted beads only; the top tier and
         // recompiles of a compiled bead go through the promoter. Every
-        // other baseline compile goes there too, so two threads work
-        // through a warm-up's queue.
+        // other baseline compile goes to a worker of its own, so two
+        // threads work through a warm-up's queue without the top
+        // tier's compiles in the way.
         let bead_interpreted = self.tier.state(id) == Some(beadie::BeadState::Interpreted);
         self.baseline_spread = self.baseline_spread.wrapping_add(1);
-        let spread = tier == CompileTier::Baseline && self.baseline_spread.is_multiple_of(2);
+        let spread = tier == CompileTier::Baseline
+            && bead_interpreted
+            && self.baseline_spread.is_multiple_of(2);
         if tier == CompileTier::Optimized || !bead_interpreted || spread {
-            let promoter = self.promoter.get_or_insert_with(Promoter::start);
-            if !promoter.submit(Box::new(move || {
+            let worker = if spread {
+                self.baseline_worker.get_or_insert_with(Promoter::start)
+            } else {
+                self.promoter
+                    .get_or_insert_with(|| Promoter::start_threads(TOP_TIER_THREADS))
+            };
+            if !worker.submit(Box::new(move || {
                 let _ = compile_fn();
             })) {
                 // Nothing is in flight; propose again at double the count.
@@ -4424,7 +4456,9 @@ impl ExecutionEngine {
                 {
                     self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
                     if let Some(job) = entries_job {
-                        let promoter = self.promoter.get_or_insert_with(Promoter::start);
+                        let promoter = self
+                            .promoter
+                            .get_or_insert_with(|| Promoter::start_threads(TOP_TIER_THREADS));
                         if promoter.submit(job) {
                             self.pending_count += 1;
                         }
@@ -4556,7 +4590,10 @@ impl ExecutionEngine {
     /// name, so this runs before the heap goes.
     pub fn stop_promoter(&mut self) {
         #[cfg(feature = "host")]
-        drop(self.promoter.take());
+        {
+            drop(self.promoter.take());
+            drop(self.baseline_worker.take());
+        }
     }
 }
 
