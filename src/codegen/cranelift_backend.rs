@@ -1056,6 +1056,9 @@ pub mod cl {
         pub retier_headers: HashSet<BlockId>,
         pub tick_headers: HashSet<BlockId>,
         pub result_kinds: usize,
+        /// Bytes at `result_kinds`: one per bytecode register. Values
+        /// the compile clone adds beyond them have no byte.
+        pub result_kinds_len: usize,
     }
 
     thread_local! {
@@ -3507,9 +3510,9 @@ pub mod cl {
                                 // its arguments the way it does call
                                 // results; the receiver is never a Num.
                                 if idx > 0 {
-                                    if let Some(hook) =
-                                        tier_hook.as_ref().filter(|h| h.result_kinds != 0)
-                                    {
+                                    if let Some(hook) = tier_hook.as_ref().filter(|h| {
+                                        h.result_kinds != 0 && (vid.0 as usize) < h.result_kinds_len
+                                    }) {
                                         emit_note_call_result(
                                             builder,
                                             hook.result_kinds + vid.0 as usize,
@@ -3745,6 +3748,7 @@ pub mod cl {
                     // call returns for the top tier to speculate on.
                     if let Some(ref hook) = tier_hook {
                         if hook.result_kinds != 0
+                            && (vid.0 as usize) < hook.result_kinds_len
                             && matches!(
                                 inst,
                                 Instruction::Call { .. }

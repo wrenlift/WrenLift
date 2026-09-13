@@ -3825,6 +3825,10 @@ impl ExecutionEngine {
                     .ensure_bytecode(id)
                     .map(|bc| unsafe { (*(*bc).result_kinds.get()).as_ptr() as usize })
                     .unwrap_or(0),
+                result_kinds_len: self
+                    .ensure_bytecode(id)
+                    .map(|bc| unsafe { (*(*bc).result_kinds.get()).len() })
+                    .unwrap_or(0),
             })
         } else {
             None

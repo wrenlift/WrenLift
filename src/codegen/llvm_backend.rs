@@ -3063,27 +3063,35 @@ pub mod llvm {
                 if expected_class != 0 && args.len() <= 4 {
                     if let Some(callee) = bodies.get(&func_id).cloned() {
                         let fast = self.new_block("kif");
+                        let (hit, _) = self.instance_check(r, expected_class as u64)?;
+                        if let Some(miss) = self.miss_exit_block()? {
+                            // A class miss leaves the function, so the
+                            // inlined body needs no merge.
+                            self.cbr(hit, fast, miss)?;
+                            self.b.position_at_end(fast);
+                            return match self.inline_body(&callee, r, &arg_vals)? {
+                                Some(v) => {
+                                    if let Some(field) = inline_getter_field {
+                                        let dst = self.cur_vid;
+                                        self.note_field_invariant(expected_class, field, dst);
+                                    }
+                                    Ok(v)
+                                }
+                                None => {
+                                    let slow = self.new_block("kis");
+                                    self.br(slow)?;
+                                    self.b.position_at_end(slow);
+                                    self.wren_call(r, m, &arg_vals)
+                                }
+                            };
+                        }
                         let slow = self.new_block("kis");
                         let merge = self.new_block("kim");
-                        let (hit, _) = self.instance_check(r, expected_class as u64)?;
-                        let miss = self.miss_exit_block()?;
-                        self.cbr(hit, fast, miss.unwrap_or(slow))?;
+                        self.cbr(hit, fast, slow)?;
                         self.b.position_at_end(fast);
                         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
                             Vec::new();
                         match self.inline_body(&callee, r, &arg_vals)? {
-                            Some(v) if miss.is_some() => {
-                                slow.remove_from_function()
-                                    .map_err(|_| "remove unused block")?;
-                                merge
-                                    .remove_from_function()
-                                    .map_err(|_| "remove unused block")?;
-                                if let Some(field) = inline_getter_field {
-                                    let dst = self.cur_vid;
-                                    self.note_field_invariant(expected_class, field, dst);
-                                }
-                                return Ok(v);
-                            }
                             Some(v) => {
                                 incoming.push((v.into(), self.b.get_insert_block().unwrap()));
                                 self.br(merge)?;
