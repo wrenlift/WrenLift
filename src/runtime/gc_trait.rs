@@ -144,6 +144,13 @@ pub fn jit_needs_write_barriers() -> bool {
     BARRIER_VMS.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
+/// True when JIT code compiled now must record its live values for
+/// the collector: Immix scans native frames conservatively and reads
+/// no stack map.
+pub fn jit_needs_stack_maps() -> bool {
+    jit_needs_write_barriers()
+}
+
 impl GcImpl {
     /// Create a new GC instance for the given strategy.
     pub fn new(strategy: GcStrategy) -> Self {

@@ -2790,11 +2790,12 @@ pub mod cl {
         // the only outbound calls are recursive self-calls that take
         // and return `f64`. Skip marking there.
         //
-        // Off by default — opt in via `WLIFT_ENABLE_STACK_MAPS=1`.
-        // Force-spilling every Wren value across every safepoint
-        // currently amplifies an unrelated UNDEF-leak in the JIT;
-        // re-enable once that init bug is fixed.
-        let mark_stack_map = f64_self_id.is_none() && env_stack_maps();
+        // A collector that scans native frames conservatively reads no
+        // stack map; `WLIFT_DISABLE_STACK_MAPS=1` turns them off for the
+        // others too, which is unsafe to run with.
+        let mark_stack_map = f64_self_id.is_none()
+            && env_stack_maps()
+            && (aot_config.is_some() || crate::runtime::gc_trait::jit_needs_stack_maps());
         let value_types = if mark_stack_map {
             infer_osr_value_types(mir)
         } else {
