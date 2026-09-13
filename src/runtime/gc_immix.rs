@@ -158,40 +158,23 @@ impl ImmixGc {
 
     // -- Marking ------------------------------------------------------------
 
-    /// Claim `header` for this cycle and queue it for tracing if the
-    /// claim is new.
-    #[inline(always)]
-    fn claim(heap: *mut c_void, header: *mut ObjHeader, gray: &mut Vec<*mut ObjHeader>) {
-        if unsafe { rt::mark_allocation(heap, header as *mut u8) } {
-            gray.push(header);
-        }
-    }
-
-    fn mark_root(&self, val: Value, gray: &mut Vec<*mut ObjHeader>) {
-        if let Some(header) = gc::object_of(val) {
-            Self::claim(self.heap, header, gray);
-        }
-    }
-
-    fn process_gray(&self, gray: &mut Vec<*mut ObjHeader>) {
-        let heap = self.heap;
-        while let Some(obj) = gray.pop() {
-            unsafe { gc::for_each_child(obj, &mut |child| Self::claim(heap, child, gray)) };
-        }
-    }
-
     /// Collect with precise `roots` plus conservative word scans of
     /// `ranges` (native stack windows, register spills).
     pub fn collect_with_ranges(&mut self, roots: &[Value], ranges: &[(usize, usize)]) {
         let start = Instant::now();
         unsafe { rt::collect_begin(self.heap) };
-        let mut gray: Vec<*mut ObjHeader> = Vec::with_capacity(1024);
+        let mut gray = Gray {
+            heap: self.heap,
+            builtin: rt::heap_is_builtin(),
+            stack: Vec::with_capacity(1024),
+        };
         for &root in roots {
-            self.mark_root(root, &mut gray);
+            if let Some(header) = gc::object_of(root) {
+                gray.claim(header);
+            }
         }
         let heap = self.heap;
-        let mut visit: &mut dyn FnMut(*mut u8) =
-            &mut |start| Self::claim(heap, start as *mut ObjHeader, &mut gray);
+        let mut visit: &mut dyn FnMut(*mut u8) = &mut |start| gray.claim(start as *mut ObjHeader);
         for &(lo, hi) in ranges {
             if lo < hi {
                 unsafe {
@@ -199,7 +182,7 @@ impl ImmixGc {
                 };
             }
         }
-        self.process_gray(&mut gray);
+        gray.drain();
         self.finish_collection(start);
     }
 
@@ -243,6 +226,39 @@ impl ImmixGc {
 unsafe extern "C" fn visit_dyn(start: *mut u8, ctx: *mut c_void) {
     let f = &mut *(ctx as *mut &mut dyn FnMut(*mut u8));
     f(start);
+}
+
+/// The objects claimed for the open cycle and not yet traced.
+struct Gray {
+    heap: *mut c_void,
+    /// The handle is an `ImmixHeap`, so a claim is a direct call rather
+    /// than one through the memory slot.
+    builtin: bool,
+    stack: Vec<*mut ObjHeader>,
+}
+
+impl Gray {
+    /// Claim `header` for this cycle and queue it for tracing if the
+    /// claim is new.
+    #[inline(always)]
+    fn claim(&mut self, header: *mut ObjHeader) {
+        let new = unsafe {
+            if self.builtin {
+                (*(self.heap as *mut super::gc_immix_heap::ImmixHeap)).mark(header as *mut u8)
+            } else {
+                rt::mark_allocation(self.heap, header as *mut u8)
+            }
+        };
+        if new {
+            self.stack.push(header);
+        }
+    }
+
+    fn drain(&mut self) {
+        while let Some(obj) = self.stack.pop() {
+            unsafe { gc::for_each_child(obj, &mut |child| self.claim(child)) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

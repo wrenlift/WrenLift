@@ -244,6 +244,8 @@ pub struct ImmixHeap {
     /// (chunk base, first block number) sorted by base, for address
     /// lookups.
     chunk_index: Vec<(usize, u32)>,
+    /// The `chunk_index` entry the last lookup resolved to.
+    last_chunk: Cell<(usize, u32)>,
     /// Free block numbers; popped from the end.
     free_blocks: Vec<u32>,
     /// One byte per quantum: 0 not a start, 1..=8 small object size in
@@ -296,6 +298,7 @@ impl ImmixHeap {
             has_span: Vec::new(),
             handed_back: Vec::new(),
             chunk_index: Vec::new(),
+            last_chunk: Cell::new((usize::MAX, 0)),
             free_blocks: Vec::new(),
             objects: Vec::new(),
             alloc_sizes: Vec::new(),
@@ -606,6 +609,11 @@ impl ImmixHeap {
     /// Block number holding `addr`, if it is inside the heap.
     #[inline]
     fn block_containing(&self, addr: usize) -> Option<u32> {
+        // Most lookups in a row hit the chunk the last one did.
+        let (base, first) = self.last_chunk.get();
+        if addr.wrapping_sub(base) < CHUNK_BYTES {
+            return Some(first + ((addr - base) / BLOCK_SIZE) as u32);
+        }
         let i = self.chunk_index.partition_point(|&(base, _)| base <= addr);
         if i == 0 {
             return None;
@@ -614,6 +622,7 @@ impl ImmixHeap {
         if addr >= base + CHUNK_BYTES {
             return None;
         }
+        self.last_chunk.set((base, first));
         Some(first + ((addr - base) / BLOCK_SIZE) as u32)
     }
 
@@ -718,11 +727,16 @@ impl ImmixHeap {
             let b = b as usize;
             let q = (addr - self.block_bases[b]) / QUANTUM;
             let code = self.objects[b * QUANTA_PER_BLOCK + q];
-            let quanta = self.alloc_quanta(b, q, code).max(1);
             let first = q / QUANTA_PER_LINE;
-            let last = (q + quanta - 1) / QUANTA_PER_LINE;
-            for l in first..=last {
-                self.line_marks[b * LINE_WORDS + l / 64] |= 1u64 << (l % 64);
+            if code & CODE_MASK != SPAN_OBJECT {
+                // A small object never straddles a line.
+                self.line_marks[b * LINE_WORDS + first / 64] |= 1u64 << (first % 64);
+            } else {
+                let quanta = self.alloc_quanta(b, q, code).max(1);
+                let last = (q + quanta - 1) / QUANTA_PER_LINE;
+                for l in first..=last {
+                    self.line_marks[b * LINE_WORDS + l / 64] |= 1u64 << (l % 64);
+                }
             }
         }
         true
