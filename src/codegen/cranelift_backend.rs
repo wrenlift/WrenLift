@@ -110,6 +110,156 @@ pub mod cl {
             && c >= f64::MIN_POSITIVE
     }
 
+    /// A fresh instance of the class object `class_val`: bumped out of
+    /// the Immix small region when the compile knows it, its fields
+    /// null, the start byte written; the helper when the region is out
+    /// of room, the object exceeds a line, or there is no region.
+    #[allow(clippy::type_complexity)]
+    fn emit_alloc_instance(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        class_val: Value,
+    ) -> Result<Value, String> {
+        use crate::runtime::gc_immix_heap::{
+            BUMP_BASE, BUMP_CUR, BUMP_LIMIT, BUMP_OBJECTS, BUMP_PLAIN_FLAG, BUMP_Q0,
+        };
+        let bump = crate::codegen::jit_bump_region();
+        let helper = get_runtime_fn(module, builder, "wren_alloc_instance", 1)?;
+        if bump == 0 {
+            let call = builder.ins().call(helper, &[class_val]);
+            return Ok(builder.inst_results(call)[0]);
+        }
+        let slow_block = builder.create_block();
+        let sized_block = builder.create_block();
+        let fast_block = builder.create_block();
+        let loop_block = builder.create_block();
+        let done_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(loop_block, types::I64);
+        builder.append_block_param(merge_block, types::I64);
+
+        let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+        let class = builder.ins().band(class_val, mask);
+        let nf16 = builder
+            .ins()
+            .load(types::I16, MemFlags::trusted(), class, CLASS_NUM_FIELDS);
+        let nf = builder.ins().uextend(types::I64, nf16);
+        // size = (40 + 8 * nf + 15) & !15
+        let fb = builder.ins().imul_imm_u(nf, VALUE_SIZE as i64);
+        let raw = builder.ins().iadd_imm_u(fb, INSTANCE_SIZE as i64 + 15);
+        let size = builder.ins().band_imm_s(raw, !15i64);
+        let fits = builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, size, 128);
+        builder.ins().brif(fits, sized_block, &[], slow_block, &[]);
+
+        builder.switch_to_block(sized_block);
+        let bump_v = builder.ins().iconst(types::I64, bump as i64);
+        let cur = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_CUR);
+        let limit = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_LIMIT);
+        // Never straddle a line: start at the next line if the object
+        // would.
+        let off = builder.ins().band_imm_u(cur, 127);
+        let end_in_line = builder.ins().iadd(off, size);
+        let straddles = builder
+            .ins()
+            .icmp_imm_u(IntCC::UnsignedGreaterThan, end_in_line, 128);
+        let c127 = builder.ins().iadd_imm_u(cur, 127);
+        let aligned = builder.ins().band_imm_s(c127, !127i64);
+        let p = builder.ins().select(straddles, aligned, cur);
+        let np = builder.ins().iadd(p, size);
+        let room = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, np, limit);
+        builder.ins().brif(room, fast_block, &[], slow_block, &[]);
+
+        builder.switch_to_block(fast_block);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), np, bump_v, BUMP_CUR);
+        let objects = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_OBJECTS);
+        let base = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_BASE);
+        let q0 = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), bump_v, BUMP_Q0);
+        let rel = builder.ins().isub(p, base);
+        let rq = builder.ins().ushr_imm_u(rel, 4);
+        let q = builder.ins().iadd(q0, rq);
+        let code_p = builder.ins().iadd(objects, q);
+        let sq = builder.ins().ushr_imm_u(size, 4);
+        let code = builder.ins().bor_imm_u(sq, BUMP_PLAIN_FLAG as i64);
+        let code8 = builder.ins().ireduce(types::I8, code);
+        builder.ins().store(MemFlags::trusted(), code8, code_p, 0);
+        // Header: type byte, clear mark/generation/flags, no next, the
+        // class, the field count, no owned fields, the fields right
+        // after the header.
+        let type_word = builder.ins().iconst(types::I64, OBJ_TYPE_INSTANCE as i64);
+        builder.ins().store(MemFlags::trusted(), type_word, p, 0);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), zero, p, HEADER_NEXT);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), class, p, HEADER_CLASS);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), nf, p, INSTANCE_NUM_FIELDS);
+        let fields = builder.ins().iadd_imm_u(p, INSTANCE_SIZE as i64);
+        let has_fields = builder.ins().icmp_imm_u(IntCC::NotEqual, nf, 0);
+        let fields_or_null = builder.ins().select(has_fields, fields, zero);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), fields_or_null, p, INSTANCE_FIELDS);
+        builder.ins().brif(
+            has_fields,
+            loop_block,
+            &[BlockArg::Value(zero)],
+            done_block,
+            &[],
+        );
+
+        // Null every field.
+        builder.switch_to_block(loop_block);
+        let i = builder.block_params(loop_block)[0];
+        let io = builder.ins().imul_imm_u(i, 8);
+        let slot = builder.ins().iadd(fields, io);
+        let null_v = builder.ins().iconst(types::I64, TAG_NULL as i64);
+        builder.ins().store(MemFlags::trusted(), null_v, slot, 0);
+        let next = builder.ins().iadd_imm_u(i, 1);
+        let more = builder.ins().icmp(IntCC::UnsignedLessThan, next, nf);
+        builder
+            .ins()
+            .brif(more, loop_block, &[BlockArg::Value(next)], done_block, &[]);
+
+        builder.switch_to_block(done_block);
+        let tag = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+        let boxed = builder.ins().bor(p, tag);
+        builder.ins().jump(merge_block, &[BlockArg::Value(boxed)]);
+
+        builder.switch_to_block(slow_block);
+        let call = builder.ins().call(helper, &[class_val]);
+        let sv = builder.inst_results(call)[0];
+        builder.ins().jump(merge_block, &[BlockArg::Value(sv)]);
+
+        builder.switch_to_block(merge_block);
+        Ok(builder.block_params(merge_block)[0])
+    }
+
     /// Or the kind of `value` into the class's field-kind byte for
     /// field `idx` of the instance at `obj_ptr`, as
     /// `ObjInstance::note_field_kind` does; a class without the bytes
@@ -5448,9 +5598,7 @@ pub mod cl {
                             );
                             builder.ins().brif(room, call_block, &[], helper_block, &[]);
                             builder.switch_to_block(call_block);
-                            let alloc = get_runtime_fn(module, builder, "wren_alloc_instance", 1)?;
-                            let a = builder.ins().call(alloc, &[r]);
-                            let inst = builder.inst_results(a)[0];
+                            let inst = emit_alloc_instance(builder, module, get_runtime_fn, r)?;
                             let deeper = builder.ins().iadd_imm_u(depth, 1);
                             builder
                                 .ins()

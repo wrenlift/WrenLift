@@ -2132,6 +2132,29 @@ pub fn top_tier_is_llvm() -> bool {
     top_tier() == TopTier::Llvm
 }
 
+thread_local! {
+    /// The Immix bump region the function this thread is compiling may
+    /// allocate instances from inline; 0 keeps the allocation helper.
+    static JIT_BUMP_REGION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the bump region for this thread's next compile; 0 clears it.
+pub fn set_jit_bump_region(addr: usize) {
+    JIT_BUMP_REGION.with(|c| c.set(addr));
+}
+
+/// The bump region for the compile in progress, when inline
+/// allocation is on (`WLIFT_DISABLE_INLINE_ALLOC=1` keeps the helper;
+/// safe to run with).
+pub fn jit_bump_region() -> usize {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("WLIFT_DISABLE_INLINE_ALLOC").is_none()) {
+        return 0;
+    }
+    JIT_BUMP_REGION.with(|c| c.get())
+}
+
 /// Compiled code calls a known compiled callee straight through its
 /// `jit_code` slot under the conservative collector, which scans the
 /// native frames a helper would otherwise root; a collector that needs

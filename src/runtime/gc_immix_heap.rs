@@ -33,6 +33,11 @@ const LINE_WORDS: usize = LINES_PER_BLOCK / 64;
 /// is `alloc_sizes[line] * LINE_SIZE`. Small allocations store their
 /// size in quanta (1..=8) instead.
 const SPAN_OBJECT: u8 = (QUANTA_PER_LINE + 1) as u8;
+/// The size code of a start byte.
+const CODE_MASK: u8 = 0x0F;
+/// Start-byte bit of an allocation that owns nothing outside the heap:
+/// the sweep reclaims it without calling the drop.
+const PLAIN: u8 = 0x10;
 
 /// Largest allocation that goes through the bump region.
 const SMALL_MAX: usize = LINE_SIZE;
@@ -51,8 +56,11 @@ const TRIGGER_CEILING: usize = 512 * 1024 * 1024;
 const DEFAULT_GROWTH: usize = 4;
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
-const WHITE: u8 = 0;
-const BLACK: u8 = 2;
+/// The two mark colours a cycle alternates between: an object marked
+/// in the previous cycle is unmarked in this one without a reset pass.
+/// Neither is 0 (fresh) or 3 (a moving collector's forwarding mark).
+const COLOR_A: u8 = 2;
+const COLOR_B: u8 = 4;
 
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
@@ -188,11 +196,40 @@ impl Region {
     }
 }
 
+/// The small bump region as compiled code sees it: it allocates an
+/// object up to a line by advancing `cur`, never past `limit` or across
+/// a line, and records the start in `objects[q0 + (start - base) / 16]`.
+/// First in the heap so the heap handle addresses it.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BumpRegion {
+    pub cur: usize,
+    pub limit: usize,
+    /// The region's block base address.
+    pub base: usize,
+    /// The block's first start-byte index.
+    pub q0: usize,
+    /// The start-byte table, refreshed whenever the table moves.
+    pub objects: *mut u8,
+}
+
+pub const BUMP_CUR: i32 = 0;
+pub const BUMP_LIMIT: i32 = 8;
+pub const BUMP_BASE: i32 = 16;
+pub const BUMP_Q0: i32 = 24;
+pub const BUMP_OBJECTS: i32 = 32;
+/// The start byte compiled code writes for an instance of `q` quanta.
+pub const BUMP_PLAIN_FLAG: u8 = PLAIN;
+
 // ---------------------------------------------------------------------------
 // Heap
 // ---------------------------------------------------------------------------
 
+#[repr(C)]
 pub struct ImmixHeap {
+    /// Mirror of `small` for compiled code; kept in step at every
+    /// refill and table move.
+    bump: BumpRegion,
     chunks: Vec<Chunk>,
     /// Absolute base address of every block, indexed by block number.
     block_bases: Vec<usize>,
@@ -214,6 +251,13 @@ pub struct ImmixHeap {
     objects: Vec<u8>,
     /// Lines owned by the span starting at that line, else 0.
     alloc_sizes: Vec<u32>,
+    /// One bit per line: a live object was marked in it this cycle.
+    line_marks: Vec<u64>,
+    /// One bit per line: an allocation the sweep must drop starts in
+    /// it, so the sweep walks it instead of clearing it whole.
+    line_drop: Vec<u64>,
+    /// The colour that means "marked" in the open cycle.
+    live_color: u8,
     /// Runs of free lines found by the last sweep: (block, first line,
     /// line count). Consumed from the end.
     recycle_spans: Vec<(u32, u16, u16)>,
@@ -224,6 +268,7 @@ pub struct ImmixHeap {
 
     total_allocated: usize,
     total_freed: usize,
+    freed_objects: usize,
     bytes_since_gc: usize,
     external_since_gc: usize,
     live_bytes: usize,
@@ -241,6 +286,10 @@ impl Default for ImmixHeap {
 impl ImmixHeap {
     pub fn new() -> Self {
         Self {
+            bump: BumpRegion {
+                objects: std::ptr::null_mut(),
+                ..BumpRegion::default()
+            },
             chunks: Vec::new(),
             block_bases: Vec::new(),
             in_use: Vec::new(),
@@ -250,11 +299,15 @@ impl ImmixHeap {
             free_blocks: Vec::new(),
             objects: Vec::new(),
             alloc_sizes: Vec::new(),
+            line_marks: Vec::new(),
+            line_drop: Vec::new(),
+            live_color: COLOR_A,
             recycle_spans: Vec::new(),
             small: Region::default(),
             medium: Region::default(),
             total_allocated: 0,
             total_freed: 0,
+            freed_objects: 0,
             bytes_since_gc: 0,
             external_since_gc: 0,
             live_bytes: 0,
@@ -302,6 +355,11 @@ impl ImmixHeap {
             .resize(self.block_bases.len() * QUANTA_PER_BLOCK, 0);
         self.alloc_sizes
             .resize(self.block_bases.len() * LINES_PER_BLOCK, 0);
+        self.line_marks
+            .resize(self.block_bases.len() * LINE_WORDS, 0);
+        self.line_drop
+            .resize(self.block_bases.len() * LINE_WORDS, 0);
+        self.bump.objects = self.objects.as_mut_ptr();
         // Push high blocks first so the lowest address pops next.
         for i in (0..BLOCKS_PER_CHUNK).rev() {
             self.free_blocks.push(first + i as u32);
@@ -331,6 +389,16 @@ impl ImmixHeap {
         self.objects[q0..q1].fill(0);
         let l0 = b * LINES_PER_BLOCK + first_line;
         self.alloc_sizes[l0..l0 + lines].fill(0);
+        for l in first_line..first_line + lines {
+            self.line_drop[b * LINE_WORDS + l / 64] &= !(1u64 << (l % 64));
+        }
+    }
+
+    /// Note that an allocation the sweep must drop starts at `addr`.
+    #[inline(always)]
+    fn note_droppable(&mut self, block: u32, addr: usize) {
+        let l = (addr - self.block_bases[block as usize]) / LINE_SIZE;
+        self.line_drop[block as usize * LINE_WORDS + l / 64] |= 1u64 << (l % 64);
     }
 
     // -- Allocation ---------------------------------------------------------
@@ -339,18 +407,23 @@ impl ImmixHeap {
     /// small region, never straddling a line. Null once the heap is
     /// exhausted.
     #[inline]
-    fn alloc_small(&mut self, size: usize) -> *mut u8 {
+    fn alloc_small(&mut self, size: usize, flags: u8) -> *mut u8 {
         loop {
-            let mut p = self.small.cur;
+            // Compiled code bumps the mirror; it is the truth for `cur`.
+            let mut p = self.bump.cur;
             if (p & (LINE_SIZE - 1)) + size > LINE_SIZE {
                 p = p.next_multiple_of(LINE_SIZE);
             }
             let np = p + size;
             if np <= self.small.limit {
                 self.small.cur = np;
+                self.bump.cur = np;
                 let b = self.small.block;
                 let q = self.quantum_index(b, p);
-                self.objects[q] = (size / QUANTUM) as u8;
+                self.objects[q] = (size / QUANTUM) as u8 | flags;
+                if flags & PLAIN == 0 {
+                    self.note_droppable(b, p);
+                }
                 return p as *mut u8;
             }
             if !self.refill_small() {
@@ -366,11 +439,11 @@ impl ImmixHeap {
             let base = self.block_bases[b as usize] + first as usize * LINE_SIZE;
             let len = n as usize * LINE_SIZE;
             self.clear_metadata(b, first as usize, n as usize);
-            self.small = Region {
+            self.set_small(Region {
                 cur: base,
                 limit: base + len,
                 block: b,
-            };
+            });
             self.bytes_since_gc += len;
             self.total_allocated += len;
             return true;
@@ -378,11 +451,11 @@ impl ImmixHeap {
         match self.acquire_free_block() {
             Some(b) => {
                 let base = self.block_bases[b as usize];
-                self.small = Region {
+                self.set_small(Region {
                     cur: base,
                     limit: base + BLOCK_SIZE,
                     block: b,
-                };
+                });
                 self.bytes_since_gc += BLOCK_SIZE;
                 self.total_allocated += BLOCK_SIZE;
                 true
@@ -391,9 +464,27 @@ impl ImmixHeap {
         }
     }
 
+    fn set_small(&mut self, region: Region) {
+        self.small = region;
+        self.bump.cur = region.cur;
+        self.bump.limit = region.limit;
+        if region.is_empty() {
+            self.bump.base = 0;
+            self.bump.q0 = 0;
+        } else {
+            self.bump.base = self.block_bases[region.block as usize];
+            self.bump.q0 = region.block as usize * QUANTA_PER_BLOCK;
+        }
+    }
+
+    /// The bump region compiled code allocates from.
+    pub fn bump_region(&self) -> *const BumpRegion {
+        &self.bump
+    }
+
     /// Hand out whole lines for an allocation larger than a line. Null
     /// once the heap is exhausted.
-    fn alloc_medium(&mut self, size: usize) -> *mut u8 {
+    fn alloc_medium(&mut self, size: usize, flags: u8) -> *mut u8 {
         let lines = size.div_ceil(LINE_SIZE);
         debug_assert!(lines <= LINES_PER_BLOCK);
         loop {
@@ -403,7 +494,10 @@ impl ImmixHeap {
                 self.medium.cur = np;
                 let b = self.medium.block;
                 let q = self.quantum_index(b, p);
-                self.objects[q] = SPAN_OBJECT;
+                self.objects[q] = SPAN_OBJECT | flags;
+                if flags & PLAIN == 0 {
+                    self.note_droppable(b, p);
+                }
                 let l = self.line_index(b, p);
                 self.alloc_sizes[l] = lines as u32;
                 self.has_span[b as usize] = true;
@@ -448,15 +542,27 @@ impl ImmixHeap {
     /// heap is exhausted.
     #[inline]
     pub fn alloc_raw(&mut self, size: usize) -> *mut u8 {
+        self.alloc_with(size, 0)
+    }
+
+    /// `alloc_raw` for contents that own nothing outside the heap; the
+    /// sweep reclaims the allocation without the drop.
+    #[inline]
+    pub fn alloc_plain(&mut self, size: usize) -> *mut u8 {
+        self.alloc_with(size, PLAIN)
+    }
+
+    #[inline]
+    fn alloc_with(&mut self, size: usize, flags: u8) -> *mut u8 {
         let size = size.max(QUANTUM).next_multiple_of(QUANTUM);
         assert!(
             size <= BLOCK_SIZE,
             "Immix: allocation of {size} bytes exceeds a block"
         );
         if size <= SMALL_MAX {
-            self.alloc_small(size)
+            self.alloc_small(size, flags)
         } else {
-            self.alloc_medium(size)
+            self.alloc_medium(size, flags)
         }
     }
 
@@ -486,6 +592,7 @@ impl ImmixHeap {
 
     #[inline(always)]
     fn alloc_quanta(&self, block: usize, q: usize, code: u8) -> usize {
+        let code = code & CODE_MASK;
         if code == SPAN_OBJECT {
             self.alloc_sizes[block * LINES_PER_BLOCK + q / QUANTA_PER_LINE] as usize
                 * QUANTA_PER_LINE
@@ -556,7 +663,7 @@ impl ImmixHeap {
             let n = self.alloc_sizes[l0 + l] as usize;
             if n != 0 {
                 let start_q = l * QUANTA_PER_LINE;
-                return if self.objects[q0 + start_q] == SPAN_OBJECT && line < l + n {
+                return if self.objects[q0 + start_q] & CODE_MASK == SPAN_OBJECT && line < l + n {
                     (base + start_q * QUANTUM) as *mut u8
                 } else {
                     std::ptr::null_mut()
@@ -598,12 +705,26 @@ impl ImmixHeap {
     /// # Safety
     /// `ptr` must be the start of an `ObjHeader`-led object.
     #[inline(always)]
-    pub unsafe fn mark(&self, ptr: *mut u8) -> bool {
+    pub unsafe fn mark(&mut self, ptr: *mut u8) -> bool {
         let header = ptr as *mut ObjHeader;
-        if (*header).gc_mark == BLACK {
+        if (*header).gc_mark == self.live_color {
             return false;
         }
-        (*header).gc_mark = BLACK;
+        (*header).gc_mark = self.live_color;
+        // The lines the object covers are live; a sweep frees the rest
+        // without reading them.
+        let addr = ptr as usize;
+        if let Some(b) = self.block_containing(addr) {
+            let b = b as usize;
+            let q = (addr - self.block_bases[b]) / QUANTUM;
+            let code = self.objects[b * QUANTA_PER_BLOCK + q];
+            let quanta = self.alloc_quanta(b, q, code).max(1);
+            let first = q / QUANTA_PER_LINE;
+            let last = (q + quanta - 1) / QUANTA_PER_LINE;
+            for l in first..=last {
+                self.line_marks[b * LINE_WORDS + l / 64] |= 1u64 << (l % 64);
+            }
+        }
         true
     }
 
@@ -611,7 +732,20 @@ impl ImmixHeap {
     /// As [`ImmixHeap::mark`].
     #[inline(always)]
     pub unsafe fn is_marked(&self, ptr: *mut u8) -> bool {
-        (*(ptr as *mut ObjHeader)).gc_mark == BLACK
+        (*(ptr as *mut ObjHeader)).gc_mark == self.live_color
+    }
+
+    /// Open a cycle: the other colour now means marked, so last cycle's
+    /// survivors count as unmarked without a reset pass.
+    pub fn collect_begin(&mut self) {
+        self.live_color = if self.live_color == COLOR_A {
+            COLOR_B
+        } else {
+            COLOR_A
+        };
+        for w in self.line_marks.iter_mut() {
+            *w = 0;
+        }
     }
 
     // -- Trigger ------------------------------------------------------------
@@ -640,6 +774,7 @@ impl ImmixHeap {
             live_bytes: self.live_bytes,
             allocated_bytes: self.total_allocated,
             freed_bytes: self.total_freed,
+            freed_objects: self.freed_objects,
         }
     }
 
@@ -650,7 +785,7 @@ impl ImmixHeap {
     pub fn collect_end<F: FnMut(*mut u8)>(&mut self, drop: F) -> usize {
         // The current regions are swept like any other lines; a fresh
         // region is taken on the next allocation.
-        self.small = Region::default();
+        self.set_small(Region::default());
         self.medium = Region::default();
 
         let quiet = self.last_collect.elapsed() >= HEARTBEAT;
@@ -674,7 +809,9 @@ impl ImmixHeap {
         self.recycle_spans.clear();
         let mut live_bytes = 0usize;
         let mut freed_bytes = 0usize;
+        let mut freed_objects = 0usize;
         let nblocks = self.block_bases.len();
+        let color = self.live_color;
         for b in 0..nblocks {
             if !self.in_use[b] {
                 continue;
@@ -682,35 +819,78 @@ impl ImmixHeap {
             let base = self.block_bases[b];
             let q0 = b * QUANTA_PER_BLOCK;
             let mut line_live = [0u64; LINE_WORDS];
-            let mut any_live = false;
-            let mut q = 0;
-            while q < QUANTA_PER_BLOCK {
-                let code = self.objects[q0 + q];
-                if code == 0 {
-                    q += 1;
+            line_live.copy_from_slice(&self.line_marks[b * LINE_WORDS..(b + 1) * LINE_WORDS]);
+            let any_live = line_live.iter().any(|w| *w != 0);
+            // A run of lines nothing was marked in and nothing to drop
+            // starts in holds only dead plain objects: its start bytes
+            // are cleared without reading the objects. A dead span
+            // starting there is cleared with its size table entry.
+            // Every other line is walked object by object.
+            let mut l = 0usize;
+            while l < LINES_PER_BLOCK {
+                let live = line_live[l / 64] & (1u64 << (l % 64)) != 0;
+                let droppable = self.line_drop[b * LINE_WORDS + l / 64] & (1u64 << (l % 64)) != 0;
+                let lq = l * QUANTA_PER_LINE;
+                if !live && !droppable {
+                    let codes = &mut self.objects[q0 + lq..q0 + lq + QUANTA_PER_LINE];
+                    for c in codes.iter_mut() {
+                        if *c != 0 {
+                            freed_objects += 1;
+                            freed_bytes += if *c & CODE_MASK == SPAN_OBJECT {
+                                0
+                            } else {
+                                (*c & CODE_MASK) as usize * QUANTUM
+                            };
+                            *c = 0;
+                        }
+                    }
+                    let li = b * LINES_PER_BLOCK + l;
+                    if self.alloc_sizes[li] != 0 {
+                        freed_bytes += self.alloc_sizes[li] as usize * LINE_SIZE;
+                        self.alloc_sizes[li] = 0;
+                    }
+                    l += 1;
                     continue;
                 }
-                let quanta = self.alloc_quanta(b, q, code);
-                let header = (base + q * QUANTUM) as *mut ObjHeader;
-                let marked = unsafe { (*header).gc_mark == BLACK };
-                if marked {
-                    unsafe { (*header).gc_mark = WHITE };
-                    any_live = true;
-                    live_bytes += quanta * QUANTUM;
-                    let first_line = q / QUANTA_PER_LINE;
-                    let last_line = (q + quanta - 1) / QUANTA_PER_LINE;
-                    for l in first_line..=last_line {
-                        line_live[l / 64] |= 1u64 << (l % 64);
+                let mut q = lq;
+                let end = lq + QUANTA_PER_LINE;
+                // The line keeps its droppable bit only for a live
+                // object the next sweep may have to drop.
+                let mut keep_droppable = false;
+                while q < end {
+                    let code = self.objects[q0 + q];
+                    if code == 0 {
+                        q += 1;
+                        continue;
                     }
-                } else {
-                    drop(header as *mut u8);
-                    self.objects[q0 + q] = 0;
-                    if code == SPAN_OBJECT {
-                        self.alloc_sizes[b * LINES_PER_BLOCK + q / QUANTA_PER_LINE] = 0;
+                    let quanta = self.alloc_quanta(b, q, code);
+                    let header = (base + q * QUANTUM) as *mut ObjHeader;
+                    let marked = unsafe { (*header).gc_mark == color };
+                    if marked {
+                        live_bytes += quanta * QUANTUM;
+                        keep_droppable |= code & PLAIN == 0;
+                    } else {
+                        if code & PLAIN == 0 {
+                            drop(header as *mut u8);
+                        }
+                        self.objects[q0 + q] = 0;
+                        if code & CODE_MASK == SPAN_OBJECT {
+                            self.alloc_sizes[b * LINES_PER_BLOCK + q / QUANTA_PER_LINE] = 0;
+                        }
+                        freed_bytes += quanta * QUANTUM;
+                        freed_objects += 1;
                     }
-                    freed_bytes += quanta * QUANTUM;
+                    q += quanta;
                 }
-                q += quanta;
+                let w = &mut self.line_drop[b * LINE_WORDS + l / 64];
+                if keep_droppable {
+                    *w |= 1u64 << (l % 64);
+                } else {
+                    *w &= !(1u64 << (l % 64));
+                }
+                // A span walked from its first line covers the lines
+                // it owns; continue past them.
+                l = (q.max(end) - 1) / QUANTA_PER_LINE + 1;
             }
             if !any_live {
                 self.in_use[b] = false;
@@ -734,6 +914,7 @@ impl ImmixHeap {
             }
         }
         self.total_freed += freed_bytes;
+        self.freed_objects += freed_objects;
         live_bytes
     }
 }
@@ -888,12 +1069,16 @@ mod tests {
         for _ in 0..50_000 {
             alloc(&mut heap, 40);
         }
+        heap.collect_begin();
         assert!(unsafe { heap.mark(keep) });
         assert!(!unsafe { heap.mark(keep) });
         assert!(unsafe { heap.is_marked(keep) });
         let (live, dropped) = sweep_unmarked(&mut heap);
         assert_eq!(dropped, 50_000);
         assert_eq!(live, 48);
+        // The next cycle's colour is the other one, so last cycle's
+        // mark no longer counts.
+        heap.collect_begin();
         assert!(!unsafe { heap.is_marked(keep) });
         let allocated = heap.total_allocated;
         for _ in 0..50_000 {

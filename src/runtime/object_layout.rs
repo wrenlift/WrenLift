@@ -23,6 +23,10 @@ pub const HEADER_SIZE: i32 = 24;
 pub const CLASS_FIELD_KINDS: i32 = 24;
 /// u8 of `CLASS_FLAG_*` bits.
 pub const CLASS_FLAGS: i32 = 32;
+/// u16: instance field count.
+pub const CLASS_NUM_FIELDS: i32 = 72;
+/// `ObjType::Instance` as the header's type byte.
+pub const OBJ_TYPE_INSTANCE: u8 = 9;
 /// The class or an ancestor other than Object defines `==` or `!=`, so
 /// equality on its instances is not identity.
 pub const CLASS_FLAG_EQ: u8 = 1;
@@ -131,6 +135,20 @@ mod tests {
         );
         assert_eq!(memoffset_of!(ObjHeader, next), HEADER_NEXT as usize);
         assert_eq!(memoffset_of!(ObjHeader, class), HEADER_CLASS as usize);
+    }
+
+    #[test]
+    fn verify_class_layout() {
+        assert_eq!(
+            memoffset_of!(ObjClass, field_kinds_ptr),
+            CLASS_FIELD_KINDS as usize
+        );
+        assert_eq!(memoffset_of!(ObjClass, flags), CLASS_FLAGS as usize);
+        assert_eq!(
+            memoffset_of!(ObjClass, num_fields),
+            CLASS_NUM_FIELDS as usize
+        );
+        assert_eq!(ObjType::Instance as u8, OBJ_TYPE_INSTANCE);
     }
 
     #[test]

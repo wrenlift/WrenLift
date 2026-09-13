@@ -2474,6 +2474,187 @@ pub mod llvm {
             Ok(())
         }
 
+        /// A fresh instance of the class object `class_val`: bumped out
+        /// of the Immix small region when the compile knows it, its
+        /// fields null, the start byte written; the helper when the
+        /// region is out of room, the object exceeds a line, or there
+        /// is no region.
+        fn alloc_instance(&mut self, class_val: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            use crate::runtime::gc_immix_heap::{
+                BUMP_BASE, BUMP_CUR, BUMP_LIMIT, BUMP_OBJECTS, BUMP_PLAIN_FLAG, BUMP_Q0,
+            };
+            let bump = crate::codegen::jit_bump_region();
+            if bump == 0 {
+                return self.call_helper("wren_alloc_instance", &[class_val]);
+            }
+            let slow = self.new_block("als");
+            let merge = self.new_block("alm");
+            let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+            let class = self.and(class_val, self.c64(PTR_MASK))?;
+            let nf_p = self.addr(class, CLASS_NUM_FIELDS as i64)?;
+            let nf16 = self
+                .b
+                .build_load(self.sh.ctx.i16_type(), nf_p, "nf16")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let nf = self
+                .b
+                .build_int_z_extend(nf16, self.i64t(), "nf")
+                .map_err(|e| e.to_string())?;
+            // size = (40 + 8 * nf + 15) & !15
+            let raw = self
+                .b
+                .build_int_add(
+                    self.b
+                        .build_int_mul(nf, self.c64(VALUE_SIZE as u64), "fb")
+                        .map_err(|e| e.to_string())?,
+                    self.c64(INSTANCE_SIZE as u64 + 15),
+                    "raw",
+                )
+                .map_err(|e| e.to_string())?;
+            let size = self.and(raw, self.c64(!15u64))?;
+            let fits = self.icmp(IntPredicate::ULE, size, self.c64(128))?;
+            let sized = self.new_block("alz");
+            self.cbr(fits, sized, slow)?;
+            self.b.position_at_end(sized);
+            let bump_v = self.c64(bump as u64);
+            let cur = self.load64(bump_v, BUMP_CUR as i64)?;
+            let limit = self.load64(bump_v, BUMP_LIMIT as i64)?;
+            // Never straddle a line: start at the next line if the
+            // object would.
+            let off = self.and(cur, self.c64(127))?;
+            let end_in_line = self
+                .b
+                .build_int_add(off, size, "eil")
+                .map_err(|e| e.to_string())?;
+            let straddles = self.icmp(IntPredicate::UGT, end_in_line, self.c64(128))?;
+            let aligned = self.and(
+                self.b
+                    .build_int_add(cur, self.c64(127), "c127")
+                    .map_err(|e| e.to_string())?,
+                self.c64(!127u64),
+            )?;
+            let p = self
+                .b
+                .build_select(straddles, aligned, cur, "p")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let np = self
+                .b
+                .build_int_add(p, size, "np")
+                .map_err(|e| e.to_string())?;
+            let room = self.icmp(IntPredicate::ULE, np, limit)?;
+            let fast = self.new_block("alf");
+            self.cbr(room, fast, slow)?;
+            self.b.position_at_end(fast);
+            self.store64(bump_v, BUMP_CUR as i64, np)?;
+            let objects = self.load64(bump_v, BUMP_OBJECTS as i64)?;
+            let base = self.load64(bump_v, BUMP_BASE as i64)?;
+            let q0 = self.load64(bump_v, BUMP_Q0 as i64)?;
+            let rel = self
+                .b
+                .build_int_sub(p, base, "rel")
+                .map_err(|e| e.to_string())?;
+            let q = self
+                .b
+                .build_int_add(
+                    q0,
+                    self.b
+                        .build_right_shift(rel, self.c64(4), false, "q")
+                        .map_err(|e| e.to_string())?,
+                    "qi",
+                )
+                .map_err(|e| e.to_string())?;
+            let code_p = self.addr(
+                self.b
+                    .build_int_add(objects, q, "cp")
+                    .map_err(|e| e.to_string())?,
+                0,
+            )?;
+            let code = self
+                .b
+                .build_int_truncate(
+                    self.b
+                        .build_or(
+                            self.b
+                                .build_right_shift(size, self.c64(4), false, "sq")
+                                .map_err(|e| e.to_string())?,
+                            self.c64(BUMP_PLAIN_FLAG as u64),
+                            "code",
+                        )
+                        .map_err(|e| e.to_string())?,
+                    self.sh.ctx.i8_type(),
+                    "code8",
+                )
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_store(code_p, code)
+                .map_err(|e| e.to_string())?;
+            // Header: type byte, clear mark/generation/flags, no next,
+            // the class, the field count, no owned fields, the fields
+            // right after the header.
+            self.store64(p, 0, self.c64(OBJ_TYPE_INSTANCE as u64))?;
+            self.store64(p, HEADER_NEXT as i64, self.c64(0))?;
+            self.store64(p, HEADER_CLASS as i64, class)?;
+            self.store64(p, INSTANCE_NUM_FIELDS as i64, nf)?;
+            let fields = self
+                .b
+                .build_int_add(p, self.c64(INSTANCE_SIZE as u64), "fields")
+                .map_err(|e| e.to_string())?;
+            let has_fields = self.icmp(IntPredicate::NE, nf, self.c64(0))?;
+            let fields_or_null = self
+                .b
+                .build_select(has_fields, fields, self.c64(0), "fp")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            self.store64(p, INSTANCE_FIELDS as i64, fields_or_null)?;
+            // Null every field.
+            let loop_bb = self.new_block("alnull");
+            let done = self.new_block("aldone");
+            let entry_bb = self.b.get_insert_block().unwrap();
+            self.cbr(has_fields, loop_bb, done)?;
+            self.b.position_at_end(loop_bb);
+            let i = self
+                .b
+                .build_phi(self.i64t(), "i")
+                .map_err(|e| e.to_string())?;
+            let slot = self.addr(
+                self.b
+                    .build_int_add(
+                        fields,
+                        self.b
+                            .build_int_mul(i.as_basic_value().into_int_value(), self.c64(8), "io")
+                            .map_err(|e| e.to_string())?,
+                        "sa",
+                    )
+                    .map_err(|e| e.to_string())?,
+                0,
+            )?;
+            self.b
+                .build_store(slot, self.c64(TAG_NULL))
+                .map_err(|e| e.to_string())?;
+            let next = self
+                .b
+                .build_int_add(i.as_basic_value().into_int_value(), self.c64(1), "i1")
+                .map_err(|e| e.to_string())?;
+            i.add_incoming(&[(&self.c64(0), entry_bb), (&next, loop_bb)]);
+            let more = self.icmp(IntPredicate::ULT, next, nf)?;
+            self.cbr(more, loop_bb, done)?;
+            self.b.position_at_end(done);
+            let boxed = self
+                .b
+                .build_or(p, self.c64(TAG_OBJ), "inst")
+                .map_err(|e| e.to_string())?;
+            incoming.push((boxed.into(), done));
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let sv = self.call_helper("wren_alloc_instance", &[class_val])?;
+            incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
+        }
+
         /// `(slot, value)` of the direct-call depth counter.
         fn direct_depth(&mut self) -> Result<(PointerValue<'ctx>, IntValue<'ctx>), String> {
             let addr = &crate::codegen::runtime_fns::JIT_DIRECT_DEPTH
@@ -2924,7 +3105,7 @@ pub mod llvm {
                             )?;
                             self.cbr(room, call_bb, helper)?;
                             self.b.position_at_end(call_bb);
-                            let inst = self.call_helper("wren_alloc_instance", &[r])?;
+                            let inst = self.alloc_instance(r)?;
                             let deeper = self
                                 .b
                                 .build_int_add(

@@ -36,6 +36,9 @@ pub struct ImmixGc {
     /// A sweep freed a class, closure, function or module, so
     /// address-keyed caches must be dropped.
     freed_code_objects: bool,
+    /// Every fiber allocated and not yet swept, so a collection finds
+    /// the fiber stacks without walking the heap.
+    fibers: Vec<*mut ObjFiber>,
 }
 
 thread_local! {
@@ -58,6 +61,7 @@ impl ImmixGc {
             stats: GcStats::default(),
             object_count: 0,
             freed_code_objects: false,
+            fibers: Vec::new(),
         }
     }
 
@@ -65,11 +69,7 @@ impl ImmixGc {
 
     #[inline]
     fn alloc_raw(&mut self, size: usize) -> *mut u8 {
-        self.stats.objects_allocated += 1;
-        self.object_count += 1;
-        if self.object_count > self.stats.peak_objects {
-            self.stats.peak_objects = self.object_count;
-        }
+        self.count_allocation();
         let p = unsafe { rt::alloc_raw(self.heap, size) };
         if p.is_null() {
             self.exhausted();
@@ -82,6 +82,25 @@ impl ImmixGc {
         let p = self.alloc_raw(std::mem::size_of::<T>()) as *mut T;
         unsafe { p.write(obj) };
         p
+    }
+
+    /// `alloc` for an object that owns nothing outside the heap.
+    fn alloc_plain<T>(&mut self, obj: T) -> *mut T {
+        self.count_allocation();
+        let p = unsafe { rt::alloc_plain(self.heap, std::mem::size_of::<T>()) } as *mut T;
+        if p.is_null() {
+            self.exhausted();
+        }
+        unsafe { p.write(obj) };
+        p
+    }
+
+    fn count_allocation(&mut self) {
+        self.stats.objects_allocated += 1;
+        self.object_count += 1;
+        if self.object_count > self.stats.peak_objects {
+            self.stats.peak_objects = self.object_count;
+        }
     }
 
     #[cold]
@@ -99,17 +118,25 @@ impl ImmixGc {
     /// Iterate every currently-allocated `ObjFiber`. See
     /// `GcImpl::for_each_fiber` for the contract.
     pub fn for_each_fiber<F: FnMut(*mut ObjFiber)>(&self, mut f: F) {
-        self.for_each_object(|h| unsafe {
-            if (*h).obj_type == ObjType::Fiber {
-                f(h as *mut ObjFiber);
-            }
-        });
+        for &fiber in &self.fibers {
+            f(fiber);
+        }
     }
 
     fn for_each_object<F: FnMut(*mut ObjHeader)>(&self, mut f: F) {
         let mut visit: &mut dyn FnMut(*mut u8) = &mut |p| f(p as *mut ObjHeader);
         unsafe {
             rt::for_each_allocation(self.heap, visit_dyn, &mut visit as *mut _ as *mut c_void);
+        }
+    }
+
+    /// The bump region compiled code may allocate small plain objects
+    /// from, when the built-in heap is in use.
+    pub fn bump_region_ptr(&self) -> usize {
+        if rt::heap_is_builtin() {
+            unsafe { rt::bump_region(self.heap) as usize }
+        } else {
+            0
         }
     }
 
@@ -184,6 +211,9 @@ impl ImmixGc {
         let prev = CLOSING.replace(this);
         unsafe { rt::collect_end(heap) };
         CLOSING.set(prev);
+        let m = unsafe { rt::stats(heap) };
+        self.stats.objects_freed = m.freed_objects;
+        self.object_count = self.stats.objects_allocated.saturating_sub(m.freed_objects);
         self.stats.major_collections += 1;
         self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
     }
@@ -239,15 +269,14 @@ pub(super) unsafe fn object_drop(obj: *mut u8) {
     let closing = CLOSING.get();
     if !closing.is_null() {
         let gc = &mut *closing;
-        if matches!(
-            (*header).obj_type,
-            ObjType::Class | ObjType::Closure | ObjType::Fn | ObjType::Module
-        ) {
-            gc.freed_code_objects = true;
+        match (*header).obj_type {
+            ObjType::Class | ObjType::Closure | ObjType::Fn | ObjType::Module => {
+                gc.freed_code_objects = true;
+            }
+            ObjType::Fiber => gc.fibers.retain(|&f| f as *mut ObjHeader != header),
+            ObjType::String => gc.unlink_intern(header),
+            _ => {}
         }
-        gc.unlink_intern(header);
-        gc.stats.objects_freed += 1;
-        gc.object_count = gc.object_count.saturating_sub(1);
     }
     gc::drop_in_place_by_type(header);
 }
@@ -282,13 +311,13 @@ impl GcAllocator for ImmixGc {
         self.alloc(ObjMap::new())
     }
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange {
-        self.alloc(ObjRange::new(from, to, inclusive))
+        self.alloc_plain(ObjRange::new(from, to, inclusive))
     }
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
         self.alloc(ObjTypedArray::new(count, kind))
     }
     fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
-        self.alloc(ObjSimd::new(kind, lanes))
+        self.alloc_plain(ObjSimd::new(kind, lanes))
     }
     fn alloc_fn(
         &mut self,
@@ -312,7 +341,9 @@ impl GcAllocator for ImmixGc {
         self.alloc(ObjUpvalue::new(location))
     }
     fn alloc_fiber(&mut self) -> *mut ObjFiber {
-        self.alloc(ObjFiber::new())
+        let f = self.alloc(ObjFiber::new());
+        self.fibers.push(f);
+        f
     }
     fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
         self.alloc(ObjClass::new(name, superclass))
@@ -331,7 +362,11 @@ impl GcAllocator for ImmixGc {
         if total > MAX_ALLOC {
             return self.alloc(ObjInstance::new(class));
         }
-        let p = self.alloc_raw(total) as *mut ObjInstance;
+        self.count_allocation();
+        let p = unsafe { rt::alloc_plain(self.heap, total) } as *mut ObjInstance;
+        if p.is_null() {
+            self.exhausted();
+        }
         let fields = if num_fields > 0 {
             let f = unsafe { (p as *mut u8).add(header_size) as *mut Value };
             // Written one slot at a time: a few fields are the common

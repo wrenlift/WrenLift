@@ -318,6 +318,15 @@ impl GcImpl {
         matches!(self, GcImpl::Immix(_))
     }
 
+    /// The Immix bump region compiled code may allocate from; 0 for
+    /// any other collector or a host-provided heap.
+    pub fn bump_region_ptr(&self) -> usize {
+        match self {
+            GcImpl::Immix(gc) => gc.bump_region_ptr(),
+            _ => 0,
+        }
+    }
+
     /// Whether address-keyed caches (method cache, inline caches) must
     /// be dropped after the last collection. Collectors that cannot
     /// say answer yes.

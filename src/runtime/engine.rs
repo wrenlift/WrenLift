@@ -2821,6 +2821,20 @@ impl ExecutionEngine {
         true
     }
 
+    /// The running VM's Immix bump region, for compiles requested while
+    /// it runs; 0 when there is none to allocate from inline.
+    #[cfg(feature = "host")]
+    fn bump_region_for_compile() -> usize {
+        if crate::runtime::gc_trait::jit_needs_write_barriers() {
+            return 0;
+        }
+        let vm = crate::codegen::runtime_fns::read_jit_ctx().vm as *const crate::runtime::vm::VM;
+        if vm.is_null() {
+            return 0;
+        }
+        unsafe { (*vm).gc.bump_region_ptr() }
+    }
+
     /// The compile clone with a `GuardNumAt` after every call whose
     /// inline cache only ever produced a Num, where the interpreter can
     /// take over if the guard fails: the function is a bound method,
@@ -3739,6 +3753,7 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let modvars_cell = self.modvars_cell_addr(id);
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
+        crate::codegen::set_jit_bump_region(Self::bump_region_for_compile());
         let compiled_result =
             crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
@@ -3754,6 +3769,7 @@ impl ExecutionEngine {
                 cha_for_codegen,
             );
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
+        crate::codegen::set_jit_bump_region(0);
         let compiled = match compiled_result {
             Ok(compiled) => compiled,
             Err(_) => return false,
@@ -3945,6 +3961,7 @@ impl ExecutionEngine {
                 sroa_mir
             };
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
+        let bump_region = Self::bump_region_for_compile();
         // The finished compile brings the baseline code's next tick
         // forward so the install lands at its next entry or outermost
         // iteration instead of at the interpreter's next safepoint.
@@ -4025,6 +4042,7 @@ impl ExecutionEngine {
             crate::codegen::cranelift_backend::cl::set_jit_cold_headers(cold);
             crate::codegen::cranelift_backend::cl::set_jit_tier_hook(tier_hook);
             crate::codegen::cranelift_backend::cl::set_jit_func_id(id.0);
+            crate::codegen::set_jit_bump_region(bump_region);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -4040,6 +4058,7 @@ impl ExecutionEngine {
             );
             crate::codegen::cranelift_backend::cl::set_jit_cold_headers(Default::default());
             crate::codegen::cranelift_backend::cl::set_jit_tier_hook(None);
+            crate::codegen::set_jit_bump_region(0);
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
             let result = result
                 .map_err(|e| {

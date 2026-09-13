@@ -58,6 +58,9 @@ pub struct RtStats {
     pub allocated_bytes: usize,
     /// Bytes reclaimed by sweeps since the heap was created.
     pub freed_bytes: usize,
+    /// Allocations reclaimed by sweeps since the heap was created,
+    /// dropped or not.
+    pub freed_objects: usize,
 }
 
 macro_rules! runtime_table {
@@ -135,6 +138,9 @@ runtime_table! {
     /// is exhausted. Contents are unspecified: wren_lift writes an object
     /// before reading it.
     alloc_raw(heap: *mut c_void, size: usize) -> *mut u8 = immix::alloc_raw;
+    /// `alloc_raw` for an object that owns nothing outside the heap:
+    /// the sweep reclaims it without `object_drop`.
+    alloc_plain(heap: *mut c_void, size: usize) -> *mut u8 = immix::alloc_plain;
     /// Start of the allocation containing `addr`, null if none.
     containing_allocation(heap: *mut c_void, addr: usize) -> *mut u8 = immix::containing_allocation;
     /// Whether `addr` lies inside an allocation.
@@ -172,10 +178,29 @@ runtime_table! {
 }
 
 pub use call::{
-    alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation, heap_drop,
-    is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, scan_range, should_collect,
-    track_external,
+    alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
+    heap_drop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, scan_range,
+    should_collect, track_external,
 };
+
+/// Whether the built-in heap serves the memory slots, so a handle is an
+/// `ImmixHeap` whose bump region compiled code may advance itself.
+pub fn heap_is_builtin() -> bool {
+    slot::alloc_raw.load(Ordering::Relaxed) == immix::alloc_raw as *mut ()
+        && slot::alloc_plain.load(Ordering::Relaxed) == immix::alloc_plain as *mut ()
+        && slot::heap_new.load(Ordering::Relaxed) == immix::heap_new as *mut ()
+        && slot::collect_end.load(Ordering::Relaxed) == immix::collect_end as *mut ()
+}
+
+/// The bump region of a built-in heap handle, for compiled code.
+///
+/// # Safety
+/// `heap` must be a handle `heap_new` returned while `heap_is_builtin`.
+pub unsafe fn bump_region(heap: *mut c_void) -> *const ImmixHeapBump {
+    (*(heap as *const super::gc_immix_heap::ImmixHeap)).bump_region()
+}
+
+pub use super::gc_immix_heap::BumpRegion as ImmixHeapBump;
 
 /// Mint a heap, sealing the table: from here on a slot may be in use.
 #[inline(always)]
@@ -273,6 +298,10 @@ mod immix {
         self::heap(heap).alloc_raw(size)
     }
 
+    pub unsafe extern "C" fn alloc_plain(heap: *mut c_void, size: usize) -> *mut u8 {
+        self::heap(heap).alloc_plain(size)
+    }
+
     pub unsafe extern "C" fn containing_allocation(heap: *mut c_void, addr: usize) -> *mut u8 {
         self::heap(heap).containing_allocation(addr)
     }
@@ -307,8 +336,9 @@ mod immix {
         self::heap(heap).should_collect()
     }
 
-    /// Marks are cleared by the previous sweep, so nothing is claimed.
-    pub unsafe extern "C" fn collect_begin(_heap: *mut c_void) {}
+    pub unsafe extern "C" fn collect_begin(heap: *mut c_void) {
+        self::heap(heap).collect_begin()
+    }
 
     pub unsafe extern "C" fn collect_end(heap: *mut c_void) -> usize {
         self::heap(heap).collect_end(|dead| call::object_drop(dead))
