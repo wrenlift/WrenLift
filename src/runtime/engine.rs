@@ -441,15 +441,6 @@ enum CompilationResult {
         executable: ExecutableFunction,
         native_meta: Option<Arc<NativeFrameMetadata>>,
         inline_safe: bool,
-        /// The compile of the OSR entries the body was installed
-        /// without; run after the install, on the promoter.
-        entries_job: Option<Box<dyn FnOnce() + Send>>,
-    },
-    /// OSR entries compiled after their body was installed.
-    OsrEntries {
-        id: FuncId,
-        tier: CompileTier,
-        executable: ExecutableFunction,
     },
     Failed {
         id: FuncId,
@@ -931,7 +922,6 @@ pub struct ExecutionEngine {
     /// The loop header the interpreter was spinning at when it asked
     /// for the next tier; its entry is compiled with the body, the
     /// other loops' entries after the install.
-    hot_header: Vec<Option<crate::mir::BlockId>>,
     /// Baseline compiles alternate between the broker and this worker.
     baseline_spread: u32,
     #[cfg(feature = "host")]
@@ -1226,7 +1216,6 @@ impl ExecutionEngine {
             trivial_setter_fields: Vec::new(),
             baseline_code: Vec::new(),
             baseline_osr_entries: Vec::new(),
-            hot_header: Vec::new(),
             baseline_spread: 0,
             #[cfg(feature = "host")]
             baseline_worker: None,
@@ -1299,7 +1288,6 @@ impl ExecutionEngine {
         self.trivial_setter_fields.push(trivial_setter);
         self.baseline_code.push(std::ptr::null());
         self.baseline_osr_entries.push(Vec::new());
-        self.hot_header.push(None);
         self.cold_osr_blocks.push(std::collections::HashSet::new());
         self.baseline_leaf.push(false);
         self.baseline_metadata.push(None);
@@ -4046,15 +4034,6 @@ impl ExecutionEngine {
     #[cfg(not(feature = "host"))]
     pub fn request_tier_up(&mut self, _id: FuncId, _interner: &crate::intern::Interner) {}
 
-    #[cfg(not(feature = "host"))]
-    pub fn request_tier_up_at(
-        &mut self,
-        _id: FuncId,
-        _header: Option<crate::mir::BlockId>,
-        _interner: &crate::intern::Interner,
-    ) {
-    }
-
     #[cfg(feature = "host")]
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         let idx = id.0 as usize;
@@ -4062,21 +4041,6 @@ impl ExecutionEngine {
             return;
         };
         self.request_compile(id, tier, interner);
-    }
-
-    /// `request_tier_up` from a loop the interpreter is running: the
-    /// entry for `header` is compiled with the body.
-    #[cfg(feature = "host")]
-    pub fn request_tier_up_at(
-        &mut self,
-        id: FuncId,
-        header: Option<crate::mir::BlockId>,
-        interner: &crate::intern::Interner,
-    ) {
-        if let Some(slot) = self.hot_header.get_mut(id.0 as usize) {
-            *slot = header;
-        }
-        self.request_tier_up(id, interner);
     }
 
     /// Compile `id` at `tier` in the background; the install lands
@@ -4228,11 +4192,6 @@ impl ExecutionEngine {
             .unwrap_or_default();
         self.pending_cold_osr
             .insert(idx, cold.keys().copied().collect());
-        let hot_header = self.hot_header[idx].take();
-        // The Cranelift tiers compile a body with many loops in two
-        // stages; the LLVM tier's body carries its entries itself.
-        let staged = tier == CompileTier::Baseline
-            || crate::codegen::top_tier() == crate::codegen::TopTier::Cranelift;
         let speculating =
             tier == CompileTier::Optimized && speculate && result_speculation_enabled();
         let exits = if speculating {
@@ -4324,52 +4283,13 @@ impl ExecutionEngine {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
-            use crate::codegen::cranelift_backend::cl::{self as cl, OsrSelect};
-            // Stage one: the body, with the entry the interpreter is
-            // waiting at. The other loops' entries follow once the
-            // body is installed.
-            let all_targets: std::collections::HashSet<crate::mir::BlockId> =
-                if staged && cl::should_compile_osr_entries(&compile_mir, &interner_clone) {
-                    cl::collect_osr_targets(&compile_mir).into_iter().collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
-            let first: std::collections::HashSet<crate::mir::BlockId> = hot_header
-                .into_iter()
-                .filter(|h| all_targets.contains(h))
-                .collect();
-            // A module body runs once, so its own entry is never taken:
-            // the loop the interpreter is waiting at comes first, with a
-            // body that only hands back to the interpreter.
-            let select = if staged && trace_name_clone == "<module>" && !first.is_empty() {
-                OsrSelect::StubBody(first.clone())
-            } else if staged {
-                OsrSelect::Headers(first.clone())
-            } else {
-                OsrSelect::All
-            };
-            let set_thread_locals = {
-                let cold = cold.clone();
-                let tier_hook = tier_hook.clone();
-                move |select: OsrSelect| {
-                    cl::set_jit_modvars_cell(modvars_cell);
-                    cl::set_jit_cold_headers(cold.clone());
-                    cl::set_jit_tier_hook(tier_hook.clone());
-                    cl::set_jit_func_id(id.0);
-                    cl::set_jit_osr_select(select);
-                    crate::codegen::set_jit_bump_region(bump_region);
-                    crate::codegen::set_jit_list_class(list_class);
-                }
-            };
-            let clear_thread_locals = || {
-                cl::set_jit_cold_headers(Default::default());
-                cl::set_jit_tier_hook(None);
-                cl::set_jit_osr_select(OsrSelect::All);
-                crate::codegen::set_jit_bump_region(0);
-                crate::codegen::set_jit_list_class(0);
-                cl::set_jit_modvars_cell(0);
-            };
-            set_thread_locals(select);
+            use crate::codegen::cranelift_backend::cl;
+            cl::set_jit_modvars_cell(modvars_cell);
+            cl::set_jit_cold_headers(cold.clone());
+            cl::set_jit_tier_hook(tier_hook.clone());
+            cl::set_jit_func_id(id.0);
+            crate::codegen::set_jit_bump_region(bump_region);
+            crate::codegen::set_jit_list_class(list_class);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -4383,58 +4303,11 @@ impl ExecutionEngine {
                 inline_bodies.clone(),
                 cha_for_codegen.clone(),
             );
-            clear_thread_locals();
-            let rest: std::collections::HashSet<crate::mir::BlockId> =
-                all_targets.difference(&first).copied().collect();
-            let entries_job: Option<Box<dyn FnOnce() + Send>> = if rest.is_empty() {
-                None
-            } else {
-                let compile_mir = Arc::clone(&compile_mir);
-                let interner_clone = interner_clone.clone();
-                let callsite_ic_ptrs = callsite_ic_ptrs.clone();
-                let callsite_ic_live_ptrs = callsite_ic_live_ptrs.clone();
-                let devirt_hints = devirt_hints.clone();
-                let callee_purity = callee_purity.clone();
-                let inline_bodies = inline_bodies.clone();
-                let cha_for_codegen = cha_for_codegen.clone();
-                let tx = tx.clone();
-                Some(Box::new(move || {
-                    set_thread_locals(OsrSelect::EntriesOnly(rest));
-                    let result =
-                        crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
-                            &compile_mir,
-                            target,
-                            &interner_clone,
-                            tier,
-                            callsite_ic_ptrs,
-                            callsite_ic_live_ptrs,
-                            devirt_hints,
-                            Some(jit_code_base_raw as *const *const u8),
-                            Some(callee_purity),
-                            inline_bodies,
-                            cha_for_codegen,
-                        );
-                    clear_thread_locals();
-                    let result = result
-                        .ok()
-                        .and_then(|artifact| artifact.code.into_executable().ok())
-                        .map(|executable| CompilationResult::OsrEntries {
-                            id,
-                            tier,
-                            executable,
-                        });
-                    if tier_trace_enabled() {
-                        eprintln!(
-                            "tier-trace: [{:.2}ms] entries {:?} FuncId({}) success={}",
-                            trace_clock_ms(),
-                            tier,
-                            id.0,
-                            result.is_some()
-                        );
-                    }
-                    let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
-                }))
-            };
+            cl::set_jit_cold_headers(Default::default());
+            cl::set_jit_tier_hook(None);
+            crate::codegen::set_jit_bump_region(0);
+            crate::codegen::set_jit_list_class(0);
+            cl::set_jit_modvars_cell(0);
             let result = result
                 .map_err(|e| {
                     if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
@@ -4463,7 +4336,6 @@ impl ExecutionEngine {
                             executable,
                             native_meta,
                             inline_safe,
-                            entries_job,
                         })
                 });
             if tier_trace_enabled() {
@@ -4579,23 +4451,15 @@ impl ExecutionEngine {
         }
         while let Ok(result) = self.compilation_rx.try_recv() {
             let idx = match result {
-                CompilationResult::Compiled { id, .. }
-                | CompilationResult::OsrEntries { id, .. }
-                | CompilationResult::Failed { id, .. } => id.0 as usize,
+                CompilationResult::Compiled { id, .. } | CompilationResult::Failed { id, .. } => {
+                    id.0 as usize
+                }
             };
             if tier_trace_enabled() {
                 match &result {
                     CompilationResult::Compiled { id, tier, .. } => {
                         eprintln!(
                             "tier-trace: [{:.2}ms] install {:?} FuncId({})",
-                            trace_clock_ms(),
-                            tier,
-                            id.0
-                        );
-                    }
-                    CompilationResult::OsrEntries { id, tier, .. } => {
-                        eprintln!(
-                            "tier-trace: [{:.2}ms] install entries {:?} FuncId({})",
                             trace_clock_ms(),
                             tier,
                             id.0
@@ -4610,16 +4474,6 @@ impl ExecutionEngine {
                     }
                 }
             }
-            if let CompilationResult::OsrEntries {
-                tier, executable, ..
-            } = result
-            {
-                if idx < self.functions.len() {
-                    self.install_osr_entries(idx, tier, executable);
-                }
-                self.pending_count = self.pending_count.saturating_sub(1);
-                continue;
-            }
             if idx < self.functions.len() {
                 if matches!(result, CompilationResult::Failed { .. })
                     && self.compiling_tier.get(idx).copied().flatten()
@@ -4633,19 +4487,10 @@ impl ExecutionEngine {
                     executable,
                     native_meta,
                     inline_safe,
-                    entries_job,
                     ..
                 } = result
                 {
                     self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
-                    if let Some(job) = entries_job {
-                        let promoter = self
-                            .promoter
-                            .get_or_insert_with(|| Promoter::start_threads(TOP_TIER_THREADS));
-                        if promoter.submit(job) {
-                            self.pending_count += 1;
-                        }
-                    }
                     // Stash callees for predictive pre-compile. The
                     // actual submits happen later in `drain_compile_queue`
                     // where we have interner access for env-var filtering.
@@ -4656,42 +4501,6 @@ impl ExecutionEngine {
                 self.compiling_tier[idx] = None;
             }
             self.pending_count = self.pending_count.saturating_sub(1);
-        }
-    }
-
-    /// Add OSR entries compiled after their body was installed, if that
-    /// body is still the tier's code; their memory stays with the
-    /// retired code, which is never freed.
-    #[cfg(feature = "host")]
-    fn install_osr_entries(
-        &mut self,
-        idx: usize,
-        tier: CompileTier,
-        executable: ExecutableFunction,
-    ) {
-        let id = FuncId(idx as u32);
-        let entries = executable.osr_entries().to_vec();
-        let (code, table) = match tier {
-            CompileTier::Baseline if self.tier_states[idx] == TierState::BaselineNative => {
-                (self.baseline_code[idx], &mut self.baseline_osr_entries[idx])
-            }
-            CompileTier::Optimized if self.tier_states[idx] == TierState::OptimizedNative => (
-                self.optimized_code[idx],
-                &mut self.optimized_osr_entries[idx],
-            ),
-            _ => return,
-        };
-        if code.is_null() || entries.is_empty() {
-            return;
-        }
-        table.extend(entries);
-        let all = encode_osr_entries(table);
-        self.retired_code.push(executable);
-        self.tier.install_or_swap_osr(id, code as *mut (), all);
-        if tier == CompileTier::Optimized {
-            self.tier_cells[idx]
-                .retier
-                .store(1, std::sync::atomic::Ordering::Release);
         }
     }
 

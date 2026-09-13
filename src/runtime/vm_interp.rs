@@ -4142,16 +4142,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             );
                         }
                         if should_tier_up {
-                            // The loop being run gets its entry with
-                            // the body.
-                            let header = bc
-                                .osr_points
-                                .iter()
-                                .find(|p| {
-                                    p.branch_offset == branch_offset && p.target_offset == target
-                                })
-                                .map(|p| p.target_block);
-                            vm.engine.request_tier_up_at(func_id, header, &vm.interner);
+                            vm.engine.request_tier_up(func_id, &vm.interner);
                         }
                         if should_tier_up
                             || vm.engine.has_pending_compilations()

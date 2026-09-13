@@ -1352,41 +1352,11 @@ pub mod cl {
         JIT_COLD_HEADERS.with(|c| c.borrow().clone())
     }
 
-    /// Which OSR entries a compile produces. A function is compiled
-    /// in two stages: the body with the entry the interpreter is
-    /// waiting at, then the entries for its other loops, so the code
-    /// is installed as soon as the body is ready.
-    #[derive(Clone, Debug, Default)]
-    pub enum OsrSelect {
-        /// The body and every entry.
-        #[default]
-        All,
-        /// The body and the entries for these headers only.
-        Headers(HashSet<BlockId>),
-        /// No body; the entries for these headers only.
-        EntriesOnly(HashSet<BlockId>),
-        /// The entries for these headers, with a body that runs the
-        /// function in the interpreter: what a body entered only
-        /// through its loops needs first.
-        StubBody(HashSet<BlockId>),
-    }
-
     thread_local! {
-        static JIT_OSR_SELECT: std::cell::RefCell<OsrSelect> =
-            const { std::cell::RefCell::new(OsrSelect::All) };
         /// The receiver of a body being spliced behind its class check,
         /// with that class.
         static INLINE_CLASS: std::cell::Cell<Option<(Value, usize)>> =
             const { std::cell::Cell::new(None) };
-    }
-
-    /// Set what this thread's next compile produces.
-    pub fn set_jit_osr_select(select: OsrSelect) {
-        JIT_OSR_SELECT.with(|c| *c.borrow_mut() = select);
-    }
-
-    fn jit_osr_select() -> OsrSelect {
-        JIT_OSR_SELECT.with(|c| c.borrow().clone())
     }
 
     /// Iterations of a cold loop before its compiled code hands back to the
@@ -1676,55 +1646,6 @@ pub mod cl {
             "wlift_{}",
             func_name.replace(['(', ')', ',', ' ', '='], "_")
         );
-        let osr_select = jit_osr_select();
-        if let OsrSelect::EntriesOnly(headers) | OsrSelect::StubBody(headers) = &osr_select {
-            let stub = if matches!(osr_select, OsrSelect::StubBody(_)) {
-                Some(define_stub_body(
-                    &mut module,
-                    &safe_name,
-                    &sig,
-                    param_count,
-                )?)
-            } else {
-                None
-            };
-            let osr_defs = compile_osr_entries(
-                mir,
-                interner,
-                &mut module,
-                &safe_name,
-                callsite_ic_ptrs,
-                callsite_ic_live_ptrs,
-                jit_code_base,
-                inline_bodies,
-                cha_by_method,
-                Some(headers),
-            );
-            module.finalize_definitions().map_err(|e| e.to_string())?;
-            let osr_entries = osr_defs
-                .into_iter()
-                .map(|def| crate::codegen::NativeOsrEntry {
-                    target_block: def.target_block,
-                    param_count: def.param_count,
-                    ptr: module.get_finalized_function(def.func_id),
-                    live_in_regs: def.live_in_regs,
-                    live_in_num: def.live_in_num,
-                    live_in_field: def.live_in_field,
-                    live_in_int: def.live_in_int,
-                })
-                .collect();
-            let fn_ptr = match stub {
-                Some(id) => module.get_finalized_function(id),
-                None => std::ptr::null(),
-            };
-            return Ok(CraneliftCompiledCode {
-                _module: module,
-                fn_ptr,
-                osr_entries,
-                code_size: 0,
-                native_meta: None,
-            });
-        }
         let func_id = module
             .declare_function(&safe_name, Linkage::Local, &sig)
             .map_err(|e| e.to_string())?;
@@ -1934,16 +1855,47 @@ pub mod cl {
             });
         }
 
-        // Standard path (no f64 specialization)
+        // Standard path (no f64 specialization): one body carrying the
+        // entries for its loops.
+        let layouts: Vec<OsrEntryLayout> = if should_compile_osr_entries(mir, interner) {
+            collect_osr_targets(mir)
+                .into_iter()
+                .filter_map(|target| {
+                    let layout = osr_entry_layout(mir, target);
+                    if layout.is_none() && std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                        eprintln!(
+                            "osr-trace: skip {} bb{} unsupported live-in layout",
+                            safe_name, target.0
+                        );
+                    }
+                    layout
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let entries = if layouts.is_empty() {
+            None
+        } else {
+            let request = module
+                .declare_data(&format!("{safe_name}_osr"), Linkage::Local, true, false)
+                .map_err(|e| e.to_string())?;
+            let mut desc = cranelift_module::DataDescription::new();
+            desc.define_zeroinit(16);
+            module
+                .define_data(request, &desc)
+                .map_err(|e| e.to_string())?;
+            Some(OsrEntries { layouts, request })
+        };
         let mut func = Function::with_name_signature(
             cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
-            sig,
+            sig.clone(),
         );
         {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
 
-            lower_mir_to_cranelift(
+            lower_mir_impl(
                 mir,
                 interner,
                 &mut builder,
@@ -1951,6 +1903,9 @@ pub mod cl {
                 callsite_ic_ptrs,
                 callsite_ic_live_ptrs,
                 jit_code_base,
+                None,
+                entries.as_ref(),
+                None,
                 inline_bodies.clone(),
                 cha_by_method.clone(),
             )?;
@@ -1982,25 +1937,11 @@ pub mod cl {
         module
             .define_function(func_id, &mut ctx)
             .map_err(|e| e.to_string())?;
-        let only = match &osr_select {
-            OsrSelect::All => None,
-            OsrSelect::Headers(h) | OsrSelect::EntriesOnly(h) | OsrSelect::StubBody(h) => Some(h),
-        };
-        let osr_defs = if should_compile_osr_entries(mir, interner) {
-            compile_osr_entries(
-                mir,
-                interner,
-                &mut module,
-                &safe_name,
-                callsite_ic_ptrs,
-                callsite_ic_live_ptrs,
-                jit_code_base,
-                inline_bodies.clone(),
-                cha_by_method.clone(),
-                only,
-            )
-        } else {
-            Vec::new()
+        let osr_defs = match &entries {
+            Some(entries) => {
+                define_osr_stubs(mir, &mut module, &safe_name, &sig, func_id, entries)?
+            }
+            None => Vec::new(),
         };
         module.finalize_definitions().map_err(|e| e.to_string())?;
 
@@ -2132,77 +2073,17 @@ pub mod cl {
         mir.blocks.iter().any(has_backward_successor)
     }
 
-    /// A body that hands its arguments to the interpreter.
-    fn define_stub_body(
-        module: &mut dyn Module,
-        safe_name: &str,
-        sig: &cranelift_codegen::ir::Signature,
-        param_count: usize,
-    ) -> Result<cranelift_module::FuncId, String> {
-        let func_id = module
-            .declare_function(safe_name, Linkage::Local, sig)
-            .map_err(|e| e.to_string())?;
-        let mut func = Function::with_name_signature(
-            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
-            sig.clone(),
-        );
-        let mut fb_ctx = FunctionBuilderContext::new();
-        {
-            let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            let params: Vec<Value> = builder.block_params(entry).to_vec();
-            let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                (param_count.max(1) * 8) as u32,
-                3,
-            ));
-            for (i, p) in params.iter().enumerate() {
-                builder
-                    .ins()
-                    .stack_store(types::I64, *p, slot, (i * 8) as i32);
-            }
-            let buf = builder.ins().stack_addr(types::I64, slot, 0);
-            let fid = builder.ins().iconst(types::I64, jit_func_id() as i64);
-            let n = builder.ins().iconst(types::I64, param_count as i64);
-            let mut helper_sig = module.make_signature();
-            for _ in 0..3 {
-                helper_sig.params.push(AbiParam::new(types::I64));
-            }
-            helper_sig.returns.push(AbiParam::new(types::I64));
-            let helper = module
-                .declare_function("wren_run_interpreted", Linkage::Import, &helper_sig)
-                .map_err(|e| e.to_string())?;
-            let helper = module.declare_func_in_func(helper, builder.func);
-            let call = builder.ins().call(helper, &[fid, n, buf]);
-            let result = builder.inst_results(call)[0];
-            builder.ins().return_(&[result]);
-            builder.seal_all_blocks();
-            builder.finalize(module.target_config());
-        }
-        let mut ctx = Context::for_function(func);
-        module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| e.to_string())?;
-        Ok(func_id)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn compile_osr_entries(
+    /// One stub per loop entry: it records the entry and the frame in
+    /// the body's request words and calls the body, which reads them
+    /// at its entry.
+    fn define_osr_stubs(
         mir: &MirFunction,
-        interner: &Interner,
         module: &mut dyn Module,
         safe_name: &str,
-        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
-        callsite_ic_live_ptrs: Option<&[usize]>,
-        jit_code_base: Option<*const *const u8>,
-        inline_bodies: Option<
-            std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
-        >,
-        cha_by_method: crate::runtime::engine::SharedCha,
-        only: Option<&HashSet<BlockId>>,
-    ) -> Vec<PendingOsrDefinition> {
+        body_sig: &cranelift_codegen::ir::Signature,
+        body: cranelift_module::FuncId,
+        entries: &OsrEntries,
+    ) -> Result<Vec<PendingOsrDefinition>, String> {
         let i64_params: HashSet<ValueId> = mir
             .blocks
             .iter()
@@ -2210,164 +2091,91 @@ pub mod cl {
             .filter(|(_, t)| *t == MirType::I64)
             .map(|(p, _)| *p)
             .collect();
-        let mut defs = Vec::new();
-        for target_block in collect_osr_targets(mir) {
-            if only.is_some_and(|set| !set.contains(&target_block)) {
-                continue;
-            }
-            let Some(layout) = osr_entry_layout(mir, target_block) else {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
-                    eprintln!(
-                        "osr-trace: skip {} bb{} unsupported live-in layout",
-                        safe_name, target_block.0
-                    );
-                }
-                continue;
-            };
-
-            // One parameter: pointer to the live-in Values in block order
-            // (externals first, then the target block's params).
-            let mut sig = module.make_signature();
-            sig.params.push(AbiParam::new(types::I64));
-            sig.returns.push(AbiParam::new(types::I64));
-
+        let mut defs = Vec::with_capacity(entries.layouts.len());
+        for (i, layout) in entries.layouts.iter().enumerate() {
+            let target_block = layout.target_block;
             if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
                 eprintln!(
                     "osr-trace: layout {} bb{} externals={:?}",
                     safe_name, target_block.0, layout.external_args
                 );
             }
+            // One parameter: pointer to the live-in Values in block order
+            // (externals first, then the target block's params).
+            let mut sig = module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
             let osr_name = format!("{}_osr_bb{}", safe_name, target_block.0);
-            let Ok(func_id) = module.declare_function(&osr_name, Linkage::Local, &sig) else {
-                continue;
-            };
+            let func_id = module
+                .declare_function(&osr_name, Linkage::Local, &sig)
+                .map_err(|e| e.to_string())?;
             let mut func = Function::with_name_signature(
                 cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
                 sig,
             );
             let mut fb_ctx = FunctionBuilderContext::new();
-            let lower_result = {
+            {
                 let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
-                let result = lower_mir_impl(
-                    mir,
-                    interner,
-                    &mut builder,
-                    module,
-                    callsite_ic_ptrs,
-                    callsite_ic_live_ptrs,
-                    jit_code_base,
-                    None,
-                    Some(layout.clone()),
-                    None, // OSR-entry path is JIT-only
-                    inline_bodies.clone(),
-                    cha_by_method.clone(),
-                );
-                if result.is_ok() {
-                    builder.seal_all_blocks();
-                    builder.finalize(module.target_config());
-                }
-                result
-            };
-            if lower_result.is_err() {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
-                    eprintln!(
-                        "osr-trace: skip {} bb{} lowering failed: {:?}",
-                        safe_name,
-                        target_block.0,
-                        lower_result.err()
-                    );
-                }
-                continue;
-            }
-            if let Err(errors) = cranelift_codegen::verify_function(&func, module.isa()) {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
-                    eprintln!(
-                        "osr-trace: skip {} bb{} verifier failed: {}",
-                        safe_name, target_block.0, errors
-                    );
-                }
-                continue;
-            }
-            if std::env::var_os("WLIFT_CL_IR").is_some() {
-                eprintln!(
-                    "=== Cranelift IR for {} osr bb{} ===",
-                    safe_name, target_block.0
-                );
-                eprintln!("{}", func.display());
-                eprintln!("=== end ===");
+                let entry = builder.create_block();
+                builder.append_block_params_for_function_params(entry);
+                builder.switch_to_block(entry);
+                let frame = builder.block_params(entry)[0];
+                let gv = module.declare_data_in_func(entries.request, builder.func);
+                let request = builder.ins().symbol_value(types::I64, gv);
+                let kind = builder.ins().iconst(types::I64, i as i64 + 1);
+                builder.ins().store(MemFlags::trusted(), kind, request, 0);
+                builder.ins().store(MemFlags::trusted(), frame, request, 8);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let args: Vec<Value> = body_sig.params.iter().map(|_| zero).collect();
+                let body_ref = module.declare_func_in_func(body, builder.func);
+                let call = builder.ins().call(body_ref, &args);
+                let result = builder.inst_results(call)[0];
+                builder.ins().return_(&[result]);
+                builder.seal_all_blocks();
+                builder.finalize(module.target_config());
             }
             let mut ctx = Context::for_function(func);
-            if let Err(error) = module.define_function(func_id, &mut ctx) {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
-                    eprintln!(
-                        "osr-trace: skip {} bb{} define failed: {}",
-                        safe_name, target_block.0, error
-                    );
-                }
-                continue;
-            }
+            module
+                .define_function(func_id, &mut ctx)
+                .map_err(|e| e.to_string())?;
+            let live: Vec<ValueId> = layout
+                .external_args
+                .iter()
+                .copied()
+                .chain(
+                    mir.blocks[target_block.0 as usize]
+                        .params
+                        .iter()
+                        .map(|(p, _)| *p),
+                )
+                .collect();
             defs.push(PendingOsrDefinition {
                 target_block,
                 param_count: layout.param_count,
                 func_id,
                 // A live-in that scalar replacement split out of an
                 // object parameter is read from that object's field.
-                live_in_regs: layout
-                    .external_args
+                live_in_regs: live
                     .iter()
-                    .copied()
-                    .chain(
-                        mir.blocks[target_block.0 as usize]
-                            .params
-                            .iter()
-                            .map(|(p, _)| *p),
-                    )
                     .map(|v| {
                         mir.scalar_param_sources
-                            .get(&v)
+                            .get(v)
                             .map(|(o, _)| o.0)
                             .unwrap_or(v.0)
                     })
                     .collect(),
-                live_in_num: layout
-                    .external_args
+                live_in_num: live
                     .iter()
-                    .copied()
-                    .chain(
-                        mir.blocks[target_block.0 as usize]
-                            .params
-                            .iter()
-                            .map(|(p, _)| *p),
-                    )
-                    .map(|v| mir.speculated_num_params.contains(&v))
+                    .map(|v| mir.speculated_num_params.contains(v))
                     .collect(),
-                live_in_field: layout
-                    .external_args
+                live_in_field: live
                     .iter()
-                    .copied()
-                    .chain(
-                        mir.blocks[target_block.0 as usize]
-                            .params
-                            .iter()
-                            .map(|(p, _)| *p),
-                    )
-                    .map(|v| mir.scalar_param_sources.get(&v).map(|(_, f)| *f))
+                    .map(|v| mir.scalar_param_sources.get(v).map(|(_, f)| *f))
                     .collect(),
-                live_in_int: layout
-                    .external_args
-                    .iter()
-                    .copied()
-                    .chain(
-                        mir.blocks[target_block.0 as usize]
-                            .params
-                            .iter()
-                            .map(|(p, _)| *p),
-                    )
-                    .map(|v| i64_params.contains(&v))
-                    .collect(),
+                live_in_int: live.iter().map(|v| i64_params.contains(v)).collect(),
             });
         }
-        defs
+        Ok(defs)
     }
 
     /// Loop headers of the function: targets of edges whose source they
@@ -2512,12 +2320,13 @@ pub mod cl {
         crate::mir::infer_value_types(mir)
     }
 
+    /// The constants a loop entry rebuilds rather than loads.
     fn emit_osr_external_constants(
         mir: &MirFunction,
         target: BlockId,
         builder: &mut FunctionBuilder,
-        val_map: &mut HashMap<ValueId, Value>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<(ValueId, Value)>, String> {
+        let mut out = Vec::new();
         for (vid, inst) in osr_rematerializable_defs(mir, target) {
             let value = match inst {
                 Instruction::ConstNum(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
@@ -2530,9 +2339,17 @@ pub mod cl {
                 Instruction::ConstI64(n) => builder.ins().iconst(types::I64, n),
                 _ => return Err("non-rematerializable OSR external value".to_string()),
             };
-            val_map.insert(vid, value);
+            out.push((vid, value));
         }
-        Ok(())
+        Ok(out)
+    }
+
+    /// The loop entries a body carries: one layout per header, and the
+    /// module's request words (entry index, then the frame pointer) a
+    /// stub writes before calling the body.
+    pub(crate) struct OsrEntries {
+        pub layouts: Vec<OsrEntryLayout>,
+        pub request: cranelift_module::DataId,
     }
 
     /// Collect all runtime function name→address pairs for Cranelift symbol resolution.
@@ -2635,7 +2452,6 @@ pub mod cl {
             "wren_retier",
             "wren_deopt_n",
             "wren_deopt_at",
-            "wren_run_interpreted",
         ];
 
         for name in &names {
@@ -2910,37 +2726,6 @@ pub mod cl {
         )
     }
 
-    /// Lower a MIR function into Cranelift IR using the FunctionBuilder.
-    #[allow(clippy::too_many_arguments)]
-    fn lower_mir_to_cranelift(
-        mir: &MirFunction,
-        interner: &Interner,
-        builder: &mut FunctionBuilder,
-        module: &mut dyn Module,
-        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
-        callsite_ic_live_ptrs: Option<&[usize]>,
-        jit_code_base: Option<*const *const u8>,
-        inline_bodies: Option<
-            std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
-        >,
-        cha_by_method: crate::runtime::engine::SharedCha,
-    ) -> Result<(), String> {
-        lower_mir_impl(
-            mir,
-            interner,
-            builder,
-            module,
-            callsite_ic_ptrs,
-            callsite_ic_live_ptrs,
-            jit_code_base,
-            None,
-            None,
-            None,
-            inline_bodies,
-            cha_by_method,
-        )
-    }
-
     /// Inner lowering with optional f64 specialization.
     /// When `f64_self_id` is Some, this function is the f64→f64 inner version:
     /// - BlockParam types are f64 (not i64)
@@ -2957,7 +2742,7 @@ pub mod cl {
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
         f64_self_id: Option<cranelift_module::FuncId>,
-        osr_entry: Option<OsrEntryLayout>,
+        entries: Option<&OsrEntries>,
         aot_config: Option<&AotLoweringConfig>,
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
@@ -3022,11 +2807,10 @@ pub mod cl {
                 .unwrap_or(false)
         };
 
-        // Live-ins that the region itself redefines on a later trip
-        // (a value built by an enclosing loop body and consumed by the
-        // inner header) become Cranelift variables: the entry defines
-        // them, the region's own definition redefines them, and the
-        // frontend merges the two at the header.
+        // A value the loops' entries load from the interpreter's frame,
+        // or rebuild from a constant, is a Cranelift variable: its own
+        // definition and each entry's define it, and the frontend
+        // merges them where the paths meet.
         let mut osr_vars: HashMap<ValueId, cranelift_frontend::Variable> = HashMap::new();
         // Block parameters carried as raw f64.
         let f64_params: std::collections::HashSet<ValueId> = mir
@@ -3043,24 +2827,23 @@ pub mod cl {
             .filter(|(_, t)| *t == MirType::I64)
             .map(|(p, _)| *p)
             .collect();
-        if let Some(ref layout) = osr_entry {
-            let reachable = osr_reachable_blocks(mir, layout.target_block);
-            let mut region_defs: std::collections::HashSet<ValueId> =
-                std::collections::HashSet::new();
-            for &idx in &reachable {
-                let block = &mir.blocks[idx];
-                region_defs.extend(block.params.iter().map(|(p, _)| *p));
-                region_defs.extend(block.instructions.iter().map(|(d, _)| *d));
-            }
-            for vid in &layout.external_args {
-                if region_defs.contains(vid) {
+        let live_in = if entries.is_some() {
+            Some(crate::mir::live_in_sets(mir))
+        } else {
+            None
+        };
+        if let Some(entries) = entries {
+            for layout in &entries.layouts {
+                for vid in &layout.external_args {
+                    if osr_vars.contains_key(vid) {
+                        continue;
+                    }
                     let ty = if f64_params.contains(vid) {
                         types::F64
                     } else {
                         types::I64
                     };
                     let var = builder.declare_var(ty);
-                    let _ = &i64_params;
                     if mark_stack_map && is_wren_value(*vid, &value_types) {
                         builder.declare_var_needs_stack_map(var);
                     }
@@ -3068,6 +2851,9 @@ pub mod cl {
                 }
             }
         }
+        // Constants a loop entry would otherwise rebuild are defined
+        // once at the function's entry, ahead of every path.
+        let mut pre_defined: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
 
         // Cold loop headers get an iteration counter and a buffer for
         // their live-ins; only OSR-entered code can hand a loop back to
@@ -3080,7 +2866,7 @@ pub mod cl {
                 Vec<ValueId>,
             ),
         > = HashMap::new();
-        if osr_entry.is_some() {
+        if entries.is_some() {
             for (header, live) in jit_cold_headers() {
                 if header.0 as usize >= mir.blocks.len() {
                     continue;
@@ -3149,61 +2935,111 @@ pub mod cl {
             infer_osr_value_types(mir)
         };
 
-        if let Some(ref layout) = osr_entry {
-            let osr_entry = builder.create_block();
-            builder.switch_to_block(osr_entry);
-            let args_ptr = builder.append_block_param(osr_entry, types::I64);
+        // The function's entry: its arguments, then a jump to the body
+        // or, when a loop entry stub left a request, to that loop's
+        // header with the interpreter's frame loaded.
+        let mut entry_params: Option<Vec<Value>> = None;
+        let mut entry_kind: Option<cranelift_frontend::Variable> = None;
+        if let Some(entries) = entries {
+            let dispatch = builder.create_block();
+            builder.switch_to_block(dispatch);
+            for _ in 0..mir.arity {
+                builder.append_block_param(dispatch, types::I64);
+            }
+            let params = builder.block_params(dispatch).to_vec();
             for (counter, _, _) in cold_exits.values() {
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().stack_store(types::I64, zero, *counter, 0);
             }
-            let mut slot = 0i32;
-            for vid in &layout.external_args {
-                let v = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    args_ptr,
-                    slot * VALUE_SIZE,
-                );
-                slot += 1;
-                let v = if f64_params.contains(vid) {
-                    builder.ins().bitcast(types::F64, MemFlags::new(), v)
-                } else if i64_params.contains(vid) {
-                    let f = builder.ins().bitcast(types::F64, MemFlags::new(), v);
-                    builder.ins().fcvt_to_sint(types::I64, f)
-                } else {
-                    v
-                };
-                val_map.insert(*vid, v);
-                if let Some(var) = osr_vars.get(vid) {
-                    builder.def_var(*var, v);
-                }
-                if mark_stack_map && is_wren_value(*vid, &value_types) {
-                    builder.declare_value_needs_stack_map(v);
+            for layout in &entries.layouts {
+                for (vid, v) in emit_osr_external_constants(mir, layout.target_block, builder)? {
+                    if pre_defined.insert(vid) {
+                        val_map.insert(vid, v);
+                    }
                 }
             }
-            let target_block = &mir.blocks[layout.target_block.0 as usize];
-            let mut args: Vec<BlockArg> = Vec::with_capacity(target_block.params.len());
-            for (_, ty) in &target_block.params {
-                let v = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    args_ptr,
-                    slot * VALUE_SIZE,
-                );
-                slot += 1;
-                let v = match ty {
-                    MirType::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), v),
-                    MirType::I64 => {
+            let gv = module.declare_data_in_func(entries.request, builder.func);
+            let request = builder.ins().symbol_value(types::I64, gv);
+            let kind = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), request, 0);
+            let kind_var = builder.declare_var(types::I64);
+            builder.def_var(kind_var, kind);
+            let osr = builder.create_block();
+            builder.set_cold_block(osr);
+            builder
+                .ins()
+                .brif(kind, osr, &[], block_map[&mir.entry_block()], &[]);
+            builder.switch_to_block(osr);
+            let args_ptr = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), request, 8);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().store(MemFlags::trusted(), zero, request, 0);
+            let prologues: Vec<cranelift_codegen::ir::Block> = entries
+                .layouts
+                .iter()
+                .map(|_| builder.create_block())
+                .collect();
+            let index = builder.ins().iadd_imm_s(kind, -1);
+            let index = builder.ins().ireduce(types::I32, index);
+            let jt = cranelift_codegen::ir::JumpTableData::new(
+                builder.func.dfg.block_call(prologues[0], &[]),
+                &prologues
+                    .iter()
+                    .map(|b| builder.func.dfg.block_call(*b, &[]))
+                    .collect::<Vec<_>>(),
+            );
+            let jt = builder.create_jump_table(jt);
+            builder.ins().br_table(index, jt);
+            for (layout, prologue) in entries.layouts.iter().zip(prologues) {
+                builder.switch_to_block(prologue);
+                let mut slot = 0i32;
+                for vid in &layout.external_args {
+                    let v = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        slot * VALUE_SIZE,
+                    );
+                    slot += 1;
+                    let v = if f64_params.contains(vid) {
+                        builder.ins().bitcast(types::F64, MemFlags::new(), v)
+                    } else if i64_params.contains(vid) {
                         let f = builder.ins().bitcast(types::F64, MemFlags::new(), v);
                         builder.ins().fcvt_to_sint(types::I64, f)
+                    } else {
+                        v
+                    };
+                    builder.def_var(osr_vars[vid], v);
+                    if mark_stack_map && is_wren_value(*vid, &value_types) {
+                        builder.declare_value_needs_stack_map(v);
                     }
-                    _ => v,
-                };
-                args.push(BlockArg::Value(v));
+                }
+                let target_block = &mir.blocks[layout.target_block.0 as usize];
+                let mut args: Vec<BlockArg> = Vec::with_capacity(target_block.params.len());
+                for (_, ty) in &target_block.params {
+                    let v = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        slot * VALUE_SIZE,
+                    );
+                    slot += 1;
+                    let v = match ty {
+                        MirType::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), v),
+                        MirType::I64 => {
+                            let f = builder.ins().bitcast(types::F64, MemFlags::new(), v);
+                            builder.ins().fcvt_to_sint(types::I64, f)
+                        }
+                        _ => v,
+                    };
+                    args.push(BlockArg::Value(v));
+                }
+                builder.ins().jump(block_map[&layout.target_block], &args);
             }
-            emit_osr_external_constants(mir, layout.target_block, builder, &mut val_map)?;
-            builder.ins().jump(block_map[&layout.target_block], &args);
+            entry_params = Some(params);
+            entry_kind = Some(kind_var);
         }
 
         // Receiver (entry_params[0]) saved for CallStaticSelf
@@ -3237,8 +3073,7 @@ pub mod cl {
         // the body has no upvalue ops (no overhead) and when running
         // outside AOT (the JIT helper path keeps its own TLS state).
         if let Some(cfg) = aot_config {
-            let needs_closure_ptr = osr_entry.is_none()
-                && f64_self_id.is_none()
+            let needs_closure_ptr = f64_self_id.is_none()
                 && mir.blocks.iter().any(|b| {
                     b.instructions.iter().any(|(_, i)| {
                         matches!(i, Instruction::GetUpvalue(_) | Instruction::SetUpvalue(..))
@@ -3269,7 +3104,7 @@ pub mod cl {
             // to restore JIT_ROOTS_STORE to its entry length —
             // releases any roots leaked into the global stack by
             // finish_alloc's "push but don't pop" model.
-            if osr_entry.is_none() && f64_self_id.is_none() {
+            if f64_self_id.is_none() {
                 let snap_var = builder.declare_var(types::I64);
                 *cfg.current_jit_roots_snapshot_var.borrow_mut() = Some(snap_var);
             }
@@ -3428,10 +3263,9 @@ pub mod cl {
         // The MIR block array may have preheader blocks (bb4) listed after
         // loop bodies (bb2), but Cranelift requires values to be defined
         // before use. RPO guarantees dominators come first.
-        let rpo = match osr_entry.as_ref() {
-            Some(layout) => compute_rpo_from(mir, layout.target_block),
+        let rpo = {
             #[cfg(feature = "aot")]
-            None => {
+            {
                 // SM resume entries are reached only via the synthetic
                 // dispatch's `br_table`, so a plain DFS-from-bb0 leaves
                 // them and every block downstream of them off the RPO
@@ -3456,10 +3290,11 @@ pub mod cl {
                 compute_rpo_multi_root(mir, &roots)
             }
             #[cfg(not(feature = "aot"))]
-            None => compute_rpo(mir),
+            {
+                compute_rpo(mir)
+            }
         };
-        // Determine reachability from bb0 (or osr_entry's
-        // start) over the post-transform MIR. The SM transform's
+        // Determine reachability from bb0 over the post-transform MIR. The SM transform's
         // tail-duplication can leave the original (pre-clone)
         // blocks unreachable. Emitting them via the regular
         // lowering path would try to bind operands to ValueIds
@@ -3471,12 +3306,8 @@ pub mod cl {
         // reached only via the synthetic dispatch's `br_table`
         // (not from bb0), so seed the walk with them too.
         let reachable: std::collections::HashSet<usize> = {
-            let start = osr_entry
-                .as_ref()
-                .map(|l| l.target_block.0 as usize)
-                .unwrap_or(0);
             let mut seen = std::collections::HashSet::new();
-            let mut stack = vec![start];
+            let mut stack = vec![0usize];
             #[cfg(feature = "aot")]
             if let Some(cfg) = aot_config {
                 if let Some(layout) = cfg.current_state_machine_layout.borrow().as_ref() {
@@ -3768,6 +3599,12 @@ pub mod cl {
             // block entry so plain lookups in this block see the value
             // flowing in along the edge that was taken.
             for (vid, var) in &osr_vars {
+                if live_in
+                    .as_ref()
+                    .is_some_and(|l| !l.contains(block_idx, *vid))
+                {
+                    continue;
+                }
                 let v = builder.use_var(*var);
                 val_map.insert(*vid, v);
             }
@@ -3788,6 +3625,16 @@ pub mod cl {
                 builder.ins().stack_store(types::I64, c1, *counter, 0);
                 let limit = builder.ins().iconst(types::I64, COLD_LOOP_EXIT_AFTER);
                 let hot = builder.ins().icmp(IntCC::SignedGreaterThan, c1, limit);
+                // Only an activation the interpreter entered has a
+                // frame to hand the loop back to.
+                let hot = match entry_kind {
+                    Some(kind) => {
+                        let k = builder.use_var(kind);
+                        let entered = builder.ins().icmp_imm_s(IntCC::NotEqual, k, 0);
+                        builder.ins().band(hot, entered)
+                    }
+                    None => hot,
+                };
                 let exit_block = builder.create_block();
                 let cont_block = builder.create_block();
                 builder.set_cold_block(exit_block);
@@ -3870,7 +3717,7 @@ pub mod cl {
             // Cranelift adds signature params to the first switched-to block.
             // For the entry block, add function params as block params
             // THEN map BlockParam instructions to those params.
-            if osr_entry.is_none() && block_idx == 0 {
+            if block_idx == 0 {
                 if f64_self_id.is_some() {
                     // f64 inner function: params are only the USED ones
                     // (sequential f64 params, no receiver).
@@ -3920,12 +3767,18 @@ pub mod cl {
                     // the bug we're fixing.)
                 } else {
                     // i64 path: add mir.arity params to match the caller ABI
-                    // (includes receiver even if dead).
-                    let arity = mir.arity as usize;
-                    for _ in 0..arity {
-                        builder.append_block_param(cl_block, types::I64);
-                    }
-                    let entry_params = builder.block_params(cl_block).to_vec();
+                    // (includes receiver even if dead), unless the
+                    // dispatch block already holds them.
+                    let entry_params = match entry_params.take() {
+                        Some(params) => params,
+                        None => {
+                            let arity = mir.arity as usize;
+                            for _ in 0..arity {
+                                builder.append_block_param(cl_block, types::I64);
+                            }
+                            builder.block_params(cl_block).to_vec()
+                        }
+                    };
                     if !entry_params.is_empty() {
                         receiver_val = Some(entry_params[0]);
                     }
@@ -4159,6 +4012,9 @@ pub mod cl {
 
             // Lower each instruction
             for &(vid, ref inst) in &block.instructions {
+                if pre_defined.contains(&vid) {
+                    continue;
+                }
                 // In a block that ends unreachable, an exit is the
                 // block: the guard that led here has already failed.
                 if let (true, Instruction::SlowPathExit { pc, live }, None) = (
@@ -8127,27 +7983,6 @@ pub mod cl {
             }
         }
 
-        post_order
-    }
-
-    pub(crate) fn compute_rpo_from(mir: &MirFunction, start: BlockId) -> Vec<usize> {
-        let n = mir.blocks.len();
-        let mut visited = vec![false; n];
-        let mut post_order = Vec::with_capacity(n);
-
-        fn dfs(idx: usize, mir: &MirFunction, visited: &mut [bool], post_order: &mut Vec<usize>) {
-            if visited[idx] {
-                return;
-            }
-            visited[idx] = true;
-            for succ in mir.blocks[idx].terminator.successors() {
-                dfs(succ.0 as usize, mir, visited, post_order);
-            }
-            post_order.push(idx);
-        }
-
-        dfs(start.0 as usize, mir, &mut visited, &mut post_order);
-        post_order.reverse();
         post_order
     }
 
