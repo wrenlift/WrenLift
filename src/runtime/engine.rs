@@ -456,6 +456,97 @@ enum CompilationResult {
     },
 }
 
+/// Registers live across the call at `block.instructions[i]`, the
+/// call's own result included, and the call's operands not among them,
+/// both ascending.
+fn call_site_live(
+    block: &crate::mir::BasicBlock,
+    i: usize,
+    live_in: &crate::mir::LiveSets,
+) -> (Vec<crate::mir::ValueId>, Vec<crate::mir::ValueId>) {
+    use std::collections::HashSet;
+    let (dst, inst) = &block.instructions[i];
+    let mut live: HashSet<crate::mir::ValueId> = HashSet::new();
+    for succ in block.terminator.successors() {
+        live.extend(live_in.iter(succ.0 as usize));
+    }
+    live.extend(block.terminator.operands());
+    for (later_dst, later) in block.instructions[i + 1..].iter().rev() {
+        live.remove(later_dst);
+        live.extend(later.operands());
+    }
+    let mut call_live: Vec<crate::mir::ValueId> = inst
+        .operands()
+        .into_iter()
+        .filter(|v| !live.contains(v))
+        .collect();
+    call_live.sort_by_key(|v| v.0);
+    call_live.dedup();
+    live.insert(*dst);
+    let mut live: Vec<crate::mir::ValueId> = live.into_iter().collect();
+    live.sort_by_key(|v| v.0);
+    (live, call_live)
+}
+
+/// Where a deopt point finds each of the authoritative MIR's values in
+/// the compile clone.
+struct DeoptSources {
+    defined: std::collections::HashSet<crate::mir::ValueId>,
+    /// A range the interpreter iterates is rebuilt from its bounds at
+    /// the exit, so the compiled body need not keep it.
+    ranges: HashMap<crate::mir::ValueId, (crate::mir::ValueId, crate::mir::ValueId, bool)>,
+}
+
+impl DeoptSources {
+    fn new(authoritative: &MirFunction, clone: &MirFunction) -> Self {
+        use crate::mir::Instruction;
+        let defined = clone
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.params
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .chain(b.instructions.iter().map(|(v, _)| *v))
+            })
+            .collect();
+        let ranges = authoritative
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::MakeRange(from, to, inclusive) => Some((*v, (*from, *to, *inclusive))),
+                _ => None,
+            })
+            .collect();
+        Self { defined, ranges }
+    }
+
+    fn source_of(&self, v: crate::mir::ValueId) -> Option<crate::mir::DeoptSource> {
+        use crate::mir::DeoptSource;
+        if let Some(&(from, to, inclusive)) = self.ranges.get(&v) {
+            if self.defined.contains(&from) && self.defined.contains(&to) {
+                return Some(DeoptSource::Range {
+                    from,
+                    to,
+                    inclusive,
+                });
+            }
+        }
+        self.defined.contains(&v).then_some(DeoptSource::Value(v))
+    }
+
+    /// The registers of `ids`, or none if one has no source.
+    fn regs(&self, ids: &[crate::mir::ValueId]) -> Option<Vec<crate::mir::DeoptReg>> {
+        ids.iter()
+            .map(|v| {
+                self.source_of(*v)
+                    .map(|source| crate::mir::DeoptReg { reg: v.0, source })
+            })
+            .collect()
+    }
+}
+
 /// Run the optimization pipeline on MIR for JIT compilation.
 /// Same passes as the AOT pipeline: ConstFold, DCE, CSE, TypeSpecialize, LICM, SRA.
 fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interner) {
@@ -2652,6 +2743,7 @@ impl ExecutionEngine {
         mir: &MirFunction,
         ics: &[CallSiteIC],
         interner: &crate::intern::Interner,
+        exits: Option<&HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>>,
     ) -> HashMap<crate::mir::ValueId, crate::mir::opt::inline_calls::KnownCallee> {
         use crate::mir::opt::inline_calls::{CalleeGuard, KnownCallee};
         use crate::mir::Instruction;
@@ -2772,12 +2864,17 @@ impl ExecutionEngine {
                 {
                     continue;
                 }
+                let exit = match constructor {
+                    Some(_) => exits.and_then(|e| e.get(dst).cloned()),
+                    None => None,
+                };
                 sites.insert(
                     *dst,
                     KnownCallee {
                         guard,
                         body,
                         constructor,
+                        exit,
                     },
                 );
             }
@@ -2899,6 +2996,110 @@ impl ExecutionEngine {
     /// take over if the guard fails: the function is a bound method,
     /// the bytecode records the offset past the call, and every
     /// register live there is a value the clone still defines.
+    /// For every call site of the authoritative MIR, the interpreter
+    /// offset and registers a compiled body hands back to redo the
+    /// call instead of making it.
+    fn call_site_exits(
+        &mut self,
+        id: FuncId,
+        authoritative: &MirFunction,
+        clone: &MirFunction,
+    ) -> Option<HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>> {
+        use crate::mir::{live_in_sets, Instruction};
+        let bc = self.ensure_bytecode(id)?;
+        let call_offsets = unsafe { &(*bc).call_offsets };
+        let live_in = live_in_sets(authoritative);
+        let sources = DeoptSources::new(authoritative, clone);
+        let mut exits = HashMap::new();
+        for block in &authoritative.blocks {
+            for (i, (dst, inst)) in block.instructions.iter().enumerate() {
+                if !matches!(inst, Instruction::Call { .. }) {
+                    continue;
+                }
+                let Some(&pc) = call_offsets.get(dst) else {
+                    continue;
+                };
+                let (live, call_live) = call_site_live(block, i, &live_in);
+                let (Some(live), Some(call_live)) = (sources.regs(&live), sources.regs(&call_live))
+                else {
+                    continue;
+                };
+                let live: Vec<crate::mir::DeoptReg> = live
+                    .into_iter()
+                    .filter(|r| r.reg != dst.0)
+                    .chain(call_live)
+                    .collect();
+                exits.insert(*dst, (pc, live));
+            }
+        }
+        Some(exits)
+    }
+
+    /// The clone with non-escaping instances kept as field values.
+    /// `WLIFT_DISABLE_PROMOTE_FIELDS` turns it off; safe to run with.
+    fn promote_fields(
+        &self,
+        mir: Arc<MirFunction>,
+        ics: Option<&[CallSiteIC]>,
+    ) -> Arc<MirFunction> {
+        use crate::mir::opt::promote_fields::FieldCall;
+        if std::env::var_os("WLIFT_DISABLE_PROMOTE_FIELDS").is_some() {
+            return mir;
+        }
+        let field_call = |dst: crate::mir::ValueId| -> Option<FieldCall> {
+            let ic = ics?.get(*mir.ic_sites.get(&dst)? as usize)?;
+            if ic.class == 0 {
+                return None;
+            }
+            match ic.kind {
+                5 => Some(FieldCall::Get {
+                    class: ic.class,
+                    field: ic.func_id as u16,
+                }),
+                1 | 2 if ic.func_id != 0 => {
+                    let f = ic.func_id as usize;
+                    if let Some(field) = self.trivial_getter_fields.get(f).copied().flatten() {
+                        Some(FieldCall::Get {
+                            class: ic.class,
+                            field,
+                        })
+                    } else {
+                        self.trivial_setter_fields
+                            .get(f)
+                            .copied()
+                            .flatten()
+                            .map(|field| FieldCall::Set {
+                                class: ic.class,
+                                field,
+                            })
+                    }
+                }
+                _ => None,
+            }
+        };
+        // The inliner only plants a class a module variable holds.
+        let num_fields = |class: usize| unsafe {
+            (*(class as *const crate::runtime::object::ObjClass)).num_fields as usize
+        };
+        let setter_field = |func_id: u32| {
+            self.trivial_setter_fields
+                .get(func_id as usize)
+                .copied()
+                .flatten()
+        };
+        let classes = crate::mir::opt::promote_fields::Classes {
+            num_fields: &num_fields,
+            setter_field: &setter_field,
+            field_call: &field_call,
+        };
+        let mut out = (*mir).clone();
+        if crate::mir::opt::promote_fields::promote_fields(&mut out, &classes) {
+            Arc::new(out)
+        } else {
+            mir
+        }
+    }
+
     fn speculate_call_results(
         &mut self,
         id: FuncId,
@@ -2907,7 +3108,7 @@ impl ExecutionEngine {
         interner: &crate::intern::Interner,
     ) -> Arc<MirFunction> {
         use crate::mir::bytecode::RESULT_NUM;
-        use crate::mir::{live_in_sets, DeoptReg, DeoptSource, Instruction, ValueId};
+        use crate::mir::{live_in_sets, DeoptReg, Instruction, ValueId};
         use std::collections::HashSet;
         let idx = id.0 as usize;
         if self
@@ -2971,26 +3172,7 @@ impl ExecutionEngine {
                 } else {
                     call_pc
                 };
-                let mut live: HashSet<ValueId> = HashSet::new();
-                for succ in block.terminator.successors() {
-                    live.extend(live_in.iter(succ.0 as usize));
-                }
-                live.extend(block.terminator.operands());
-                for (later_dst, later) in block.instructions[i + 1..].iter().rev() {
-                    live.remove(later_dst);
-                    live.extend(later.operands());
-                }
-                // The call's own operands, needed to redo it.
-                let mut call_live: Vec<ValueId> = inst
-                    .operands()
-                    .into_iter()
-                    .filter(|v| !live.contains(v))
-                    .collect();
-                call_live.sort_by_key(|v| v.0);
-                call_live.dedup();
-                live.insert(*dst);
-                let mut live: Vec<ValueId> = live.into_iter().collect();
-                live.sort_by_key(|v| v.0);
+                let (live, call_live) = call_site_live(block, i, &live_in);
                 sites.push(Site {
                     dst: *dst,
                     pc,
@@ -3004,39 +3186,7 @@ impl ExecutionEngine {
         if sites.is_empty() {
             return mir;
         }
-        let defined: HashSet<ValueId> = mir
-            .blocks
-            .iter()
-            .flat_map(|b| {
-                b.params
-                    .iter()
-                    .map(|(v, _)| *v)
-                    .chain(b.instructions.iter().map(|(v, _)| *v))
-            })
-            .collect();
-        // A range the interpreter iterates is rebuilt from its bounds
-        // at the exit, so the compiled body need not keep it.
-        let ranges: HashMap<ValueId, (ValueId, ValueId, bool)> = authoritative
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|(v, inst)| match inst {
-                Instruction::MakeRange(from, to, inclusive) => Some((*v, (*from, *to, *inclusive))),
-                _ => None,
-            })
-            .collect();
-        let source_of = |v: ValueId| -> Option<DeoptSource> {
-            if let Some(&(from, to, inclusive)) = ranges.get(&v) {
-                if defined.contains(&from) && defined.contains(&to) {
-                    return Some(DeoptSource::Range {
-                        from,
-                        to,
-                        inclusive,
-                    });
-                }
-            }
-            defined.contains(&v).then_some(DeoptSource::Value(v))
-        };
+        let sources = DeoptSources::new(authoritative, &mir);
         // A result nothing reads (a setter used as a statement) needs
         // no guard.
         let used: HashSet<ValueId> = mir
@@ -3063,12 +3213,8 @@ impl ExecutionEngine {
             if guard && !used.contains(&dst) {
                 continue;
             }
-            let regs = |ids: &[ValueId]| -> Option<Vec<DeoptReg>> {
-                ids.iter()
-                    .map(|v| source_of(*v).map(|source| DeoptReg { reg: v.0, source }))
-                    .collect()
-            };
-            let (Some(live), Some(call_live)) = (regs(&live), regs(&call_live)) else {
+            let (Some(live), Some(call_live)) = (sources.regs(&live), sources.regs(&call_live))
+            else {
                 continue;
             };
             let Some((bi, pos)) = out.blocks.iter().enumerate().find_map(|(bi, b)| {
@@ -3175,6 +3321,7 @@ impl ExecutionEngine {
         clone: Arc<MirFunction>,
         ics: Option<&[CallSiteIC]>,
         interner: &crate::intern::Interner,
+        exits: Option<&HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>>,
     ) -> Arc<MirFunction> {
         if std::env::var_os("WLIFT_DISABLE_MIR_INLINE").is_some() {
             return clone;
@@ -3188,7 +3335,7 @@ impl ExecutionEngine {
         let Some(ics) = ics else {
             return clone;
         };
-        let sites = self.known_call_sites(caller, mir, ics, interner);
+        let sites = self.known_call_sites(caller, mir, ics, interner, exits);
         if sites.is_empty() {
             return clone;
         }
@@ -3825,7 +3972,14 @@ impl ExecutionEngine {
             }
             Some(Arc::new(cha))
         };
-        let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
+        let sroa_mir = self.inline_known(
+            id,
+            &mir,
+            sroa_mir,
+            callsite_ic_ptrs.as_deref(),
+            interner,
+            None,
+        );
         let speculate = !self.speculation_failed[idx];
         let compile_mir =
             Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref(), speculate);
@@ -4079,13 +4233,27 @@ impl ExecutionEngine {
         // stages; the LLVM tier's body carries its entries itself.
         let staged = tier == CompileTier::Baseline
             || crate::codegen::top_tier() == crate::codegen::TopTier::Cranelift;
-        let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
-        let sroa_mir =
-            if tier == CompileTier::Optimized && speculate && result_speculation_enabled() {
-                self.speculate_call_results(id, &mir, sroa_mir, interner)
-            } else {
-                sroa_mir
-            };
+        let speculating =
+            tier == CompileTier::Optimized && speculate && result_speculation_enabled();
+        let exits = if speculating {
+            self.call_site_exits(id, &mir, &sroa_mir)
+        } else {
+            None
+        };
+        let sroa_mir = self.inline_known(
+            id,
+            &mir,
+            sroa_mir,
+            callsite_ic_ptrs.as_deref(),
+            interner,
+            exits.as_ref(),
+        );
+        let sroa_mir = if speculating {
+            let out = self.speculate_call_results(id, &mir, sroa_mir, interner);
+            self.promote_fields(out, callsite_ic_ptrs.as_deref())
+        } else {
+            sroa_mir
+        };
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let bump_region = Self::bump_region_for_compile();
         let list_class = Self::list_class_for_compile();

@@ -4035,6 +4035,28 @@ pub mod cl {
 
             // Lower each instruction
             for &(vid, ref inst) in &block.instructions {
+                // In a block that ends unreachable, an exit is the
+                // block: the guard that led here has already failed.
+                if let (true, Instruction::SlowPathExit { pc, live }, None) = (
+                    matches!(block.terminator, Terminator::Unreachable),
+                    inst,
+                    aot_config,
+                ) {
+                    emit_deopt_at(
+                        builder,
+                        module,
+                        &mut get_runtime_fn,
+                        jit_func_id(),
+                        *pc,
+                        live,
+                        &val_map,
+                        &raw_bools,
+                        &exit_value_types,
+                    )?;
+                    let dead = builder.create_block();
+                    builder.switch_to_block(dead);
+                    continue;
+                }
                 // Track raw booleans from f64 comparisons
                 let is_raw_bool = matches!(
                     inst,
@@ -4475,6 +4497,41 @@ pub mod cl {
         builder.set_cold_block(deopt_block);
         builder.ins().brif(fails, deopt_block, &[], cont_block, &[]);
         builder.switch_to_block(deopt_block);
+        emit_deopt_at(
+            builder,
+            module,
+            get_runtime_fn,
+            func_id,
+            pc,
+            live,
+            val_map,
+            raw_bools,
+            value_types,
+        )?;
+        builder.switch_to_block(cont_block);
+        Ok(())
+    }
+
+    /// Leave the function from the current block: store the `live`
+    /// registers in the word layout `wren_deopt_at` reads, hand the
+    /// function to it and return its result.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn emit_deopt_at(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        func_id: u32,
+        pc: u32,
+        live: &[DeoptReg],
+        val_map: &HashMap<ValueId, Value>,
+        raw_bools: &HashSet<ValueId>,
+        value_types: &[MirType],
+    ) -> Result<(), String> {
         let words = live
             .iter()
             .map(crate::codegen::runtime_fns::deopt_words)
@@ -4490,17 +4547,20 @@ pub mod cl {
                 .ins()
                 .iconst(types::I64, crate::codegen::runtime_fns::deopt_tag(r) as i64);
             builder.ins().stack_store(types::I64, tag, slot, at * 8);
-            let sources = r.source.operands();
-            for (k, vid) in sources.iter().enumerate() {
-                let Some(&v) = val_map.get(vid) else {
+            at += 1;
+            for c in crate::codegen::runtime_fns::deopt_consts(r) {
+                let c = builder.ins().iconst(types::I64, c as i64);
+                builder.ins().stack_store(types::I64, c, slot, at * 8);
+                at += 1;
+            }
+            for vid in r.source.operands() {
+                let Some(&v) = val_map.get(&vid) else {
                     return Err(format!("deopt live value {:?} undefined", vid));
                 };
-                let boxed = box_for_snapshot(builder, v, *vid, raw_bools, value_types);
-                builder
-                    .ins()
-                    .stack_store(types::I64, boxed, slot, (at + 1 + k as i32) * 8);
+                let boxed = box_for_snapshot(builder, v, vid, raw_bools, value_types);
+                builder.ins().stack_store(types::I64, boxed, slot, at * 8);
+                at += 1;
             }
-            at += 1 + sources.len() as i32;
         }
         let buf = builder.ins().stack_addr(types::I64, slot, 0);
         let fid = builder.ins().iconst(types::I64, func_id as i64);
@@ -4510,7 +4570,6 @@ pub mod cl {
         let call = builder.ins().call(f, &[fid, pc, n, buf]);
         let result = builder.inst_results(call)[0];
         builder.ins().return_(&[result]);
-        builder.switch_to_block(cont_block);
         Ok(())
     }
 

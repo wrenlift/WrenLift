@@ -5367,3 +5367,192 @@ System.print("not reached")
         e1
     );
 }
+
+/// Run `warm` as module "main", wait for `name` to reach the top tier,
+/// then run `then` as another module importing it; returns the second
+/// run's output and the deopts it caused, or nothing in a build
+/// without a top tier.
+fn run_after_top_tier(warm: &str, name: &str, then: &str) -> Option<(String, u32)> {
+    use wren_lift::runtime::engine::{FuncId, TierState};
+    if wren_lift::codegen::top_tier() == wren_lift::codegen::TopTier::Off {
+        return None;
+    }
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", warm);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "{}",
+        vm.take_output()
+    );
+    let id = (0..vm.engine.function_count() as u32)
+        .map(FuncId)
+        .find(|id| {
+            vm.engine
+                .get_mir(*id)
+                .is_some_and(|m| vm.interner.resolve(m.name) == name)
+        })
+        .unwrap_or_else(|| panic!("{name} is registered"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while vm.engine.tier_state(id) != TierState::OptimizedNative
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        vm.engine.poll_compilations();
+        let _ = vm.interpret("tick", "var x = 1\n");
+    }
+    assert_eq!(
+        vm.engine.tier_state(id),
+        TierState::OptimizedNative,
+        "{name} never reached the top tier: {:?}",
+        vm.engine.tier_state(id)
+    );
+    vm.output_buffer = Some(String::new());
+    let before = vm.engine.deopt_exits;
+    let result = vm.interpret("then", then);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    Some((output, vm.engine.deopt_exits - before))
+}
+
+const PROMOTED_ACC: &str = r#"
+class Acc {
+  construct new(v) { _v = v }
+  bump(x) {
+    _v = _v + x
+    return _v
+  }
+  v { _v }
+  v=(x) { _v = x }
+}
+"#;
+
+#[test]
+fn e2e_promoted_instance_is_rebuilt_at_a_deopt() {
+    // The top tier keeps `a` as field values; when the guard on
+    // `probe`'s result fails, the interpreter resumes with an instance
+    // rebuilt from them and finishes the loop and the calls after it.
+    let warm = format!(
+        "{PROMOTED_ACC}
+class K {{
+  static probe(i, bad) {{
+    var k = 0
+    while (k < 1) k = k + 1
+    return bad && i == 7 ? \"s\" : 1
+  }}
+  static run(n, bad) {{
+    var a = Acc.new(10)
+    var s = 0
+    for (i in 0...n) {{
+      a.bump(1)
+      var m = K.probe(i, bad)
+      if (m is Num) s = s + m
+    }}
+    a.bump(100)
+    return \"%(a.v) %(s)\"
+  }}
+}}
+for (k in 0...3000) K.run(20, false)
+"
+    );
+    let then =
+        "import \"main\" for K\nSystem.print(K.run(20, true))\nSystem.print(K.run(20, false))\n";
+    let Some((output, deopts)) = run_after_top_tier(&warm, "run(_,_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "130 19\n130 20");
+    assert!(deopts >= 1, "the result guard never fired");
+}
+
+#[test]
+fn e2e_promoted_instance_survives_a_class_reassignment() {
+    // The constructor site's guard reads the module variable; once it
+    // holds another class the compiled body hands the call back to the
+    // interpreter, which makes the other class's instance.
+    let warm = format!(
+        "{PROMOTED_ACC}
+class Other {{
+  construct new(v) {{ _v = v * 10 }}
+  bump(x) {{
+    _v = _v + x * 10
+    return _v
+  }}
+  v {{ _v }}
+}}
+var Ctor = Acc
+class K {{
+  static build(n) {{
+    var s = 0
+    for (i in 0...n) {{
+      var a = Ctor.new(i)
+      a.bump(1)
+      s = s + a.v
+    }}
+    return s
+  }}
+  static swap() {{ Ctor = Other }}
+}}
+for (k in 0...3000) K.build(30)
+"
+    );
+    let then = "import \"main\" for K\nSystem.print(K.build(30))\nK.swap()\nSystem.print(K.build(30))\nSystem.print(K.build(30))\n";
+    let Some((output, _)) = run_after_top_tier(&warm, "build(_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "465\n4650\n4650");
+}
+
+#[test]
+fn e2e_promoted_instance_fields_merge_across_branches() {
+    // Fields stored on different paths meet where the paths join, and
+    // one instance's field feeds another's; the top tier lands mid-run.
+    let src = format!(
+        "{PROMOTED_ACC}
+class K {{
+  static branchy(n) {{
+    var a = Acc.new(0)
+    var t = 0
+    for (i in 0...n) {{
+      if (i % 2 == 0) a.v = i else a.bump(2)
+      t = t + a.v
+    }}
+    return \"%(a.v) %(t)\"
+  }}
+  static nested(n) {{
+    var a = Acc.new(1)
+    var b = Acc.new(2)
+    var s = 0
+    for (i in 0...n) {{
+      a.bump(b.v)
+      b.v = a.v % 7
+      s = s + b.v
+    }}
+    return \"%(a.v) %(b.v) %(s)\"
+  }}
+}}
+System.print(K.branchy(300000))
+System.print(K.nested(300000))
+var x = \"\"
+for (r in 0...3) x = K.branchy(50000) + \" \" + K.nested(50000)
+System.print(x)
+"
+    );
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(&src, config);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(
+        output.trim(),
+        "300000 45000000000\n1399998 5 1400000\n50000 1250000000 233330 6 233333"
+    );
+}

@@ -40,8 +40,8 @@ pub mod llvm {
     use crate::codegen::NativeOsrEntry;
     use crate::intern::Interner;
     use crate::mir::{
-        osr_reachable_blocks, osr_rematerializable_defs, BlockId, DeoptReg, DeoptSource,
-        Instruction, MirFunction, MirType, Terminator, ValueId,
+        osr_reachable_blocks, osr_rematerializable_defs, BlockId, DeoptReg, Instruction,
+        MirFunction, MirType, Terminator, ValueId,
     };
     use crate::runtime::object_layout::*;
 
@@ -431,6 +431,7 @@ pub mod llvm {
         cur_block: usize,
         /// The receiver of a body spliced behind its class check.
         inline_class: Option<(IntValue<'ctx>, usize)>,
+
         /// A guarded getter whose class keeps its field as Nums: the
         /// guard that follows checks the class's field-kind byte at
         /// this address instead of the value.
@@ -1423,7 +1424,7 @@ pub mod llvm {
                             .iter()
                             .filter(|r| r.reg != vid.0)
                             .chain(call_live.iter())
-                            .copied()
+                            .cloned()
                             .collect();
                         Some((*call_pc, regs))
                     }
@@ -2088,7 +2089,20 @@ pub mod llvm {
                     self.num_values.insert(v);
                     v.into()
                 }
-                I::SlowPathExit { .. } => return Ok(None),
+                // In a block that ends unreachable, the exit is the
+                // block: the guard that led here has already failed.
+                I::SlowPathExit { pc, live } => {
+                    let ends = matches!(
+                        self.sh.mir.blocks[self.cur_block].terminator,
+                        Terminator::Unreachable
+                    );
+                    if ends && self.inline_depth == 0 {
+                        self.deopt_exit(*pc, live)?;
+                        let dead = self.new_block("after_exit");
+                        self.b.position_at_end(dead);
+                    }
+                    return Ok(None);
+                }
                 I::GuardNumAt {
                     value, pc, live, ..
                 } => {
@@ -2548,19 +2562,15 @@ pub mod llvm {
                     at * 8,
                     self.c64(crate::codegen::runtime_fns::deopt_tag(r)),
                 )?;
-                match r.source {
-                    DeoptSource::Value(v) => {
-                        let v = self.boxed(&v)?;
-                        self.store64(buf, at * 8 + 8, v)?;
-                        at += 2;
-                    }
-                    DeoptSource::Range { from, to, .. } => {
-                        let f = self.boxed(&from)?;
-                        let t = self.boxed(&to)?;
-                        self.store64(buf, at * 8 + 8, f)?;
-                        self.store64(buf, at * 8 + 16, t)?;
-                        at += 3;
-                    }
+                at += 1;
+                for c in crate::codegen::runtime_fns::deopt_consts(r) {
+                    self.store64(buf, at * 8, self.c64(c))?;
+                    at += 1;
+                }
+                for v in r.source.operands() {
+                    let v = self.boxed(&v)?;
+                    self.store64(buf, at * 8, v)?;
+                    at += 1;
                 }
             }
             let fid = self.c64(jit_func_id() as u64);

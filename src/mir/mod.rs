@@ -472,7 +472,7 @@ pub enum Instruction {
 
 /// What a register holds when compiled code hands a function back to
 /// the interpreter mid-body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeoptSource {
     /// A value the compiled body still has.
     Value(ValueId),
@@ -483,11 +483,18 @@ pub enum DeoptSource {
         to: ValueId,
         inclusive: bool,
     },
+    /// An instance the compiled body keeps as field values, rebuilt
+    /// from them; registers sharing an `id` get the same object.
+    Object {
+        class: usize,
+        id: u32,
+        fields: Vec<ValueId>,
+    },
 }
 
 /// A register of the interpreter's frame and where its value comes
 /// from at a deopt point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeoptReg {
     pub reg: u32,
     pub source: DeoptSource,
@@ -498,6 +505,7 @@ impl DeoptSource {
         match self {
             DeoptSource::Value(v) => vec![*v],
             DeoptSource::Range { from, to, .. } => vec![*from, *to],
+            DeoptSource::Object { fields, .. } => fields.clone(),
         }
     }
     pub fn map(&mut self, f: &dyn Fn(ValueId) -> ValueId) {
@@ -506,6 +514,11 @@ impl DeoptSource {
             DeoptSource::Range { from, to, .. } => {
                 *from = f(*from);
                 *to = f(*to);
+            }
+            DeoptSource::Object { fields, .. } => {
+                for v in fields.iter_mut() {
+                    *v = f(*v);
+                }
             }
         }
     }
@@ -1576,7 +1589,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
             value,
             pc,
             live.iter()
-                .map(|r| match r.source {
+                .map(|r| match &r.source {
                     DeoptSource::Value(v) => format!("r{}={}", r.reg, v),
                     DeoptSource::Range {
                         from,
@@ -1586,9 +1599,11 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
                         "r{}={}{}{}",
                         r.reg,
                         from,
-                        if inclusive { ".." } else { "..." },
+                        if *inclusive { ".." } else { "..." },
                         to
                     ),
+                    DeoptSource::Object { class, fields, .. } =>
+                        format!("r{}=new {:#x}({})", r.reg, class, fmt_val_list(fields)),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")

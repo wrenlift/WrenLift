@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use super::licm::{compute_dominators, compute_rpo, detect_loops, merge_loops_by_header};
 use super::{remap_inst, remap_term};
-use crate::mir::{live_in_sets, BlockId, Instruction, MirFunction, MirType, Terminator, ValueId};
+use crate::mir::{
+    live_in_sets, BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
+};
 
 /// What the receiver is checked against before the inlined body runs.
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +36,9 @@ pub struct KnownCallee {
     /// initialiser, run on a fresh instance, and the call's value is
     /// that instance.
     pub constructor: Option<usize>,
+    /// A failed guard resumes the interpreter at this offset with
+    /// these registers instead of making the call.
+    pub exit: Option<(u32, Vec<DeoptReg>)>,
 }
 
 impl KnownCallee {
@@ -558,6 +563,23 @@ fn inline_site(
     }
     operands.extend_from_slice(&args);
     let entry = splice_body(func, &callee.body, post, constructor, &operands);
+
+    if let Some((pc, live)) = callee.exit.clone() {
+        let exit_block = func.new_block();
+        let exit = func.new_value();
+        func.block_mut(exit_block)
+            .instructions
+            .push((exit, Instruction::SlowPathExit { pc, live }));
+        func.block_mut(exit_block).terminator = Terminator::Unreachable;
+        func.block_mut(block).terminator = Terminator::CondBranch {
+            condition: guard,
+            true_target: entry,
+            true_args: Vec::new(),
+            false_target: exit_block,
+            false_args: Vec::new(),
+        };
+        return;
+    }
 
     // Generic path: the original call, then either the fast
     // continuation or the slow copy's continuation.

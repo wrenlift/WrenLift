@@ -5692,20 +5692,35 @@ fn deopt_impl(func_id: u32, args: &[u64]) -> u64 {
 /// the register.
 const DEOPT_RANGE: u64 = 1 << 32;
 const DEOPT_INCLUSIVE: u64 = 1 << 33;
+/// Bit 34 marks an instance rebuilt from its field words, which follow
+/// its class word and identity word; bits 40-55 hold the field count.
+const DEOPT_OBJECT: u64 = 1 << 34;
+const DEOPT_FIELDS_SHIFT: u32 = 40;
 
 /// The tag word of `r` in a deopt buffer.
 pub fn deopt_tag(r: &crate::mir::DeoptReg) -> u64 {
-    match r.source {
+    match &r.source {
         crate::mir::DeoptSource::Value(_) => r.reg as u64,
         crate::mir::DeoptSource::Range { inclusive, .. } => {
-            r.reg as u64 | DEOPT_RANGE | if inclusive { DEOPT_INCLUSIVE } else { 0 }
+            r.reg as u64 | DEOPT_RANGE | if *inclusive { DEOPT_INCLUSIVE } else { 0 }
         }
+        crate::mir::DeoptSource::Object { fields, .. } => {
+            r.reg as u64 | DEOPT_OBJECT | ((fields.len() as u64) << DEOPT_FIELDS_SHIFT)
+        }
+    }
+}
+
+/// The constant words that follow the tag of `r`, before its operands.
+pub fn deopt_consts(r: &crate::mir::DeoptReg) -> Vec<u64> {
+    match &r.source {
+        crate::mir::DeoptSource::Object { class, id, .. } => vec![*class as u64, *id as u64],
+        _ => Vec::new(),
     }
 }
 
 /// Words `r` takes in a deopt buffer, tag included.
 pub fn deopt_words(r: &crate::mir::DeoptReg) -> usize {
-    1 + r.source.operands().len()
+    1 + deopt_consts(r).len() + r.source.operands().len()
 }
 
 /// A mid-body speculation in `func_id` failed: resume the interpreter
@@ -5726,6 +5741,7 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
     let words: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
     let root_len_before = jit_roots_snapshot_len();
     let mut regs: Vec<(u32, Value)> = Vec::new();
+    let mut objects: Vec<(u32, Value)> = Vec::new();
     let mut i = 0;
     while i < words.len() {
         let tag = words[i];
@@ -5741,6 +5757,28 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
             push_jit_root(val);
             regs.push((reg, val));
             i += 3;
+        } else if tag & DEOPT_OBJECT != 0 {
+            let class = words[i + 1] as *mut crate::runtime::object::ObjClass;
+            let id = words[i + 2] as u32;
+            let nfields = (tag >> DEOPT_FIELDS_SHIFT) as usize & 0xffff;
+            let val = match objects.iter().find(|(k, _)| *k == id) {
+                Some((_, v)) => *v,
+                None => {
+                    let inst = vm.gc.alloc_instance(class);
+                    unsafe {
+                        (*inst).header.class = class;
+                        for f in 0..nfields.min((*inst).num_fields as usize) {
+                            (*inst).set_field_unchecked(f, Value::from_bits(words[i + 3 + f]));
+                        }
+                    }
+                    let val = Value::object(inst as *mut u8);
+                    push_jit_root(val);
+                    objects.push((id, val));
+                    val
+                }
+            };
+            regs.push((reg, val));
+            i += 3 + nfields;
         } else {
             regs.push((reg, Value::from_bits(words[i + 1])));
             i += 2;

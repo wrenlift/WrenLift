@@ -12,6 +12,7 @@ pub mod inline_calls;
 pub mod int_loop;
 pub mod licm;
 pub mod math_guard;
+pub mod promote_fields;
 pub mod purity;
 pub mod range_loop;
 pub mod sra;
