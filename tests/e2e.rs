@@ -5163,6 +5163,61 @@ System.print(Maker.build(2000000))
 }
 
 #[test]
+fn e2e_inlined_sites_in_a_loop_with_a_merge_compile() {
+    // Two inlinable constructor calls in the arms of a conditional
+    // inside a loop: the loop is versioned, both sites enter the
+    // generic copy after their own calls, and the copy's merge block
+    // reads values only the copy defines. Every tier must compile it.
+    let src = r#"
+class P {
+  construct new(i) { _i = i }
+  i { _i }
+}
+class M {
+  construct new(i) { _i = i * 2 }
+  i { _i }
+}
+class B {
+  static build(n) {
+    var world = []
+    for (i in 0...n) world.add(i % 2 == 0 ? P.new(i) : M.new(i))
+    var sum = 0
+    for (e in world) sum = sum + e.i
+    return sum
+  }
+}
+var total = 0
+for (k in 0...2000) total = total + B.build(40)
+System.print(total)
+"#;
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(output.trim(), "2360000");
+    let build = (0..vm.engine.function_count() as u32)
+        .map(wren_lift::runtime::engine::FuncId)
+        .find(|id| {
+            vm.engine
+                .get_mir(*id)
+                .is_some_and(|m| vm.interner.resolve(m.name) == "build(_)")
+        })
+        .expect("build(_) is registered");
+    assert_ne!(
+        vm.engine.tier_state(build),
+        wren_lift::runtime::engine::TierState::Interpreted,
+        "build(_) never left the interpreter"
+    );
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,

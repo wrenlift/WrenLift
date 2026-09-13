@@ -201,6 +201,9 @@ pub fn inline_known_calls(func: &mut MirFunction, sites: &HashMap<ValueId, Known
                 for s in in_loop {
                     inline_site(func, s.dst, sites, slow.as_mut());
                 }
+                if let Some(copy) = slow {
+                    repair_copy_ssa(func, &copy);
+                }
             }
             None => inline_site(func, site.dst, sites, None),
         }
@@ -228,6 +231,79 @@ struct SlowCopy {
     fast_to_slow: HashMap<ValueId, ValueId>,
     /// Copy value → the fast-world value it stands for.
     slow_to_fast: HashMap<ValueId, ValueId>,
+    /// `(fast-world block, copy block)`: a guard's failure path enters
+    /// the copy there, after its generic call.
+    entries: Vec<(BlockId, BlockId)>,
+}
+
+/// Give every copy block a parameter for each value the copy defines
+/// elsewhere and the block reads, and pass it along every edge. The
+/// copy is then entered anywhere with only what the entry names: the
+/// failure edges hand over the fast world's own values.
+fn repair_copy_ssa(func: &mut MirFunction, copy: &SlowCopy) {
+    func.compute_predecessors();
+    let mut copy_defs: HashSet<ValueId> = HashSet::new();
+    for &b in &copy.blocks {
+        copy_defs.extend(func.block(b).defined_values());
+    }
+    let live_in = live_in_sets(func);
+    let types = crate::mir::infer_value_types(func);
+    let mut ordered: Vec<BlockId> = copy.blocks.iter().copied().collect();
+    ordered.sort_by_key(|b| b.0);
+    // Per block: the values it needs, and the parameter standing for
+    // each inside it.
+    let mut needed: HashMap<BlockId, Vec<ValueId>> = HashMap::new();
+    let mut names: HashMap<BlockId, HashMap<ValueId, ValueId>> = HashMap::new();
+    for &b in &ordered {
+        if b == copy.header {
+            continue;
+        }
+        let mut need: Vec<ValueId> = live_in
+            .iter(b.0 as usize)
+            .filter(|v| copy_defs.contains(v))
+            .collect();
+        need.sort_by_key(|v| v.0);
+        if need.is_empty() {
+            continue;
+        }
+        let mut rename: HashMap<ValueId, ValueId> = HashMap::new();
+        for &v in &need {
+            let p = func.new_value();
+            func.block_mut(b).params.push((p, param_type(&types, v)));
+            rename.insert(v, p);
+        }
+        let block = func.block_mut(b);
+        for (_, inst) in &mut block.instructions {
+            remap_inst(inst, &rename);
+        }
+        remap_term(&mut block.terminator, &rename);
+        needed.insert(b, need);
+        names.insert(b, rename);
+    }
+    // Edges inside the copy pass the predecessor's name for each value.
+    for &p in &ordered {
+        let succs = func.block(p).terminator.successors();
+        for s in succs {
+            let Some(need) = needed.get(&s) else {
+                continue;
+            };
+            let empty = HashMap::new();
+            let mine = names.get(&p).unwrap_or(&empty);
+            let args: Vec<ValueId> = need
+                .iter()
+                .map(|v| mine.get(v).copied().unwrap_or(*v))
+                .collect();
+            append_edge_args(&mut func.block_mut(p).terminator, s, &args);
+        }
+    }
+    // Failure edges pass the fast world's values.
+    for &(from, post) in &copy.entries {
+        let Some(need) = needed.get(&post) else {
+            continue;
+        };
+        let args: Vec<ValueId> = need.iter().map(|v| copy.slow_to_fast[v]).collect();
+        func.block_mut(from).terminator = Terminator::Branch { target: post, args };
+    }
 }
 
 /// `a` dominates `b`; false for blocks the entry does not reach.
@@ -360,6 +436,7 @@ fn version_loop(
         blocks: block_map.values().copied().collect(),
         fast_to_slow,
         slow_to_fast,
+        entries: Vec::new(),
     })
 }
 
@@ -499,28 +576,23 @@ fn inline_site(
         Some(copy) => {
             let slow_dst = copy.fast_to_slow[&dst];
             copy.slow_to_fast.insert(slow_dst, slow_result);
-            let target = slow_continuation(func, copy, slow_dst, slow_block);
-            let args: Vec<ValueId> = func
-                .block(target)
-                .params
-                .iter()
-                .map(|(p, _)| copy.slow_to_fast[p])
-                .collect();
-            Terminator::Branch { target, args }
+            let target = slow_continuation(func, copy, slow_dst);
+            copy.entries.push((slow_block, target));
+            // `repair_copy_ssa` supplies the arguments once every site
+            // in the loop is done.
+            Terminator::Branch {
+                target,
+                args: Vec::new(),
+            }
         }
     };
     func.block_mut(slow_block).terminator = slow_term;
 }
 
-/// Split the slow copy after its own copy of the call and turn every
-/// copy-defined value live there into a parameter of the tail, so the
-/// fast world's guard failure can enter with its own values.
-fn slow_continuation(
-    func: &mut MirFunction,
-    copy: &mut SlowCopy,
-    slow_dst: ValueId,
-    slow_block: BlockId,
-) -> BlockId {
+/// Split the slow copy after its own copy of the call; the tail is
+/// where the fast world's guard failure enters once `repair_copy_ssa`
+/// has given it parameters.
+fn slow_continuation(func: &mut MirFunction, copy: &mut SlowCopy, slow_dst: ValueId) -> BlockId {
     let (block, k) = locate(func, slow_dst).expect("slow copy holds the cloned call");
     let post = split_after(func, block, k);
     func.block_mut(block).terminator = Terminator::Branch {
@@ -528,51 +600,6 @@ fn slow_continuation(
         args: Vec::new(),
     };
     copy.blocks.insert(post);
-
-    // Dominance inside the copy is that of the loop entered at its
-    // header. Until a site links the fast world in, the copy is
-    // unreachable and every block would look undominated; a provisional
-    // edge from the generic-call block to the header, replaced by the
-    // caller with the real continuation, gives the copy its shape.
-    func.block_mut(slow_block).terminator = Terminator::Branch {
-        target: copy.header,
-        args: Vec::new(),
-    };
-    func.compute_predecessors();
-    let rpo = compute_rpo(func);
-    let idom = compute_dominators(func, &rpo);
-    let live_in = live_in_sets(func);
-    let mut copy_defs: HashSet<ValueId> = HashSet::new();
-    for &b in &copy.blocks {
-        copy_defs.extend(func.block(b).defined_values());
-    }
-    let mut needed: Vec<ValueId> = live_in
-        .iter(post.0 as usize)
-        .filter(|v| copy_defs.contains(v))
-        .collect();
-    needed.sort_by_key(|v| v.0);
-
-    let types = crate::mir::infer_value_types(func);
-    let mut rename: HashMap<ValueId, ValueId> = HashMap::new();
-    for &v in &needed {
-        let p = func.new_value();
-        func.block_mut(post).params.push((p, param_type(&types, v)));
-        rename.insert(v, p);
-        let fast = copy.slow_to_fast[&v];
-        copy.slow_to_fast.insert(p, fast);
-    }
-    for bi in 0..func.blocks.len() {
-        if dominated(&idom, post.0 as usize, bi) {
-            let b = &mut func.blocks[bi];
-            for (_, inst) in &mut b.instructions {
-                remap_inst(inst, &rename);
-            }
-            remap_term(&mut b.terminator, &rename);
-        }
-    }
-    if let Terminator::Branch { args, .. } = &mut func.block_mut(block).terminator {
-        args.extend_from_slice(&needed);
-    }
     post
 }
 
