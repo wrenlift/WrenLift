@@ -4331,10 +4331,19 @@ impl ExecutionEngine {
     }
 }
 
-impl Drop for ExecutionEngine {
-    fn drop(&mut self) {
+impl ExecutionEngine {
+    /// Wait for a top-tier compile in flight and drop the ones queued.
+    /// A compile reads heap objects (classes, closures) the caches
+    /// name, so this runs before the heap goes.
+    pub fn stop_promoter(&mut self) {
         #[cfg(feature = "host")]
         drop(self.promoter.take());
+    }
+}
+
+impl Drop for ExecutionEngine {
+    fn drop(&mut self) {
+        self.stop_promoter();
         // Beadie's broker owns the worker thread now; its Drop impl sends
         // a shutdown signal and joins when TierManager drops. Any in-flight
         // compile results that never reached `poll_compilations` get

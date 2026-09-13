@@ -6067,6 +6067,9 @@ impl Drop for VM {
         if std::env::var_os("WLIFT_TIER_STATS").is_some() {
             self.engine.dump_tier_stats(&self.interner);
         }
+        // The heap drops before the engine; a compile still running
+        // would read freed objects.
+        self.engine.stop_promoter();
     }
 }
 
