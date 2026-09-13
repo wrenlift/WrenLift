@@ -2254,25 +2254,10 @@ fn devirt_calls_with_ic(
     use crate::mir::Instruction;
 
     let mut new_mir = mir.clone();
+    let sites = mir.ic_sites.clone();
 
-    // Pre-compute per-block IC base (same logic as cranelift_backend)
-    let mut block_ic_base: Vec<usize> = Vec::with_capacity(mir.blocks.len());
-    let mut running = 0usize;
-    for blk in &mir.blocks {
-        block_ic_base.push(running);
-        for (_, inst) in &blk.instructions {
-            if matches!(
-                inst,
-                Instruction::Call { .. } | Instruction::SuperCall { .. }
-            ) {
-                running += 1;
-            }
-        }
-    }
-
-    for (block_idx, block) in new_mir.blocks.iter_mut().enumerate() {
-        let mut ic_idx = block_ic_base[block_idx];
-        for (_, inst) in block.instructions.iter_mut() {
+    for block in new_mir.blocks.iter_mut() {
+        for (dst, inst) in block.instructions.iter_mut() {
             if let Instruction::Call {
                 receiver,
                 method,
@@ -2280,6 +2265,9 @@ fn devirt_calls_with_ic(
                 pure_call: _,
             } = inst
             {
+                let Some(ic_idx) = sites.get(dst).map(|i| *i as usize) else {
+                    continue;
+                };
                 if ic_idx < ic_snapshot.len() {
                     let ic = &ic_snapshot[ic_idx];
                     // Kinds 1, 2 and 6 name a closure method with its
@@ -2302,9 +2290,6 @@ fn devirt_calls_with_ic(
                         };
                     }
                 }
-                ic_idx += 1;
-            } else if matches!(inst, Instruction::SuperCall { .. }) {
-                ic_idx += 1;
             }
         }
     }

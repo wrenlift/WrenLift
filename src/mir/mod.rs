@@ -931,9 +931,35 @@ pub struct MirFunction {
     /// Compile-time only.
     #[serde(skip)]
     pub osr_excluded: std::collections::HashSet<BlockId>,
+    /// The inline-cache entry of each call, by the call's result: the
+    /// bytecode numbers `Call` and `CallKnownFunc` in block order, and
+    /// a transformation that clones or moves a call carries its entry
+    /// along. A call without an entry dispatches generically.
+    /// Compile-time only.
+    #[serde(skip)]
+    pub ic_sites: std::collections::HashMap<ValueId, u32>,
 }
 
 impl MirFunction {
+    /// The inline-cache entries the bytecode of this function has, by
+    /// the call's result.
+    pub fn ic_site_numbering(&self) -> std::collections::HashMap<ValueId, u32> {
+        let mut sites = std::collections::HashMap::new();
+        let mut i = 0u32;
+        for block in &self.blocks {
+            for (dst, inst) in &block.instructions {
+                if matches!(
+                    inst,
+                    Instruction::Call { .. } | Instruction::CallKnownFunc { .. }
+                ) {
+                    sites.insert(*dst, i);
+                    i += 1;
+                }
+            }
+        }
+        sites
+    }
+
     pub fn new(name: SymbolId, arity: u8) -> Self {
         Self {
             name,
@@ -946,6 +972,7 @@ impl MirFunction {
             speculated_num_params: Vec::new(),
             scalar_param_sources: std::collections::HashMap::new(),
             osr_excluded: std::collections::HashSet::new(),
+            ic_sites: std::collections::HashMap::new(),
         }
     }
 

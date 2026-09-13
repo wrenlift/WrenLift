@@ -694,7 +694,7 @@ pub mod cl {
         receiver: Value,
         method: crate::intern::SymbolId,
         args: &[Value],
-        ic_idx: usize,
+        ic_idx: Option<usize>,
         aot_config: Option<&AotLoweringConfig>,
     ) -> Result<Option<Value>, String>
     where
@@ -1248,7 +1248,7 @@ pub mod cl {
             receiver,
             method,
             args,
-            Some(ic_idx),
+            ic_idx,
             aot_config,
         )?;
         builder
@@ -3017,25 +3017,6 @@ pub mod cl {
         // Cache for declared runtime functions
         let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> = HashMap::new();
 
-        // Pre-compute per-block call site base index.
-        // The IC table is indexed by sequential block order (bb0, bb1, ...),
-        // but we process blocks in RPO order. Without this map, call_site_idx
-        // would assign wrong IC entries to call sites in reordered blocks.
-        let mut block_call_site_base: Vec<usize> = Vec::with_capacity(mir.blocks.len());
-        {
-            let mut running = 0usize;
-            for blk in &mir.blocks {
-                block_call_site_base.push(running);
-                for (_, inst) in &blk.instructions {
-                    if matches!(
-                        inst,
-                        Instruction::Call { .. } | Instruction::SuperCall { .. }
-                    ) {
-                        running += 1;
-                    }
-                }
-            }
-        }
         // Helper to get or declare a runtime function
         let mut get_runtime_fn = |module: &mut dyn Module,
                                   builder: &mut FunctionBuilder,
@@ -3568,11 +3549,6 @@ pub mod cl {
                 continue 'block_loop;
             }
 
-            // Reset call_site_idx to the pre-computed base for this block.
-            // This ensures IC entries are read from the correct sequential
-            // position even though blocks are processed in RPO order.
-            let mut call_site_idx = block_call_site_base[block_idx];
-
             // Add block parameters (from loop back-edges / CondBranch args)
             for (vid, ty) in &block.params {
                 let cl_type = match ty {
@@ -4010,7 +3986,7 @@ pub mod cl {
                     callsite_ic_ptrs,
                     callsite_ic_live_ptrs,
                     jit_code_base,
-                    &mut call_site_idx,
+                    mir.ic_sites.get(&vid).map(|i| *i as usize),
                     f64_self_id,
                     receiver_val,
                     aot_config,
@@ -4687,7 +4663,8 @@ pub mod cl {
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
-        call_site_idx: &mut usize,
+        // The inline-cache entry of this call, when it has one.
+        ic_site: Option<usize>,
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
         aot_config: Option<&AotLoweringConfig>,
@@ -5179,8 +5156,6 @@ pub mod cl {
                     return Ok(Some(builder.inst_results(call)[0]));
                 }
                 let r = get(receiver);
-                let ic_idx = *call_site_idx;
-                *call_site_idx += 1;
                 let arg_vals: Vec<Value> = args.iter().map(get).collect();
 
                 if let Some(simd_result) = try_lower_simd_intrinsic_call(
@@ -5191,7 +5166,7 @@ pub mod cl {
                     r,
                     *method,
                     &arg_vals,
-                    ic_idx,
+                    ic_site,
                     aot_config,
                 )? {
                     return Ok(Some(simd_result));
@@ -5541,7 +5516,6 @@ pub mod cl {
                                         callee_args.push(get(a));
                                     }
                                     let callee_block = &callee_mir.blocks[0];
-                                    let mut inline_call_idx = 0usize;
                                     let mut inline_failed = false;
                                     for (vid, callee_inst) in &callee_block.instructions {
                                         match callee_inst {
@@ -5566,7 +5540,7 @@ pub mod cl {
                                                     None,
                                                     None,
                                                     jit_code_base,
-                                                    &mut inline_call_idx,
+                                                    None,
                                                     f64_self_id,
                                                     Some(callee_args[0]),
                                                     aot_config,
@@ -5676,8 +5650,8 @@ pub mod cl {
                 // Try inline IC: emit class-check + fast path.
                 // Kind=5 (getter): inline field load (class baked as constant).
                 // Kind=1: currently only used for IC index encoding in slow path.
-                let ic = callsite_ic_ptrs.and_then(|ics| ics.get(ic_idx));
-                let _live_ptr = callsite_ic_live_ptrs.and_then(|ptrs| ptrs.get(ic_idx).copied());
+                let ic = ic_site.and_then(|i| callsite_ic_ptrs.and_then(|ics| ics.get(i)));
+                let _ = callsite_ic_live_ptrs;
 
                 // AOT mode: ICs are JIT-only (mutable code memory).
                 // Skip the kind=5 inline-getter fast path entirely
@@ -5689,7 +5663,12 @@ pub mod cl {
                     // A constructor on a resolved class: allocate and run
                     // the initialiser directly when the receiver is that
                     // class object.
-                    if ic.kind == 3 && ic.class != 0 && ic.func_id != 0 && args.len() <= 3 {
+                    if ic.kind == 3
+                        && ic.class != 0
+                        && ic.func_id != 0
+                        && args.len() <= 3
+                        && std::env::var_os("X_NO3").is_none()
+                    {
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
@@ -5795,7 +5774,7 @@ pub mod cl {
                     // Only emit IC fast path for kind=5 (getter inline).
                     // Kind=1 uses the slow path with IC index encoding so
                     // dispatch_call_rooted can use cached method lookups.
-                    if ic.kind == 5 && ic.class != 0 {
+                    if ic.kind == 5 && ic.class != 0 && std::env::var_os("X_NO5").is_none() {
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
@@ -5836,8 +5815,8 @@ pub mod cl {
                         // Slow path: full dispatch via wren_call_N
                         builder.switch_to_block(slow_block);
                         let mut method_bits = method.index() as u64;
-                        if env_jit_callsite_ic() {
-                            method_bits |= ((ic_idx as u64) + 1) << 32;
+                        if let Some(i) = ic_site.filter(|_| env_jit_callsite_ic()) {
+                            method_bits |= ((i as u64) + 1) << 32;
                         }
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                         let arg_vals: Vec<_> = args.iter().map(&get).collect();
@@ -5882,8 +5861,8 @@ pub mod cl {
                         .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
                 } else {
                     let mut method_bits = method.index() as u64;
-                    if env_jit_callsite_ic() {
-                        method_bits |= ((ic_idx as u64) + 1) << 32;
+                    if let Some(i) = ic_site.filter(|_| env_jit_callsite_ic()) {
+                        method_bits |= ((i as u64) + 1) << 32;
                     }
                     builder.ins().iconst(types::I64, method_bits as i64)
                 };
@@ -6023,7 +6002,6 @@ pub mod cl {
                                 callee_args.push(get(a));
                             }
                             let callee_block = &callee_mir.blocks[0];
-                            let mut inline_call_idx = 0usize;
                             let mut inline_failed = false;
                             for (vid, callee_inst) in &callee_block.instructions {
                                 match callee_inst {
@@ -6050,7 +6028,7 @@ pub mod cl {
                                             None,
                                             None,
                                             jit_code_base,
-                                            &mut inline_call_idx,
+                                            None,
                                             f64_self_id,
                                             Some(callee_args[0]),
                                             aot_config,

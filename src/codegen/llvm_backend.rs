@@ -433,8 +433,7 @@ pub mod llvm {
         cur_vid: ValueId,
         raw_bools: HashSet<ValueId>,
         value_types: Vec<MirType>,
-        call_site_idx: usize,
-        block_call_site_base: Vec<usize>,
+
         receiver: Option<IntValue<'ctx>>,
         /// Main-entry parameters when the body has an entry switch.
         param_regs: Vec<IntValue<'ctx>>,
@@ -455,19 +454,6 @@ pub mod llvm {
             entries: &'a [OsrEntryLayout],
         ) -> Self {
             let mir = sh.mir;
-            let mut block_call_site_base = Vec::with_capacity(mir.blocks.len());
-            let mut running = 0usize;
-            for blk in &mir.blocks {
-                block_call_site_base.push(running);
-                for (_, inst) in &blk.instructions {
-                    if matches!(
-                        inst,
-                        Instruction::Call { .. } | Instruction::SuperCall { .. }
-                    ) {
-                        running += 1;
-                    }
-                }
-            }
             Self {
                 sh,
                 b: sh.ctx.create_builder(),
@@ -486,8 +472,7 @@ pub mod llvm {
                 cur_vid: ValueId(u32::MAX),
                 raw_bools: HashSet::new(),
                 value_types: infer_osr_value_types(mir),
-                call_site_idx: 0,
-                block_call_site_base,
+
                 receiver: None,
                 param_regs: Vec::new(),
                 inline_depth: 0,
@@ -1362,7 +1347,6 @@ pub mod llvm {
         fn lower_block(&mut self, bi: usize) -> Result<(), String> {
             let mir = self.sh.mir;
             let block = &mir.blocks[bi];
-            self.call_site_idx = self.block_call_site_base[bi];
             for (p, _) in &block.params {
                 let (slot, ty) = *self
                     .slots
@@ -3262,13 +3246,7 @@ pub mod llvm {
                 let ic_idx = self.take_ic_idx();
                 return self.list_add(r, arg_vals[0], method, ic_idx);
             }
-            let ic_idx = if self.inline_depth == 0 {
-                let i = self.call_site_idx;
-                self.call_site_idx += 1;
-                Some(i)
-            } else {
-                None
-            };
+            let ic_idx = self.take_ic_idx();
 
             // Class-hierarchy devirtualisation: one guarded direct call
             // per known implementation.
@@ -3467,11 +3445,11 @@ pub mod llvm {
             self.wren_call(r, m, &arg_vals)
         }
 
+        /// The inline-cache entry of the call being lowered: only a
+        /// call of this body's own MIR has one.
         fn take_ic_idx(&mut self) -> Option<usize> {
             if self.inline_depth == 0 {
-                let i = self.call_site_idx;
-                self.call_site_idx += 1;
-                Some(i)
+                self.sh.mir.ic_sites.get(&self.cur_vid).map(|i| *i as usize)
             } else {
                 None
             }

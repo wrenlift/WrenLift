@@ -174,34 +174,30 @@ pub enum TopTierCeiling {
     High,
 }
 
-/// `inline_site(i)` says whether the `i`-th call site (in block order,
-/// `Call` and `SuperCall` only) is one the top tier lowers without a
-/// call: a trivial getter or setter, a resolved initialiser, a small
-/// resolved body it splices in, or the iteration protocol.
+/// `inline_site(i)` says whether the call with inline-cache entry `i`
+/// is one the top tier lowers without a call: a trivial getter or
+/// setter, a resolved initialiser, a small resolved body it splices
+/// in, or the iteration protocol.
 pub fn top_tier_ceiling(mir: &MirFunction, inline_site: &dyn Fn(usize) -> bool) -> TopTierCeiling {
     use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
     use crate::mir::Instruction;
     let instrs: usize = mir.blocks.iter().map(|b| b.instructions.len()).sum();
-    let mut site = 0usize;
+    let sites = mir.ic_site_numbering();
     let mut calls = 0usize;
     // A body that calls itself iterates through the stack; it is
     // judged like a loop.
     let mut recursive = false;
     for block in &mir.blocks {
-        for (_, inst) in &block.instructions {
+        for (dst, inst) in &block.instructions {
             match inst {
                 Instruction::Call { method, .. } => {
-                    if !inline_site(site) {
+                    if !sites.get(dst).is_some_and(|i| inline_site(*i as usize)) {
                         calls += 1;
                     }
                     recursive |= *method == mir.name;
-                    site += 1;
                 }
                 Instruction::SuperCall { .. } => {
-                    if !inline_site(site) {
-                        calls += 1;
-                    }
-                    site += 1;
+                    calls += 1;
                 }
                 Instruction::CallKnownFunc { method, .. } => {
                     calls += 1;
@@ -1708,13 +1704,17 @@ impl ExecutionEngine {
         Arc::new(map)
     }
 
+    /// Fill empty call-site caches from what the compile can resolve:
+    /// a method with one implementation across the class hierarchy
+    /// (kind 1), and a constructor called on a class a module variable
+    /// holds right now (kind 3; the site still checks the receiver is
+    /// that class object).
     /// Mutate `ic_snapshot` in place: for any empty entry, plant a
     /// kind=1 IC when CHA shows exactly one impl for the call's
     /// method symbol. The downstream `compute_devirt_hints` +
     /// `devirt_calls_with_ic` then converts those Call sites into
     /// class-checked direct calls (or trivial-getter inlines).
-    /// Walks MIR Call/SuperCall in the same order
-    /// `callsite_ic_data_for_compile` produces the snapshot.
+    /// Entries are found by the call's inline-cache numbering.
     ///
     /// Polymorphic methods (multiple `(class, fn)` impls in CHA)
     /// stay empty: planting an arbitrary first impl turns class-
@@ -1722,74 +1722,6 @@ impl ExecutionEngine {
     /// that doesn't match, which on benchmarks like delta_blue
     /// regresses 3-5%. A multi-class dispatch tree (mirroring
     /// AOT-CHA's emit) is the proper fix and will land separately.
-    /// Re-order a bytecode-ordered inline-cache snapshot to the call
-    /// order of an optimised MIR. Both the bytecode emitter and the
-    /// backends number call sites by walking blocks in order, but the
-    /// JIT compiles a clone whose passes drop, add and move calls, so
-    /// positions no longer agree. A call's destination value id does
-    /// survive optimisation, so entries are matched on it; calls the
-    /// optimiser introduced get an empty entry.
-    fn align_callsite_ics(
-        authoritative: &MirFunction,
-        optimised: &MirFunction,
-        ics: Vec<CallSiteIC>,
-        live: Vec<usize>,
-        hints: Option<Vec<crate::codegen::DevirtHint>>,
-    ) -> (
-        Vec<CallSiteIC>,
-        Vec<usize>,
-        Option<Vec<crate::codegen::DevirtHint>>,
-    ) {
-        use crate::mir::Instruction;
-        let mut by_dst: HashMap<crate::mir::ValueId, usize> = HashMap::new();
-        let mut idx = 0usize;
-        for block in &authoritative.blocks {
-            for (dst, inst) in &block.instructions {
-                if matches!(
-                    inst,
-                    Instruction::Call { .. } | Instruction::SuperCall { .. }
-                ) {
-                    by_dst.insert(*dst, idx);
-                    idx += 1;
-                }
-            }
-        }
-        let mut out_ics = Vec::new();
-        let mut out_live = Vec::new();
-        let mut out_hints = hints.as_ref().map(|_| Vec::new());
-        for block in &optimised.blocks {
-            for (dst, inst) in &block.instructions {
-                if matches!(
-                    inst,
-                    Instruction::Call { .. } | Instruction::SuperCall { .. }
-                ) {
-                    match by_dst.get(dst) {
-                        Some(&i) if i < ics.len() => {
-                            out_ics.push(ics[i]);
-                            out_live.push(live.get(i).copied().unwrap_or(0));
-                            if let (Some(out), Some(h)) = (out_hints.as_mut(), hints.as_ref()) {
-                                out.push(h.get(i).copied().unwrap_or_default());
-                            }
-                        }
-                        _ => {
-                            out_ics.push(CallSiteIC::default());
-                            out_live.push(0);
-                            if let Some(out) = out_hints.as_mut() {
-                                out.push(Default::default());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (out_ics, out_live, out_hints)
-    }
-
-    /// Fill empty call-site caches from what the compile can resolve:
-    /// a method with one implementation across the class hierarchy
-    /// (kind 1), and a constructor called on a class a module variable
-    /// holds right now (kind 3; the site still checks the receiver is
-    /// that class object).
     fn fill_ic_with_cha(
         &self,
         id: FuncId,
@@ -1841,42 +1773,39 @@ impl ExecutionEngine {
                     _ => None,
                 }
             };
-        let mut ic_idx = 0usize;
+        let sites = mir.ic_site_numbering();
         for block in &mir.blocks {
-            for (_, inst) in &block.instructions {
-                match inst {
-                    Instruction::Call {
-                        receiver, method, ..
-                    } => {
-                        if let Some(slot) = ic_snapshot.get_mut(ic_idx) {
-                            if slot.kind == 0 {
-                                if let Some(impls) = cha.get(method) {
-                                    if impls.len() == 1 {
-                                        let one = impls[0];
-                                        slot.class = one.class;
-                                        slot.func_id = one.fid as u64;
-                                        slot.closure = one.closure as *const u8;
-                                        slot.kind = 1;
-                                    }
-                                }
-                            }
-                            if slot.kind == 0 {
-                                if let Some((class_ptr, fid, closure)) =
-                                    constructor_of(receiver, method)
-                                {
-                                    slot.class = class_ptr;
-                                    slot.func_id = fid as u64;
-                                    slot.closure = closure as *const u8;
-                                    slot.kind = 3;
-                                }
-                            }
+            for (dst, inst) in &block.instructions {
+                let Instruction::Call {
+                    receiver, method, ..
+                } = inst
+                else {
+                    continue;
+                };
+                let Some(ic_idx) = sites.get(dst).map(|i| *i as usize) else {
+                    continue;
+                };
+                let Some(slot) = ic_snapshot.get_mut(ic_idx) else {
+                    continue;
+                };
+                if slot.kind == 0 {
+                    if let Some(impls) = cha.get(method) {
+                        if impls.len() == 1 {
+                            let one = impls[0];
+                            slot.class = one.class;
+                            slot.func_id = one.fid as u64;
+                            slot.closure = one.closure as *const u8;
+                            slot.kind = 1;
                         }
-                        ic_idx += 1;
                     }
-                    Instruction::SuperCall { .. } => {
-                        ic_idx += 1;
+                }
+                if slot.kind == 0 {
+                    if let Some((class_ptr, fid, closure)) = constructor_of(receiver, method) {
+                        slot.class = class_ptr;
+                        slot.func_id = fid as u64;
+                        slot.closure = closure as *const u8;
+                        slot.kind = 3;
                     }
-                    _ => {}
                 }
             }
         }
@@ -2708,19 +2637,20 @@ impl ExecutionEngine {
             };
             value.as_object().map(|p| p as usize) == Some(class)
         };
-        let mut ic_idx = 0usize;
+        let numbering = mir.ic_site_numbering();
         for block in &mir.blocks {
             for (dst, inst) in &block.instructions {
-                let (method, receiver) = match inst {
-                    Instruction::Call {
-                        method, receiver, ..
-                    } => (Some(*method), Some(*receiver)),
-                    Instruction::SuperCall { .. } => (None, None),
-                    _ => continue,
+                let Instruction::Call {
+                    method, receiver, ..
+                } = inst
+                else {
+                    continue;
                 };
-                let ic = ics.get(ic_idx).copied();
-                ic_idx += 1;
-                let (Some(method), Some(ic)) = (method, ic) else {
+                let (method, receiver) = (*method, Some(*receiver));
+                let Some(ic) = numbering
+                    .get(dst)
+                    .and_then(|i| ics.get(*i as usize).copied())
+                else {
                     continue;
                 };
                 if std::env::var_os("WLIFT_INLINE_TRACE").is_some() {
@@ -2833,17 +2763,13 @@ impl ExecutionEngine {
         if mir.blocks.is_empty() {
             return cold;
         }
-        // Call-site index per block, in the snapshot's order.
-        let mut ic_idx = 0usize;
+        // Inline-cache kinds per block.
+        let numbering = mir.ic_site_numbering();
         let mut site_kinds: Vec<Vec<u64>> = vec![Vec::new(); mir.blocks.len()];
         for (bi, block) in mir.blocks.iter().enumerate() {
-            for (_, inst) in &block.instructions {
-                if matches!(
-                    inst,
-                    Instruction::Call { .. } | Instruction::SuperCall { .. }
-                ) {
-                    site_kinds[bi].push(ics.get(ic_idx).map(|ic| ic.kind).unwrap_or(0));
-                    ic_idx += 1;
+            for (dst, inst) in &block.instructions {
+                if let (Instruction::Call { .. }, Some(i)) = (inst, numbering.get(dst)) {
+                    site_kinds[bi].push(ics.get(*i as usize).map(|ic| ic.kind).unwrap_or(0));
                 }
             }
         }
@@ -3563,18 +3489,17 @@ impl ExecutionEngine {
         let ics = self.callsite_ic_data_for_compile(id).map(|(s, _)| s);
         let iterate = interner.lookup("iterate(_)");
         let iter_value = interner.lookup("iteratorValue(_)");
-        let methods: Vec<Option<SymbolId>> = mir
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|(_, inst)| match inst {
-                Instruction::Call { method, .. } => Some(Some(*method)),
-                Instruction::SuperCall { .. } => Some(None),
-                _ => None,
-            })
-            .collect();
+        let numbering = mir.ic_site_numbering();
+        let mut methods: HashMap<usize, SymbolId> = HashMap::new();
+        for b in &mir.blocks {
+            for (dst, inst) in &b.instructions {
+                if let (Instruction::Call { method, .. }, Some(i)) = (inst, numbering.get(dst)) {
+                    methods.insert(*i as usize, *method);
+                }
+            }
+        }
         let inline_site = |site: usize| -> bool {
-            let method = methods.get(site).copied().flatten();
+            let method = methods.get(&site).copied();
             if method.is_some() && (method == iterate || method == iter_value) {
                 return true;
             }
@@ -3832,7 +3757,8 @@ impl ExecutionEngine {
                 stats.compile_attempts += 1;
             }
         }
-        let sroa_mir = self.scalar_replaced(id, &mir, interner);
+        let mut sroa_mir = self.scalar_replaced(id, &mir, interner);
+        Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
         let (mut callsite_ic_ptrs, callsite_ic_live_ptrs) = self
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
@@ -3854,15 +3780,6 @@ impl ExecutionEngine {
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(id, ics));
-        let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
-            match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
-                (Some(ics), Some(live)) => {
-                    let (a, b, h) =
-                        Self::align_callsite_ics(&mir, &compile_mir, ics, live, devirt_hints);
-                    (Some(a), Some(b), h)
-                }
-                _ => (None, None, None),
-            };
         let jit_code_base = Some(self.jit_code.as_ptr());
         let callee_purity = Some(self.compute_callee_purity_map());
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
@@ -4037,7 +3954,8 @@ impl ExecutionEngine {
         } else {
             None
         };
-        let sroa_mir = self.scalar_replaced(id, &mir, interner);
+        let mut sroa_mir = self.scalar_replaced(id, &mir, interner);
+        Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
         let profile = self.get_type_profile(id).cloned();
         let speculate = !self.speculation_failed[idx];
         let trace_name = self
@@ -4153,15 +4071,6 @@ impl ExecutionEngine {
                     .extend(cold.keys().copied());
             }
             let mir_ready = compile_started.elapsed();
-            let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
-                match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
-                    (Some(ics), Some(live)) => {
-                        let (a, b, h) =
-                            Self::align_callsite_ics(&mir, &compile_mir, ics, live, devirt_hints);
-                        (Some(a), Some(b), h)
-                    }
-                    _ => (None, None, None),
-                };
             if std::env::var("WLIFT_JIT_DUMP").is_ok() {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));

@@ -5247,6 +5247,51 @@ System.print(out.join(" "))
 }
 
 #[test]
+fn e2e_calls_after_a_super_call_keep_their_inline_caches() {
+    // A super call takes no inline-cache slot in the bytecode; the
+    // calls after it in the same body must still resolve to their own
+    // entries, or a getter is devirtualised to its neighbour's field.
+    let src = r#"
+class Base {
+  construct new(a, b) {
+    _a = a
+    _b = b
+  }
+  a { _a }
+  b { _b }
+  tag() { 0 }
+}
+class Derived is Base {
+  construct new(a, b) { super(a, b) }
+  probe() {
+    var t = super.tag()
+    var x = a
+    var y = b
+    return t * 100 + x * 10 + y
+  }
+  step(n) {
+    var s = 0
+    for (i in 0...n) s = s + probe()
+    return s
+  }
+}
+System.print(Derived.new(3, 7).step(100000))
+"#;
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(output.trim(), "3700000");
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,

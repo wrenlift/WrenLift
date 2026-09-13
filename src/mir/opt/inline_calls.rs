@@ -430,6 +430,12 @@ fn version_loop(
     }
     let slow_to_fast: HashMap<ValueId, ValueId> =
         fast_to_slow.iter().map(|(f, s)| (*s, *f)).collect();
+    // The copy's calls keep their inline-cache entries.
+    let cloned_sites: Vec<(ValueId, u32)> = fast_to_slow
+        .iter()
+        .filter_map(|(f, s)| func.ic_sites.get(f).map(|i| (*s, *i)))
+        .collect();
+    func.ic_sites.extend(cloned_sites);
     func.osr_excluded.extend(block_map.values().copied());
     Some(SlowCopy {
         header: block_map[&header],
@@ -557,6 +563,9 @@ fn inline_site(
     // continuation or the slow copy's continuation.
     let slow_block = func.new_block();
     let slow_result = func.new_value();
+    if let Some(site) = func.ic_sites.get(&dst).copied() {
+        func.ic_sites.insert(slow_result, site);
+    }
     func.block_mut(slow_block)
         .instructions
         .push((slow_result, call.clone()));
