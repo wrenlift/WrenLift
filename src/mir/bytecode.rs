@@ -468,6 +468,9 @@ impl<'a> Encoder<'a> {
             Instruction::GuardNum(a) => self.emit_unary(Op::GuardNum, dst, *a),
             Instruction::GuardNumAt { value, .. } => self.emit_unary(Op::GuardNum, dst, *value),
             Instruction::SlowPathExit { .. } => {}
+            Instruction::NewInstance { .. } => {
+                unreachable!("NewInstance is planted in JIT compile clones only")
+            }
             Instruction::GuardBool(a) => self.emit_unary(Op::GuardBool, dst, *a),
 
             // -- 7B binary: op + dst + lhs + rhs --

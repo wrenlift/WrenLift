@@ -7158,6 +7158,17 @@ pub mod cl {
                     .iconst(types::I64, (TAG_OBJ | (*obj_ptr as u64 & PTR_MASK)) as i64);
                 Ok(Some(builder.ins().icmp(IntCC::Equal, v, expected)))
             }
+            Instruction::NewInstance { class, .. } => {
+                let class_val = builder
+                    .ins()
+                    .iconst(types::I64, (TAG_OBJ | (*class as u64 & PTR_MASK)) as i64);
+                Ok(Some(emit_alloc_instance(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    class_val,
+                )?))
+            }
             Instruction::ClosureFnIs(a, fn_ptr) => {
                 let v = get(a);
                 let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);

@@ -1616,6 +1616,7 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 Instruction::IsNum(_) => MirType::Bool,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
                 Instruction::SlowPathExit { .. } => MirType::Void,
+                Instruction::NewInstance { .. } => MirType::Value,
                 Instruction::BitAnd(..)
                 | Instruction::BitOr(..)
                 | Instruction::BitXor(..)
@@ -4474,6 +4475,9 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
                 panic!("speculation guards are lowered by the Cranelift backend only")
+            }
+            Instruction::NewInstance { .. } => {
+                panic!("inlined constructors are lowered by the JIT backends only")
             }
             Instruction::AddI64(..)
             | Instruction::SubI64(..)

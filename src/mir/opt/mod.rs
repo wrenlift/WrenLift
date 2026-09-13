@@ -112,8 +112,16 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
     use Instruction::*;
     match inst {
         // No operands
-        ConstNum(_) | ConstBool(_) | ConstNull | ConstString(_) | ConstF64(_) | ConstI64(_)
-        | GetModuleVar(_) | GetUpvalue(_) | BlockParam(_) => {}
+        ConstNum(_)
+        | ConstBool(_)
+        | ConstNull
+        | ConstString(_)
+        | ConstF64(_)
+        | ConstI64(_)
+        | GetModuleVar(_)
+        | GetUpvalue(_)
+        | BlockParam(_)
+        | NewInstance { .. } => {}
 
         // One operand
         Neg(a)

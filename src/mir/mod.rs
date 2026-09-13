@@ -459,6 +459,15 @@ pub enum Instruction {
         pc: u32,
         live: Vec<DeoptReg>,
     },
+    /// A fresh instance of the class at this pointer. Fields in
+    /// `assigned` (a bit per index) are stored by the instructions
+    /// that follow before anything can observe the object; the rest
+    /// start null. Planted by the call inliner in place of a
+    /// constructor call; JIT-only.
+    NewInstance {
+        class: usize,
+        assigned: u64,
+    },
 }
 
 /// What a register holds when compiled code hands a function back to
@@ -530,6 +539,7 @@ impl Instruction {
                 | Instruction::MakeMap(..)
                 | Instruction::MakeRange { .. }
                 | Instruction::MakeClosure { .. }
+                | Instruction::NewInstance { .. }
                 | Instruction::StringConcat(..)
                 | Instruction::ToString(..)
                 | Instruction::SetStaticField(..)
@@ -547,6 +557,7 @@ impl Instruction {
                     | Instruction::MakeMap(..)
                     | Instruction::MakeRange { .. }
                     | Instruction::MakeClosure { .. }
+                    | Instruction::NewInstance { .. }
             )
     }
 
@@ -561,6 +572,7 @@ impl Instruction {
             | Instruction::ConstI64(_)
             | Instruction::GetModuleVar(_)
             | Instruction::GetUpvalue(_)
+            | Instruction::NewInstance { .. }
             | Instruction::BlockParam(_) => vec![],
 
             Instruction::Add(a, b)
@@ -1527,6 +1539,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::SlowPathExit { pc, live } => {
             format!("slow.exit pc={} live={}", pc, live.len())
         }
+        Instruction::NewInstance { class, assigned } => {
+            format!("new_instance {:#x} assigned={:#b}", class, assigned)
+        }
         Instruction::GuardNumAt {
             value, pc, live, ..
         } => format!(
@@ -1701,6 +1716,7 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 Instruction::I64ToF64(_) => MirType::F64,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
                 Instruction::SlowPathExit { .. } => MirType::Void,
+                Instruction::NewInstance { .. } => MirType::Value,
                 Instruction::GuardNum(src)
                 | Instruction::GuardBool(src)
                 | Instruction::Move(src)

@@ -5114,6 +5114,55 @@ System.print(h.count(P.new(7), 3000000))
 }
 
 #[test]
+fn e2e_top_tier_inlined_constructor_keeps_field_semantics() {
+    // A constructor call on a module-level class is inlined into a hot
+    // caller: fields the initialiser stores first are not pre-nulled,
+    // every other field starts null even when read before its own
+    // store, and the call's value is the instance.
+    let src = r#"
+class Pair {
+  construct new(a, b) {
+    _a = a
+    _b = b
+    _seenC = _c
+    _c = a + b
+  }
+  a { _a }
+  b { _b }
+  c { _c }
+  seenC { _seenC }
+}
+class Maker {
+  static build(n) {
+    var total = 0
+    var nulls = 0
+    var last = null
+    for (i in 0...n) {
+      var p = Pair.new(i, 1)
+      total = total + p.a + p.b + p.c
+      if (p.seenC == null) nulls = nulls + 1
+      last = p
+    }
+    return "%(total) %(nulls) %(last is Pair) %(last.c)"
+  }
+}
+System.print(Maker.build(2000000))
+"#;
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(output.trim(), "4000002000000 2000000 true 2000000");
+}
+
+#[test]
 fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
     // A missing operator or method reached from compiled code raises
     // the interpreter's error instead of yielding null and carrying on,

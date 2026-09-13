@@ -2082,6 +2082,9 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
                 return Err("speculation guards are not lowered to wasm".into());
             }
+            Instruction::NewInstance { .. } => {
+                return Err("inlined constructors are not lowered to wasm".into());
+            }
             Instruction::AddI64(..)
             | Instruction::SubI64(..)
             | Instruction::MulI64(..)

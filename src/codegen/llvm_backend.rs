@@ -418,6 +418,10 @@ pub mod llvm {
         /// Boxed values known to be Nums; a store of one needs no
         /// field-kind note.
         num_values: HashSet<IntValue<'ctx>>,
+        /// Instances this body allocated, by class: their fields lie
+        /// right after the header and their kind notes have a fixed
+        /// address.
+        fresh: HashMap<IntValue<'ctx>, usize>,
         /// A guarded getter whose class keeps its field as Nums: the
         /// guard that follows checks the class's field-kind byte at
         /// this address instead of the value.
@@ -474,6 +478,7 @@ pub mod llvm {
                 field_tbaa_root: None,
                 miss_exit: None,
                 num_values: HashSet::new(),
+                fresh: HashMap::new(),
                 field_invariant: None,
                 cur_vid: ValueId(u32::MAX),
                 raw_bools: HashSet::new(),
@@ -749,6 +754,75 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?;
             self.br(done)?;
             self.b.position_at_end(done);
+            Ok(())
+        }
+
+        /// The fields array of the instance `obj` (unmasked `r`): right
+        /// after the header for an instance this body allocated.
+        fn instance_fields(
+            &mut self,
+            r: IntValue<'ctx>,
+            obj: IntValue<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            if self.fresh.contains_key(&r) {
+                self.b
+                    .build_int_add(obj, self.c64(INSTANCE_SIZE as u64), "fields")
+                    .map_err(|e| e.to_string())
+            } else {
+                self.load64_stable(obj, INSTANCE_FIELDS as i64)
+            }
+        }
+
+        /// `note_field_kind` for an instance of a class known at compile
+        /// time: the byte has a fixed address, and one that already
+        /// records another kind, or the kind being stored, never changes
+        /// again.
+        fn note_field_kind_static(
+            &mut self,
+            class: usize,
+            idx: u16,
+            v: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            use crate::runtime::object::{FIELD_NUM, FIELD_OTHER};
+            let class = class as *const crate::runtime::object::ObjClass;
+            let kinds = unsafe { (*class).field_kinds_ptr };
+            let len = unsafe { (*class).field_kinds.len() };
+            if kinds.is_null() || idx as usize >= len {
+                return Ok(());
+            }
+            let seen = unsafe { std::ptr::read_volatile(kinds.add(idx as usize)) };
+            let known_num = self.num_values.contains(&v);
+            if seen & FIELD_OTHER != 0 || (known_num && seen & FIELD_NUM != 0) {
+                return Ok(());
+            }
+            let p = self.addr(self.c64(kinds as u64), idx as i64)?;
+            let cur = self
+                .b
+                .build_load(self.sh.ctx.i8_type(), p, "seen")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let bit = if known_num {
+                self.sh.ctx.i8_type().const_int(FIELD_NUM as u64, false)
+            } else {
+                let is_box = self.is_nan_boxed(v)?;
+                self.b
+                    .build_select(
+                        is_box,
+                        self.sh.ctx.i8_type().const_int(FIELD_OTHER as u64, false),
+                        self.sh.ctx.i8_type().const_int(FIELD_NUM as u64, false),
+                        "kind",
+                    )
+                    .map_err(|e| e.to_string())?
+                    .into_int_value()
+            };
+            let seen = self
+                .b
+                .build_or(cur, bit, "seen")
+                .map_err(|e| e.to_string())?;
+            let st = self.b.build_store(p, seen).map_err(|e| e.to_string())?;
+            let tag = self.kinds_tag();
+            st.set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
 
@@ -1543,16 +1617,18 @@ pub mod llvm {
                 I::GetField(recv, idx) => {
                     let r = self.boxed(recv)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
+                    let fields = self.instance_fields(r, obj)?;
                     self.field_load(fields, *idx)?.into()
                 }
                 I::SetField(recv, idx, val) => {
                     let r = self.boxed(recv)?;
                     let v = self.boxed(val)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let fields = self.load64_stable(obj, INSTANCE_FIELDS as i64)?;
+                    let fields = self.instance_fields(r, obj)?;
                     self.field_store(fields, *idx, v)?;
-                    if !self.num_values.contains(&v) {
+                    if let Some(&class) = self.fresh.get(&r) {
+                        self.note_field_kind_static(class, *idx, v)?;
+                    } else if !self.num_values.contains(&v) {
                         self.note_field_kind(obj, *idx, v)?;
                     }
                     if crate::runtime::gc_trait::jit_needs_write_barriers() {
@@ -1836,6 +1912,19 @@ pub mod llvm {
                     let v = self.boxed(a)?;
                     let expected = self.c64(TAG_OBJ | (*obj_ptr as u64 & PTR_MASK));
                     self.icmp(IntPredicate::EQ, v, expected)?.into()
+                }
+                I::NewInstance { class, assigned } => {
+                    let class_val = self.c64(TAG_OBJ | (*class as u64 & PTR_MASK));
+                    let nf = unsafe {
+                        (*(*class as *const crate::runtime::object::ObjClass)).num_fields
+                    };
+                    let inst = self.alloc_instance(class_val, Some((nf, *assigned)))?;
+                    // The slow path allocates the same layout: fields
+                    // follow the header whenever a bump region exists.
+                    if crate::codegen::jit_bump_region() != 0 {
+                        self.fresh.insert(inst, *class);
+                    }
+                    inst.into()
                 }
                 I::ClosureFnIs(a, fn_ptr) => {
                     let v = self.boxed(a)?;
@@ -2479,44 +2568,59 @@ pub mod llvm {
         /// fields null, the start byte written; the helper when the
         /// region is out of room, the object exceeds a line, or there
         /// is no region.
-        fn alloc_instance(&mut self, class_val: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+        /// A new instance of `class_val`. With `known`, the field count
+        /// is a compile-time constant and the fields in the `assigned`
+        /// mask are left for the stores that follow.
+        fn alloc_instance(
+            &mut self,
+            class_val: IntValue<'ctx>,
+            known: Option<(u16, u64)>,
+        ) -> Result<IntValue<'ctx>, String> {
             use crate::runtime::gc_immix_heap::{
                 BUMP_BASE, BUMP_CUR, BUMP_LIMIT, BUMP_OBJECTS, BUMP_PLAIN_FLAG, BUMP_Q0,
             };
             let bump = crate::codegen::jit_bump_region();
-            if bump == 0 {
+            let known_size = known
+                .map(|(nf, _)| (INSTANCE_SIZE as u64 + VALUE_SIZE as u64 * nf as u64 + 15) & !15);
+            if bump == 0 || known_size.is_some_and(|s| s > 128) {
                 return self.call_helper("wren_alloc_instance", &[class_val]);
             }
             let slow = self.new_block("als");
             let merge = self.new_block("alm");
             let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
             let class = self.and(class_val, self.c64(PTR_MASK))?;
-            let nf_p = self.addr(class, CLASS_NUM_FIELDS as i64)?;
-            let nf16 = self
-                .b
-                .build_load(self.sh.ctx.i16_type(), nf_p, "nf16")
-                .map_err(|e| e.to_string())?
-                .into_int_value();
-            let nf = self
-                .b
-                .build_int_z_extend(nf16, self.i64t(), "nf")
-                .map_err(|e| e.to_string())?;
-            // size = (40 + 8 * nf + 15) & !15
-            let raw = self
-                .b
-                .build_int_add(
-                    self.b
-                        .build_int_mul(nf, self.c64(VALUE_SIZE as u64), "fb")
-                        .map_err(|e| e.to_string())?,
-                    self.c64(INSTANCE_SIZE as u64 + 15),
-                    "raw",
-                )
-                .map_err(|e| e.to_string())?;
-            let size = self.and(raw, self.c64(!15u64))?;
-            let fits = self.icmp(IntPredicate::ULE, size, self.c64(128))?;
-            let sized = self.new_block("alz");
-            self.cbr(fits, sized, slow)?;
-            self.b.position_at_end(sized);
+            let (nf, size) = match known {
+                Some((nf, _)) => (self.c64(nf as u64), self.c64(known_size.unwrap())),
+                None => {
+                    let nf_p = self.addr(class, CLASS_NUM_FIELDS as i64)?;
+                    let nf16 = self
+                        .b
+                        .build_load(self.sh.ctx.i16_type(), nf_p, "nf16")
+                        .map_err(|e| e.to_string())?
+                        .into_int_value();
+                    let nf = self
+                        .b
+                        .build_int_z_extend(nf16, self.i64t(), "nf")
+                        .map_err(|e| e.to_string())?;
+                    // size = (40 + 8 * nf + 15) & !15
+                    let raw = self
+                        .b
+                        .build_int_add(
+                            self.b
+                                .build_int_mul(nf, self.c64(VALUE_SIZE as u64), "fb")
+                                .map_err(|e| e.to_string())?,
+                            self.c64(INSTANCE_SIZE as u64 + 15),
+                            "raw",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let size = self.and(raw, self.c64(!15u64))?;
+                    let fits = self.icmp(IntPredicate::ULE, size, self.c64(128))?;
+                    let sized = self.new_block("alz");
+                    self.cbr(fits, sized, slow)?;
+                    self.b.position_at_end(sized);
+                    (nf, size)
+                }
+            };
             let bump_v = self.c64(bump as u64);
             let cur = self.load64(bump_v, BUMP_CUR as i64)?;
             let limit = self.load64(bump_v, BUMP_LIMIT as i64)?;
@@ -2608,6 +2712,28 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?
                 .into_int_value();
             self.store64(p, INSTANCE_FIELDS as i64, fields_or_null)?;
+            if let Some((count, assigned)) = known {
+                // Null the fields nothing stores before the object can
+                // be seen.
+                for i in 0..count {
+                    if i < 64 && assigned & (1 << i) != 0 {
+                        continue;
+                    }
+                    self.field_store(fields, i, self.c64(TAG_NULL))?;
+                }
+                let boxed = self
+                    .b
+                    .build_or(p, self.c64(TAG_OBJ), "inst")
+                    .map_err(|e| e.to_string())?;
+                incoming.push((boxed.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+                self.b.position_at_end(slow);
+                let sv = self.call_helper("wren_alloc_instance", &[class_val])?;
+                incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+                self.b.position_at_end(merge);
+                return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
+            }
             // Null every field.
             let loop_bb = self.new_block("alnull");
             let done = self.new_block("aldone");
@@ -3112,7 +3238,7 @@ pub mod llvm {
                             )?;
                             self.cbr(room, call_bb, helper)?;
                             self.b.position_at_end(call_bb);
-                            let inst = self.alloc_instance(r)?;
+                            let inst = self.alloc_instance(r, None)?;
                             let deeper = self
                                 .b
                                 .build_int_add(

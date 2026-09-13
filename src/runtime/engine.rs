@@ -2667,12 +2667,39 @@ impl ExecutionEngine {
         let mut sites = HashMap::new();
         let tainted = self.compute_may_yield_methods(interner);
         let caller_module = self.func_modules.get(caller.0 as usize).cloned().flatten();
+        // A constructor is inlined only on a class a module variable
+        // holds right now: the compile reads the class object, and an
+        // inline cache alone does not keep one alive.
+        let modvars = caller_module
+            .as_ref()
+            .and_then(|m| self.modules.get(m.as_str()))
+            .map(|e| &e.vars);
+        let modvar_of: HashMap<crate::mir::ValueId, u32> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::GetModuleVar(idx) => Some((*v, *idx as u32)),
+                _ => None,
+            })
+            .collect();
+        let rooted_class = |receiver: &crate::mir::ValueId, class: usize| -> bool {
+            let Some(slot) = modvar_of.get(receiver) else {
+                return false;
+            };
+            let Some(value) = modvars.and_then(|vars| vars.get(*slot as usize)) else {
+                return false;
+            };
+            value.as_object().map(|p| p as usize) == Some(class)
+        };
         let mut ic_idx = 0usize;
         for block in &mir.blocks {
             for (dst, inst) in &block.instructions {
-                let method = match inst {
-                    Instruction::Call { method, .. } => Some(*method),
-                    Instruction::SuperCall { .. } => None,
+                let (method, receiver) = match inst {
+                    Instruction::Call {
+                        method, receiver, ..
+                    } => (Some(*method), Some(*receiver)),
+                    Instruction::SuperCall { .. } => (None, None),
                     _ => continue,
                 };
                 let ic = ics.get(ic_idx).copied();
@@ -2693,8 +2720,17 @@ impl ExecutionEngine {
                 if callee == caller {
                     continue;
                 }
+                let mut constructor = None;
                 let guard = match ic.kind {
                     7 => CalleeGuard::ClosureFn(ic.class),
+                    // The receiver is the class itself; the body is its
+                    // initialiser, run on a fresh instance.
+                    3 if ic.func_id != 0
+                        && receiver.is_some_and(|r| rooted_class(&r, ic.class)) =>
+                    {
+                        constructor = Some(ic.class);
+                        CalleeGuard::Object(ic.class)
+                    }
                     // Method kinds use function id 0 as "unset".
                     1 | 2 | 6 if ic.func_id != 0 => {
                         // A class receiving a static call is cached under its
@@ -2728,8 +2764,11 @@ impl ExecutionEngine {
                 }
                 // The backend already splices small bodies behind a guard;
                 // MIR inlining earns its keep only where the caller's types
-                // can reach arithmetic in the body.
-                if !crate::mir::opt::inline_calls::body_has_arithmetic(&body) {
+                // can reach arithmetic in the body. A constructor is
+                // different: inlined, its allocation and field stores fuse.
+                if constructor.is_none()
+                    && !crate::mir::opt::inline_calls::body_has_arithmetic(&body)
+                {
                     continue;
                 }
                 let callee_module = self.func_modules.get(callee.0 as usize).cloned().flatten();
@@ -2741,7 +2780,14 @@ impl ExecutionEngine {
                 {
                     continue;
                 }
-                sites.insert(*dst, KnownCallee { guard, body });
+                sites.insert(
+                    *dst,
+                    KnownCallee {
+                        guard,
+                        body,
+                        constructor,
+                    },
+                );
             }
         }
         sites
