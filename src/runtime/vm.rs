@@ -6134,7 +6134,7 @@ impl Drop for VM {
         }
         // The heap drops before the engine; a compile still running
         // would read freed objects.
-        self.engine.stop_promoter();
+        self.engine.stop_compilers();
     }
 }
 

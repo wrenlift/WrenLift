@@ -4773,6 +4773,17 @@ impl ExecutionEngine {
             drop(self.baseline_worker.take());
         }
     }
+
+    /// Stop every compile thread, waiting for the compile each is in
+    /// the middle of: the promoter pool, the baseline worker, and the
+    /// broker, which a fresh tier manager replaces.
+    pub fn stop_compilers(&mut self) {
+        self.stop_promoter();
+        self.tier = super::tier::TierManager::with_thresholds(
+            super::tier::BASELINE_THRESHOLD,
+            super::tier::OPTIMIZED_THRESHOLD,
+        );
+    }
 }
 
 impl Drop for ExecutionEngine {
