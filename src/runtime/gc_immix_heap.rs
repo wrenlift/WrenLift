@@ -392,8 +392,12 @@ impl ImmixHeap {
         self.objects[q0..q1].fill(0);
         let l0 = b * LINES_PER_BLOCK + first_line;
         self.alloc_sizes[l0..l0 + lines].fill(0);
-        for l in first_line..first_line + lines {
-            self.line_drop[b * LINE_WORDS + l / 64] &= !(1u64 << (l % 64));
+        if first_line == 0 && lines == LINES_PER_BLOCK {
+            self.line_drop[b * LINE_WORDS..(b + 1) * LINE_WORDS].fill(0);
+        } else {
+            for l in first_line..first_line + lines {
+                self.line_drop[b * LINE_WORDS + l / 64] &= !(1u64 << (l % 64));
+            }
         }
     }
 
@@ -835,6 +839,28 @@ impl ImmixHeap {
             let mut line_live = [0u64; LINE_WORDS];
             line_live.copy_from_slice(&self.line_marks[b * LINE_WORDS..(b + 1) * LINE_WORDS]);
             let any_live = line_live.iter().any(|w| *w != 0);
+            let any_droppable = self.line_drop[b * LINE_WORDS..(b + 1) * LINE_WORDS]
+                .iter()
+                .any(|w| *w != 0);
+            if !any_live && !any_droppable {
+                // Only dead plain objects: count them a word of start
+                // bytes at a time and free the block whole; the next
+                // owner clears its tables.
+                let (n, bytes) = count_dead_plain(&self.objects[q0..q0 + QUANTA_PER_BLOCK]);
+                freed_objects += n;
+                freed_bytes += bytes;
+                let l0 = b * LINES_PER_BLOCK;
+                for l in 0..LINES_PER_BLOCK {
+                    let s = self.alloc_sizes[l0 + l] as usize;
+                    if s != 0 {
+                        freed_bytes += s * LINE_SIZE;
+                    }
+                }
+                self.in_use[b] = false;
+                self.has_span[b] = false;
+                self.free_blocks.push(b as u32);
+                continue;
+            }
             // A run of lines nothing was marked in and nothing to drop
             // starts in holds only dead plain objects: its start bytes
             // are cleared without reading the objects. A dead span
@@ -931,6 +957,34 @@ impl ImmixHeap {
         self.freed_objects += freed_objects;
         live_bytes
     }
+}
+
+/// `(objects, bytes)` of the allocation starts in `codes`, none of them
+/// spans: eight start bytes are summed as one word. A span's bytes are
+/// counted from the size table by the caller.
+fn count_dead_plain(codes: &[u8]) -> (usize, usize) {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    let mut objects = 0usize;
+    let mut quanta = 0usize;
+    for chunk in codes.as_chunks::<8>().0 {
+        let w = u64::from_ne_bytes(*chunk);
+        if w == 0 {
+            continue;
+        }
+        // A start byte is at most PLAIN | SPAN_OBJECT, so folding its
+        // five low bits into bit 0 marks each nonzero byte once.
+        let nz = (w | (w >> 1) | (w >> 2) | (w >> 3) | (w >> 4)) & LOW;
+        objects += nz.count_ones() as usize;
+        // Low nibbles hold sizes in quanta (a span's reads as
+        // SPAN_OBJECT and is replaced by its table entry below).
+        let nibbles = w & (LOW * 0x0F);
+        quanta += (nibbles.wrapping_mul(LOW) >> 56) as usize;
+        let spans = (nibbles & (LOW * SPAN_OBJECT as u64)) ^ (LOW * SPAN_OBJECT as u64);
+        // Bytes equal to SPAN_OBJECT have zero in every bit of `spans`.
+        let is_span = !((spans | (spans >> 1) | (spans >> 2) | (spans >> 3)) & LOW) & LOW;
+        quanta -= is_span.count_ones() as usize * SPAN_OBJECT as usize;
+    }
+    (objects, quanta * QUANTUM)
 }
 
 /// Free blocks kept resident so a burst after an idle period does not
