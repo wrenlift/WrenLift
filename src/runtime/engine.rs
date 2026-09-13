@@ -3189,6 +3189,12 @@ impl ExecutionEngine {
             return clone;
         }
         let mut out = (*clone).clone();
+        // A counted range loop is recognised from its single body; version
+        // the loop only once the protocol calls are gone.
+        crate::mir::opt::MirPass::run(
+            &crate::mir::opt::range_loop::RangeLoop { interner },
+            &mut out,
+        );
         if crate::mir::opt::inline_calls::inline_known_calls(&mut out, &sites) {
             if std::env::var_os("WLIFT_INLINE_TRACE").is_some() {
                 eprintln!(
