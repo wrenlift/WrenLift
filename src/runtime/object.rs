@@ -476,8 +476,12 @@ impl ObjList {
         }
         let new_layout = std::alloc::Layout::array::<Value>(new_cap as usize).unwrap();
         let new_ptr = if self.elements.is_null() {
+            super::gc_immix::watch_malloc_owner(self as *const Self as *const u8);
             unsafe { std::alloc::alloc(new_layout) as *mut Value }
         } else if self.heap_buffer() {
+            // A plain list taking malloc memory must be dropped when
+            // it dies after all.
+            super::gc_immix::watch_malloc_owner(self as *const Self as *const u8);
             let p = unsafe { std::alloc::alloc(new_layout) as *mut Value };
             unsafe { std::ptr::copy_nonoverlapping(self.elements, p, self.count as usize) };
             self.header.flags &= !FLAG_HEAP_BUFFER;

@@ -53,6 +53,15 @@ thread_local! {
 /// Elements a list allocated without a size starts with room for.
 const LIST_INLINE_CAPACITY: usize = 8;
 
+/// The object at `owner` now owns malloc memory: if it is a plain
+/// allocation of the active heap, the cycle that finds it dead drops it.
+pub fn watch_malloc_owner(owner: *const u8) {
+    let heap = ACTIVE_HEAP.get();
+    if !heap.is_null() && rt::heap_is_builtin() {
+        unsafe { rt::watch(heap, owner as *mut u8) };
+    }
+}
+
 /// `bytes` of payload for the object at `owner`, as a `Buffer` object
 /// in the heap that holds `owner`; null when there is no such heap,
 /// the owner is not in it, or the payload is too large for it. The
@@ -359,7 +368,9 @@ impl GcAllocator for ImmixGc {
         self.alloc_list_sized(LIST_INLINE_CAPACITY)
     }
     /// The elements follow the header in the same allocation while
-    /// they fit a line; growth moves them to a buffer object.
+    /// they fit a line; growth moves them to a buffer object. The list
+    /// is plain: it owns nothing outside the heap unless a buffer too
+    /// large for the heap makes it watched.
     fn alloc_list_sized(&mut self, cap: usize) -> *mut ObjList {
         // An empty literal is usually about to be filled.
         let cap = if cap == 0 { LIST_INLINE_CAPACITY } else { cap };
@@ -367,7 +378,12 @@ impl GcAllocator for ImmixGc {
         if total > MAX_ALLOC {
             return self.alloc(ObjList::new());
         }
-        let p = self.alloc_raw(total) as *mut ObjList;
+        self.count_allocation();
+        ACTIVE_HEAP.set(self.heap);
+        let p = unsafe { rt::alloc_plain(self.heap, total) } as *mut ObjList;
+        if p.is_null() {
+            self.exhausted();
+        }
         unsafe {
             let mut list = ObjList::new();
             list.elements = (p as *mut u8).add(std::mem::size_of::<ObjList>()) as *mut Value;

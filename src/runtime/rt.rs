@@ -157,6 +157,10 @@ runtime_table! {
     scan_range(heap: *mut c_void, lo: usize, hi: usize, visit: Visit, ctx: *mut c_void) = immix::scan_range;
     /// Charge `bytes` held outside the heap against the next collection.
     track_external(heap: *mut c_void, bytes: usize) = immix::track_external;
+    /// Have `object_drop` run for the plain allocation at `ptr` once a
+    /// cycle finds it dead, as if it had been allocated with `alloc_raw`;
+    /// false when `ptr` is not a plain allocation of this heap.
+    watch(heap: *mut c_void, ptr: *mut u8) -> bool = immix::watch;
     /// Whether the mutator should collect now.
     should_collect(heap: *mut c_void) -> bool = immix::should_collect;
     /// Open a cycle: no allocation is claimed.
@@ -180,7 +184,7 @@ runtime_table! {
 pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
     heap_drop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, scan_range,
-    should_collect, track_external,
+    should_collect, track_external, watch,
 };
 
 /// Whether the built-in heap serves the memory slots, so a handle is an
@@ -330,6 +334,10 @@ mod immix {
 
     pub unsafe extern "C" fn track_external(heap: *mut c_void, bytes: usize) {
         self::heap(heap).track_external(bytes);
+    }
+
+    pub unsafe extern "C" fn watch(heap: *mut c_void, ptr: *mut u8) -> bool {
+        self::heap(heap).watch(ptr)
     }
 
     pub unsafe extern "C" fn should_collect(heap: *mut c_void) -> bool {

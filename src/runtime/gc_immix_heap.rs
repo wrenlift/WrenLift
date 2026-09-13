@@ -272,6 +272,9 @@ pub struct ImmixHeap {
     /// Runs of free lines found by the last sweep: (block, first line,
     /// line count). Consumed from the end.
     recycle_spans: Vec<(u32, u16, u16)>,
+    /// Plain allocations that came to own memory outside the heap:
+    /// dropped by the cycle that finds them dead.
+    watched: Vec<usize>,
     /// Bump region for allocations up to a line.
     small: Region,
     /// Bump region for line-owning allocations; always line-aligned.
@@ -315,6 +318,7 @@ impl ImmixHeap {
             line_drop: Vec::new(),
             live_color: COLOR_A,
             recycle_spans: Vec::new(),
+            watched: Vec::new(),
             small: Region::default(),
             medium: Region::default(),
             total_allocated: 0,
@@ -783,6 +787,27 @@ impl ImmixHeap {
         self.external_since_gc += bytes;
     }
 
+    /// Run the drop on the plain allocation at `ptr` once it dies.
+    pub fn watch(&mut self, ptr: *mut u8) -> bool {
+        let addr = ptr as usize;
+        let Some(b) = self.block_containing(addr) else {
+            return false;
+        };
+        let b = b as usize;
+        if !self.in_use[b] {
+            return false;
+        }
+        let q = (addr - self.block_bases[b]) / QUANTUM;
+        let code = self.objects[b * QUANTA_PER_BLOCK + q];
+        if code & CODE_MASK == 0 || code & PLAIN == 0 {
+            return false;
+        }
+        if !self.watched.contains(&addr) {
+            self.watched.push(addr);
+        }
+        true
+    }
+
     pub fn should_collect(&self) -> bool {
         if stress_enabled() {
             return self.bytes_since_gc > 0;
@@ -818,7 +843,20 @@ impl ImmixHeap {
         self.medium = Region::default();
 
         let quiet = self.last_collect.elapsed() >= HEARTBEAT;
-        let live = self.sweep(drop);
+        let mut drop = drop;
+        let live = self.sweep(&mut drop);
+        // A dead watched object's memory is intact until a region is
+        // handed out again, so its mark byte still says it died.
+        let color = self.live_color;
+        let mut watched = std::mem::take(&mut self.watched);
+        watched.retain(|&p| {
+            let alive = unsafe { (*(p as *const ObjHeader)).gc_mark == color };
+            if !alive {
+                drop(p as *mut u8);
+            }
+            alive
+        });
+        self.watched = watched;
         if quiet {
             self.hand_back_free_blocks();
         }
