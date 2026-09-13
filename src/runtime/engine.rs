@@ -163,13 +163,11 @@ pub enum TopTierCeiling {
     High,
 }
 
-/// `field_access_site(i)` says whether the `i`-th call site (in block
-/// order, `Call` and `SuperCall` only) resolves to a trivial getter or
-/// setter, which the tiers lower to a field access rather than a call.
-pub fn top_tier_ceiling(
-    mir: &MirFunction,
-    field_access_site: &dyn Fn(usize) -> bool,
-) -> TopTierCeiling {
+/// `inline_site(i)` says whether the `i`-th call site (in block order,
+/// `Call` and `SuperCall` only) is one the top tier lowers without a
+/// call: a trivial getter or setter, a resolved initialiser, a small
+/// resolved body it splices in, or the iteration protocol.
+pub fn top_tier_ceiling(mir: &MirFunction, inline_site: &dyn Fn(usize) -> bool) -> TopTierCeiling {
     use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
     use crate::mir::Instruction;
     let instrs: usize = mir.blocks.iter().map(|b| b.instructions.len()).sum();
@@ -182,14 +180,14 @@ pub fn top_tier_ceiling(
         for (_, inst) in &block.instructions {
             match inst {
                 Instruction::Call { method, .. } => {
-                    if !field_access_site(site) {
+                    if !inline_site(site) {
                         calls += 1;
                     }
                     recursive |= *method == mir.name;
                     site += 1;
                 }
                 Instruction::SuperCall { .. } => {
-                    if !field_access_site(site) {
+                    if !inline_site(site) {
                         calls += 1;
                     }
                     site += 1;
@@ -2944,9 +2942,15 @@ impl ExecutionEngine {
                 let guard = match inst {
                     Instruction::Call { method, .. } => {
                         let seen = result_kinds.get(dst.0 as usize).copied().unwrap_or(0);
-                        if seen == RESULT_NUM {
+                        if Some(*method) == iterate {
+                            // The inline path's result is guarded by
+                            // the loop itself; the protocol ends every
+                            // loop with `false`, which a Num guard
+                            // would take as a failed speculation.
+                            false
+                        } else if seen == RESULT_NUM {
                             true
-                        } else if Some(*method) == iterate || Some(*method) == iter_value {
+                        } else if Some(*method) == iter_value {
                             // The list protocol has an inline path.
                             false
                         } else {
@@ -3521,9 +3525,31 @@ impl ExecutionEngine {
     /// The top tier's ceiling for `id`, with call sites the inline
     /// caches resolve to trivial getters and setters counted as field
     /// accesses.
-    fn ceiling(&mut self, id: FuncId, mir: &MirFunction) -> TopTierCeiling {
+    fn ceiling(
+        &mut self,
+        id: FuncId,
+        mir: &MirFunction,
+        interner: &crate::intern::Interner,
+    ) -> TopTierCeiling {
+        use crate::mir::Instruction;
         let ics = self.callsite_ic_data_for_compile(id).map(|(s, _)| s);
-        let field_access = |site: usize| -> bool {
+        let iterate = interner.lookup("iterate(_)");
+        let iter_value = interner.lookup("iteratorValue(_)");
+        let methods: Vec<Option<SymbolId>> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(_, inst)| match inst {
+                Instruction::Call { method, .. } => Some(Some(*method)),
+                Instruction::SuperCall { .. } => Some(None),
+                _ => None,
+            })
+            .collect();
+        let inline_site = |site: usize| -> bool {
+            let method = methods.get(site).copied().flatten();
+            if method.is_some() && (method == iterate || method == iter_value) {
+                return true;
+            }
             let Some(ics) = ics.as_ref() else {
                 return false;
             };
@@ -3536,8 +3562,12 @@ impl ExecutionEngine {
             if ic.func_id == 0 || ic.class == 0 {
                 return false;
             }
+            if ic.kind == 3 {
+                return true;
+            }
             let callee = ic.func_id as usize;
-            self.trivial_getter_fields
+            let trivial = self
+                .trivial_getter_fields
                 .get(callee)
                 .map(|f| f.is_some())
                 .unwrap_or(false)
@@ -3545,9 +3575,14 @@ impl ExecutionEngine {
                     .trivial_setter_fields
                     .get(callee)
                     .map(|f| f.is_some())
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+            trivial
+                || matches!(ic.kind, 1 | 2 | 6)
+                    && self
+                        .get_mir(FuncId(ic.func_id as u32))
+                        .is_some_and(|m| crate::mir::opt::inline_calls::inlinable_body(&m))
         };
-        top_tier_ceiling(mir, &field_access)
+        top_tier_ceiling(mir, &inline_site)
     }
 
     /// Baseline code's own entry count crossing a sampling point.
@@ -3930,7 +3965,8 @@ impl ExecutionEngine {
         let mir = Arc::clone(body.mir());
         let top_tier_on = crate::codegen::top_tier() != crate::codegen::TopTier::Off;
         let worth_top_tier = top_tier_on
-            && (!promotion_gate_enabled() || self.ceiling(id, &mir) == TopTierCeiling::High);
+            && (!promotion_gate_enabled()
+                || self.ceiling(id, &mir, interner) == TopTierCeiling::High);
         if tier == CompileTier::Optimized {
             if !top_tier_on {
                 return;
