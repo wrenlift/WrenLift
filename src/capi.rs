@@ -3587,6 +3587,57 @@ mod tests {
         wrenFreeVM(vm);
     }
 
+    /// A static field is the class's: a setter reached through a call
+    /// handle writes what the getter reads, from a handle or from Wren.
+    #[test]
+    fn test_call_reaches_static_fields() {
+        let vm = wrenNewVM(ptr::null());
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.output_buffer = Some(String::new());
+        let module = CString::new("test").unwrap();
+        let source = CString::new(
+            "class Counter {\n  static count { __count }\n  static count=(v) { __count = v }\n}\nCounter.count = 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wrenInterpret(vm, module.as_ptr(), source.as_ptr()),
+            WrenInterpretResult::Success
+        );
+        let class_name = CString::new("Counter").unwrap();
+
+        // What Wren wrote, read through a handle.
+        wrenEnsureSlots(vm, 1);
+        wrenGetVariable(vm, module.as_ptr(), class_name.as_ptr(), 0);
+        let get = CString::new("count").unwrap();
+        let get = wrenMakeCallHandle(vm, get.as_ptr());
+        assert_eq!(wrenCall(vm, get), WrenInterpretResult::Success);
+        assert_eq!(wrenGetSlotDouble(vm, 0), 1.0);
+
+        // Written through a handle, read through a handle and by Wren.
+        wrenEnsureSlots(vm, 2);
+        wrenGetVariable(vm, module.as_ptr(), class_name.as_ptr(), 0);
+        wrenSetSlotDouble(vm, 1, 5.0);
+        let set = CString::new("count=(_)").unwrap();
+        let set = wrenMakeCallHandle(vm, set.as_ptr());
+        assert_eq!(wrenCall(vm, set), WrenInterpretResult::Success);
+        wrenEnsureSlots(vm, 1);
+        wrenGetVariable(vm, module.as_ptr(), class_name.as_ptr(), 0);
+        assert_eq!(wrenCall(vm, get), WrenInterpretResult::Success);
+        assert_eq!(wrenGetSlotDouble(vm, 0), 5.0);
+        let check = CString::new("check").unwrap();
+        let source =
+            CString::new("import \"test\" for Counter\nSystem.print(Counter.count)\n").unwrap();
+        assert_eq!(
+            wrenInterpret(vm, check.as_ptr(), source.as_ptr()),
+            WrenInterpretResult::Success
+        );
+        assert_eq!(vm_ref.take_output(), "5\n");
+
+        wrenReleaseHandle(vm, get);
+        wrenReleaseHandle(vm, set);
+        wrenFreeVM(vm);
+    }
+
     #[test]
     fn test_has_module() {
         let vm = wrenNewVM(ptr::null());

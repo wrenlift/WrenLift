@@ -4684,11 +4684,14 @@ impl NativeContext for VM {
             }
         }
 
+        // The method and the class it was found on: the class a static
+        // field inside it belongs to, as the dispatcher passes for a call
+        // from Wren code.
         let class = self.class_of(receiver);
         let method_sym = self.interner.intern(method);
-        let method_entry = unsafe {
+        let (method_entry, defining_class) = unsafe {
             match (*class).find_method(method_sym).cloned() {
-                Some(m) => m,
+                Some(m) => (m, class),
                 None => {
                     // If receiver is a class value, try static: prefix on the class itself
                     if receiver.is_object() {
@@ -4698,7 +4701,7 @@ impl NativeContext for VM {
                             let recv_class = ptr as *mut ObjClass;
                             let static_sig = format!("static:{}", method);
                             let static_sym = self.interner.intern(&static_sig);
-                            *(*recv_class).find_method(static_sym)?
+                            (*(*recv_class).find_method(static_sym)?, recv_class)
                         } else {
                             return None;
                         }
@@ -4735,7 +4738,9 @@ impl NativeContext for VM {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 result
             }
-            Method::Closure(closure_ptr) => self.call_closure_sync(closure_ptr, &all_args, None),
+            Method::Closure(closure_ptr) => {
+                self.call_closure_sync(closure_ptr, &all_args, Some(defining_class))
+            }
             Method::Constructor(closure_ptr) => {
                 let class_ptr = receiver
                     .as_object()
