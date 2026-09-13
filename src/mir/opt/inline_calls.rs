@@ -466,15 +466,15 @@ fn inline_site(
         class,
         assigned: fields_assigned_first(&callee.body),
     });
-    let entry = splice_body(func, &callee.body, post, constructor);
-
-    // An initialiser's instance is allocated by the body itself, so
-    // the fast edge carries only the arguments.
-    let mut fast_args = Vec::with_capacity(1 + args.len());
+    // The body reads the call's operands directly: its entry has the
+    // guard's true edge as its only predecessor. An initialiser's
+    // instance is allocated by the body itself.
+    let mut operands = Vec::with_capacity(1 + args.len());
     if callee.takes_receiver() && callee.constructor.is_none() {
-        fast_args.push(receiver);
+        operands.push(receiver);
     }
-    fast_args.extend_from_slice(&args);
+    operands.extend_from_slice(&args);
+    let entry = splice_body(func, &callee.body, post, constructor, &operands);
 
     // Generic path: the original call, then either the fast
     // continuation or the slow copy's continuation.
@@ -486,7 +486,7 @@ fn inline_site(
     func.block_mut(block).terminator = Terminator::CondBranch {
         condition: guard,
         true_target: entry,
-        true_args: fast_args,
+        true_args: Vec::new(),
         false_target: slow_block,
         false_args: Vec::new(),
     };
@@ -576,16 +576,18 @@ fn slow_continuation(
     post
 }
 
-/// Copy the callee's blocks into `func`. The entry block takes the
-/// receiver and arguments as parameters; every return jumps to `post`
-/// with the returned value. With `constructor`, the receiver is
-/// instead that allocation, made first in the entry block, and every
-/// return hands it to `post`.
+/// Copy the callee's blocks into `func`. The body's parameters read
+/// `operands` (the receiver, then the arguments) in place; every
+/// return jumps to `post` with the returned value. With `constructor`,
+/// the receiver is instead that allocation, made first in the entry
+/// block and absent from `operands`, and every return hands it to
+/// `post`.
 fn splice_body(
     func: &mut MirFunction,
     body: &MirFunction,
     post: BlockId,
     constructor: Option<Instruction>,
+    operands: &[ValueId],
 ) -> BlockId {
     let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
     for b in &body.blocks {
@@ -598,26 +600,27 @@ fn splice_body(
         }
     }
     let entry = block_map[&body.blocks[0].id];
-    let mut entry_params: Vec<(ValueId, MirType)> = Vec::with_capacity(body.arity as usize);
-    for _ in 0..body.arity {
-        entry_params.push((func.new_value(), MirType::Value));
+    // What each `BlockParam` of the body reads.
+    let mut params_in: Vec<ValueId> = Vec::with_capacity(body.arity as usize);
+    if constructor.is_some() {
+        params_in.push(func.new_value());
     }
-    let receiver = entry_params[0].0;
+    params_in.extend_from_slice(operands);
+    let receiver = params_in[0];
     for b in &body.blocks {
         let nb = block_map[&b.id];
         let mut params: Vec<(ValueId, MirType)> =
             b.params.iter().map(|(v, t)| (vmap[v], *t)).collect();
         let mut instructions = Vec::with_capacity(b.instructions.len());
         if b.id == body.blocks[0].id {
-            params = entry_params.clone();
+            params.clear();
             if let Some(alloc) = constructor.clone() {
-                params.remove(0);
                 instructions.push((receiver, alloc));
             }
         }
         for (dst, inst) in &b.instructions {
             if let Instruction::BlockParam(idx) = inst {
-                vmap.insert(*dst, entry_params[*idx as usize].0);
+                vmap.insert(*dst, params_in[*idx as usize]);
                 continue;
             }
             let mut inst = inst.clone();
