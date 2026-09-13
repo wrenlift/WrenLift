@@ -3028,6 +3028,64 @@ pub mod llvm {
             self.c64(bits)
         }
 
+        /// Call `func_id`'s compiled code through its `jit_code` slot,
+        /// counting the direct-call depth around it. Branches to `slow`
+        /// when the slot is empty or the depth is out; returns the
+        /// result and the block it arrives from, or `None` when there
+        /// is no slot table (the builder is then unmoved).
+        fn slot_call(
+            &mut self,
+            func_id: u32,
+            r: IntValue<'ctx>,
+            args: &[IntValue<'ctx>],
+            slow: BasicBlock<'ctx>,
+        ) -> Result<Option<(IntValue<'ctx>, BasicBlock<'ctx>)>, String> {
+            let Some(base) = self.sh.jit_code_base else {
+                return Ok(None);
+            };
+            let depth_bb = self.new_block("sld");
+            let call_bb = self.new_block("slc");
+            let slot_addr = unsafe { base.add(func_id as usize) } as u64;
+            let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
+            let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
+            self.cbr(has, depth_bb, slow)?;
+            self.b.position_at_end(depth_bb);
+            let (depth_p, depth) = self.direct_depth()?;
+            let room = self.icmp(
+                IntPredicate::ULT,
+                depth,
+                self.sh
+                    .ctx
+                    .i32_type()
+                    .const_int(crate::codegen::runtime_fns::MAX_JIT_DEPTH as u64, false),
+            )?;
+            self.cbr(room, call_bb, slow)?;
+            self.b.position_at_end(call_bb);
+            let deeper = self
+                .b
+                .build_int_add(depth, self.sh.ctx.i32_type().const_int(1, false), "d1")
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_store(depth_p, deeper)
+                .map_err(|e| e.to_string())?;
+            let ty = self.helper_type(1 + args.len());
+            let ptr = self
+                .b
+                .build_int_to_ptr(jit_ptr, self.ptrt(), "jp")
+                .map_err(|e| e.to_string())?;
+            let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
+            a.extend(args.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+            let call = self
+                .b
+                .build_indirect_call(ty, ptr, &a, "direct")
+                .map_err(|e| e.to_string())?;
+            let fv = call.try_as_basic_value().basic().unwrap().into_int_value();
+            self.b
+                .build_store(depth_p, depth)
+                .map_err(|e| e.to_string())?;
+            Ok(Some((fv, call_bb)))
+        }
+
         fn known_call_nocheck(
             &mut self,
             func_id: u32,
@@ -3144,7 +3202,7 @@ pub mod llvm {
             // per known implementation.
             if let Some(cha) = self.sh.cha_by_method {
                 if args.len() <= 4 {
-                    let impls: Vec<(usize, u32, usize)> =
+                    let impls: Vec<crate::runtime::engine::ChaImpl> =
                         cha.get(&method).cloned().unwrap_or_default();
                     if !impls.is_empty() {
                         let merge = self.new_block("cham");
@@ -3152,7 +3210,8 @@ pub mod llvm {
                         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
                             Vec::new();
                         let (is_obj, _, recv_class) = self.class_of(r)?;
-                        for (class_ptr, fid, _) in &impls {
+                        for imp in &impls {
+                            let (class_ptr, fid) = (&imp.class, &imp.fid);
                             let next = self.new_block("chan");
                             let fast = self.new_block("chaf");
                             let same = self.icmp(
@@ -3174,6 +3233,21 @@ pub mod llvm {
                                     self.br(merge)?;
                                     done = true;
                                 }
+                            }
+                            if !done
+                                && imp.direct
+                                && args.len() <= 4
+                                && self.sh.jit_code_base.is_some()
+                            {
+                                // Straight through the slot when the callee
+                                // is compiled; the helper otherwise.
+                                let helper = self.new_block("chah");
+                                let (v, end) = self
+                                    .slot_call(*fid, r, &arg_vals, helper)?
+                                    .expect("a slot table");
+                                incoming.push((v.into(), end));
+                                self.br(merge)?;
+                                self.b.position_at_end(helper);
                             }
                             if !done {
                                 if args.len() <= 3 {
@@ -3627,64 +3701,29 @@ pub mod llvm {
                 && direct
                 && expected_class != 0
                 && args.len() <= 4
+                && self.sh.jit_code_base.is_some()
             {
-                if let Some(base) = self.sh.jit_code_base {
-                    let fast = self.new_block("plf");
-                    let slow = self.new_block("pls");
-                    let call_bb = self.new_block("plc");
-                    let merge = self.new_block("plm");
-                    let (hit, _) = self.instance_check(r, expected_class as u64)?;
-                    self.cbr(hit, fast, slow)?;
-                    self.b.position_at_end(fast);
-                    let slot_addr = unsafe { base.add(func_id as usize) } as u64;
-                    let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
-                    let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
-                    let depth_bb = self.new_block("pld");
-                    self.cbr(has, depth_bb, slow)?;
-                    self.b.position_at_end(depth_bb);
-                    let (depth_p, depth) = self.direct_depth()?;
-                    let room = self.icmp(
-                        IntPredicate::ULT,
-                        depth,
-                        self.sh
-                            .ctx
-                            .i32_type()
-                            .const_int(crate::codegen::runtime_fns::MAX_JIT_DEPTH as u64, false),
-                    )?;
-                    self.cbr(room, call_bb, slow)?;
-                    self.b.position_at_end(call_bb);
-                    let deeper = self
-                        .b
-                        .build_int_add(depth, self.sh.ctx.i32_type().const_int(1, false), "d1")
-                        .map_err(|e| e.to_string())?;
-                    self.b
-                        .build_store(depth_p, deeper)
-                        .map_err(|e| e.to_string())?;
-                    let ty = self.helper_type(1 + args.len());
-                    let ptr = self
-                        .b
-                        .build_int_to_ptr(jit_ptr, self.ptrt(), "jp")
-                        .map_err(|e| e.to_string())?;
-                    let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
-                    a.extend(arg_vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
-                    let call = self
-                        .b
-                        .build_indirect_call(ty, ptr, &a, "direct")
-                        .map_err(|e| e.to_string())?;
-                    let fv = call.try_as_basic_value().basic().unwrap();
-                    self.b
-                        .build_store(depth_p, depth)
-                        .map_err(|e| e.to_string())?;
-                    self.br(merge)?;
-                    self.b.position_at_end(slow);
-                    let sv = self.wren_call(r, m, &arg_vals)?;
-                    let slow_end = self.b.get_insert_block().unwrap();
-                    self.br(merge)?;
-                    self.b.position_at_end(merge);
-                    return Ok(self
-                        .phi(self.i64t().into(), &[(fv, call_bb), (sv.into(), slow_end)])?
-                        .into_int_value());
-                }
+                let fast = self.new_block("plf");
+                let slow = self.new_block("pls");
+                let merge = self.new_block("plm");
+                let (hit, _) = self.instance_check(r, expected_class as u64)?;
+                self.cbr(hit, fast, slow)?;
+                self.b.position_at_end(fast);
+                let (fv, call_bb) = self
+                    .slot_call(func_id, r, &arg_vals, slow)?
+                    .expect("a slot table");
+                self.br(merge)?;
+                self.b.position_at_end(slow);
+                let sv = self.wren_call(r, m, &arg_vals)?;
+                let slow_end = self.b.get_insert_block().unwrap();
+                self.br(merge)?;
+                self.b.position_at_end(merge);
+                return Ok(self
+                    .phi(
+                        self.i64t().into(),
+                        &[(fv.into(), call_bb), (sv.into(), slow_end)],
+                    )?
+                    .into_int_value());
             }
 
             if let Some(field) = inline_getter_field {

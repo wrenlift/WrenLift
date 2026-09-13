@@ -5349,7 +5349,7 @@ pub mod cl {
                 // alone keeps thrashing).
                 if let Some(cha) = cha_by_method {
                     if args.len() <= 4 {
-                        let impls: Vec<(usize, u32, usize)> =
+                        let impls: Vec<crate::runtime::engine::ChaImpl> =
                             cha.get(method).cloned().unwrap_or_default();
                         if !impls.is_empty() {
                             let merge_block = builder.create_block();
@@ -5366,7 +5366,12 @@ pub mod cl {
                             let (_obj_ptr, recv_class) =
                                 emit_class_load_guarded(builder, r, slow_block);
 
-                            for (class_ptr, fid, _closure_ptr) in &impls {
+                            for crate::runtime::engine::ChaImpl {
+                                class: class_ptr,
+                                fid,
+                                ..
+                            } in &impls
+                            {
                                 let next_check = builder.create_block();
                                 let fast_block = builder.create_block();
                                 let cached_class =

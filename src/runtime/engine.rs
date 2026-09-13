@@ -28,7 +28,18 @@ use crate::mir::MirFunction;
 /// it. Consumed by both the JIT (to plant IC entries before any
 /// runtime miss) and the interpreter (to dispatch monomorphic
 /// CHA-known sites without a method-cache lookup).
-pub type ChaMap = HashMap<SymbolId, Vec<(usize, u32, usize)>>;
+pub type ChaMap = HashMap<SymbolId, Vec<ChaImpl>>;
+
+/// One implementation of a method: its class, function and closure,
+/// and whether the compiling caller may call it straight through its
+/// `jit_code` slot.
+#[derive(Clone, Copy, Debug)]
+pub struct ChaImpl {
+    pub class: usize,
+    pub fid: u32,
+    pub closure: usize,
+    pub direct: bool,
+}
 
 /// Counters baseline code keeps for the tier above it. `countdown` is
 /// decremented on every entry and outermost-loop iteration and calls
@@ -1547,7 +1558,9 @@ impl ExecutionEngine {
     /// slow path. Including `closure_ptr` lets the interpreter
     /// dispatch directly from a CHA-planted IC entry instead of
     /// falling back to a method-table lookup.
-    pub fn build_jit_cha(&self) -> ChaMap {
+    pub fn build_jit_cha(&self, caller: FuncId) -> ChaMap {
+        let direct_calls = crate::codegen::direct_calls_enabled();
+        let caller_module = self.func_module(caller);
         let mut by_method: ChaMap = HashMap::new();
         for entry in self.modules.values() {
             for var in &entry.vars {
@@ -1581,17 +1594,22 @@ impl ExecutionEngine {
                         continue;
                     }
                     let func_id = unsafe { (*closure.function).fn_id };
+                    let mut direct = false;
                     if let Some(mir) = self.get_mir(FuncId(func_id)) {
                         if Self::mir_uses_defining_class(&mir) {
                             continue;
                         }
+                        direct = direct_calls
+                            && self.func_module(FuncId(func_id)) == caller_module
+                            && Self::mir_is_direct_callee(&mir);
                     }
                     let sym = crate::intern::SymbolId::from_raw(idx as u32);
-                    by_method.entry(sym).or_default().push((
-                        class_ptr as usize,
-                        func_id,
-                        closure_ptr as usize,
-                    ));
+                    by_method.entry(sym).or_default().push(ChaImpl {
+                        class: class_ptr as usize,
+                        fid: func_id,
+                        closure: closure_ptr as usize,
+                        direct,
+                    });
                 }
             }
         }
@@ -1834,10 +1852,10 @@ impl ExecutionEngine {
                             if slot.kind == 0 {
                                 if let Some(impls) = cha.get(method) {
                                     if impls.len() == 1 {
-                                        let (class_ptr, fid, closure_ptr) = impls[0];
-                                        slot.class = class_ptr;
-                                        slot.func_id = fid as u64;
-                                        slot.closure = closure_ptr as *const u8;
+                                        let one = impls[0];
+                                        slot.class = one.class;
+                                        slot.func_id = one.fid as u64;
+                                        slot.closure = one.closure as *const u8;
                                         slot.kind = 1;
                                     }
                                 }
@@ -3813,7 +3831,7 @@ impl ExecutionEngine {
         let cha_for_codegen: SharedCha = if cha_disabled {
             None
         } else {
-            let cha = self.build_jit_cha();
+            let cha = self.build_jit_cha(id);
             if let Some(ref mut ics) = callsite_ic_ptrs {
                 self.fill_ic_with_cha(id, &mir, ics, &cha, interner);
             }
@@ -4035,7 +4053,7 @@ impl ExecutionEngine {
         let cha_for_codegen: SharedCha = if cha_disabled {
             None
         } else {
-            let cha = self.build_jit_cha();
+            let cha = self.build_jit_cha(id);
             if let Some(ref mut ics) = callsite_ic_ptrs {
                 self.fill_ic_with_cha(id, &mir, ics, &cha, interner);
             }
