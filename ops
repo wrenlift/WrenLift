@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":5,"timestamp":1789303315,"nonce":"ts4NZlbRAghXs08+YfO5hmRPm7o=","added":["bug","area:mir","priority:high"],"removed":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789313404,"nonce":"JSr4edrPfdu/zWSsQJwCPNxFtsM=","message":"The loop variable was bound without box_if_captured, so a closure read the raw value through the box subscript. Fixed in e08b0f3104ae9c2c07ceed983e5dd81adaaa3227.","files":null}]}
