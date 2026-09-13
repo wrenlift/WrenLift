@@ -3099,13 +3099,21 @@ pub mod llvm {
             let Some(base) = self.sh.jit_code_base else {
                 return Ok(None);
             };
-            let depth_bb = self.new_block("sld");
             let call_bb = self.new_block("slc");
-            let slot_addr = unsafe { base.add(func_id as usize) } as u64;
-            let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
-            let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
-            self.cbr(has, depth_bb, slow)?;
-            self.b.position_at_end(depth_bb);
+            // The body calling itself is the code in its own slot; it
+            // needs no slot to tell it so.
+            let is_self = self.inline_depth == 0 && func_id == jit_func_id();
+            let jit_ptr = if is_self {
+                None
+            } else {
+                let depth_bb = self.new_block("sld");
+                let slot_addr = unsafe { base.add(func_id as usize) } as u64;
+                let jit_ptr = self.load64(self.c64(slot_addr), 0)?;
+                let has = self.icmp(IntPredicate::NE, jit_ptr, self.c64(0))?;
+                self.cbr(has, depth_bb, slow)?;
+                self.b.position_at_end(depth_bb);
+                Some(jit_ptr)
+            };
             let (depth_p, depth) = self.direct_depth()?;
             let room = self.icmp(
                 IntPredicate::ULT,
@@ -3124,17 +3132,24 @@ pub mod llvm {
             self.b
                 .build_store(depth_p, deeper)
                 .map_err(|e| e.to_string())?;
-            let ty = self.helper_type(1 + args.len());
-            let ptr = self
-                .b
-                .build_int_to_ptr(jit_ptr, self.ptrt(), "jp")
-                .map_err(|e| e.to_string())?;
             let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
             a.extend(args.iter().map(|v| BasicMetadataValueEnum::from(*v)));
-            let call = self
-                .b
-                .build_indirect_call(ty, ptr, &a, "direct")
-                .map_err(|e| e.to_string())?;
+            let call = match jit_ptr {
+                Some(jit_ptr) => {
+                    let ty = self.helper_type(1 + args.len());
+                    let ptr = self
+                        .b
+                        .build_int_to_ptr(jit_ptr, self.ptrt(), "jp")
+                        .map_err(|e| e.to_string())?;
+                    self.b
+                        .build_indirect_call(ty, ptr, &a, "direct")
+                        .map_err(|e| e.to_string())?
+                }
+                None => self
+                    .b
+                    .build_call(self.sh.main_fn, &a, "self")
+                    .map_err(|e| e.to_string())?,
+            };
             let fv = call.try_as_basic_value().basic().unwrap().into_int_value();
             self.b
                 .build_store(depth_p, depth)
