@@ -884,8 +884,9 @@ fn populate_callsite_ic(
         // For ForeignC the dispatch is already dominated by the
         // dlsym'd plugin call; for ForeignCDynamic it's dominated
         // by the JS-bridge round-trip. Re-resolution overhead is
-        // negligible against either.
-        Method::ForeignC(_) | Method::ForeignCDynamic(_) => {
+        // negligible against either. A host method carries two
+        // words the entry has no room for, so it is not cached yet.
+        Method::Host(..) | Method::ForeignC(_) | Method::ForeignCDynamic(_) => {
             crate::mir::bytecode::CallSiteIC::default()
         }
     };
@@ -3215,6 +3216,77 @@ fn handle_jit_fiber_action(
     }
 }
 
+/// Call `closure`'s body on `args`, receiver first, with `defining_class`
+/// as the context's class: what `dispatch_method` does for a closure, for
+/// a caller that has found the method itself and calls it again and
+/// again. The compiled body when there is one, through the thread's JIT
+/// state read once; else the interpreter, with the tier ticked so the
+/// body compiles.
+pub fn call_found_closure(
+    vm: &mut crate::runtime::vm::VM,
+    closure: *mut ObjClosure,
+    args: &[Value],
+    defining_class: *mut crate::runtime::object::ObjClass,
+) -> u64 {
+    if let Some(result) = try_dispatch_trivial_accessor_fastpath(vm, Method::Closure(closure), args)
+    {
+        return result;
+    }
+    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure).function).fn_id });
+    let fn_idx = func_id.0 as usize;
+    let fn_ptr = vm
+        .engine
+        .jit_code
+        .get(fn_idx)
+        .copied()
+        .unwrap_or(std::ptr::null());
+    #[cfg(feature = "aot")]
+    let is_sm = vm
+        .engine
+        .aot_state_machine
+        .get(fn_idx)
+        .copied()
+        .unwrap_or(false);
+    #[cfg(not(feature = "aot"))]
+    let is_sm = false;
+    #[cfg(feature = "cranelift")]
+    let compiled = !fn_ptr.is_null() && !is_sm;
+    #[cfg(not(feature = "cranelift"))]
+    let compiled = {
+        let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+        !fn_ptr.is_null() && is_leaf && !is_sm
+    };
+    if !compiled || args.len() > 8 || jit_disabled() {
+        if fn_ptr.is_null()
+            && vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter
+            && vm.engine.record_call(func_id)
+        {
+            vm.engine.request_tier_up(func_id, &vm.interner);
+        }
+        return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
+    }
+    let j = jit_state();
+    let state = unsafe { &mut *j };
+    if state.depth >= MAX_JIT_DEPTH {
+        return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
+    }
+    let saved_ctx = state.ctx;
+    let saved_depth = state.depth;
+    if state.ctx.vm.is_null() {
+        state.ctx.vm = vm as *mut _ as *mut u8;
+    }
+    state.ctx.current_func_id = func_id.0 as u64;
+    state.ctx.closure = closure as *mut u8;
+    state.ctx.defining_class = defining_class as *mut u8;
+    state.depth = saved_depth + 1;
+    vm.engine.note_native_entry(func_id);
+    let result = unsafe { call_jit_with_shadow_st(j, vm, fn_ptr, func_id, args) };
+    let state = unsafe { &mut *j };
+    state.depth = saved_depth;
+    state.ctx = saved_ctx;
+    result
+}
+
 /// Dispatch a resolved method entry.
 #[inline(always)]
 pub fn dispatch_method_pub(
@@ -3237,6 +3309,13 @@ fn dispatch_method(
             vm.engine
                 .note_runtime_call_stats(|s| s.dispatch_method_native += 1);
             let result = native_fn(vm, args).to_bits();
+            if let Some(action) = vm.pending_fiber_action.take() {
+                return handle_jit_fiber_action(vm, action);
+            }
+            result
+        }
+        Method::Host(host_fn, context) => {
+            let result = host_fn(vm, context, args).to_bits();
             if let Some(action) = vm.pending_fiber_action.take() {
                 return handle_jit_fiber_action(vm, action);
             }
@@ -4676,6 +4755,7 @@ fn dispatch_super_call_rooted(
     };
     match lookup {
         Some((Method::Native(native_fn), _dc)) => native_fn(vm, args).to_bits(),
+        Some((Method::Host(host_fn, context), _dc)) => host_fn(vm, context, args).to_bits(),
         Some((Method::ForeignC(foreign_fn), _dc)) => {
             crate::runtime::foreign::dispatch_foreign_c(vm, foreign_fn, args).to_bits()
         }

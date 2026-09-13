@@ -4777,7 +4777,10 @@ impl NativeContext for VM {
         all_args.extend_from_slice(args);
 
         match method_entry {
-            m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_)) => {
+            m @ (Method::Native(_)
+            | Method::Host(..)
+            | Method::ForeignC(_)
+            | Method::ForeignCDynamic(_)) => {
                 let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                 for &arg in &all_args {
                     crate::codegen::runtime_fns::push_jit_root(arg);
@@ -4787,6 +4790,7 @@ impl NativeContext for VM {
                     .collect();
                 let result = Some(match m {
                     Method::Native(func) => func(self, &rooted_args),
+                    Method::Host(func, context) => func(self, context, &rooted_args),
                     Method::ForeignC(func) => {
                         crate::runtime::foreign::dispatch_foreign_c(self, func, &rooted_args)
                     }
@@ -6359,6 +6363,7 @@ mod tests {
         let method = unsafe { (*class).find_method(sym).cloned() };
         match method {
             Some(Method::Native(func)) => func(vm, args),
+            Some(Method::Host(func, context)) => func(vm, context, args),
             Some(Method::ForeignC(func)) => {
                 crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
             }
@@ -6375,6 +6380,7 @@ mod tests {
         let method = unsafe { (*class).find_method(sym).cloned() };
         match method {
             Some(Method::Native(func)) => func(vm, args),
+            Some(Method::Host(func, context)) => func(vm, context, args),
             Some(Method::ForeignC(func)) => {
                 crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
             }

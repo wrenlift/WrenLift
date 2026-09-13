@@ -2032,6 +2032,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
             Some(Method::Closure(cp)) => cp,
             Some(Method::Constructor(cp)) => cp,
             Some(Method::Native(_))
+            | Some(Method::Host(..))
             | Some(Method::ForeignC(_))
             | Some(Method::ForeignCDynamic(_)) => {
                 // Native / foreign methods can't be state-machine
@@ -3635,6 +3636,74 @@ mod tests {
 
         wrenReleaseHandle(vm, get);
         wrenReleaseHandle(vm, set);
+        wrenFreeVM(vm);
+    }
+
+    /// A host's method is told the word it was bound with, from the
+    /// interpreter and from a compiled body alike; and a closure a host
+    /// has found runs through `call_found_closure` as through a send.
+    #[test]
+    fn test_host_method_and_found_closure() {
+        use crate::runtime::object::{Method, ObjClass, ObjClosure};
+        let vm = wrenNewVM(ptr::null());
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.output_buffer = Some(String::new());
+        let module = CString::new("test").unwrap();
+        let source = CString::new(
+            "class Counter {
+  construct new(n) { _n = n }
+  n { _n }
+  twice(x) { x + x }
+}
+",
+        )
+        .unwrap();
+        assert_eq!(
+            wrenInterpret(vm, module.as_ptr(), source.as_ptr()),
+            WrenInterpretResult::Success
+        );
+        let class = vm_ref
+            .find_imported_var_from("Counter", "test")
+            .and_then(|v| v.as_object())
+            .expect("the class") as *mut ObjClass;
+
+        fn bump(_vm: &mut crate::runtime::vm::VM, context: usize, args: &[Value]) -> Value {
+            Value::num(args[1].as_num().unwrap_or(0.0) + context as f64)
+        }
+        let sym = vm_ref.interner.intern("bump(_)");
+        unsafe { (*class).bind_host(sym, bump, 10) };
+        assert!(matches!(
+            unsafe { (*class).find_method(sym) },
+            Some(Method::Host(_, 10))
+        ));
+
+        let check = CString::new("check").unwrap();
+        let source = CString::new(
+            "import \"test\" for Counter\nvar c = Counter.new(1)\nvar s = 0\nfor (i in 0...2000) s = c.bump(i)\nSystem.print(s)\nSystem.print(c.bump(5))\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wrenInterpret(vm, check.as_ptr(), source.as_ptr()),
+            WrenInterpretResult::Success
+        );
+        assert_eq!(vm_ref.take_output(), "2009\n15\n");
+
+        let twice = vm_ref.interner.intern("twice(_)");
+        let Some(&Method::Closure(closure)) = (unsafe { (*class).find_method(twice) }) else {
+            panic!("twice is a closure");
+        };
+        let recv = vm_ref
+            .find_imported_var_from("c", "check")
+            .expect("the instance");
+        for _ in 0..3 {
+            let bits = crate::codegen::runtime_fns::call_found_closure(
+                vm_ref,
+                closure as *mut ObjClosure,
+                &[recv, Value::num(21.0)],
+                class,
+            );
+            assert_eq!(Value::from_bits(bits).as_num(), Some(42.0));
+        }
         wrenFreeVM(vm);
     }
 

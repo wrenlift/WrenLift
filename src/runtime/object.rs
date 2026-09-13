@@ -1421,6 +1421,10 @@ pub enum Method {
     Constructor(*mut ObjClosure),
     /// A native/foreign function.
     Native(NativeFn),
+    /// A host's native method with the word the host bound it with,
+    /// passed back on every call, so one function can stand behind many
+    /// members and be told which. Called with the VM itself.
+    Host(HostFn, usize),
     /// A C-ABI foreign method bound from a dynamic library via
     /// `#!native` + `#!symbol`. Dispatched through the slot-based
     /// bridge that matches the standard Wren embedding API.
@@ -1443,6 +1447,7 @@ impl fmt::Debug for Method {
             Method::Closure(_) => write!(f, "Method::Closure(...)"),
             Method::Constructor(_) => write!(f, "Method::Constructor(...)"),
             Method::Native(_) => write!(f, "Method::Native(...)"),
+            Method::Host(_, context) => write!(f, "Method::Host(..., {context:#x})"),
             Method::ForeignC(_) => write!(f, "Method::ForeignC(...)"),
             Method::ForeignCDynamic(idx) => write!(f, "Method::ForeignCDynamic({idx})"),
         }
@@ -1451,6 +1456,10 @@ impl fmt::Debug for Method {
 
 /// Signature for native functions: (vm, args) → result.
 pub type NativeFn = fn(&mut dyn NativeContext, &[Value]) -> Value;
+
+/// A host's native method: `(vm, context, args)`, the context being the
+/// word it was bound with (`Method::Host`). `args[0]` is the receiver.
+pub type HostFn = fn(&mut crate::runtime::vm::VM, usize, &[Value]) -> Value;
 
 /// Trait for native function context (implemented by the VM).
 ///
@@ -1687,6 +1696,12 @@ impl ObjClass {
     pub fn bind_native(&mut self, name: SymbolId, func: NativeFn) {
         self.ensure_capacity(name);
         self.methods[name.index() as usize] = Some(Method::Native(func));
+    }
+
+    /// Bind a host's native method with the word it is told on every call.
+    pub fn bind_host(&mut self, name: SymbolId, func: HostFn, context: usize) {
+        self.ensure_capacity(name);
+        self.methods[name.index() as usize] = Some(Method::Host(func, context));
     }
 
     /// Note that `signature` is being bound on this class: equality
