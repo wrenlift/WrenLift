@@ -4671,7 +4671,8 @@ pub mod cl {
                 builder
                     .ins()
                     .store(MemFlags::trusted(), store_val, fields_ptr, offset);
-                if aot_config.is_none() {
+                // Only the LLVM tier reads the field kinds.
+                if aot_config.is_none() && crate::codegen::top_tier_is_llvm() {
                     emit_note_field_kind(builder, obj_ptr, *idx, store_val);
                 }
                 // Write barrier; AOT cannot know the binary's collector,
