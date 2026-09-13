@@ -132,7 +132,8 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
         | ObjType::Range
         | ObjType::Foreign
         | ObjType::TypedArray
-        | ObjType::Simd => {}
+        | ObjType::Simd
+        | ObjType::Buffer => {}
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
@@ -266,6 +267,7 @@ unsafe fn object_size(header: *mut ObjHeader) -> usize {
         ObjType::Module => std::mem::size_of::<ObjModule>(),
         ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
         ObjType::Simd => std::mem::size_of::<ObjSimd>(),
+        ObjType::Buffer => std::mem::size_of::<ObjHeader>(),
     }
 }
 
@@ -313,6 +315,8 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::Simd => {
             let _ = Box::from_raw(header as *mut ObjSimd);
         }
+        // Only the built-in heap allocates buffers; it never boxes.
+        ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
     }
 }
 

@@ -2679,7 +2679,7 @@ impl VM {
             crate::codegen::runtime_fns::push_jit_root(elem);
         }
 
-        let obj = self.gc.alloc_list();
+        let obj = self.gc.alloc_list_sized(elements.len());
         let list_val = Value::object(obj as *mut u8);
         crate::codegen::runtime_fns::push_jit_root(list_val);
         unsafe {

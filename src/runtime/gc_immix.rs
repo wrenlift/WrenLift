@@ -45,6 +45,35 @@ thread_local! {
     /// The collector closing a cycle on this thread: whose intern table
     /// `object_drop` unlinks from and whose counters it updates.
     static CLOSING: Cell<*mut ImmixGc> = const { Cell::new(std::ptr::null_mut()) };
+    /// The heap the thread last allocated from or collected: where an
+    /// object living in it grows its buffers.
+    static ACTIVE_HEAP: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Elements a list allocated without a size starts with room for.
+const LIST_INLINE_CAPACITY: usize = 8;
+
+/// `bytes` of payload for the object at `owner`, as a `Buffer` object
+/// in the heap that holds `owner`; null when there is no such heap,
+/// the owner is not in it, or the payload is too large for it. The
+/// owner must mark the buffer and leave it to the sweep.
+pub fn alloc_buffer(owner: *const u8, bytes: usize) -> *mut u8 {
+    let heap = ACTIVE_HEAP.get();
+    if heap.is_null() || !rt::heap_is_builtin() {
+        return std::ptr::null_mut();
+    }
+    let total = std::mem::size_of::<ObjHeader>() + bytes;
+    if total > MAX_ALLOC || unsafe { !rt::is_heap_ptr(heap, owner as usize) } {
+        return std::ptr::null_mut();
+    }
+    let p = unsafe { rt::alloc_plain(heap, total) };
+    if p.is_null() {
+        return p;
+    }
+    unsafe {
+        (p as *mut ObjHeader).write(ObjHeader::new(ObjType::Buffer));
+        p.add(std::mem::size_of::<ObjHeader>())
+    }
 }
 
 impl Default for ImmixGc {
@@ -70,6 +99,7 @@ impl ImmixGc {
     #[inline]
     fn alloc_raw(&mut self, size: usize) -> *mut u8 {
         self.count_allocation();
+        ACTIVE_HEAP.set(self.heap);
         let p = unsafe { rt::alloc_raw(self.heap, size) };
         if p.is_null() {
             self.exhausted();
@@ -87,6 +117,7 @@ impl ImmixGc {
     /// `alloc` for an object that owns nothing outside the heap.
     fn alloc_plain<T>(&mut self, obj: T) -> *mut T {
         self.count_allocation();
+        ACTIVE_HEAP.set(self.heap);
         let p = unsafe { rt::alloc_plain(self.heap, std::mem::size_of::<T>()) } as *mut T;
         if p.is_null() {
             self.exhausted();
@@ -162,6 +193,7 @@ impl ImmixGc {
     /// `ranges` (native stack windows, register spills).
     pub fn collect_with_ranges(&mut self, roots: &[Value], ranges: &[(usize, usize)]) {
         let start = Instant::now();
+        ACTIVE_HEAP.set(self.heap);
         unsafe { rt::collect_begin(self.heap) };
         let mut gray = Gray {
             heap: self.heap,
@@ -299,6 +331,9 @@ pub(super) unsafe fn object_drop(obj: *mut u8) {
 
 impl Drop for ImmixGc {
     fn drop(&mut self) {
+        if ACTIVE_HEAP.get() == self.heap {
+            ACTIVE_HEAP.set(std::ptr::null_mut());
+        }
         let mut all = Vec::new();
         self.for_each_object(|h| all.push(h));
         // Nothing is closing: the intern table goes with `self` and the
@@ -321,7 +356,26 @@ impl GcAllocator for ImmixGc {
         self.alloc(ObjString::new(s))
     }
     fn alloc_list(&mut self) -> *mut ObjList {
-        self.alloc(ObjList::new())
+        self.alloc_list_sized(LIST_INLINE_CAPACITY)
+    }
+    /// The elements follow the header in the same allocation while
+    /// they fit a line; growth moves them to a buffer object.
+    fn alloc_list_sized(&mut self, cap: usize) -> *mut ObjList {
+        // An empty literal is usually about to be filled.
+        let cap = if cap == 0 { LIST_INLINE_CAPACITY } else { cap };
+        let total = std::mem::size_of::<ObjList>() + cap * std::mem::size_of::<Value>();
+        if total > MAX_ALLOC {
+            return self.alloc(ObjList::new());
+        }
+        let p = self.alloc_raw(total) as *mut ObjList;
+        unsafe {
+            let mut list = ObjList::new();
+            list.elements = (p as *mut u8).add(std::mem::size_of::<ObjList>()) as *mut Value;
+            list.capacity = cap as u32;
+            list.header.flags |= FLAG_HEAP_BUFFER;
+            p.write(list);
+        }
+        p
     }
     fn alloc_map(&mut self) -> *mut ObjMap {
         self.alloc(ObjMap::new())
@@ -379,6 +433,7 @@ impl GcAllocator for ImmixGc {
             return self.alloc(ObjInstance::new(class));
         }
         self.count_allocation();
+        ACTIVE_HEAP.set(self.heap);
         let p = unsafe { rt::alloc_plain(self.heap, total) } as *mut ObjInstance;
         if p.is_null() {
             self.exhausted();

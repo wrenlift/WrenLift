@@ -179,6 +179,7 @@ pub mod llvm {
             main_fn,
             iterate_sym: interner.lookup("iterate(_)"),
             iter_value_sym: interner.lookup("iteratorValue(_)"),
+            add_sym: interner.lookup("add(_)"),
             globals: std::cell::RefCell::new(Vec::new()),
         };
 
@@ -385,9 +386,11 @@ pub mod llvm {
         inline_bodies: Option<&'a InlineBodies>,
         cha_by_method: Option<&'a crate::runtime::engine::ChaMap>,
         main_fn: FunctionValue<'ctx>,
-        /// `iterate(_)` and `iteratorValue(_)`, lowered inline for lists.
+        /// `iterate(_)`, `iteratorValue(_)` and `add(_)`, lowered inline
+        /// for lists.
         iterate_sym: Option<crate::intern::SymbolId>,
         iter_value_sym: Option<crate::intern::SymbolId>,
+        add_sym: Option<crate::intern::SymbolId>,
         /// Externals the module reads through a global of known size,
         /// so LLVM may hoist their loads: `(global, address)`, mapped
         /// into the execution engine before the code is finalised.
@@ -3122,6 +3125,13 @@ pub mod llvm {
                 let ic_idx = self.take_ic_idx();
                 return self.list_iterator_value(r, arg_vals[0], method, ic_idx);
             }
+            if args.len() == 1
+                && Some(method) == self.sh.add_sym
+                && !crate::runtime::gc_trait::jit_needs_write_barriers()
+            {
+                let ic_idx = self.take_ic_idx();
+                return self.list_add(r, arg_vals[0], method, ic_idx);
+            }
             let ic_idx = if self.inline_depth == 0 {
                 let i = self.call_site_idx;
                 self.call_site_idx += 1;
@@ -3421,6 +3431,74 @@ pub mod llvm {
                 .phi(
                     self.i64t().into(),
                     &[(fast.into(), fast_end), (sv.into(), slow_end)],
+                )?
+                .into_int_value())
+        }
+
+        /// `list.add(v)` with room in the buffer: store and count; a
+        /// full list or another receiver takes the call. Returns the
+        /// list.
+        fn list_add(
+            &mut self,
+            r: IntValue<'ctx>,
+            v: IntValue<'ctx>,
+            method: crate::intern::SymbolId,
+            ic_idx: Option<usize>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let slow = self.new_block("las");
+            let merge = self.new_block("lam");
+            let (obj, count) = self.list_probe(r, slow)?;
+            let cap_p = self.addr(obj, LIST_CAPACITY as i64)?;
+            let cap32 = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), cap_p, "cap")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let cap = self
+                .b
+                .build_int_z_extend(cap32, self.i64t(), "cap64")
+                .map_err(|e| e.to_string())?;
+            let room = self.icmp(IntPredicate::ULT, count, cap)?;
+            let store_bb = self.new_block("lat");
+            let grow_bb = self.new_block("lag");
+            self.cbr(room, store_bb, grow_bb)?;
+            // A full list grows through the helper, not the call.
+            self.b.position_at_end(grow_bb);
+            self.call_helper("wren_list_add", &[r, v])?;
+            let grow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(store_bb);
+            let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
+            let p = self.element_addr(elements, count, 8)?;
+            self.b.build_store(p, v).map_err(|e| e.to_string())?;
+            let next = self
+                .b
+                .build_int_add(count, self.c64(1), "count1")
+                .map_err(|e| e.to_string())?;
+            let next32 = self
+                .b
+                .build_int_truncate(next, self.sh.ctx.i32_type(), "count32")
+                .map_err(|e| e.to_string())?;
+            let count_p = self.addr(obj, LIST_COUNT as i64)?;
+            self.b
+                .build_store(count_p, next32)
+                .map_err(|e| e.to_string())?;
+            let fast_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let m = self.method_bits(method, ic_idx);
+            let sv = self.wren_call(r, m, &[v])?;
+            let slow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(
+                    self.i64t().into(),
+                    &[
+                        (r.into(), fast_end),
+                        (r.into(), grow_end),
+                        (sv.into(), slow_end),
+                    ],
                 )?
                 .into_int_value())
         }

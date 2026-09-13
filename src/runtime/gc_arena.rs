@@ -228,6 +228,8 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::Simd => {
             let _ = Box::from_raw(header as *mut ObjSimd);
         }
+        // Only the built-in heap allocates buffers; it never boxes.
+        ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
     }
 }
 

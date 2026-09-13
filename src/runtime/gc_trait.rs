@@ -23,6 +23,12 @@ pub trait GcAllocator {
 
     fn alloc_string(&mut self, s: String) -> *mut ObjString;
     fn alloc_list(&mut self) -> *mut ObjList;
+    /// A list with room for `cap` elements before it grows; zero
+    /// leaves the room to the allocator.
+    fn alloc_list_sized(&mut self, cap: usize) -> *mut ObjList {
+        let _ = cap;
+        self.alloc_list()
+    }
     fn alloc_map(&mut self) -> *mut ObjMap;
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange;
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray;
@@ -161,6 +167,10 @@ impl GcImpl {
     #[inline(always)]
     pub fn alloc_list(&mut self) -> *mut ObjList {
         gc_dispatch!(self, alloc_list)
+    }
+    #[inline(always)]
+    pub fn alloc_list_sized(&mut self, cap: usize) -> *mut ObjList {
+        gc_dispatch!(self, alloc_list_sized, cap)
     }
     #[inline(always)]
     pub fn alloc_map(&mut self) -> *mut ObjMap {
@@ -350,6 +360,10 @@ impl GcAllocator for GcImpl {
     #[inline(always)]
     fn alloc_list(&mut self) -> *mut ObjList {
         gc_dispatch!(self, alloc_list)
+    }
+    #[inline(always)]
+    fn alloc_list_sized(&mut self, cap: usize) -> *mut ObjList {
+        gc_dispatch!(self, alloc_list_sized, cap)
     }
     #[inline(always)]
     fn alloc_map(&mut self) -> *mut ObjMap {

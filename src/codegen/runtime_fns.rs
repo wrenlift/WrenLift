@@ -4781,7 +4781,7 @@ fn make_list_impl(elements: &[u64]) -> u64 {
         push_jit_root(Value::from_bits(elem));
     }
 
-    let list_ptr = vm.gc.alloc_list();
+    let list_ptr = vm.gc.alloc_list_sized(elements.len());
     let list_val = Value::object(list_ptr as *mut u8);
     push_jit_root(list_val);
     unsafe {

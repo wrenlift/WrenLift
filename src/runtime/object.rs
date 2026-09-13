@@ -45,6 +45,9 @@ pub enum ObjType {
     /// the concrete lane interpretation lives in the `kind` byte on
     /// `ObjSimd`).
     Simd,
+    /// A payload another object owns (a list's element buffer): no
+    /// class, no children, nothing to drop; the owner marks it.
+    Buffer,
 }
 
 /// Element type for `ObjTypedArray`. Stored as a `u8` on the
@@ -150,6 +153,10 @@ pub struct ObjHeader {
 
 /// Per-object header-flag bits. See [`ObjHeader::flags`].
 pub const FLAG_ARENA_ALLOCATED: u8 = 1 << 0;
+/// The object's element buffer is a `Buffer` object in the built-in
+/// heap rather than a malloc'd block: the collector traces and frees
+/// it, and `Drop` leaves it alone.
+pub const FLAG_HEAP_BUFFER: u8 = 1 << 1;
 
 impl ObjHeader {
     pub fn new(obj_type: ObjType) -> Self {
@@ -423,6 +430,24 @@ impl ObjList {
         list
     }
 
+    /// Whether the buffer lives in the built-in heap.
+    pub fn heap_buffer(&self) -> bool {
+        self.header.flags & FLAG_HEAP_BUFFER != 0
+    }
+
+    /// Whether the elements follow the list in its own allocation.
+    fn inline_buffer(&self) -> bool {
+        self.elements as *const u8
+            == unsafe { (self as *const Self as *const u8).add(std::mem::size_of::<Self>()) }
+    }
+
+    /// The `Buffer` object holding the elements, when they are in one.
+    pub fn buffer_object(&self) -> Option<*mut ObjHeader> {
+        (self.heap_buffer() && !self.elements.is_null() && !self.inline_buffer()).then(|| unsafe {
+            (self.elements as *mut u8).sub(std::mem::size_of::<ObjHeader>()) as *mut ObjHeader
+        })
+    }
+
     fn ensure_capacity(&mut self, needed: u32) {
         if needed <= self.capacity {
             return;
@@ -432,9 +457,31 @@ impl ObjList {
         } else {
             (self.capacity * 2).max(needed)
         };
+        let bytes = new_cap as usize * std::mem::size_of::<Value>();
+        // A list that lives in the built-in heap keeps its buffer
+        // there too: no malloc, no free, and a dead list costs the
+        // sweep nothing. The old buffer is left to the collector when
+        // it was the heap's, freed here when it was malloc's.
+        let from_heap =
+            super::gc_immix::alloc_buffer(self as *const Self as *const u8, bytes) as *mut Value;
+        if !from_heap.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.elements, from_heap, self.count as usize);
+            }
+            self.release_malloc_buffer();
+            self.elements = from_heap;
+            self.capacity = new_cap;
+            self.header.flags |= FLAG_HEAP_BUFFER;
+            return;
+        }
         let new_layout = std::alloc::Layout::array::<Value>(new_cap as usize).unwrap();
         let new_ptr = if self.elements.is_null() {
             unsafe { std::alloc::alloc(new_layout) as *mut Value }
+        } else if self.heap_buffer() {
+            let p = unsafe { std::alloc::alloc(new_layout) as *mut Value };
+            unsafe { std::ptr::copy_nonoverlapping(self.elements, p, self.count as usize) };
+            self.header.flags &= !FLAG_HEAP_BUFFER;
+            p
         } else {
             let old_layout = std::alloc::Layout::array::<Value>(self.capacity as usize).unwrap();
             unsafe {
@@ -445,16 +492,20 @@ impl ObjList {
         self.elements = new_ptr;
         self.capacity = new_cap;
     }
-}
 
-impl Drop for ObjList {
-    fn drop(&mut self) {
-        if !self.elements.is_null() && self.capacity > 0 {
+    fn release_malloc_buffer(&mut self) {
+        if !self.elements.is_null() && self.capacity > 0 && !self.heap_buffer() {
             let layout = std::alloc::Layout::array::<Value>(self.capacity as usize).unwrap();
             unsafe {
                 std::alloc::dealloc(self.elements as *mut u8, layout);
             }
         }
+    }
+}
+
+impl Drop for ObjList {
+    fn drop(&mut self) {
+        self.release_malloc_buffer();
     }
 }
 

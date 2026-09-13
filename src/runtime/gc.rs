@@ -879,7 +879,8 @@ impl Gc {
             | ObjType::Range
             | ObjType::Foreign
             | ObjType::TypedArray
-            | ObjType::Simd => {}
+            | ObjType::Simd
+            | ObjType::Buffer => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -1642,6 +1643,7 @@ impl Gc {
             ObjType::Module => self.promote_typed::<ObjModule>(old_header),
             ObjType::TypedArray => self.promote_typed::<ObjTypedArray>(old_header),
             ObjType::Simd => self.promote_typed::<ObjSimd>(old_header),
+            ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
         };
 
         // Fix ObjUpvalue self-referential location pointer.
@@ -1814,7 +1816,8 @@ impl Gc {
             | ObjType::Range
             | ObjType::Foreign
             | ObjType::TypedArray
-            | ObjType::Simd => {}
+            | ObjType::Simd
+            | ObjType::Buffer => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -2100,10 +2103,14 @@ pub(super) unsafe fn for_each_child<F: FnMut(*mut ObjHeader)>(header: *mut ObjHe
         | ObjType::Range
         | ObjType::Foreign
         | ObjType::TypedArray
-        | ObjType::Simd => {}
+        | ObjType::Simd
+        | ObjType::Buffer => {}
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
+            if let Some(buffer) = list.buffer_object() {
+                child_ptr(buffer, f);
+            }
             for &val in list.as_slice() {
                 child_value(val, f);
             }
@@ -2285,7 +2292,7 @@ unsafe fn forget_heap_on_source(header: *mut ObjHeader) {
             // Allocated straight to old gen via alloc_old; never
             // promoted via this path. Falling through is fine.
         }
-        ObjType::Range | ObjType::Fn | ObjType::Upvalue | ObjType::Simd => {
+        ObjType::Range | ObjType::Fn | ObjType::Upvalue | ObjType::Simd | ObjType::Buffer => {
             // No heap-owned fields: Range/Fn/Upvalue carry only
             // primitives + raw pointers we don't own here, Simd
             // is inline lane data.
@@ -2353,7 +2360,8 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
         | ObjType::Range
         | ObjType::Foreign
         | ObjType::TypedArray
-        | ObjType::Simd => {}
+        | ObjType::Simd
+        | ObjType::Buffer => {}
 
         ObjType::List => {
             let list = &mut *(header as *mut ObjList);
@@ -2501,6 +2509,7 @@ fn object_size(header: *mut ObjHeader) -> usize {
             ObjType::Module => std::mem::size_of::<ObjModule>(),
             ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
             ObjType::Simd => std::mem::size_of::<ObjSimd>(),
+            ObjType::Buffer => std::mem::size_of::<ObjHeader>(),
         }
     }
 }
@@ -2526,6 +2535,7 @@ pub(super) unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
         ObjType::Module => std::ptr::drop_in_place(header as *mut ObjModule),
         ObjType::TypedArray => std::ptr::drop_in_place(header as *mut ObjTypedArray),
         ObjType::Simd => std::ptr::drop_in_place(header as *mut ObjSimd),
+        ObjType::Buffer => {}
     }
 }
 
@@ -2582,6 +2592,7 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::Simd => {
             std::ptr::drop_in_place(header as *mut ObjSimd);
         }
+        ObjType::Buffer => {}
     }
 }
 
