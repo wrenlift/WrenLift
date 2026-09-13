@@ -437,6 +437,8 @@ pub enum Instruction {
     CmpGeI64(ValueId, ValueId),
     /// Exact conversion of a proven-integral value back to f64.
     I64ToF64(ValueId),
+    /// Whether a boxed value is a Num (raw bool). JIT compile clones only.
+    IsNum(ValueId),
 }
 
 impl Instruction {
@@ -530,7 +532,8 @@ impl Instruction {
             | Instruction::ObjectIs(a, _)
             | Instruction::ClosureFnIs(a, _)
             | Instruction::NegI64(a)
-            | Instruction::I64ToF64(a) => vec![*a],
+            | Instruction::I64ToF64(a)
+            | Instruction::IsNum(a) => vec![*a],
             Instruction::AddI64(a, b)
             | Instruction::SubI64(a, b)
             | Instruction::MulI64(a, b)
@@ -1429,6 +1432,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CmpLeI64(a, b) => format!("icmp_i64.le {}, {}", a, b),
         Instruction::CmpGeI64(a, b) => format!("icmp_i64.ge {}, {}", a, b),
         Instruction::I64ToF64(a) => format!("i64_to_f64 {}", a),
+        Instruction::IsNum(a) => format!("is_num {}", a),
         Instruction::ClosureFnIs(a, f) => format!("closure_fn_is {}, {:#x}", a, f),
 
         Instruction::IsType(a, sym) => {
@@ -1805,7 +1809,8 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 | Instruction::CmpLtI64(..)
                 | Instruction::CmpGtI64(..)
                 | Instruction::CmpLeI64(..)
-                | Instruction::CmpGeI64(..) => MirType::Bool,
+                | Instruction::CmpGeI64(..)
+                | Instruction::IsNum(_) => MirType::Bool,
                 Instruction::AddI64(..)
                 | Instruction::SubI64(..)
                 | Instruction::MulI64(..)

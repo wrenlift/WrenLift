@@ -2089,7 +2089,8 @@ impl<'a> MirWasmEmitter<'a> {
             | Instruction::CmpLeI64(..)
             | Instruction::CmpGeI64(..)
             | Instruction::NegI64(_)
-            | Instruction::I64ToF64(_) => {
+            | Instruction::I64ToF64(_)
+            | Instruction::IsNum(_) => {
                 return Err("integer arithmetic is not lowered to wasm".into());
             }
             Instruction::SubscriptGet { receiver, args } => {

@@ -74,14 +74,15 @@ impl TierCell {
 /// function is re-proposed later.
 #[cfg(feature = "host")]
 struct Promoter {
-    tx: mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
+    tx: Option<mpsc::SyncSender<Box<dyn FnOnce() + Send>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(feature = "host")]
 impl Promoter {
     fn start() -> Self {
         let (tx, rx) = mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(256);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("wlift-promoter".into())
             .spawn(move || {
                 for job in rx {
@@ -89,11 +90,30 @@ impl Promoter {
                 }
             })
             .expect("spawn promoter thread");
-        Self { tx }
+        Self {
+            tx: Some(tx),
+            worker: Some(worker),
+        }
     }
 
     fn submit(&self, job: Box<dyn FnOnce() + Send>) -> bool {
-        self.tx.try_send(job).is_ok()
+        self.tx
+            .as_ref()
+            .map(|tx| tx.try_send(job).is_ok())
+            .unwrap_or(false)
+    }
+}
+
+/// A job in flight writes into engine memory (the function's tier cell,
+/// the install channel), so the engine waits for the queue to drain
+/// before its tables go.
+#[cfg(feature = "host")]
+impl Drop for Promoter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -373,6 +393,11 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
         range_loop::RangeLoop, sra::Sra, MirPass,
     };
     let range_loop = RangeLoop { interner };
+    // WLIFT_DISABLE_MATH_GUARD=1 leaves math methods on unknown
+    // receivers as calls; safe to run with.
+    if std::env::var_os("WLIFT_DISABLE_MATH_GUARD").is_none() {
+        crate::mir::opt::math_guard::MathGuard::new(interner).run(mir);
+    }
     let constfold = ConstFold;
     let dce = Dce;
     let cse = Cse::default();
@@ -3874,6 +3899,8 @@ impl ExecutionEngine {
 
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
+        #[cfg(feature = "host")]
+        drop(self.promoter.take());
         // Beadie's broker owns the worker thread now; its Drop impl sends
         // a shutdown signal and joins when TierManager drops. Any in-flight
         // compile results that never reached `poll_compilations` get

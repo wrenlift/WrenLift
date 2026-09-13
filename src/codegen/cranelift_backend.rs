@@ -3610,6 +3610,7 @@ pub mod cl {
                         | Instruction::CmpGtI64(..)
                         | Instruction::CmpLeI64(..)
                         | Instruction::CmpGeI64(..)
+                        | Instruction::IsNum(..)
                 );
                 let result = lower_instruction(
                     inst,
@@ -6608,6 +6609,12 @@ pub mod cl {
                 get(b),
             ))),
             Instruction::I64ToF64(a) => Ok(Some(builder.ins().fcvt_from_sint(types::F64, get(a)))),
+            Instruction::IsNum(a) => {
+                let v = get(a);
+                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                let masked = builder.ins().band(v, qnan);
+                Ok(Some(builder.ins().icmp(IntCC::NotEqual, masked, qnan)))
+            }
             Instruction::ObjectIs(a, obj_ptr) => {
                 let v = get(a);
                 let expected = builder

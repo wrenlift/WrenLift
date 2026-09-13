@@ -102,6 +102,10 @@ impl<'a> RangeLoop<'a> {
         let mut init_call: Option<(usize, usize, ValueId)> = None; // (block_idx, inst_idx, result_vid)
         let mut body_iterate: Option<(usize, usize, ValueId, ValueId)> = None; // (block_idx, inst_idx, result_vid, iter_arg)
         let mut body_iter_value: Option<(usize, usize, ValueId, ValueId)> = None;
+        // A loop with `continue` iterates the range from more than one
+        // place; only the single-latch shape is rewritten.
+        let mut iterate_sites = 0usize;
+        let mut iter_value_sites = 0usize;
 
         for (bi, block) in func.blocks.iter().enumerate() {
             for (ii, &(vid, ref inst)) in block.instructions.iter().enumerate() {
@@ -127,9 +131,11 @@ impl<'a> RangeLoop<'a> {
                             init_call = Some((bi, ii, vid));
                         } else {
                             body_iterate = Some((bi, ii, vid, arg));
+                            iterate_sites += 1;
                         }
                     } else if method.index() == iter_value_sym.index() && args.len() == 1 {
                         body_iter_value = Some((bi, ii, vid, args[0]));
+                        iter_value_sites += 1;
                     }
                 }
             }
@@ -139,7 +145,7 @@ impl<'a> RangeLoop<'a> {
             Some(v) => v,
             None => return false,
         };
-        let (body_bi, body_iter_ii, _body_iter_vid, _iter_arg) = match body_iterate {
+        let (body_bi, body_iter_ii, body_iter_vid, _iter_arg) = match body_iterate {
             Some(v) => v,
             None => return false,
         };
@@ -147,9 +153,7 @@ impl<'a> RangeLoop<'a> {
             Some(v) => v,
             None => return false,
         };
-
-        // body_iterate and body_iter_value should be in the same block
-        if body_bi != body_val_bi {
+        if iterate_sites != 1 || iter_value_sites != 1 {
             return false;
         }
 
@@ -165,6 +169,22 @@ impl<'a> RangeLoop<'a> {
             _ => return false,
         };
 
+        // A preheader between the initial iterate and the header forwards
+        // the iterator as its first parameter; look through it.
+        let mut cond_bid = cond_bid;
+        for _ in 0..8 {
+            let Some(b) = func.blocks.iter().find(|b| b.id == cond_bid) else {
+                return false;
+            };
+            match &b.terminator {
+                Terminator::Branch { target, args }
+                    if !b.params.is_empty() && args.first() == Some(&b.params[0].0) =>
+                {
+                    cond_bid = *target;
+                }
+                _ => break,
+            }
+        }
         let cond_bi = match func.blocks.iter().position(|b| b.id == cond_bid) {
             Some(v) => v,
             None => return false,
@@ -200,10 +220,16 @@ impl<'a> RangeLoop<'a> {
             _ => return false,
         };
 
-        // Verify body block matches
-        let body_block_id = func.blocks[body_bi].id;
-        if body_bid != body_block_id {
+        // The body's entry holds iteratorValue; the latch, which may be
+        // a later block when the body branches, feeds the next iterator
+        // straight back to the header.
+        if body_bid != func.blocks[body_val_bi].id {
             return false;
+        }
+        match &func.blocks[body_bi].terminator {
+            Terminator::Branch { target, args }
+                if *target == cond_bid && args.first() == Some(&body_iter_vid) => {}
+            _ => return false,
         }
 
         // Verify iter_val_arg == iter_param (iteratorValue receives the iterator)
@@ -238,7 +264,7 @@ impl<'a> RangeLoop<'a> {
 
         // 3. Replace iteratorValue Call with Move(iter_param)
         //    (Range.iteratorValue is identity — returns the iterator value as-is)
-        func.blocks[body_bi].instructions[body_val_ii].1 = Instruction::Move(iter_param);
+        func.blocks[body_val_bi].instructions[body_val_ii].1 = Instruction::Move(iter_param);
 
         // 4. Replace iterate Call with AddF64(iter_param, 1.0)
         //    Insert ConstNum(1.0) before the iterate call position

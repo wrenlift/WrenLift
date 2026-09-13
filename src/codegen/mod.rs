@@ -1613,6 +1613,7 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::BandI64(..)
                 | Instruction::NegI64(_) => MirType::I64,
                 Instruction::I64ToF64(_) => MirType::F64,
+                Instruction::IsNum(_) => MirType::Bool,
                 Instruction::BitAnd(..)
                 | Instruction::BitOr(..)
                 | Instruction::BitXor(..)
@@ -4445,7 +4446,8 @@ impl<'a> LowerCtx<'a> {
             | Instruction::CmpLeI64(..)
             | Instruction::CmpGeI64(..)
             | Instruction::NegI64(_)
-            | Instruction::I64ToF64(_) => {
+            | Instruction::I64ToF64(_)
+            | Instruction::IsNum(_) => {
                 panic!("integer arithmetic is lowered by the Cranelift backend only")
             }
             // -- IsType: inline tag checks for primitives, class ptr for objects --

@@ -342,7 +342,8 @@ pub fn eval_pure_instruction(
         | Instruction::CmpLeI64(..)
         | Instruction::CmpGeI64(..)
         | Instruction::NegI64(_)
-        | Instruction::I64ToF64(_) => Err(InterpError::Unsupported("integer arithmetic".into())),
+        | Instruction::I64ToF64(_)
+        | Instruction::IsNum(_) => Err(InterpError::Unsupported("integer arithmetic".into())),
         Instruction::SubscriptGet { .. } => Err(InterpError::Unsupported("SubscriptGet".into())),
         Instruction::SubscriptSet { .. } => Err(InterpError::Unsupported("SubscriptSet".into())),
         Instruction::GetStaticField(_) => Err(InterpError::Unsupported("GetStaticField".into())),

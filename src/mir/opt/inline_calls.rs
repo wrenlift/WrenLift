@@ -385,7 +385,7 @@ fn retarget(term: &mut Terminator, map: &HashMap<BlockId, BlockId>) {
 /// Split `block` after instruction `k`: the tail and the terminator move
 /// to a fresh block, which is returned. The head keeps an `Unreachable`
 /// terminator for the caller to replace.
-fn split_after(func: &mut MirFunction, block: BlockId, k: usize) -> BlockId {
+pub(crate) fn split_after(func: &mut MirFunction, block: BlockId, k: usize) -> BlockId {
     let post = func.new_block();
     let head = func.block_mut(block);
     let tail: Vec<(ValueId, Instruction)> = head.instructions.drain(k + 1..).collect();

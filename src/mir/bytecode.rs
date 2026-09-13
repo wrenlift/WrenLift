@@ -499,7 +499,8 @@ impl<'a> Encoder<'a> {
             | Instruction::CmpLeI64(..)
             | Instruction::CmpGeI64(..)
             | Instruction::NegI64(_)
-            | Instruction::I64ToF64(_) => {
+            | Instruction::I64ToF64(_)
+            | Instruction::IsNum(_) => {
                 unreachable!("integer arithmetic exists only in JIT compile clones")
             }
             Instruction::IsType(a, sym) => {

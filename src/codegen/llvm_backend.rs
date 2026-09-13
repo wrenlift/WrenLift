@@ -177,6 +177,8 @@ pub mod llvm {
             inline_bodies: inline_bodies.as_ref(),
             cha_by_method: cha_by_method.as_deref(),
             main_fn,
+            iterate_sym: interner.lookup("iterate(_)"),
+            iter_value_sym: interner.lookup("iteratorValue(_)"),
         };
 
         let mut osr_defs: Vec<OsrDef> = Vec::new();
@@ -370,6 +372,9 @@ pub mod llvm {
         inline_bodies: Option<&'a InlineBodies>,
         cha_by_method: Option<&'a crate::runtime::engine::ChaMap>,
         main_fn: FunctionValue<'ctx>,
+        /// `iterate(_)` and `iteratorValue(_)`, lowered inline for lists.
+        iterate_sym: Option<crate::intern::SymbolId>,
+        iter_value_sym: Option<crate::intern::SymbolId>,
     }
 
     /// Lowering state for one LLVM function (the body or an OSR entry).
@@ -487,6 +492,7 @@ pub mod llvm {
                 ty,
                 addr,
                 &args.iter().map(|a| (*a).into()).collect::<Vec<_>>(),
+                name,
             )
             .map(|v| v.into_int_value())
         }
@@ -496,6 +502,7 @@ pub mod llvm {
             ty: FunctionType<'ctx>,
             addr: usize,
             args: &[BasicMetadataValueEnum<'ctx>],
+            name: &str,
         ) -> Result<BasicValueEnum<'ctx>, String> {
             let ptr = self
                 .b
@@ -503,7 +510,7 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?;
             let call = self
                 .b
-                .build_indirect_call(ty, ptr, args, "call")
+                .build_indirect_call(ty, ptr, args, name)
                 .map_err(|e| e.to_string())?;
             call.try_as_basic_value()
                 .basic()
@@ -1589,6 +1596,14 @@ pub mod llvm {
                     .build_signed_int_to_float(self.geti(a)?, self.f64t(), "i2f")
                     .map_err(|e| e.to_string())?
                     .into(),
+                I::IsNum(a) => {
+                    let v = self.boxed(a)?;
+                    let boxed = self.is_nan_boxed(v)?;
+                    self.b
+                        .build_not(boxed, "isnum")
+                        .map_err(|e| e.to_string())?
+                        .into()
+                }
 
                 I::AddF64(a, b) => self
                     .b
@@ -2221,6 +2236,14 @@ pub mod llvm {
                 let m = self.c64(method.index() as u64);
                 return self.wren_call(r, m, &arg_vals);
             }
+            if args.len() == 1 && Some(method) == self.sh.iterate_sym {
+                let ic_idx = self.take_ic_idx();
+                return self.list_iterate(r, arg_vals[0], method, ic_idx);
+            }
+            if args.len() == 1 && Some(method) == self.sh.iter_value_sym {
+                let ic_idx = self.take_ic_idx();
+                return self.list_iterator_value(r, arg_vals[0], method, ic_idx);
+            }
             let ic_idx = if self.inline_depth == 0 {
                 let i = self.call_site_idx;
                 self.call_site_idx += 1;
@@ -2314,6 +2337,162 @@ pub mod llvm {
             }
             let m = self.method_bits(method, ic_idx);
             self.wren_call(r, m, &arg_vals)
+        }
+
+        fn take_ic_idx(&mut self) -> Option<usize> {
+            if self.inline_depth == 0 {
+                let i = self.call_site_idx;
+                self.call_site_idx += 1;
+                Some(i)
+            } else {
+                None
+            }
+        }
+
+        /// Branch to `slow` unless `r` is a List; on the returned block
+        /// `(obj_ptr, count)` are ready.
+        fn list_probe(
+            &mut self,
+            r: IntValue<'ctx>,
+            slow: BasicBlock<'ctx>,
+        ) -> Result<(IntValue<'ctx>, IntValue<'ctx>), String> {
+            let high = self.and(r, self.c64(TAG_OBJ))?;
+            let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(TAG_OBJ))?;
+            let obj_bb = self.new_block("lo");
+            self.cbr(is_obj, obj_bb, slow)?;
+            self.b.position_at_end(obj_bb);
+            let obj = self.and(r, self.c64(PTR_MASK))?;
+            let ty = self.load8(obj, HEADER_OBJ_TYPE as i64)?;
+            let is_list = self.icmp(
+                IntPredicate::EQ,
+                ty,
+                self.c64(crate::runtime::object::ObjType::List as u64),
+            )?;
+            let list_bb = self.new_block("ll");
+            self.cbr(is_list, list_bb, slow)?;
+            self.b.position_at_end(list_bb);
+            let count_p = self.addr(obj, LIST_COUNT as i64)?;
+            let count32 = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), count_p, "count")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let count = self
+                .b
+                .build_int_z_extend(count32, self.i64t(), "count64")
+                .map_err(|e| e.to_string())?;
+            Ok((obj, count))
+        }
+
+        /// `list.iterate(i)`: null starts at 0, a Num steps by one, and
+        /// the end of the list is `false`; anything else takes the call.
+        fn list_iterate(
+            &mut self,
+            r: IntValue<'ctx>,
+            iter: IntValue<'ctx>,
+            method: crate::intern::SymbolId,
+            ic_idx: Option<usize>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let slow = self.new_block("its");
+            let merge = self.new_block("itm");
+            let (_, count) = self.list_probe(r, slow)?;
+            let countf = self
+                .b
+                .build_unsigned_int_to_float(count, self.f64t(), "countf")
+                .map_err(|e| e.to_string())?;
+            let is_null = self.icmp(IntPredicate::EQ, iter, self.c64(TAG_NULL))?;
+            let is_box = self.is_nan_boxed(iter)?;
+            let num_bb = self.new_block("itn");
+            let null_bb = self.new_block("it0");
+            // A non-null box that is not a Num is not an iterator we
+            // know; the call answers.
+            let step_bb = self.new_block("itp");
+            let test_bb = self.b.get_insert_block().unwrap();
+            self.cbr(is_null, null_bb, num_bb)?;
+            self.b.position_at_end(num_bb);
+            self.cbr(is_box, slow, step_bb)?;
+            self.b.position_at_end(step_bb);
+            let f = self.f64_of(iter)?;
+            let next = self
+                .b
+                .build_float_add(f, self.cf64(1.0), "next")
+                .map_err(|e| e.to_string())?;
+            self.br(null_bb)?;
+            self.b.position_at_end(null_bb);
+            let cand = self
+                .phi(
+                    self.f64t().into(),
+                    &[(self.cf64(0.0).into(), test_bb), (next.into(), step_bb)],
+                )?
+                .into_float_value();
+            let in_range = self.fcmp(FloatPredicate::OLT, cand, countf)?;
+            let bits = self.bits(cand)?;
+            let fast = self
+                .b
+                .build_select(in_range, bits, self.c64(TAG_FALSE), "iter")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let fast_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let m = self.method_bits(method, ic_idx);
+            let sv = self.wren_call(r, m, &[iter])?;
+            let slow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(
+                    self.i64t().into(),
+                    &[(fast.into(), fast_end), (sv.into(), slow_end)],
+                )?
+                .into_int_value())
+        }
+
+        /// `list.iteratorValue(i)`: the element at a Num index within
+        /// the count; anything else takes the call.
+        fn list_iterator_value(
+            &mut self,
+            r: IntValue<'ctx>,
+            iter: IntValue<'ctx>,
+            method: crate::intern::SymbolId,
+            ic_idx: Option<usize>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let slow = self.new_block("ivs");
+            let merge = self.new_block("ivm");
+            let (obj, count) = self.list_probe(r, slow)?;
+            let is_box = self.is_nan_boxed(iter)?;
+            let num_bb = self.new_block("ivn");
+            self.cbr(is_box, slow, num_bb)?;
+            self.b.position_at_end(num_bb);
+            let f = self.f64_of(iter)?;
+            let idx = self
+                .b
+                .build_float_to_signed_int(f, self.i64t(), "idx")
+                .map_err(|e| e.to_string())?;
+            let in_range = self.icmp(IntPredicate::ULT, idx, count)?;
+            let load_bb = self.new_block("ivl");
+            self.cbr(in_range, load_bb, slow)?;
+            self.b.position_at_end(load_bb);
+            let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
+            let p = self.element_addr(elements, idx, 8)?;
+            let v = self
+                .b
+                .build_load(self.i64t(), p, "elem")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let m = self.method_bits(method, ic_idx);
+            let sv = self.wren_call(r, m, &[iter])?;
+            let slow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(
+                    self.i64t().into(),
+                    &[(v.into(), load_bb), (sv.into(), slow_end)],
+                )?
+                .into_int_value())
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -2505,6 +2684,7 @@ pub mod llvm {
                 | Instruction::CmpGtI64(..)
                 | Instruction::CmpLeI64(..)
                 | Instruction::CmpGeI64(..)
+                | Instruction::IsNum(..)
         )
     }
 }

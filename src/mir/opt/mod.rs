@@ -11,6 +11,7 @@ pub mod inline;
 pub mod inline_calls;
 pub mod int_loop;
 pub mod licm;
+pub mod math_guard;
 pub mod purity;
 pub mod range_loop;
 pub mod sra;
@@ -128,7 +129,7 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
         | MathUnaryF64(_, a) => {
             *a = f(*a);
         }
-        NegI64(a) | I64ToF64(a) => {
+        NegI64(a) | I64ToF64(a) | IsNum(a) => {
             *a = f(*a);
         }
         AddI64(a, b)
