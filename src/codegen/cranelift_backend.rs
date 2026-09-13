@@ -1309,6 +1309,35 @@ pub mod cl {
         JIT_COLD_HEADERS.with(|c| c.borrow().clone())
     }
 
+    /// Which OSR entries a compile produces. A function is compiled
+    /// in two stages: the body with the entry the interpreter is
+    /// waiting at, then the entries for its other loops, so the code
+    /// is installed as soon as the body is ready.
+    #[derive(Clone, Debug, Default)]
+    pub enum OsrSelect {
+        /// The body and every entry.
+        #[default]
+        All,
+        /// The body and the entries for these headers only.
+        Headers(HashSet<BlockId>),
+        /// No body; the entries for these headers only.
+        EntriesOnly(HashSet<BlockId>),
+    }
+
+    thread_local! {
+        static JIT_OSR_SELECT: std::cell::RefCell<OsrSelect> =
+            const { std::cell::RefCell::new(OsrSelect::All) };
+    }
+
+    /// Set what this thread's next compile produces.
+    pub fn set_jit_osr_select(select: OsrSelect) {
+        JIT_OSR_SELECT.with(|c| *c.borrow_mut() = select);
+    }
+
+    fn jit_osr_select() -> OsrSelect {
+        JIT_OSR_SELECT.with(|c| c.borrow().clone())
+    }
+
     /// Iterations of a cold loop before its compiled code hands back to the
     /// interpreter.
     const COLD_LOOP_EXIT_AFTER: i64 = 256;
@@ -1596,6 +1625,41 @@ pub mod cl {
             "wlift_{}",
             func_name.replace(['(', ')', ',', ' ', '='], "_")
         );
+        let osr_select = jit_osr_select();
+        if let OsrSelect::EntriesOnly(headers) = &osr_select {
+            let osr_defs = compile_osr_entries(
+                mir,
+                interner,
+                &mut module,
+                &safe_name,
+                callsite_ic_ptrs,
+                callsite_ic_live_ptrs,
+                jit_code_base,
+                inline_bodies,
+                cha_by_method,
+                Some(headers),
+            );
+            module.finalize_definitions().map_err(|e| e.to_string())?;
+            let osr_entries = osr_defs
+                .into_iter()
+                .map(|def| crate::codegen::NativeOsrEntry {
+                    target_block: def.target_block,
+                    param_count: def.param_count,
+                    ptr: module.get_finalized_function(def.func_id),
+                    live_in_regs: def.live_in_regs,
+                    live_in_num: def.live_in_num,
+                    live_in_field: def.live_in_field,
+                    live_in_int: def.live_in_int,
+                })
+                .collect();
+            return Ok(CraneliftCompiledCode {
+                _module: module,
+                fn_ptr: std::ptr::null(),
+                osr_entries,
+                code_size: 0,
+                native_meta: None,
+            });
+        }
         let func_id = module
             .declare_function(&safe_name, Linkage::Local, &sig)
             .map_err(|e| e.to_string())?;
@@ -1853,6 +1917,10 @@ pub mod cl {
         module
             .define_function(func_id, &mut ctx)
             .map_err(|e| e.to_string())?;
+        let only = match &osr_select {
+            OsrSelect::All => None,
+            OsrSelect::Headers(h) | OsrSelect::EntriesOnly(h) => Some(h),
+        };
         let osr_defs = if should_compile_osr_entries(mir, interner) {
             compile_osr_entries(
                 mir,
@@ -1864,6 +1932,7 @@ pub mod cl {
                 jit_code_base,
                 inline_bodies.clone(),
                 cha_by_method.clone(),
+                only,
             )
         } else {
             Vec::new()
@@ -2011,6 +2080,7 @@ pub mod cl {
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
         cha_by_method: crate::runtime::engine::SharedCha,
+        only: Option<&HashSet<BlockId>>,
     ) -> Vec<PendingOsrDefinition> {
         let i64_params: HashSet<ValueId> = mir
             .blocks
@@ -2021,6 +2091,9 @@ pub mod cl {
             .collect();
         let mut defs = Vec::new();
         for target_block in collect_osr_targets(mir) {
+            if only.is_some_and(|set| !set.contains(&target_block)) {
+                continue;
+            }
             let Some(layout) = osr_entry_layout(mir, target_block) else {
                 if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
                     eprintln!(
@@ -2179,7 +2252,7 @@ pub mod cl {
     /// Loop headers of the function: targets of edges whose source they
     /// dominate. Block ids are no guide once passes append blocks out of
     /// order, so this uses dominators.
-    pub(crate) fn collect_osr_targets(mir: &MirFunction) -> Vec<BlockId> {
+    pub fn collect_osr_targets(mir: &MirFunction) -> Vec<BlockId> {
         use crate::mir::opt::licm::{compute_dominators, compute_rpo};
         let mut with_preds = mir.clone();
         with_preds.compute_predecessors();
