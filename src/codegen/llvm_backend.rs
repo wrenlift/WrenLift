@@ -425,6 +425,12 @@ pub mod llvm {
         /// right after the header and their kind notes have a fixed
         /// address.
         fresh: HashMap<IntValue<'ctx>, usize>,
+        /// Receivers whose class a dominating `ClassIs` guard proved,
+        /// per block.
+        class_facts: HashMap<usize, Vec<(ValueId, usize)>>,
+        cur_block: usize,
+        /// The receiver of a body spliced behind its class check.
+        inline_class: Option<(IntValue<'ctx>, usize)>,
         /// A guarded getter whose class keeps its field as Nums: the
         /// guard that follows checks the class's field-kind byte at
         /// this address instead of the value.
@@ -468,6 +474,9 @@ pub mod llvm {
                 miss_exit: None,
                 num_values: HashSet::new(),
                 fresh: HashMap::new(),
+                class_facts: HashMap::new(),
+                cur_block: 0,
+                inline_class: None,
                 field_invariant: None,
                 cur_vid: ValueId(u32::MAX),
                 raw_bools: HashSet::new(),
@@ -732,11 +741,38 @@ pub mod llvm {
                 )
                 .map_err(|e| e.to_string())?
                 .into_int_value();
-            let seen = self
+            self.store_kind_bit(p, seen, bit)?;
+            self.br(done)?;
+            self.b.position_at_end(done);
+            Ok(())
+        }
+
+        /// The class a guard proved for `recv` in the current block.
+        fn known_class(&self, recv: ValueId) -> Option<usize> {
+            self.class_facts
+                .get(&self.cur_block)?
+                .iter()
+                .find(|(v, _)| *v == recv)
+                .map(|(_, c)| *c)
+        }
+
+        /// Store `seen | bit` at `p` when that changes the byte.
+        fn store_kind_bit(
+            &mut self,
+            p: PointerValue<'ctx>,
+            seen: IntValue<'ctx>,
+            bit: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            let new = self
                 .b
                 .build_or(seen, bit, "seen")
                 .map_err(|e| e.to_string())?;
-            let st = self.b.build_store(p, seen).map_err(|e| e.to_string())?;
+            let changed = self.icmp(IntPredicate::NE, new, seen)?;
+            let store = self.new_block("fks");
+            let done = self.new_block("fkd");
+            self.cbr(changed, store, done)?;
+            self.b.position_at_end(store);
+            let st = self.b.build_store(p, new).map_err(|e| e.to_string())?;
             let tag = self.kinds_tag();
             st.set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
                 .map_err(|e| e.to_string())?;
@@ -803,15 +839,7 @@ pub mod llvm {
                     .map_err(|e| e.to_string())?
                     .into_int_value()
             };
-            let seen = self
-                .b
-                .build_or(cur, bit, "seen")
-                .map_err(|e| e.to_string())?;
-            let st = self.b.build_store(p, seen).map_err(|e| e.to_string())?;
-            let tag = self.kinds_tag();
-            st.set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
-                .map_err(|e| e.to_string())?;
-            Ok(())
+            self.store_kind_bit(p, cur, bit)
         }
 
         /// When `class` has only ever held Nums in field `idx` and every
@@ -1306,6 +1334,7 @@ pub mod llvm {
 
             let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
+            self.class_facts = class_facts(mir);
             for &bi in &rpo {
                 let bb = self.blocks[bi];
                 self.b.position_at_end(bb);
@@ -1313,6 +1342,7 @@ pub mod llvm {
                     self.b.build_unreachable().map_err(|e| e.to_string())?;
                     continue;
                 }
+                self.cur_block = bi;
                 self.lower_block(bi)?;
             }
             for bb in self.blocks.iter() {
@@ -1613,7 +1643,16 @@ pub mod llvm {
                     let obj = self.and(r, self.c64(PTR_MASK))?;
                     let fields = self.instance_fields(r, obj)?;
                     self.field_store(fields, *idx, v)?;
-                    if let Some(&class) = self.fresh.get(&r) {
+                    let known = self
+                        .fresh
+                        .get(&r)
+                        .copied()
+                        .or_else(|| match self.inline_class {
+                            Some((recv, class)) if recv == r => Some(class),
+                            _ => None,
+                        })
+                        .or_else(|| self.known_class(*recv));
+                    if let Some(class) = known {
                         self.note_field_kind_static(class, *idx, v)?;
                     } else if !self.num_values.contains(&v) {
                         self.note_field_kind(obj, *idx, v)?;
@@ -3177,11 +3216,13 @@ pub mod llvm {
             &mut self,
             callee: &Arc<MirFunction>,
             r: IntValue<'ctx>,
+            class: usize,
             args: &[IntValue<'ctx>],
         ) -> Result<Option<IntValue<'ctx>>, String> {
             let block = &callee.blocks[0];
             let mut callee_args = vec![r];
             callee_args.extend_from_slice(args);
+            let saved_class = self.inline_class.replace((r, class));
             let saved_vals = std::mem::take(&mut self.vals);
             let saved_bools = std::mem::take(&mut self.raw_bools);
             let saved_types =
@@ -3224,6 +3265,7 @@ pub mod llvm {
                 };
             }
             self.inline_depth -= 1;
+            self.inline_class = saved_class;
             self.receiver = saved_recv;
             self.value_types = saved_types;
             self.raw_bools = saved_bools;
@@ -3293,7 +3335,9 @@ pub mod llvm {
                             let body = self.sh.inline_bodies.and_then(|b| b.get(fid)).cloned();
                             let mut done = false;
                             if let Some(callee) = body {
-                                if let Some(v) = self.inline_body(&callee, r, &arg_vals)? {
+                                if let Some(v) =
+                                    self.inline_body(&callee, r, *class_ptr, &arg_vals)?
+                                {
                                     incoming.push((v.into(), self.b.get_insert_block().unwrap()));
                                     self.br(merge)?;
                                     done = true;
@@ -3722,7 +3766,7 @@ pub mod llvm {
                             // inlined body needs no merge.
                             self.cbr(hit, fast, miss)?;
                             self.b.position_at_end(fast);
-                            return match self.inline_body(&callee, r, &arg_vals)? {
+                            return match self.inline_body(&callee, r, expected_class, &arg_vals)? {
                                 Some(v) => {
                                     if let Some(field) = inline_getter_field {
                                         let dst = self.cur_vid;
@@ -3744,7 +3788,7 @@ pub mod llvm {
                         self.b.position_at_end(fast);
                         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
                             Vec::new();
-                        match self.inline_body(&callee, r, &arg_vals)? {
+                        match self.inline_body(&callee, r, expected_class, &arg_vals)? {
                             Some(v) => {
                                 incoming.push((v.into(), self.b.get_insert_block().unwrap()));
                                 self.br(merge)?;
@@ -3861,6 +3905,67 @@ pub mod llvm {
         Div,
         Rem,
         Cmp(FloatPredicate),
+    }
+
+    /// For each block, the receivers a dominating `ClassIs` guard
+    /// proved: the guard's true edge is the only way into a block that
+    /// dominates it.
+    fn class_facts(mir: &MirFunction) -> HashMap<usize, Vec<(ValueId, usize)>> {
+        use crate::mir::opt::licm::{compute_dominators, compute_rpo};
+        let n = mir.blocks.len();
+        let mut preds = vec![0usize; n];
+        for b in &mir.blocks {
+            for s in b.terminator.successors() {
+                if let Some(c) = preds.get_mut(s.0 as usize) {
+                    *c += 1;
+                }
+            }
+        }
+        let class_of: HashMap<ValueId, (ValueId, usize)> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::ClassIs(r, c) => Some((*v, (*r, *c))),
+                _ => None,
+            })
+            .collect();
+        let guards: Vec<(usize, ValueId, usize)> = mir
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.terminator {
+                Terminator::CondBranch {
+                    condition,
+                    true_target,
+                    ..
+                } if preds.get(true_target.0 as usize) == Some(&1) => class_of
+                    .get(condition)
+                    .map(|&(r, c)| (true_target.0 as usize, r, c)),
+                _ => None,
+            })
+            .collect();
+        let mut facts: HashMap<usize, Vec<(ValueId, usize)>> = HashMap::new();
+        if guards.is_empty() {
+            return facts;
+        }
+        let rpo = compute_rpo(mir);
+        let idom = compute_dominators(mir, &rpo);
+        for bi in 0..n {
+            let mut d = bi;
+            loop {
+                for &(t, r, c) in &guards {
+                    if t == d {
+                        facts.entry(bi).or_default().push((r, c));
+                    }
+                }
+                let up = idom.get(d).copied().unwrap_or(usize::MAX);
+                if up == usize::MAX || up == d {
+                    break;
+                }
+                d = up;
+            }
+        }
+        facts
     }
 
     fn is_raw_bool(inst: &Instruction) -> bool {
