@@ -408,6 +408,7 @@ pub struct RuntimeCallStats {
     pub ic_kind4_hits: u64,
     pub ic_kind5_hits: u64,
     pub ic_kind6_hits: u64,
+    pub ic_kind8_hits: u64,
     pub ic_invalidations: u64,
 }
 
@@ -2478,13 +2479,14 @@ impl ExecutionEngine {
                 runtime.jit_context_save_restore_pairs,
             );
             eprintln!(
-                "ic_hits kind1={} kind2={} kind3={} kind4={} kind5={} kind6={} invalidations={}",
+                "ic_hits kind1={} kind2={} kind3={} kind4={} kind5={} kind6={} kind8={} invalidations={}",
                 runtime.ic_kind1_hits,
                 runtime.ic_kind2_hits,
                 runtime.ic_kind3_hits,
                 runtime.ic_kind4_hits,
                 runtime.ic_kind5_hits,
                 runtime.ic_kind6_hits,
+                runtime.ic_kind8_hits,
                 runtime.ic_invalidations,
             );
         }

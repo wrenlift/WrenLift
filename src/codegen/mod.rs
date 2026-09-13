@@ -3976,7 +3976,7 @@ impl<'a> LowerCtx<'a> {
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
 
-                    // ── Non-JIT dispatch: getter (kind=5) or native (kind=4) ──
+                    // ── Non-JIT dispatch: getter (kind=5), native (kind=4), host (kind=8) ──
                     self.mf.emit(MachInst::DefLabel(non_jit_label));
                     let kind = self.mf.new_gp();
                     self.mf.emit(MachInst::Ldr {
@@ -4010,10 +4010,10 @@ impl<'a> LowerCtx<'a> {
                         lhs: kind,
                         rhs: kind4,
                     });
-                    let ctor_label = self.mf.new_label();
+                    let host_label = self.mf.new_label();
                     self.mf.emit(MachInst::JmpIf {
                         cond: Cond::Ne,
-                        target: ctor_label,
+                        target: host_label,
                     });
                     {
                         let native_fn = self.mf.new_gp();
@@ -4032,6 +4032,49 @@ impl<'a> LowerCtx<'a> {
                         self.mf.emit(MachInst::CallRuntime {
                             name: native_call_name,
                             args: native_args,
+                            ret: Some(dst),
+                        });
+                    }
+                    self.mf.emit(MachInst::Jmp { target: done_label });
+
+                    // Kind=8: host method, called with its context word
+                    self.mf.emit(MachInst::DefLabel(host_label));
+                    let kind8 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: kind8,
+                        bits: 8,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: kind8,
+                    });
+                    let ctor_label = self.mf.new_label();
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: ctor_label,
+                    });
+                    {
+                        let host_fn = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: host_fn,
+                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
+                        });
+                        let context = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: context,
+                            mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
+                        });
+                        let host_call_name = match args.len() {
+                            0 => "wren_ic_host_0",
+                            1 => "wren_ic_host_1",
+                            2 => "wren_ic_host_2",
+                            _ => "wren_ic_host_3",
+                        };
+                        let mut host_args = vec![host_fn, context, r];
+                        host_args.extend(user_args.iter().copied());
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: host_call_name,
+                            args: host_args,
                             ret: Some(dst),
                         });
                     }

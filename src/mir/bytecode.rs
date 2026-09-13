@@ -150,6 +150,7 @@ pub enum BcConst {
 ///   3 = constructor (skip method lookup, alloc instance, inline frame push)
 ///   4 = native method (direct fn pointer call)
 ///   5 = trivial getter (direct field load; func_id stores field index)
+///   8 = host method (closure holds the fn, func_id its context word)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CallSiteIC {
@@ -162,7 +163,7 @@ pub struct CallSiteIC {
     /// Cached func_id for quick bytecode lookup (kinds 2/3) or field index (kind 5).
     pub func_id: u64,
     /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native, 5 = getter,
-    /// 7 = closure call (`class` holds the `ObjFn` pointer).
+    /// 7 = closure call (`class` holds the `ObjFn` pointer), 8 = host method.
     pub kind: u64,
 }
 

@@ -26,7 +26,6 @@ use crate::runtime::object::{
     ObjSimd, ObjString, ObjType, SimdKind,
 };
 use crate::runtime::value::Value;
-use std::cell::RefCell;
 use std::sync::OnceLock;
 
 /// Flat shadow root storage. All shadow frames share a single contiguous
@@ -47,32 +46,29 @@ static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
 // Stack of active JIT frames for GC stack walking.
 // Each entry: (frame_pointer, func_id, return_address).
 // The return_address identifies the active safepoint for precise root scanning.
-thread_local! {
-    static JIT_FRAME_STACK: RefCell<Vec<(usize, u32, usize)>> = const { RefCell::new(Vec::new()) };
-}
-
 /// Push a JIT frame for GC visibility.
 #[inline(always)]
 pub fn push_jit_frame(fp: usize, func_id: u32, ret_addr: usize) {
-    JIT_FRAME_STACK.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        if stack.len() < 64 {
-            stack.push((fp, func_id, ret_addr));
-        }
-    });
+    push_frame_on(jit_state(), fp, func_id, ret_addr);
+}
+
+#[inline(always)]
+fn push_frame_on(j: *mut JitThread, fp: usize, func_id: u32, ret_addr: usize) {
+    let frames = unsafe { &mut (*j).frames };
+    if frames.len() < 64 {
+        frames.push((fp, func_id, ret_addr));
+    }
 }
 
 /// Pop a JIT frame.
 #[inline(always)]
 pub fn pop_jit_frame() {
-    JIT_FRAME_STACK.with(|stack| {
-        stack.borrow_mut().pop();
-    });
+    unsafe { (*jit_state()).frames.pop() };
 }
 
 /// Get all active JIT frames (fp, func_id, ret_addr) for GC stack walking.
 pub fn jit_frame_entries() -> Vec<(usize, u32, usize)> {
-    JIT_FRAME_STACK.with(|stack| stack.borrow().clone())
+    unsafe { (*jit_state()).frames.clone() }
 }
 
 /// Trace switches read once: these gates sit on every dispatch.
@@ -85,14 +81,6 @@ fn trace_jit_ic(msg: impl FnOnce() -> String) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if env_flag(&ON, "WLIFT_TRACE_JIT_IC") {
         eprintln!("{}", msg());
-    }
-}
-
-#[inline(always)]
-fn note_wren_call_entry() {
-    if let Some(vm) = unsafe { vm_ref() } {
-        vm.engine
-            .note_runtime_call_stats(|s| s.wren_call_entries += 1);
     }
 }
 
@@ -297,16 +285,28 @@ fn try_dispatch_trivial_accessor_fastpath(
     None
 }
 
+/// What the frameless pass over a send found.
+enum Frameless {
+    Done(u64),
+    /// The method cache resolved a host method; it runs under a frame.
+    Host(crate::runtime::object::HostFn, usize),
+    Miss,
+}
+
 #[inline(always)]
-fn try_dispatch_call_noframe_fast(recv: Value, method_packed: u64, args: &[Value]) -> Option<u64> {
-    let vm = unsafe { vm_ref() }?;
+fn try_dispatch_call_noframe_fast(
+    vm: &mut crate::runtime::vm::VM,
+    recv: Value,
+    method_packed: u64,
+    args: &[Value],
+) -> Frameless {
     // Same has_error short-circuit as `dispatch_call_rooted`. The
     // no-frame fast path is the first stop on every JIT-issued
     // Call; without the guard a chained call after a Fiber.abort
     // would still hit a list/method-cache fast path and overwrite
     // the in-flight error with whatever the second call returns.
     if vm.has_error {
-        return Some(Value::null().to_bits());
+        return Frameless::Done(Value::null().to_bits());
     }
     let (method_sym, _) = decode_method_and_ic(method_packed);
     let class = vm.class_of(recv);
@@ -317,7 +317,7 @@ fn try_dispatch_call_noframe_fast(recv: Value, method_packed: u64, args: &[Value
                 s.wren_call_noframe_fastpath += 1;
                 s.dispatch_call_entries += 1;
             });
-            return Some(result);
+            return Frameless::Done(result);
         }
     }
 
@@ -329,19 +329,27 @@ fn try_dispatch_call_noframe_fast(recv: Value, method_packed: u64, args: &[Value
                 s.dispatch_call_entries += 1;
                 s.dispatch_call_method_cache_hits += 1;
             });
-            return Some(result);
+            return Frameless::Done(result);
+        }
+        if let Method::Host(host_fn, context) = method {
+            vm.engine.note_runtime_call_stats(|s| {
+                s.dispatch_call_entries += 1;
+                s.dispatch_call_method_cache_hits += 1;
+            });
+            return Frameless::Host(host_fn, context);
         }
     }
 
-    None
+    Frameless::Miss
 }
 
 #[inline(always)]
 fn current_jit_callsite_ic(
     vm: &mut crate::runtime::vm::VM,
+    j: *mut JitThread,
     ic_idx: usize,
 ) -> Option<*mut crate::mir::bytecode::CallSiteIC> {
-    let ctx = read_jit_ctx();
+    let ctx = unsafe { &(*j).ctx };
     let func_id = if ctx.current_func_id != u32::MAX as u64 {
         crate::runtime::engine::FuncId(ctx.current_func_id as u32)
     } else {
@@ -884,11 +892,17 @@ fn populate_callsite_ic(
         // For ForeignC the dispatch is already dominated by the
         // dlsym'd plugin call; for ForeignCDynamic it's dominated
         // by the JS-bridge round-trip. Re-resolution overhead is
-        // negligible against either. A host method carries two
-        // words the entry has no room for, so it is not cached yet.
-        Method::Host(..) | Method::ForeignC(_) | Method::ForeignCDynamic(_) => {
+        // negligible against either.
+        Method::ForeignC(_) | Method::ForeignCDynamic(_) => {
             crate::mir::bytecode::CallSiteIC::default()
         }
+        Method::Host(host_fn, context) => crate::mir::bytecode::CallSiteIC {
+            class: cache_key_class as usize,
+            jit_ptr: std::ptr::null(),
+            closure: host_fn as *const () as *const u8,
+            func_id: context as u64,
+            kind: 8,
+        },
     };
 
     unsafe {
@@ -1107,6 +1121,18 @@ fn try_dispatch_callsite_ic(
                 unsafe { std::mem::transmute(ic.closure) };
             Some(native_fn(vm, args).to_bits())
         }
+        8 => {
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind8_hits += 1);
+            trace_jit_ic(|| "jit-ic: hit kind=8".to_string());
+            let host_fn: crate::runtime::object::HostFn =
+                unsafe { std::mem::transmute(ic.closure) };
+            let context = ic.func_id as usize;
+            let result = host_fn(vm, context, args).to_bits();
+            if let Some(action) = vm.pending_fiber_action.take() {
+                return Some(handle_jit_fiber_action(vm, action));
+            }
+            Some(result)
+        }
         5 => {
             let instance = recv
                 .as_object()
@@ -1244,7 +1270,11 @@ impl Default for JitContext {
 pub struct JitThread {
     pub ctx: JitContext,
     pub roots: Vec<Value>,
+    /// Compiled frames the collector walks: (fp, func_id, return address).
+    pub frames: Vec<(usize, u32, usize)>,
     pub depth: u32,
+    /// All JIT dispatch off, for a shadow check against the interpreter.
+    pub disabled: bool,
 }
 
 thread_local! {
@@ -1262,7 +1292,9 @@ thread_local! {
             jit_code_len: 0,
         },
         roots: Vec::new(),
+        frames: Vec::new(),
         depth: 0,
+        disabled: false,
     }) };
 
     /// Flat shadow root stack — zero-alloc push/pop after warmup.
@@ -1272,10 +1304,6 @@ thread_local! {
             boundaries: Vec::new(),
         }) };
 
-
-    /// When true, all JIT dispatch is disabled (fall back to interpreter).
-    /// Used by shadow check to run interpreter-only path for comparison.
-    static JIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// This thread's JIT state. Valid for the thread's lifetime; only this
@@ -1490,7 +1518,7 @@ pub fn set_jit_depth(depth: u32) {
 /// Check if JIT dispatch is disabled (for shadow check mode).
 #[inline(always)]
 pub fn jit_disabled() -> bool {
-    JIT_DISABLED.with(|d| d.get())
+    unsafe { (*jit_state()).disabled }
 }
 
 /// Whether the IC kind=1 inline-JIT fast path is enabled. Default ON.
@@ -2150,9 +2178,15 @@ pub extern "C" fn wren_exit_shadow_frame() {
 /// is valid for the duration of the borrow.
 #[inline(always)]
 unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
-    let ctx = read_jit_ctx();
-    if !ctx.vm.is_null() {
-        return Some(unsafe { &mut *(ctx.vm as *mut crate::runtime::vm::VM) });
+    unsafe { vm_at(jit_state()) }
+}
+
+/// The VM the given JIT state runs on.
+#[inline(always)]
+unsafe fn vm_at(j: *mut JitThread) -> Option<&'static mut crate::runtime::vm::VM> {
+    let vm = unsafe { (*j).ctx.vm };
+    if !vm.is_null() {
+        return Some(unsafe { &mut *(vm as *mut crate::runtime::vm::VM) });
     }
     #[cfg(all(target_arch = "wasm32", not(feature = "host")))]
     {
@@ -2599,7 +2633,7 @@ pub fn call_closure_jit_or_sync(
         // to `call_closure_sync` (BC interp on the original
         // MIR — the SM transform is JIT-only). Never let the
         // native fast path catch an SM body.
-        let native_fn_ptr: Option<*const u8> = if JIT_DISABLED.with(|d| d.get()) || is_sm {
+        let native_fn_ptr: Option<*const u8> = if jit_disabled() || is_sm {
             None
         } else {
             vm.engine
@@ -2711,15 +2745,20 @@ unsafe fn find_method_with_class(
 
 /// Internal: dispatch a method call with a pre-built args slice.
 fn dispatch_call(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
-    dispatch_call_rooted(recv, method_packed, args)
+    let j = jit_state();
+    match unsafe { vm_at(j) } {
+        Some(vm) => dispatch_call_rooted(vm, j, recv, method_packed, args),
+        None => Value::null().to_bits(),
+    }
 }
 
-fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
-    let vm = unsafe { vm_ref() };
-    let vm = match vm {
-        Some(v) => v,
-        None => return Value::null().to_bits(),
-    };
+fn dispatch_call_rooted(
+    vm: &mut crate::runtime::vm::VM,
+    j: *mut JitThread,
+    recv: Value,
+    method_packed: u64,
+    args: &[Value],
+) -> u64 {
     // If we already have a runtime error in flight, short-circuit
     // every subsequent call within the AOT body to a null return.
     // The block-entry `wren_aot_check_error` poll catches the
@@ -2758,7 +2797,7 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
             return result;
         }
     }
-    let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, idx));
+    let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, j, idx));
 
     if let Some(ic_ptr) = ic_ptr {
         vm.engine
@@ -3257,7 +3296,9 @@ pub fn call_found_closure(
         let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
         !fn_ptr.is_null() && is_leaf && !is_sm
     };
-    if !compiled || args.len() > 8 || jit_disabled() {
+    let j = jit_state();
+    let state = unsafe { &mut *j };
+    if !compiled || args.len() > 8 || state.disabled {
         if fn_ptr.is_null()
             && vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter
             && vm.engine.record_call(func_id)
@@ -3266,14 +3307,17 @@ pub fn call_found_closure(
         }
         return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
     }
-    let j = jit_state();
-    let state = unsafe { &mut *j };
     if state.depth >= MAX_JIT_DEPTH {
         return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
     }
-    let saved_ctx = state.ctx;
+    // Only the fields written here are saved; a cross-module call
+    // restores the rest itself.
+    let saved_vm = state.ctx.vm;
+    let saved_func_id = state.ctx.current_func_id;
+    let saved_closure = state.ctx.closure;
+    let saved_defining_class = state.ctx.defining_class;
     let saved_depth = state.depth;
-    if state.ctx.vm.is_null() {
+    if saved_vm.is_null() {
         state.ctx.vm = vm as *mut _ as *mut u8;
     }
     state.ctx.current_func_id = func_id.0 as u64;
@@ -3284,7 +3328,10 @@ pub fn call_found_closure(
     let result = unsafe { call_jit_with_shadow_st(j, vm, fn_ptr, func_id, args) };
     let state = unsafe { &mut *j };
     state.depth = saved_depth;
-    state.ctx = saved_ctx;
+    state.ctx.vm = saved_vm;
+    state.ctx.current_func_id = saved_func_id;
+    state.ctx.closure = saved_closure;
+    state.ctx.defining_class = saved_defining_class;
     result
 }
 
@@ -3458,8 +3505,8 @@ fn dispatch_method(
 /// Call a method with 0 extra args. Codegen: `[receiver, method_sym]`
 /// On aarch64, wren_call_N uses `#[naked]` wrappers to capture the caller's
 /// frame pointer (x29) at zero cost to JIT code. The FP is passed as the
-/// LAST argument to the inner function, which pushes it to JIT_FRAME_STACK
-/// for GC stack walking.
+/// LAST argument to the inner function, which pushes it to the thread's
+/// JIT frames for GC stack walking.
 ///
 /// # Safety
 /// Called only from JIT-compiled code via `CallRuntime`. The receiver and
@@ -3495,32 +3542,65 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0, 0)
 }
-extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
-    note_wren_call_entry();
-    // Push the receiver as a JIT root before dispatch so a GC fired
-    // by the callee's allocator (or any nested helper) can update
-    // the pointer through the shared roots Vec — register-passed
-    // u64 args are otherwise invisible to the collector and decay
-    // to freed memory the moment generational promote runs.
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &[recv]) {
-            return result;
+#[inline(always)]
+fn root_at(j: *mut JitThread, idx: usize) -> Value {
+    unsafe { (&(*j).roots)[idx] }
+}
+
+/// One send issued by compiled code. The receiver and arguments come
+/// in registers, invisible to the collector, so they are rooted first and
+/// read back from the roots around anything that may allocate. The
+/// thread's JIT state is fetched once; the whole send works through it.
+#[inline(always)]
+fn wren_call_inner<const M: usize>(
+    method: u64,
+    words: [u64; M],
+    jit_fp: u64,
+    ret_addr: u64,
+) -> u64 {
+    let j = jit_state();
+    let root_base = unsafe {
+        let roots = &mut (*j).roots;
+        let base = roots.len();
+        roots.extend(words.iter().map(|&w| Value::from_bits(w)));
+        base
+    };
+    let result = match unsafe { vm_at(j) } {
+        Some(vm) => {
+            vm.engine
+                .note_runtime_call_stats(|s| s.wren_call_entries += 1);
+            let args: [Value; M] = std::array::from_fn(|i| root_at(j, root_base + i));
+            match try_dispatch_call_noframe_fast(vm, args[0], method, &args) {
+                Frameless::Done(result) => result,
+                Frameless::Host(host_fn, context) => {
+                    let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+                    push_frame_on(j, jit_fp as usize, func_id, ret_addr as usize);
+                    let result = host_fn(vm, context, &args).to_bits();
+                    let result = match vm.pending_fiber_action.take() {
+                        Some(action) => handle_jit_fiber_action(vm, action),
+                        None => result,
+                    };
+                    unsafe { (*j).frames.pop() };
+                    result
+                }
+                Frameless::Miss => {
+                    let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+                    push_frame_on(j, jit_fp as usize, func_id, ret_addr as usize);
+                    let args: [Value; M] = std::array::from_fn(|i| root_at(j, root_base + i));
+                    let result = dispatch_call_rooted(vm, j, args[0], method, &args);
+                    unsafe { (*j).frames.pop() };
+                    result
+                }
+            }
         }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let result = dispatch_call(recv, method, &[recv]);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+        None => Value::null().to_bits(),
+    };
+    unsafe { (*j).roots.truncate(root_base) };
     result
+}
+
+extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
+    wren_call_inner(method, [receiver], jit_fp, ret_addr)
 }
 
 /// # Safety
@@ -3563,30 +3643,7 @@ extern "C" fn wren_call_1_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
-    note_wren_call_entry();
-    // Root recv + a0 — see wren_call_0_inner for the rationale.
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1)];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1)];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
-    result
+    wren_call_inner(method, [receiver, a0], jit_fp, ret_addr)
 }
 
 /// # Safety
@@ -3630,30 +3687,7 @@ extern "C" fn wren_call_2_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
-    note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    push_jit_root(Value::from_bits(a1));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1), jit_root_at(root_base + 2)];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1), jit_root_at(root_base + 2)];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
-    result
+    wren_call_inner(method, [receiver, a0, a1], jit_fp, ret_addr)
 }
 
 /// # Safety
@@ -3734,41 +3768,7 @@ extern "C" fn wren_call_3_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
-    note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    push_jit_root(Value::from_bits(a1));
-    push_jit_root(Value::from_bits(a2));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-        ];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-        ];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
-    result
+    wren_call_inner(method, [receiver, a0, a1, a2], jit_fp, ret_addr)
 }
 
 /// # Safety
@@ -3850,34 +3850,47 @@ pub extern "C" fn wren_call_4(
 /// non-mainstream-arch fallback the lower-arity helpers already
 /// take.
 fn wren_call_n_inner(receiver: u64, method: u64, args_in: &[u64]) -> u64 {
-    note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    for &a in args_in {
-        push_jit_root(Value::from_bits(a));
-    }
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let mut args = Vec::with_capacity(args_in.len() + 1);
-        args.push(recv);
-        for i in 0..args_in.len() {
-            args.push(jit_root_at(root_base + 1 + i));
+    let j = jit_state();
+    let root_base = unsafe {
+        let roots = &mut (*j).roots;
+        let base = roots.len();
+        roots.push(Value::from_bits(receiver));
+        roots.extend(args_in.iter().map(|&w| Value::from_bits(w)));
+        base
+    };
+    let n = args_in.len() + 1;
+    let read = |i: usize| root_at(j, root_base + i);
+    let result = match unsafe { vm_at(j) } {
+        Some(vm) => {
+            vm.engine
+                .note_runtime_call_stats(|s| s.wren_call_entries += 1);
+            let args: Vec<Value> = (0..n).map(read).collect();
+            match try_dispatch_call_noframe_fast(vm, args[0], method, &args) {
+                Frameless::Done(result) => result,
+                Frameless::Host(host_fn, context) => {
+                    let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+                    push_frame_on(j, 0, func_id, 0);
+                    let result = host_fn(vm, context, &args).to_bits();
+                    let result = match vm.pending_fiber_action.take() {
+                        Some(action) => handle_jit_fiber_action(vm, action),
+                        None => result,
+                    };
+                    unsafe { (*j).frames.pop() };
+                    result
+                }
+                Frameless::Miss => {
+                    let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+                    push_frame_on(j, 0, func_id, 0);
+                    let args: Vec<Value> = (0..n).map(read).collect();
+                    let result = dispatch_call_rooted(vm, j, args[0], method, &args);
+                    unsafe { (*j).frames.pop() };
+                    result
+                }
+            }
         }
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(0, read_jit_ctx().current_func_id as u32, 0);
-        let recv = jit_root_at(root_base);
-        let mut args = Vec::with_capacity(args_in.len() + 1);
-        args.push(recv);
-        for i in 0..args_in.len() {
-            args.push(jit_root_at(root_base + 1 + i));
-        }
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+        None => Value::null().to_bits(),
+    };
+    unsafe { (*j).roots.truncate(root_base) };
     result
 }
 
@@ -3977,44 +3990,7 @@ extern "C" fn wren_call_4_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
-    note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    push_jit_root(Value::from_bits(a1));
-    push_jit_root(Value::from_bits(a2));
-    push_jit_root(Value::from_bits(a3));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-            jit_root_at(root_base + 4),
-        ];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-            jit_root_at(root_base + 4),
-        ];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
-    result
+    wren_call_inner(method, [receiver, a0, a1, a2, a3], jit_fp, ret_addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -6535,6 +6511,11 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_ic_native_1" => Some(wren_ic_native_1 as *const () as usize),
         "wren_ic_native_2" => Some(wren_ic_native_2 as *const () as usize),
         "wren_ic_native_3" => Some(wren_ic_native_3 as *const () as usize),
+        // Inline IC host dispatch for kind=8
+        "wren_ic_host_0" => Some(wren_ic_host_0 as *const () as usize),
+        "wren_ic_host_1" => Some(wren_ic_host_1 as *const () as usize),
+        "wren_ic_host_2" => Some(wren_ic_host_2 as *const () as usize),
+        "wren_ic_host_3" => Some(wren_ic_host_3 as *const () as usize),
         _ => None,
     }
 }
@@ -6601,6 +6582,114 @@ ic_native_inner!(wren_ic_native_1_inner, a0);
 ic_native_inner!(wren_ic_native_2_inner, a0, a1);
 #[cfg(feature = "host")]
 ic_native_inner!(wren_ic_native_3_inner, a0, a1, a2);
+
+/// Host method dispatch from an inline IC hit (kind=8): the fn and its
+/// context word come from the entry, the receiver and arguments from
+/// the call. The thread's JIT state is read once.
+#[cfg(feature = "host")]
+macro_rules! ic_host_inner {
+    ($name:ident, $($arg:ident),*) => {
+        extern "C" fn $name(host_fn: u64, context: u64, recv: u64, $($arg: u64,)* jit_fp: u64) -> u64 {
+            let ret_addr = if jit_fp != 0 {
+                unsafe { *((jit_fp as usize + 8) as *const usize) }
+            } else { 0 };
+            let j = jit_state();
+            let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+            push_frame_on(j, jit_fp as usize, func_id, ret_addr);
+            let result = match unsafe { vm_at(j) } {
+                Some(vm) => {
+                    let f: crate::runtime::object::HostFn = unsafe { std::mem::transmute(host_fn) };
+                    let result = f(vm, context as usize, &[Value::from_bits(recv), $(Value::from_bits($arg)),*]).to_bits();
+                    match vm.pending_fiber_action.take() {
+                        Some(action) => handle_jit_fiber_action(vm, action),
+                        None => result,
+                    }
+                }
+                None => Value::null().to_bits(),
+            };
+            unsafe { (*j).frames.pop() };
+            result
+        }
+    };
+}
+
+#[cfg(feature = "host")]
+ic_host_inner!(wren_ic_host_0_inner,);
+#[cfg(feature = "host")]
+ic_host_inner!(wren_ic_host_1_inner, a0);
+#[cfg(feature = "host")]
+ic_host_inner!(wren_ic_host_2_inner, a0, a1);
+#[cfg(feature = "host")]
+ic_host_inner!(wren_ic_host_3_inner, a0, a1, a2);
+
+/// # Safety
+/// Called only from JIT-compiled code via inline IC dispatch (kind=8).
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
+#[unsafe(naked)]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_ic_host_0(_hfn: u64, _ctx: u64, _recv: u64) -> u64 {
+    core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_host_0_inner);
+}
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_ic_host_0(hfn: u64, ctx: u64, recv: u64) -> u64 {
+    wren_ic_host_0_inner(hfn, ctx, recv, 0)
+}
+
+/// # Safety
+/// Called only from JIT-compiled code via inline IC dispatch (kind=8).
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
+#[unsafe(naked)]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_ic_host_1(_hfn: u64, _ctx: u64, _recv: u64, _a0: u64) -> u64 {
+    core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_host_1_inner);
+}
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_ic_host_1(hfn: u64, ctx: u64, recv: u64, a0: u64) -> u64 {
+    wren_ic_host_1_inner(hfn, ctx, recv, a0, 0)
+}
+
+/// # Safety
+/// Called only from JIT-compiled code via inline IC dispatch (kind=8).
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
+#[unsafe(naked)]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_ic_host_2(
+    _hfn: u64,
+    _ctx: u64,
+    _recv: u64,
+    _a0: u64,
+    _a1: u64,
+) -> u64 {
+    core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_host_2_inner);
+}
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_ic_host_2(hfn: u64, ctx: u64, recv: u64, a0: u64, a1: u64) -> u64 {
+    wren_ic_host_2_inner(hfn, ctx, recv, a0, a1, 0)
+}
+
+/// # Safety
+/// Called only from JIT-compiled code via inline IC dispatch (kind=8).
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
+#[unsafe(naked)]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub unsafe extern "C" fn wren_ic_host_3(
+    _hfn: u64,
+    _ctx: u64,
+    _recv: u64,
+    _a0: u64,
+    _a1: u64,
+    _a2: u64,
+) -> u64 {
+    core::arch::naked_asm!("mov x6, x29", "b {inner}", inner = sym wren_ic_host_3_inner);
+}
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_ic_host_3(hfn: u64, ctx: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_ic_host_3_inner(hfn, ctx, recv, a0, a1, a2, 0)
+}
 
 // #[naked] wrappers capture x29 (JIT FP) as the last argument.
 /// # Safety
