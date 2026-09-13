@@ -2144,6 +2144,21 @@ pub fn set_jit_bump_region(addr: usize) {
     JIT_BUMP_REGION.with(|c| c.set(addr));
 }
 
+thread_local! {
+    /// The VM's List class, for lists compiled code lays out itself;
+    /// 0 keeps the helper.
+    static JIT_LIST_CLASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the List class for this thread's next compile; 0 clears it.
+pub fn set_jit_list_class(class: usize) {
+    JIT_LIST_CLASS.with(|c| c.set(class));
+}
+
+pub fn jit_list_class() -> usize {
+    JIT_LIST_CLASS.with(|c| c.get())
+}
+
 /// The bump region for the compile in progress, when inline
 /// allocation is on (`WLIFT_DISABLE_INLINE_ALLOC=1` keeps the helper;
 /// safe to run with).

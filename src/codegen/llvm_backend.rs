@@ -1755,27 +1755,11 @@ pub mod llvm {
                 }
 
                 I::MakeList(elems) => {
-                    if elems.len() <= 4 {
-                        let name = [
-                            "wren_make_list",
-                            "wren_make_list_1",
-                            "wren_make_list_2",
-                            "wren_make_list_3",
-                            "wren_make_list_4",
-                        ][elems.len()];
-                        let mut a = Vec::new();
-                        for e in elems {
-                            a.push(self.boxed(e)?);
-                        }
-                        self.call_helper(name, &a)?.into()
-                    } else {
-                        let list = self.call_helper("wren_make_list", &[])?;
-                        for e in elems {
-                            let v = self.boxed(e)?;
-                            self.call_helper("wren_list_add", &[list, v])?;
-                        }
-                        list.into()
+                    let mut a = Vec::with_capacity(elems.len());
+                    for e in elems {
+                        a.push(self.boxed(e)?);
                     }
+                    self.alloc_list(&a)?.into()
                 }
                 I::MakeMap(pairs) => {
                     let map = self.call_helper("wren_make_map", &[])?;
@@ -2571,58 +2555,18 @@ pub mod llvm {
         /// fields null, the start byte written; the helper when the
         /// region is out of room, the object exceeds a line, or there
         /// is no region.
-        /// A new instance of `class_val`. With `known`, the field count
-        /// is a compile-time constant and the fields in the `assigned`
-        /// mask are left for the stores that follow.
-        fn alloc_instance(
+        /// `size` bytes (16-aligned, at most a line) of plain object
+        /// from the bump region at `bump`, its start byte written; the
+        /// builder ends in the block holding the address, and `slow`
+        /// is taken when the region has no room.
+        fn bump_alloc(
             &mut self,
-            class_val: IntValue<'ctx>,
-            known: Option<(u16, u64)>,
+            bump: usize,
+            size: IntValue<'ctx>,
+            slow: BasicBlock<'ctx>,
         ) -> Result<IntValue<'ctx>, String> {
             use crate::runtime::gc_immix_heap::{
                 BUMP_CODES, BUMP_CUR, BUMP_LIMIT, BUMP_PLAIN_FLAG,
-            };
-            let bump = crate::codegen::jit_bump_region();
-            let known_size = known
-                .map(|(nf, _)| (INSTANCE_SIZE as u64 + VALUE_SIZE as u64 * nf as u64 + 15) & !15);
-            if bump == 0 || known_size.is_some_and(|s| s > 128) {
-                return self.call_helper("wren_alloc_instance", &[class_val]);
-            }
-            let slow = self.new_block("als");
-            let merge = self.new_block("alm");
-            let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
-            let class = self.and(class_val, self.c64(PTR_MASK))?;
-            let (nf, size) = match known {
-                Some((nf, _)) => (self.c64(nf as u64), self.c64(known_size.unwrap())),
-                None => {
-                    let nf_p = self.addr(class, CLASS_NUM_FIELDS as i64)?;
-                    let nf16 = self
-                        .b
-                        .build_load(self.sh.ctx.i16_type(), nf_p, "nf16")
-                        .map_err(|e| e.to_string())?
-                        .into_int_value();
-                    let nf = self
-                        .b
-                        .build_int_z_extend(nf16, self.i64t(), "nf")
-                        .map_err(|e| e.to_string())?;
-                    // size = (40 + 8 * nf + 15) & !15
-                    let raw = self
-                        .b
-                        .build_int_add(
-                            self.b
-                                .build_int_mul(nf, self.c64(VALUE_SIZE as u64), "fb")
-                                .map_err(|e| e.to_string())?,
-                            self.c64(INSTANCE_SIZE as u64 + 15),
-                            "raw",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let size = self.and(raw, self.c64(!15u64))?;
-                    let fits = self.icmp(IntPredicate::ULE, size, self.c64(128))?;
-                    let sized = self.new_block("alz");
-                    self.cbr(fits, sized, slow)?;
-                    self.b.position_at_end(sized);
-                    (nf, size)
-                }
             };
             let bump_v = self.c64(bump as u64);
             let cur = self.load64(bump_v, BUMP_CUR as i64)?;
@@ -2685,6 +2629,134 @@ pub mod llvm {
             self.b
                 .build_store(code_p, code)
                 .map_err(|e| e.to_string())?;
+            Ok(p)
+        }
+
+        /// A list of `elems` in one plain allocation, its elements
+        /// after the header; a literal too long for a line, or no bump
+        /// region, takes the helper.
+        fn alloc_list(&mut self, elems: &[IntValue<'ctx>]) -> Result<IntValue<'ctx>, String> {
+            use crate::runtime::object::{ObjType, FLAG_HEAP_BUFFER};
+            let bump = crate::codegen::jit_bump_region();
+            let list_class = crate::codegen::jit_list_class();
+            let n = elems.len();
+            // An empty literal starts with the room the runtime gives it.
+            let cap = if n == 0 { 8 } else { n };
+            let size = (LIST_SIZE as u64 + VALUE_SIZE as u64 * cap as u64 + 15) & !15;
+            if bump == 0 || list_class == 0 || size > 128 || n > 4 {
+                return self.make_list_helper(elems);
+            }
+            let slow = self.new_block("lls");
+            let merge = self.new_block("llm");
+            let p = self.bump_alloc(bump, self.c64(size), slow)?;
+            // Header: list type with the heap-buffer flag, no next, the
+            // list class; count and capacity share a word; the elements
+            // follow.
+            let type_word = ObjType::List as u64 | ((FLAG_HEAP_BUFFER as u64) << 24);
+            self.store64(p, 0, self.c64(type_word))?;
+            self.store64(p, HEADER_NEXT as i64, self.c64(0))?;
+            self.store64(p, HEADER_CLASS as i64, self.c64(list_class as u64))?;
+            self.store64(
+                p,
+                LIST_COUNT as i64,
+                self.c64(n as u64 | ((cap as u64) << 32)),
+            )?;
+            let elements = self
+                .b
+                .build_int_add(p, self.c64(LIST_SIZE as u64), "elements")
+                .map_err(|e| e.to_string())?;
+            self.store64(p, LIST_ELEMENTS as i64, elements)?;
+            for (i, v) in elems.iter().enumerate() {
+                self.store64(elements, i as i64 * VALUE_SIZE as i64, *v)?;
+            }
+            let boxed = self
+                .b
+                .build_or(p, self.c64(TAG_OBJ), "list")
+                .map_err(|e| e.to_string())?;
+            let fast_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let sv = self.make_list_helper(elems)?;
+            let slow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(
+                    self.i64t().into(),
+                    &[(boxed.into(), fast_end), (sv.into(), slow_end)],
+                )?
+                .into_int_value())
+        }
+
+        fn make_list_helper(&mut self, elems: &[IntValue<'ctx>]) -> Result<IntValue<'ctx>, String> {
+            if elems.len() <= 4 {
+                let name = [
+                    "wren_make_list",
+                    "wren_make_list_1",
+                    "wren_make_list_2",
+                    "wren_make_list_3",
+                    "wren_make_list_4",
+                ][elems.len()];
+                return self.call_helper(name, elems);
+            }
+            let list = self.call_helper("wren_make_list", &[])?;
+            for v in elems {
+                self.call_helper("wren_list_add", &[list, *v])?;
+            }
+            Ok(list)
+        }
+
+        /// A new instance of `class_val`. With `known`, the field count
+        /// is a compile-time constant and the fields in the `assigned`
+        /// mask are left for the stores that follow.
+        fn alloc_instance(
+            &mut self,
+            class_val: IntValue<'ctx>,
+            known: Option<(u16, u64)>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let bump = crate::codegen::jit_bump_region();
+            let known_size = known
+                .map(|(nf, _)| (INSTANCE_SIZE as u64 + VALUE_SIZE as u64 * nf as u64 + 15) & !15);
+            if bump == 0 || known_size.is_some_and(|s| s > 128) {
+                return self.call_helper("wren_alloc_instance", &[class_val]);
+            }
+            let slow = self.new_block("als");
+            let merge = self.new_block("alm");
+            let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+            let class = self.and(class_val, self.c64(PTR_MASK))?;
+            let (nf, size) = match known {
+                Some((nf, _)) => (self.c64(nf as u64), self.c64(known_size.unwrap())),
+                None => {
+                    let nf_p = self.addr(class, CLASS_NUM_FIELDS as i64)?;
+                    let nf16 = self
+                        .b
+                        .build_load(self.sh.ctx.i16_type(), nf_p, "nf16")
+                        .map_err(|e| e.to_string())?
+                        .into_int_value();
+                    let nf = self
+                        .b
+                        .build_int_z_extend(nf16, self.i64t(), "nf")
+                        .map_err(|e| e.to_string())?;
+                    // size = (40 + 8 * nf + 15) & !15
+                    let raw = self
+                        .b
+                        .build_int_add(
+                            self.b
+                                .build_int_mul(nf, self.c64(VALUE_SIZE as u64), "fb")
+                                .map_err(|e| e.to_string())?,
+                            self.c64(INSTANCE_SIZE as u64 + 15),
+                            "raw",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let size = self.and(raw, self.c64(!15u64))?;
+                    let fits = self.icmp(IntPredicate::ULE, size, self.c64(128))?;
+                    let sized = self.new_block("alz");
+                    self.cbr(fits, sized, slow)?;
+                    self.b.position_at_end(sized);
+                    (nf, size)
+                }
+            };
+            let p = self.bump_alloc(bump, size, slow)?;
             // Header: type byte, clear mark/generation/flags, no next,
             // the class, the field count, no owned fields, the fields
             // right after the header.

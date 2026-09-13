@@ -2912,6 +2912,16 @@ impl ExecutionEngine {
         unsafe { (*vm).gc.bump_region_ptr() }
     }
 
+    /// The List class of the running VM, for compiled code that lays
+    /// lists out itself.
+    fn list_class_for_compile() -> usize {
+        let vm = crate::codegen::runtime_fns::read_jit_ctx().vm as *const crate::runtime::vm::VM;
+        if vm.is_null() {
+            return 0;
+        }
+        unsafe { (*vm).list_class as usize }
+    }
+
     /// The compile clone with a `GuardNumAt` after every call whose
     /// inline cache only ever produced a Num, where the interpreter can
     /// take over if the guard fails: the function is a bound method,
@@ -3868,6 +3878,7 @@ impl ExecutionEngine {
         let modvars_cell = self.modvars_cell_addr(id);
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
         crate::codegen::set_jit_bump_region(Self::bump_region_for_compile());
+        crate::codegen::set_jit_list_class(Self::list_class_for_compile());
         let compiled_result =
             crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
@@ -3884,6 +3895,7 @@ impl ExecutionEngine {
             );
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
         crate::codegen::set_jit_bump_region(0);
+        crate::codegen::set_jit_list_class(0);
         let compiled = match compiled_result {
             Ok(compiled) => compiled,
             Err(_) => return false,
@@ -4077,6 +4089,7 @@ impl ExecutionEngine {
             };
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let bump_region = Self::bump_region_for_compile();
+        let list_class = Self::list_class_for_compile();
         // The finished compile brings the baseline code's next tick
         // forward so the install lands at its next entry or outermost
         // iteration instead of at the interpreter's next safepoint.
@@ -4158,6 +4171,7 @@ impl ExecutionEngine {
             crate::codegen::cranelift_backend::cl::set_jit_tier_hook(tier_hook);
             crate::codegen::cranelift_backend::cl::set_jit_func_id(id.0);
             crate::codegen::set_jit_bump_region(bump_region);
+            crate::codegen::set_jit_list_class(list_class);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -4174,6 +4188,7 @@ impl ExecutionEngine {
             crate::codegen::cranelift_backend::cl::set_jit_cold_headers(Default::default());
             crate::codegen::cranelift_backend::cl::set_jit_tier_hook(None);
             crate::codegen::set_jit_bump_region(0);
+            crate::codegen::set_jit_list_class(0);
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
             let result = result
                 .map_err(|e| {
