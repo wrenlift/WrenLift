@@ -459,6 +459,9 @@ pub struct VM {
     /// line up — without it, the subclass would start its own fields
     /// at slot 0 and clobber the parent's state.
     pub field_layouts: HashMap<String, Vec<String>>,
+    /// One function object per closure body, indexed by function id, so
+    /// every closure made from the same code shares it.
+    pub closure_fns: Vec<*mut ObjFn>,
 
     /// During `reload_module`, maps class-name → existing `ObjClass`
     /// pointer so the re-install loop can mutate the old class in
@@ -618,6 +621,7 @@ impl VM {
             #[cfg(feature = "host")]
             native_temp_dirs: Vec::new(),
             field_layouts: HashMap::new(),
+            closure_fns: Vec::new(),
             reload_class_table: None,
             module_mtimes: HashMap::new(),
             reload_callbacks: Vec::new(),
@@ -2673,6 +2677,46 @@ impl VM {
     }
 
     /// Allocate a GC-managed list and return it as a Value.
+    /// The function object closures of `fn_id` share; allocated on
+    /// first use and kept alive by the VM.
+    pub fn closure_fn(&mut self, fn_id: u32, upvalue_count: u16) -> *mut ObjFn {
+        let idx = fn_id as usize;
+        if let Some(&ptr) = self.closure_fns.get(idx) {
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+        let arity = self
+            .engine
+            .get_mir(super::engine::FuncId(fn_id))
+            .map(|m| m.arity)
+            .unwrap_or(0);
+        let name = self.interner.intern("<closure>");
+        let fn_ptr = self.gc.alloc_fn(name, arity, upvalue_count, fn_id);
+        unsafe {
+            (*fn_ptr).header.class = self.fn_class;
+            (*fn_ptr).trivial_getter_field = self
+                .engine
+                .trivial_getter_fields
+                .get(idx)
+                .copied()
+                .flatten()
+                .unwrap_or(u16::MAX);
+            (*fn_ptr).trivial_setter_field = self
+                .engine
+                .trivial_setter_fields
+                .get(idx)
+                .copied()
+                .flatten()
+                .unwrap_or(u16::MAX);
+        }
+        if self.closure_fns.len() <= idx {
+            self.closure_fns.resize(idx + 1, ptr::null_mut());
+        }
+        self.closure_fns[idx] = fn_ptr;
+        fn_ptr
+    }
+
     pub fn new_list(&mut self, elements: Vec<Value>) -> Value {
         let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
         for &elem in &elements {
@@ -3851,6 +3895,16 @@ impl VM {
             }
         }
 
+        // 3a. Shared closure function objects.
+        let closure_fns_start = roots.len();
+        for &ptr in &self.closure_fns {
+            roots.push(if ptr.is_null() {
+                Value::null()
+            } else {
+                Value::object(ptr as *mut u8)
+            });
+        }
+
         // 3b. Register files interpreter activations currently hold
         //     outside their frames.
         super::live_regs::collect_live_values(&mut roots);
@@ -4017,6 +4071,12 @@ impl VM {
             let val = roots[classes_start + i];
             if let Some(ptr) = val.as_object() {
                 *field = ptr as *mut ObjClass;
+            }
+        }
+
+        for (i, fn_ptr) in self.closure_fns.iter_mut().enumerate() {
+            if let Some(ptr) = roots[closure_fns_start + i].as_object() {
+                *fn_ptr = ptr as *mut ObjFn;
             }
         }
 

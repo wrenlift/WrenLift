@@ -3908,30 +3908,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let fn_id = read_u32(code, &mut pc);
                     let uv_count = read_u8(code, &mut pc) as usize;
 
-                    let closure_name = vm.interner.intern("<closure>");
-                    let arity = vm
-                        .engine
-                        .get_mir(FuncId(fn_id))
-                        .map(|mir| mir.arity)
-                        .unwrap_or(0);
-                    let fn_ptr = vm.gc.alloc_fn(closure_name, arity, uv_count as u16, fn_id);
-                    unsafe {
-                        (*fn_ptr).header.class = vm.fn_class;
-                        (*fn_ptr).trivial_getter_field = vm
-                            .engine
-                            .trivial_getter_fields
-                            .get(fn_id as usize)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(u16::MAX);
-                        (*fn_ptr).trivial_setter_field = vm
-                            .engine
-                            .trivial_setter_fields
-                            .get(fn_id as usize)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(u16::MAX);
-                    }
+                    let fn_ptr = vm.closure_fn(fn_id, uv_count as u16);
                     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
                     unsafe {
                         (*closure_ptr).header.class = vm.fn_class;

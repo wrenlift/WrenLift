@@ -4916,35 +4916,7 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
         None => return Value::null().to_bits(),
     };
 
-    let func_id = fn_id as u32;
-    let name_sym = vm.interner.intern("<closure>");
-    let uv_count = upvalue_vals.len() as u16;
-    let arity = vm
-        .engine
-        .get_mir(crate::runtime::engine::FuncId(func_id))
-        .map(|mir| mir.arity)
-        .unwrap_or(0);
-    let fn_ptr = vm.gc.alloc_fn(name_sym, arity, uv_count, func_id);
-    unsafe {
-        (*fn_ptr).header.class = vm.fn_class;
-        (*fn_ptr).trivial_getter_field = vm
-            .engine
-            .trivial_getter_fields
-            .get(func_id as usize)
-            .copied()
-            .flatten()
-            .unwrap_or(u16::MAX);
-        (*fn_ptr).trivial_setter_field = vm
-            .engine
-            .trivial_setter_fields
-            .get(func_id as usize)
-            .copied()
-            .flatten()
-            .unwrap_or(u16::MAX);
-    }
-    // Root the fn object before further allocations.
-    push_jit_root(Value::object(fn_ptr as *mut u8));
-
+    let fn_ptr = vm.closure_fn(fn_id as u32, upvalue_vals.len() as u16);
     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
     unsafe {
         (*closure_ptr).header.class = vm.fn_class;
@@ -4990,7 +4962,6 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     // before popping so `finish_alloc` sees the live closure
     // pointer, not the stale local `closure_ptr`.
     let closure_val = pop_jit_root().expect("closure root vanished");
-    pop_jit_root().expect("fn root vanished");
     unsafe { finish_alloc(vm, closure_val) }
 }
 
