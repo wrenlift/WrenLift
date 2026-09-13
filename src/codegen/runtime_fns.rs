@@ -1666,7 +1666,7 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
     // lands.
     #[cfg(not(target_arch = "wasm32"))]
     if vm.gc.is_immix() {
-        if !collect_suppressed() && vm.gc.should_collect() {
+        if vm.gc.should_collect() && !collect_suppressed() {
             let pinned = std::hint::black_box(val);
             vm.collect_garbage();
             if vm.gc.take_freed_code_objects() {

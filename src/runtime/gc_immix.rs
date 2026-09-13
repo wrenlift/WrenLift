@@ -334,8 +334,12 @@ impl GcAllocator for ImmixGc {
         let p = self.alloc_raw(total) as *mut ObjInstance;
         let fields = if num_fields > 0 {
             let f = unsafe { (p as *mut u8).add(header_size) as *mut Value };
-            for i in 0..num_fields {
-                unsafe { f.add(i).write(Value::null()) };
+            // Written one slot at a time: a few fields are the common
+            // case, and a pattern fill of that size costs a call.
+            let mut i = 0;
+            while i < num_fields {
+                unsafe { f.add(i).write(std::hint::black_box(Value::null())) };
+                i += 1;
             }
             f
         } else {
