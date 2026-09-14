@@ -369,8 +369,12 @@ impl Sched {
     }
 
     /// Wait until a wake arrives, a timer is due, or `deadline`
-    /// passes. Returns at once while something is ready.
-    pub fn idle(&self, deadline: Option<Instant>) {
+    /// passes. Returns at once while something is ready. The thread
+    /// is safe for a collector while it waits.
+    ///
+    /// # Safety
+    /// `vm` is the view this world belongs to, on the calling thread.
+    pub unsafe fn idle(&self, deadline: Option<Instant>, vm: *mut crate::runtime::vm::VM) {
         if !self.ready.is_empty() {
             return;
         }
@@ -378,6 +382,13 @@ impl Sched {
         if let Some(Reverse((when, _, _))) = self.timers.peek() {
             until = Some(until.map_or(*when, |d| d.min(*when)));
         }
+        let mut spill = crate::runtime::vm::Spill::new();
+        unsafe { (*vm).enter_safe(&mut spill) };
+        self.wait_for_wake(until);
+        unsafe { (*vm).leave_safe() };
+    }
+
+    fn wait_for_wake(&self, until: Option<Instant>) {
         let mut wakes = self
             .endpoint
             .wakes
@@ -421,13 +432,21 @@ impl Sched {
 
     /// Drive the world until `token` is woken or `deadline` passes:
     /// the park of a stack that is not a task.
-    pub fn drive_until(&mut self, token: Token, deadline: Option<Instant>) -> bool {
+    ///
+    /// # Safety
+    /// As [`Sched::idle`].
+    pub unsafe fn drive_until(
+        &mut self,
+        token: Token,
+        deadline: Option<Instant>,
+        vm: *mut crate::runtime::vm::VM,
+    ) -> bool {
         loop {
             self.step();
             if let Some(woken) = claim(token, deadline.is_some_and(|d| Instant::now() >= d)) {
                 return woken;
             }
-            self.idle(deadline);
+            unsafe { self.idle(deadline, vm) };
         }
     }
 
@@ -470,14 +489,18 @@ mod tests {
         let mut sched = Sched::new();
         let token = sched.new_waiter();
         let deadline = Some(Instant::now() + Duration::from_millis(5));
-        assert!(!sched.drive_until(token, deadline));
+        let mut vm = crate::runtime::vm::VM::new_default();
+        let vm_ptr: *mut crate::runtime::vm::VM = &mut vm;
+        assert!(!unsafe { sched.drive_until(token, deadline, vm_ptr) });
 
         let token = sched.new_waiter();
         let woken = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(5));
             wake(token)
         });
-        assert!(sched.drive_until(token, Some(Instant::now() + Duration::from_secs(5))));
+        assert!(unsafe {
+            sched.drive_until(token, Some(Instant::now() + Duration::from_secs(5)), vm_ptr)
+        });
         assert!(woken.join().unwrap());
     }
 }

@@ -24,21 +24,32 @@ use crate::portable_time::Instant;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub struct ImmixGc {
     /// The table's heap handle; opaque here.
     heap: *mut c_void,
-    intern_table: HashMap<u64, Vec<*mut ObjString>>,
+    /// Locked only once the program has several threads.
+    intern_table: Mutex<HashMap<u64, Vec<*mut ObjString>>>,
     /// Object counters and cycle timing; the byte counters come from
     /// the memory side at `stats()`.
     stats: GcStats,
     object_count: usize,
+    /// The program has several threads: allocations are counted
+    /// atomically and the tables are locked.
+    threaded: bool,
+    threaded_allocs: AtomicUsize,
     /// A sweep freed a class, closure, function or module, so
     /// address-keyed caches must be dropped.
     freed_code_objects: bool,
     /// Every fiber allocated and not yet swept, so a collection finds
     /// the fiber stacks without walking the heap.
-    fibers: Vec<*mut ObjFiber>,
+    fibers: Mutex<Vec<*mut ObjFiber>>,
 }
 
 thread_local! {
@@ -95,11 +106,13 @@ impl ImmixGc {
     pub fn new() -> Self {
         Self {
             heap: rt::heap_new(),
-            intern_table: HashMap::new(),
+            intern_table: Mutex::new(HashMap::new()),
             stats: GcStats::default(),
             object_count: 0,
+            threaded: false,
+            threaded_allocs: AtomicUsize::new(0),
             freed_code_objects: false,
-            fibers: Vec::new(),
+            fibers: Mutex::new(Vec::new()),
         }
     }
 
@@ -136,6 +149,10 @@ impl ImmixGc {
     }
 
     fn count_allocation(&mut self) {
+        if self.threaded {
+            self.threaded_allocs.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         self.stats.objects_allocated += 1;
         self.object_count += 1;
         if self.object_count > self.stats.peak_objects {
@@ -158,7 +175,7 @@ impl ImmixGc {
     /// Iterate every currently-allocated `ObjFiber`. See
     /// `GcImpl::for_each_fiber` for the contract.
     pub fn for_each_fiber<F: FnMut(*mut ObjFiber)>(&self, mut f: F) {
-        for &fiber in &self.fibers {
+        for &fiber in lock(&self.fibers).iter() {
             f(fiber);
         }
     }
@@ -177,6 +194,16 @@ impl ImmixGc {
             unsafe { rt::bump_region(self.heap) as usize }
         } else {
             0
+        }
+    }
+
+    /// Close the compiled region: from here the program's threads
+    /// each allocate through regions of their own. Only the built-in
+    /// heap has one; a host's heap is its own to run.
+    pub fn set_multithreaded(&mut self) {
+        self.threaded = true;
+        if rt::heap_is_builtin() {
+            unsafe { (*(self.heap as *mut super::gc_immix_heap::ImmixHeap)).set_multithreaded() }
         }
     }
 
@@ -236,8 +263,10 @@ impl ImmixGc {
         unsafe { rt::collect_end(heap) };
         CLOSING.set(prev);
         let m = unsafe { rt::stats(heap) };
+        self.stats.objects_allocated += self.threaded_allocs.swap(0, Ordering::Relaxed);
         self.stats.objects_freed = m.freed_objects;
         self.object_count = self.stats.objects_allocated.saturating_sub(m.freed_objects);
+        self.stats.peak_objects = self.stats.peak_objects.max(self.object_count);
         self.stats.major_collections += 1;
         self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
     }
@@ -248,10 +277,11 @@ impl ImmixGc {
                 return;
             }
             let s = &*(header as *mut ObjString);
-            if let Some(ptrs) = self.intern_table.get_mut(&s.hash) {
+            let mut table = lock(&self.intern_table);
+            if let Some(ptrs) = table.get_mut(&s.hash) {
                 ptrs.retain(|&p| p != header as *mut ObjString);
                 if ptrs.is_empty() {
-                    self.intern_table.remove(&s.hash);
+                    table.remove(&s.hash);
                 }
             }
         }
@@ -314,6 +344,17 @@ pub(super) unsafe fn object_trace<F: FnMut(*mut u8)>(obj: *mut u8, mut mark: F) 
     gc::for_each_child(obj as *mut ObjHeader, &mut |child| mark(child as *mut u8));
 }
 
+fn lookup_interned(
+    table: &HashMap<u64, Vec<*mut ObjString>>,
+    hash: u64,
+    s: &str,
+) -> Option<*mut ObjString> {
+    let ptrs = table.get(&hash)?;
+    ptrs.iter()
+        .copied()
+        .find(|&ptr| unsafe { (*ptr).value == s })
+}
+
 /// Release what the dead object `obj` owns outside the heap. While the
 /// collector that allocated it is closing a cycle on this thread, also
 /// unlink it from the intern table and count it.
@@ -330,7 +371,7 @@ pub(super) unsafe fn object_drop(obj: *mut u8) {
             ObjType::Class | ObjType::Closure | ObjType::Fn | ObjType::Module => {
                 gc.freed_code_objects = true;
             }
-            ObjType::Fiber => gc.fibers.retain(|&f| f as *mut ObjHeader != header),
+            ObjType::Fiber => lock(&gc.fibers).retain(|&f| f as *mut ObjHeader != header),
             ObjType::String => gc.unlink_intern(header),
             _ => {}
         }
@@ -428,7 +469,7 @@ impl GcAllocator for ImmixGc {
     }
     fn alloc_fiber(&mut self) -> *mut ObjFiber {
         let f = self.alloc(ObjFiber::new());
-        self.fibers.push(f);
+        lock(&self.fibers).push(f);
         f
     }
     fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
@@ -485,15 +526,33 @@ impl GcAllocator for ImmixGc {
 
     fn intern_string(&mut self, s: String) -> *mut ObjString {
         let hash = fnv1a_hash_bytes(s.as_bytes());
-        if let Some(ptrs) = self.intern_table.get(&hash) {
-            for &ptr in ptrs {
-                if unsafe { (*ptr).value == s } {
-                    return ptr;
-                }
-            }
+        // The lock is taken only when other threads can be in the
+        // table; alone, the table is this thread's.
+        let found = if self.threaded {
+            lookup_interned(&lock(&self.intern_table), hash, &s)
+        } else {
+            lookup_interned(
+                self.intern_table
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner()),
+                hash,
+                &s,
+            )
+        };
+        if let Some(ptr) = found {
+            return ptr;
         }
         let ptr = self.alloc_string(s);
-        self.intern_table.entry(hash).or_default().push(ptr);
+        if self.threaded {
+            lock(&self.intern_table).entry(hash).or_default().push(ptr);
+        } else {
+            self.intern_table
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(hash)
+                .or_default()
+                .push(ptr);
+        }
         ptr
     }
 
@@ -592,7 +651,7 @@ mod tests {
         assert_eq!(gc.intern_string("hello".to_string()), a);
         let bye_hash = fnv1a_hash_bytes(b"bye");
         assert!(
-            !gc.intern_table.contains_key(&bye_hash),
+            !lock(&gc.intern_table).contains_key(&bye_hash),
             "dead interned string still in the table"
         );
     }

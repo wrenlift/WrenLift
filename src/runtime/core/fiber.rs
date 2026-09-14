@@ -1044,7 +1044,7 @@ pub(crate) fn park_on(
         Ok(false) => {}
     }
     match sched.context() {
-        Context::Driver => Some(sched.drive_until(token, deadline)),
+        Context::Driver => Some(unsafe { sched.drive_until(token, deadline, vm) }),
         Context::Task => {
             sched.request_park(token, deadline);
             if try_krio_yield(Value::null()).is_none() {
@@ -1159,10 +1159,13 @@ fn fiber_idle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Ok(deadline) = deadline_arg(ctx, "Fiber.idle", args[1]) else {
         return Value::null();
     };
+    let Some(vm) = sched_vm(ctx, "Fiber.idle") else {
+        return Value::null();
+    };
     let Some(sched) = driver_sched(ctx, "Fiber.idle") else {
         return Value::null();
     };
-    sched.idle(deadline);
+    unsafe { sched.idle(deadline, vm) };
     Value::null()
 }
 

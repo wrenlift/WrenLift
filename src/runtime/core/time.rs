@@ -58,8 +58,19 @@ fn time_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     // expected to drive a cooperative scheduler that translates
     // sleep into a `setTimeout` + `Fiber.yield`; the runtime itself
     // just no-ops the request.
+    // The thread is safe for a collector while it sleeps.
     #[cfg(feature = "host")]
-    std::thread::sleep(Duration::from_secs_f64(secs));
+    {
+        let vm = ctx.krio_vm_raw_ptr() as *mut VM;
+        let mut spill = crate::runtime::vm::Spill::new();
+        if !vm.is_null() {
+            unsafe { (*vm).enter_safe(&mut spill) };
+        }
+        std::thread::sleep(Duration::from_secs_f64(secs));
+        if !vm.is_null() {
+            unsafe { (*vm).leave_safe() };
+        }
+    }
     #[cfg(not(feature = "host"))]
     let _ = secs;
     Value::null()

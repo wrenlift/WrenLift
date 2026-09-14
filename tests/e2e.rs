@@ -5889,6 +5889,55 @@ for (t in tickers) System.print(t.join(5000))
 }
 
 #[test]
+fn e2e_two_threads_allocate_and_collect_one_heap() {
+    // Two views of one program allocate on two threads; a collection
+    // on either stops the other at its safepoint and keeps what it
+    // holds. Both threads touch only the runtime API, so nothing
+    // Wren-level runs in parallel.
+    use wren_lift::runtime::object::NativeContext;
+    use wren_lift::runtime::vm::Spill;
+    let mut a = VM::new_default();
+    fn churn(vm: &mut VM, tag: &str) -> Vec<String> {
+        vm.leave_safe();
+        let mut kept: Vec<String> = Vec::new();
+        for i in 0..200_000 {
+            let text = format!("{tag}-{i}");
+            let v = vm.alloc_string(text.clone());
+            if i % 97 == 0 {
+                vm.api_stack.push(v);
+                kept.push(text);
+            }
+            if i % 1000 == 0 {
+                vm.poll_gc();
+            }
+            if i % 50_000 == 0 {
+                vm.collect_garbage();
+            }
+        }
+        let mut spill = Spill::new();
+        vm.enter_safe(&mut spill);
+        let out: Vec<String> = vm.api_stack[vm.api_stack.len() - kept.len()..]
+            .iter()
+            .map(|&v| wren_lift::runtime::core::as_string(v).to_owned())
+            .collect();
+        vm.leave_safe();
+        std::hint::black_box(&spill);
+        assert_eq!(out, kept);
+        kept
+    }
+    let worker = a.spawn_thread(|b| churn(b, "b"));
+    churn(&mut a, "a");
+    let kept_b = worker.join().unwrap();
+    assert_eq!(kept_b.len(), 200_000 / 97 + 1);
+    // Both threads asked for collections; each stopped the other.
+    assert!(
+        a.gc.stats().major_collections >= 8,
+        "{}",
+        a.gc.stats().major_collections
+    );
+}
+
+#[test]
 fn e2e_compiled_bodies_yield_from_fiber_stacks() {
     // With fibers on stacks of their own, a body that yields is
     // compiled like any other. Two fibers run the same closure code

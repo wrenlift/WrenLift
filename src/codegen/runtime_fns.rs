@@ -1705,7 +1705,7 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
     // lands.
     #[cfg(not(target_arch = "wasm32"))]
     if vm.gc.is_immix() {
-        if vm.gc.should_collect() && !collect_suppressed() {
+        if vm.safepoint_due() && !collect_suppressed() {
             let pinned = std::hint::black_box(val);
             vm.collect_garbage();
             if vm.gc.take_freed_code_objects() {
@@ -1757,6 +1757,12 @@ pub extern "C" fn wren_jit_roots_snapshot() -> u64 {
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_jit_roots_restore(len: u64) {
     jit_roots_restore_len(len as usize);
+}
+
+/// A copy of this thread's JIT roots, for publishing to a collector
+/// on another thread.
+pub fn jit_roots_snapshot() -> Vec<Value> {
+    unsafe { (*jit_state()).roots.clone() }
 }
 
 /// Take all JIT roots for GC scanning. Returns the values (caller must write back
@@ -1914,6 +1920,11 @@ pub fn pop_native_shadow_frame() {
         }
         sync_flat_shadow_ptr(stack);
     });
+}
+
+/// A copy of this thread's native shadow roots.
+pub fn native_shadow_roots_snapshot() -> Vec<Value> {
+    FLAT_SHADOW.with(|s| unsafe { (*s.get()).roots.clone() })
 }
 
 pub fn take_native_shadow_roots() -> (Vec<usize>, Vec<Value>) {

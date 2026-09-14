@@ -1747,7 +1747,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                 if !unlimited_steps && steps > vm.config.step_limit {
                     return Err(RuntimeError::StepLimitExceeded);
                 }
-                if vm.gc.should_collect() || vm.gc_requested {
+                if vm.safepoint_due() || vm.gc_requested {
                     vm.gc_requested = false;
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {

@@ -377,6 +377,10 @@ pub struct Shared {
     #[cfg(feature = "host")]
     pub isolate_arg: Option<crate::runtime::isolate::Xfer>,
 
+    /// The program's threads and the collector's request to them.
+    #[cfg(feature = "host")]
+    pub world: super::stw::World,
+
     /// The `isolate` module's classes, null until it is imported.
     #[cfg(feature = "host")]
     pub isolate_class: *mut ObjClass,
@@ -507,6 +511,13 @@ unsafe impl Sync for SharedCell {}
 pub struct VM {
     /// The program: everything the threads running it have in common.
     shared: Arc<SharedCell>,
+    /// This thread's standing with the collector.
+    #[cfg(feature = "host")]
+    pub thread: Arc<super::stw::ThreadState>,
+    /// Nesting of `interpret` on this thread: the outermost call is
+    /// where the thread becomes running and safe again.
+    #[cfg(feature = "host")]
+    interpret_depth: u32,
 
     // -- Execution state --
     pub fiber: *mut ObjFiber,
@@ -617,6 +628,10 @@ impl VM {
     pub fn new_thread(&self) -> VM {
         VM {
             shared: Arc::clone(&self.shared),
+            #[cfg(feature = "host")]
+            thread: self.world.join(),
+            #[cfg(feature = "host")]
+            interpret_depth: 0,
             fiber: ptr::null_mut(),
             api_stack: Vec::new(),
             has_error: false,
@@ -733,13 +748,21 @@ impl VM {
             #[cfg(feature = "host")]
             isolate_arg: None,
             #[cfg(feature = "host")]
+            world: super::stw::World::new(),
+            #[cfg(feature = "host")]
             isolate_class: ptr::null_mut(),
             #[cfg(feature = "host")]
             channel_class: ptr::null_mut(),
             staged_hatch_modules: HashMap::new(),
         };
+        #[cfg(feature = "host")]
+        let thread = shared.world.join();
         let mut vm = Self {
             shared: Arc::new(SharedCell(UnsafeCell::new(shared))),
+            #[cfg(feature = "host")]
+            thread,
+            #[cfg(feature = "host")]
+            interpret_depth: 0,
 
             fiber: ptr::null_mut(),
 
@@ -1410,6 +1433,28 @@ impl VM {
     /// Pipeline: lex → parse → sema → lower to MIR → optimize → execute.
     /// Execution happens inside a Fiber context via run_fiber().
     pub fn interpret(&mut self, module_name: &str, source: &str) -> InterpretResult {
+        #[cfg(feature = "host")]
+        {
+            if self.interpret_depth == 0 {
+                self.leave_safe();
+            }
+            self.interpret_depth += 1;
+        }
+        let result = self.interpret_inner(module_name, source);
+        #[cfg(feature = "host")]
+        {
+            self.interpret_depth -= 1;
+            if self.interpret_depth == 0 {
+                // Back in the embedder: safe where the stack stands.
+                let mut spill = Spill::new();
+                self.enter_safe(&mut spill);
+                std::hint::black_box(&spill);
+            }
+        }
+        result
+    }
+
+    fn interpret_inner(&mut self, module_name: &str, source: &str) -> InterpretResult {
         use crate::diagnostics::Severity;
         use crate::mir::opt::{
             self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
@@ -4090,6 +4135,36 @@ impl VM {
     fn validate_stackmap_coverage(&self) {}
 
     pub fn collect_garbage(&mut self) {
+        // With other threads in the program, they stop for the
+        // collection; a request already out means one of them is the
+        // collector, and this thread parks for it first.
+        #[cfg(feature = "host")]
+        let stopped = if self.gc.is_immix() && self.world.thread_count() > 1 {
+            if self.world.requested() {
+                self.park();
+                if !self.gc.should_collect() {
+                    return;
+                }
+            }
+            let mut spill = Spill::new();
+            self.enter_safe(&mut spill);
+            // The world outlives this call; the guard is not tied to
+            // the borrow of `self` the collection needs.
+            let world: *const super::stw::World = &self.world;
+            let guard = unsafe { (*world).stop(&self.thread) };
+            Some((guard, spill))
+        } else {
+            None
+        };
+        self.collect_garbage_stopped();
+        #[cfg(feature = "host")]
+        if let Some((guard, spill)) = stopped {
+            self.world.resume(guard);
+            std::hint::black_box(&spill);
+        }
+    }
+
+    fn collect_garbage_stopped(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
 
         // 1. API stack
@@ -4262,6 +4337,12 @@ impl VM {
         #[cfg(feature = "host")]
         if let Some(sched) = &self.sched {
             roots.extend(sched.fibers().map(|f| Value::object(f as *mut u8)));
+        }
+
+        // 10e. What the other threads published when they stopped.
+        #[cfg(feature = "host")]
+        for other in self.world.others(&self.thread) {
+            roots.extend_from_slice(&other.roots.lock().unwrap_or_else(|e| e.into_inner()));
         }
 
         // `WLIFT_VALIDATE_BARRIERS=1` opts the GC into a pre-collect
@@ -4453,14 +4534,15 @@ impl VM {
         }
     }
 
-    /// Native stack windows for the conservative scan. The running
-    /// chain starts at krio's current fiber and follows each resume
-    /// point outward to the host stack: the innermost stack is live
-    /// from the register spill, every other chain member from the
-    /// point its child was resumed at. Fibers off the chain are
-    /// suspended and live from their saved sp. krio keeps a stale
-    /// `caller_sp` after a yield, so membership is decided by the
-    /// chain walk, never by that field alone.
+    /// Native stack windows for the conservative scan, for this thread
+    /// and every other thread of the program stopped at a safepoint.
+    /// A thread's running chain starts at the krio fiber it is inside
+    /// and follows each resume point outward to its host stack: the
+    /// innermost stack is live from the register spill, every other
+    /// chain member from the point its child was resumed at. Fibers on
+    /// no chain are suspended and live from their saved sp. krio keeps
+    /// a stale `caller_sp` after a yield, so membership is decided by
+    /// the chain walk, never by that field alone.
     #[cfg(all(unix, feature = "host"))]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         let mut spill = [0usize; super::stack_scan::SPILL_WORDS];
@@ -4469,6 +4551,20 @@ impl VM {
         let host_top = super::stack_scan::thread_stack_top();
         if host_top == 0 {
             return Vec::new();
+        }
+        // (probe, host top, current fiber id) per thread.
+        let mut threads: Vec<(usize, usize, u64)> =
+            vec![(probe, host_top, krio_fiber::current_fiber_id().unwrap_or(0))];
+        for other in self.world.others(&self.thread) {
+            let sp = other.sp.load(std::sync::atomic::Ordering::Relaxed);
+            let top = other.stack_top.load(std::sync::atomic::Ordering::Relaxed);
+            if sp != 0 && top != 0 {
+                threads.push((
+                    sp,
+                    top,
+                    other.fiber_id.load(std::sync::atomic::Ordering::Relaxed),
+                ));
+            }
         }
         // (id, lo, hi, saved_sp, caller_sp) per live krio fiber.
         let mut fibers: Vec<(u64, usize, usize, usize, usize)> = Vec::new();
@@ -4489,30 +4585,35 @@ impl VM {
                 k.caller_sp() as usize,
             ));
         });
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(fibers.len() + 1);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(fibers.len() + threads.len());
         let mut on_chain = vec![false; fibers.len()];
-        // Walk the running chain from the innermost fiber outward.
-        let mut start = probe;
-        let mut cur =
-            krio_fiber::current_fiber_id().and_then(|id| fibers.iter().position(|f| f.0 == id));
-        while let Some(i) = cur {
-            on_chain[i] = true;
-            let (_, lo, hi, _, caller_sp) = fibers[i];
-            let s = if start >= lo && start < hi { start } else { lo };
-            ranges.push((s, hi));
-            start = caller_sp;
-            cur = fibers
-                .iter()
-                .position(|&(_, lo, hi, _, _)| caller_sp >= lo && caller_sp < hi);
-            if let Some(j) = cur {
-                if on_chain[j] {
-                    break;
+        for &(probe, host_top, current) in &threads {
+            // Walk the running chain from the innermost fiber outward.
+            let mut start = probe;
+            let mut cur = if current == 0 {
+                None
+            } else {
+                fibers.iter().position(|f| f.0 == current)
+            };
+            while let Some(i) = cur {
+                on_chain[i] = true;
+                let (_, lo, hi, _, caller_sp) = fibers[i];
+                let s = if start >= lo && start < hi { start } else { lo };
+                ranges.push((s, hi));
+                start = caller_sp;
+                cur = fibers
+                    .iter()
+                    .position(|&(_, lo, hi, _, _)| caller_sp >= lo && caller_sp < hi);
+                if let Some(j) = cur {
+                    if on_chain[j] {
+                        break;
+                    }
                 }
             }
+            // Whatever the chain resumed from last is the host stack.
+            let host_start = if start >= host_top { probe } else { start };
+            ranges.push((host_start, host_top));
         }
-        // Whatever the chain resumed from last is the host stack.
-        let host_start = if start >= host_top { probe } else { start };
-        ranges.push((host_start, host_top));
         for (i, &(_, lo, hi, saved_sp, _)) in fibers.iter().enumerate() {
             if on_chain[i] || saved_sp == 0 {
                 continue;
@@ -4899,7 +5000,7 @@ impl NativeContext for VM {
     }
 
     fn poll_gc(&mut self) {
-        if self.gc.should_collect() {
+        if self.safepoint_due() {
             self.collect_garbage();
             self.method_cache.invalidate();
             self.engine.invalidate_inline_caches();
@@ -6332,6 +6433,135 @@ impl VM {
             Some(v) if !v.is_null() => v,
             _ => live_instance,
         }
+    }
+}
+
+/// The register spill a thread leaves in its own frame while it is
+/// safe; the collector's scan of that thread starts at it.
+#[cfg(feature = "host")]
+pub struct Spill([usize; super::stack_scan::SPILL_WORDS]);
+
+#[cfg(feature = "host")]
+impl Default for Spill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "host")]
+impl Spill {
+    #[inline(always)]
+    pub fn new() -> Spill {
+        Spill([0; super::stack_scan::SPILL_WORDS])
+    }
+}
+
+#[cfg(feature = "host")]
+impl VM {
+    /// Values this thread holds outside any stack.
+    fn thread_roots(&self) -> Vec<Value> {
+        let mut roots = Vec::new();
+        roots.extend_from_slice(&self.api_stack);
+        for f in [self.fiber, self.error_fiber, self.sync_entry_fiber] {
+            if !f.is_null() {
+                roots.push(Value::object(f as *mut u8));
+            }
+        }
+        roots.extend(
+            self.sync_fiber_pool
+                .iter()
+                .map(|&f| Value::object(f as *mut u8)),
+        );
+        if let Some(sched) = &self.sched {
+            roots.extend(sched.fibers().map(|f| Value::object(f as *mut u8)));
+        }
+        super::live_regs::collect_live_values(&mut roots);
+        roots.extend(crate::codegen::runtime_fns::jit_roots_snapshot());
+        roots.extend(crate::codegen::runtime_fns::native_shadow_roots_snapshot());
+        let (jit_closure, jit_class) = crate::codegen::runtime_fns::jit_context_roots();
+        roots.push(jit_closure);
+        roots.push(jit_class);
+        roots
+    }
+
+    /// Publish this thread as safe for a collector on another thread:
+    /// its registers spilled into `spill`, which must live in the
+    /// caller's frame for as long as the thread stays safe, its stack
+    /// and its precise roots. Pair with `leave_safe`.
+    pub fn enter_safe(&mut self, spill: &mut Spill) {
+        super::stack_scan::spill_callee_saved(&mut spill.0);
+        let sp = (spill.0.as_ptr() as usize).min(super::stack_scan::approx_sp());
+        if self
+            .thread
+            .stack_top
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            self.thread.stack_top.store(
+                super::stack_scan::thread_stack_top(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let fiber_id = krio_fiber::current_fiber_id().unwrap_or(0);
+        let roots = self.thread_roots();
+        self.world.become_safe(&self.thread, sp, fiber_id, roots);
+    }
+
+    /// Back to running Wren, once no collection is waiting.
+    pub fn leave_safe(&mut self) {
+        self.world.become_running(&self.thread);
+    }
+
+    /// Run `body` on a new OS thread with a view of this program of
+    /// its own. The view starts safe; `body` calls `leave_safe`
+    /// before touching the heap (`interpret` does) and the view is
+    /// dropped when `body` returns.
+    pub fn spawn_thread<F, R>(&mut self, body: F) -> std::thread::JoinHandle<R>
+    where
+        F: FnOnce(&mut VM) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        struct Sent(VM);
+        // SAFETY: the view is used only by the thread it is sent to;
+        // what it shares is `Shared`, which every thread reaches
+        // under the collector's discipline.
+        unsafe impl Send for Sent {}
+        self.gc.set_multithreaded();
+        let sent = Sent(self.new_thread());
+        std::thread::spawn(move || {
+            let mut sent = sent;
+            body(&mut sent.0)
+        })
+    }
+
+    /// A safepoint: stop here while another thread collects.
+    pub fn park(&mut self) {
+        let mut spill = Spill::new();
+        self.enter_safe(&mut spill);
+        self.leave_safe();
+    }
+
+    /// Whether the next safepoint has work: a collection is due, or
+    /// another thread is waiting to collect.
+    #[inline(always)]
+    pub fn safepoint_due(&self) -> bool {
+        self.gc.should_collect() || self.world.requested()
+    }
+}
+
+#[cfg(not(feature = "host"))]
+impl VM {
+    #[inline(always)]
+    pub fn safepoint_due(&self) -> bool {
+        self.gc.should_collect()
+    }
+}
+
+#[cfg(feature = "host")]
+impl Drop for VM {
+    fn drop(&mut self) {
+        let thread = self.thread.clone();
+        self.world.leave(&thread);
     }
 }
 

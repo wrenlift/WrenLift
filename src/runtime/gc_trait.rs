@@ -344,6 +344,15 @@ impl GcImpl {
         }
     }
 
+    /// The program is about to run on more than one thread: compiled
+    /// code stops bumping the heap's own region. Only Immix serves
+    /// several threads; the other collectors ignore this.
+    pub fn set_multithreaded(&mut self) {
+        if let GcImpl::Immix(gc) = self {
+            gc.set_multithreaded();
+        }
+    }
+
     /// Whether address-keyed caches (method cache, inline caches) must
     /// be dropped after the last collection. Collectors that cannot
     /// say answer yes.
