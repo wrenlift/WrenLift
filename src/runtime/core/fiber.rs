@@ -683,6 +683,9 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
         std::ptr::null_mut()
     };
 
+    // Whether the caller tried this fiber, read before the run: routing
+    // an error inside it to this try consumes the flag.
+    let was_try = unsafe { (*target).is_try };
     unsafe {
         (*target).state = FiberState::Suspended; // running, but not New
     }
@@ -802,6 +805,13 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
                 (*target).krio_return_value = Value::null();
                 (*target).is_try = false;
             }
+            // An error `try` did not ask for aborts the caller too, as
+            // Wren does: raised here, on the caller's own run.
+            if !err.is_null() && !was_try && !vm_ptr.is_null() {
+                let message = unsafe { crate::runtime::core::as_string(v) }.to_owned();
+                unsafe { (*vm_ptr).runtime_error(message) };
+                return Some(Value::null());
+            }
             v
         }
         krio_fiber::FiberStep::Errored => {
@@ -905,7 +915,24 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
         // the final `Fiber.call(_)`. Stash it on the ObjFiber so
         // try_krio_call can return it after the body exits.
         let result = crate::runtime::vm_interp::run_fiber(&mut *vm_ptr);
-        (*target_ptr).krio_return_value = result.unwrap_or(Value::null());
+        // An error no `try` up the chain caught ends the fiber with it:
+        // the host side hands it on to the caller as an abort there.
+        match result {
+            Ok(v) => (*target_ptr).krio_return_value = v,
+            Err(err) => {
+                let message = match err {
+                    crate::runtime::vm_interp::RuntimeError::Error(m) => m,
+                    other => format!("{other:?}"),
+                };
+                let err_val = (*vm_ptr).new_string(message);
+                (*target_ptr).error = err_val;
+                (*vm_ptr)
+                    .gc
+                    .write_barrier(target_ptr as *mut ObjHeader, err_val);
+                (*target_ptr).krio_return_value = Value::null();
+                (*target_ptr).state = FiberState::Error;
+            }
+        }
 
         (*vm_ptr).fiber = prev_fiber;
         if (*target_ptr).state == FiberState::Running {

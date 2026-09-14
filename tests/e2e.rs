@@ -1590,6 +1590,43 @@ System.print(fiber.error)
     );
 }
 
+// An error in a fiber run with `call()` aborts its caller too, up the
+// chain to the nearest `try`, which answers with it; every fiber on
+// the way is done with the error. Reference Wren's `runtimeError`.
+#[test]
+fn e2e_fiber_abort_reaches_the_callers_try() {
+    assert_output(
+        r#"
+var c = Fiber.new { Fiber.abort("deep") }
+var b = Fiber.new { c.call() }
+var a = Fiber.new { b.call() }
+System.print(a.try())
+System.print("%(a.isDone) %(b.isDone) %(c.isDone)")
+System.print("%(a.error) %(b.error) %(c.error)")
+var inner = Fiber.new { Fiber.abort("mid") }
+var mid = Fiber.new {
+  var r = inner.try()
+  System.print("mid caught %(r)")
+  return "mid done"
+}
+System.print(Fiber.new { mid.call() }.try())
+var y = Fiber.new {
+  Fiber.yield(1)
+  Fiber.abort("late")
+}
+System.print(y.call())
+System.print(Fiber.new { y.call() }.try())
+"#,
+        "deep
+true true true
+deep deep deep
+mid caught mid
+mid done
+1
+late",
+    );
+}
+
 // `Fiber.try` should catch method-not-found errors, not just
 // `Fiber.abort` and native `runtime_error`. Used to abort the
 // process — the dispatch site raised RuntimeError::MethodNotFound

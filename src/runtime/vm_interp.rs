@@ -1285,12 +1285,20 @@ fn run_guarded_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Run
     }
 }
 
-/// Whether an error raised on `fiber` may be caught here by its
-/// `Fiber.try`. A fiber a nested loop was entered on belongs to the
-/// caller waiting on it, so its errors unwind instead.
+/// Whether an error raised on `fiber` may be caught here by a
+/// `Fiber.try`: on `fiber` itself, or on a fiber up its chain of
+/// callers, each of which the error aborts on its way. A fiber a nested
+/// loop was entered on belongs to the caller waiting on it, so an error
+/// reaching it unwinds instead.
 fn may_route_try(vm: &VM, fiber: *mut ObjFiber) -> bool {
-    let is_try = unsafe { (*fiber).is_try };
-    is_try && !std::ptr::eq(vm.sync_entry_fiber, fiber)
+    let mut cur = fiber;
+    while !cur.is_null() && !std::ptr::eq(vm.sync_entry_fiber, cur) {
+        if unsafe { (*cur).is_try } {
+            return true;
+        }
+        cur = unsafe { (*cur).caller };
+    }
+    false
 }
 
 fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, RuntimeError> {
@@ -5354,14 +5362,15 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
     }
 }
 
-/// Resume a caller fiber with a value.
-/// If `fiber` was launched via `.try()` / `.try(arg)`, route a
-/// raised runtime error through its `error` slot, mark it done,
-/// and resume the caller (if any). Returns `Some(value)` if the
-/// error was caught — outer caller should `continue 'fiber_loop`
-/// (caller resumed) or `return Ok(value)` (no caller, fiber run
-/// terminates here). Returns `None` if the fiber wasn't in try
-/// mode — the error should propagate to `Err(...)` like before.
+/// Route an error raised on `fiber` to the nearest `Fiber.try` up its
+/// chain of callers, as Wren does: every fiber on the way gets the
+/// error and is done, its caller unhooked; the fiber that was tried
+/// gets it too, and its caller resumes with the error as `try`'s
+/// value. Returns `Some(value)` when the error was caught — the outer
+/// caller should `continue 'fiber_loop` (caller resumed) or `return
+/// Ok(value)` (no caller, fiber run terminates here). Returns `None`
+/// when no try is up the chain (`may_route_try`) — the error should
+/// propagate to `Err(...)` like before.
 ///
 /// Mirrors the native-side error catch in the bytecode `Op::Call`
 /// dispatcher so non-native error sites (method-not-found, super
@@ -5387,17 +5396,24 @@ pub unsafe fn route_method_error_through_fiber_try(
             );
         }
         let err_val = vm.new_string(err_msg);
-        (*fiber).error = err_val;
-        (*fiber).is_try = false;
-        (*fiber).state = FiberState::Done;
-        // Old-gen fiber, young err string.
-        vm.gc.write_barrier(fiber as *mut ObjHeader, err_val);
-        let caller = (*fiber).caller;
-        if !caller.is_null() {
-            (*fiber).caller = std::ptr::null_mut();
-            resume_caller(vm, caller, err_val);
+        let mut cur = fiber;
+        loop {
+            (*cur).error = err_val;
+            (*cur).state = FiberState::Done;
+            // Old-gen fiber, young err string.
+            vm.gc.write_barrier(cur as *mut ObjHeader, err_val);
+            let caller = (*cur).caller;
+            (*cur).caller = std::ptr::null_mut();
+            if (*cur).is_try {
+                (*cur).is_try = false;
+                if !caller.is_null() {
+                    resume_caller(vm, caller, err_val);
+                }
+                return Some(err_val);
+            }
+            // `may_route_try` found a try further up, so there is a caller.
+            cur = caller;
         }
-        Some(err_val)
     }
 }
 
