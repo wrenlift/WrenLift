@@ -615,7 +615,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
     }
     // The VM is never dropped below, so its exit-time report runs here.
     if std::env::var_os("WLIFT_TIER_STATS").is_some() {
-        vm.engine.dump_tier_stats(&vm.interner);
+        vm.dump_tier_stats();
     }
     // Dropping the VM would wait for a top-tier compile still in
     // flight, and a plain exit runs the compiler's static destructors

@@ -2950,7 +2950,7 @@ impl ExecutionEngine {
         if vm.is_null() {
             return 0;
         }
-        unsafe { (*vm).gc.bump_region_ptr() }
+        unsafe { (&*vm).gc.bump_region_ptr() }
     }
 
     /// The List class of the running VM, for compiled code that lays
@@ -2960,7 +2960,7 @@ impl ExecutionEngine {
         if vm.is_null() {
             return 0;
         }
-        unsafe { (*vm).list_class as usize }
+        unsafe { (&*vm).list_class as usize }
     }
 
     /// The compile clone with a `GuardNumAt` after every call whose

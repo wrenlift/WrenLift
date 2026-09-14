@@ -2,10 +2,12 @@
 ///
 /// Owns all runtime state: GC heap, interner, core classes, fibers,
 /// module registry, and configuration callbacks.
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Hot reload — SIGUSR1-driven reload-pending flag.
@@ -292,7 +294,12 @@ pub fn __set_thread_local_current_vm(new: *mut VM) -> *mut VM {
     })
 }
 
-pub struct VM {
+/// What a program's threads share: the heap, the code and its tier
+/// state, the classes, the modules and their variables. Reached
+/// through `VM`'s deref. Structural changes to it (a module load, a
+/// class install, a code install) happen with the other threads
+/// stopped; the rest is one-word reads and writes.
+pub struct Shared {
     // -- Memory --
     pub gc: GcImpl,
     pub interner: Interner,
@@ -332,52 +339,24 @@ pub struct VM {
     pub simd_class: *mut ObjClass,
     pub simd4f_class: *mut ObjClass,
     pub simd4i_class: *mut ObjClass,
-
-    // -- Execution state --
-    pub fiber: *mut ObjFiber,
     pub modules: HashMap<String, *mut ObjModule>,
 
     // -- Execution engine (tiered runtime) --
     pub engine: ExecutionEngine,
-
-    // -- API --
-    pub api_stack: Vec<Value>,
     pub handles: Vec<WrenHandle>,
     pub user_data: *mut c_void,
 
     // -- Configuration --
     pub config: VMConfig,
 
-    // -- Error state (set by primitives) --
-    pub has_error: bool,
-
     // -- Output capture (for testing; None = print to stdout) --
     pub output_buffer: Option<String>,
-
-    // -- Fiber switching (set by fiber natives, consumed by interpreter) --
-    pub pending_fiber_action: Option<FiberAction>,
 
     // -- Source code storage (for runtime error reporting with ariadne) --
     pub module_sources: HashMap<String, String>,
 
-    // -- Post-mortem error fiber (saved before restoring prev_fiber) --
-    pub error_fiber: *mut ObjFiber,
-
-    /// Last error message from runtime_error (for Fiber.try to retrieve).
-    pub last_error: Option<String>,
-
-    /// The fiber a nested, depth-bounded run loop was entered on (a
-    /// native or compiled caller waiting for one frame to unwind).
-    /// An error on that fiber must unwind to that caller rather than
-    /// switch fibers underneath it; the caller's own level routes it
-    /// through `Fiber.try`. Null at the outermost loop.
-    pub sync_entry_fiber: *mut ObjFiber,
-
     /// Modules currently being loaded (for circular import detection).
     loading_modules: HashSet<String>,
-
-    /// Flag set by System.gc() — actual collection happens at next safepoint.
-    pub gc_requested: bool,
 
     /// Fibers run on stacks of their own (krio) rather than through
     /// the interpreter's stackless switch. On by default on native;
@@ -386,10 +365,6 @@ pub struct VM {
     /// regardless.
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
-
-    /// The VM's scheduler world, made on the first `Fiber.spawn`.
-    #[cfg(feature = "host")]
-    pub sched: Option<Box<crate::runtime::sched::Sched>>,
 
     /// How to build a VM for an isolate this one spawns: the
     /// embedder's, with its module loader and packages. Without one
@@ -427,16 +402,6 @@ pub struct VM {
     /// plain bool field, mirroring `krio_fiber_active`.
     #[cfg(feature = "host")]
     pub fiber_arena_active: bool,
-
-    // (Earlier iterations used a side-table `krio_backed_fibers`
-    // here, but it accumulated dangling pointers after the GC
-    // swept short-lived fibers. Pass 3 now enumerates via
-    // `GcImpl::for_each_fiber` which only sees live fibers.)
-    /// Pool of reusable register files to avoid per-call heap allocation.
-    pub register_pool: Vec<Vec<Value>>,
-
-    /// Pool of reusable temporary fibers for synchronous closure/constructor calls.
-    pub sync_fiber_pool: Vec<*mut ObjFiber>,
 
     /// Global inline method cache for fast monomorphic dispatch.
     pub method_cache: super::vm_interp::MethodCache,
@@ -527,6 +492,147 @@ pub struct VM {
     file_watches: Vec<FileWatch>,
 }
 
+/// The cell the threads of a program share `Shared` through.
+pub struct SharedCell(UnsafeCell<Shared>);
+
+// SAFETY: `Shared` is reached from every thread of the program
+// through raw derefs; the threads keep to one-word reads and writes
+// outside a stop-the-world, which is the contract the collector and
+// the code installers rely on.
+unsafe impl Send for SharedCell {}
+unsafe impl Sync for SharedCell {}
+
+/// A thread's view of a program: the fiber it is running, its error
+/// state and its scheduler world, over the shared `Shared`.
+pub struct VM {
+    /// The program: everything the threads running it have in common.
+    shared: Arc<SharedCell>,
+
+    // -- Execution state --
+    pub fiber: *mut ObjFiber,
+
+    // -- API --
+    pub api_stack: Vec<Value>,
+
+    // -- Error state (set by primitives) --
+    pub has_error: bool,
+
+    // -- Fiber switching (set by fiber natives, consumed by interpreter) --
+    pub pending_fiber_action: Option<FiberAction>,
+
+    // -- Post-mortem error fiber (saved before restoring prev_fiber) --
+    pub error_fiber: *mut ObjFiber,
+
+    /// Last error message from runtime_error (for Fiber.try to retrieve).
+    pub last_error: Option<String>,
+
+    /// The fiber a nested, depth-bounded run loop was entered on (a
+    /// native or compiled caller waiting for one frame to unwind).
+    /// An error on that fiber must unwind to that caller rather than
+    /// switch fibers underneath it; the caller's own level routes it
+    /// through `Fiber.try`. Null at the outermost loop.
+    pub sync_entry_fiber: *mut ObjFiber,
+
+    /// Flag set by System.gc() — actual collection happens at next safepoint.
+    pub gc_requested: bool,
+
+    /// The VM's scheduler world, made on the first `Fiber.spawn`.
+    #[cfg(feature = "host")]
+    pub sched: Option<Box<crate::runtime::sched::Sched>>,
+
+    // (Earlier iterations used a side-table `krio_backed_fibers`
+    // here, but it accumulated dangling pointers after the GC
+    // swept short-lived fibers. Pass 3 now enumerates via
+    // `GcImpl::for_each_fiber` which only sees live fibers.)
+    /// Pool of reusable register files to avoid per-call heap allocation.
+    pub register_pool: Vec<Vec<Value>>,
+
+    /// Pool of reusable temporary fibers for synchronous closure/constructor calls.
+    pub sync_fiber_pool: Vec<*mut ObjFiber>,
+}
+
+impl Shared {
+    // The engine's interner-taking entry points, for callers that
+    // reach both through one borrow of the shared program.
+    pub fn request_tier_up(&mut self, id: super::engine::FuncId) {
+        self.engine.request_tier_up(id, &self.interner);
+    }
+    pub fn tier_up(&mut self, id: super::engine::FuncId) -> bool {
+        self.engine.tier_up(id, &self.interner)
+    }
+    pub fn drain_compile_queue(&mut self) {
+        self.engine.drain_compile_queue(&self.interner);
+    }
+    #[cfg(feature = "host")]
+    pub fn ensure_threaded_code(
+        &mut self,
+        id: super::engine::FuncId,
+    ) -> Option<&crate::mir::threaded::ThreadedCode> {
+        self.engine.ensure_threaded_code(id, &self.interner)
+    }
+    #[cfg(feature = "host")]
+    pub fn note_speculation_failed(&mut self, id: super::engine::FuncId) {
+        self.engine.note_speculation_failed(id, &self.interner);
+    }
+    #[cfg(feature = "host")]
+    pub fn native_tick(&mut self, id: super::engine::FuncId) {
+        self.engine.native_tick(id, &self.interner);
+    }
+    pub fn osr_entry_is_cold(
+        &mut self,
+        id: super::engine::FuncId,
+        block: crate::mir::BlockId,
+    ) -> bool {
+        self.engine.osr_entry_is_cold(id, block, &self.interner)
+    }
+    pub fn dump_tier_stats(&self) {
+        self.engine.dump_tier_stats(&self.interner);
+    }
+}
+
+impl std::ops::Deref for VM {
+    type Target = Shared;
+    #[inline(always)]
+    fn deref(&self) -> &Shared {
+        unsafe { &*self.shared.0.get() }
+    }
+}
+
+impl std::ops::DerefMut for VM {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Shared {
+        unsafe { &mut *self.shared.0.get() }
+    }
+}
+
+impl VM {
+    /// The shared program, for a borrow that needs more than one of
+    /// its parts at once.
+    #[inline(always)]
+    pub fn shared_mut(&mut self) -> &mut Shared {
+        unsafe { &mut *self.shared.0.get() }
+    }
+
+    /// Another thread's view of the same program.
+    pub fn new_thread(&self) -> VM {
+        VM {
+            shared: Arc::clone(&self.shared),
+            fiber: ptr::null_mut(),
+            api_stack: Vec::new(),
+            has_error: false,
+            pending_fiber_action: None,
+            error_fiber: ptr::null_mut(),
+            last_error: None,
+            sync_entry_fiber: ptr::null_mut(),
+            gc_requested: false,
+            #[cfg(feature = "host")]
+            sched: None,
+            register_pool: Vec::new(),
+            sync_fiber_pool: Vec::new(),
+        }
+    }
+}
+
 /// One entry in `vm.file_watches`. Held as plain fields so the GC
 /// can walk just the `callback` Value, leaving the path / mtime as
 /// inert metadata.
@@ -551,7 +657,7 @@ impl VM {
         crate::codegen::runtime_fns::clear_jit_roots();
         crate::runtime::gc_ringbuf::init_if_enabled();
 
-        let mut vm = Self {
+        let shared = Shared {
             gc: GcImpl::new(config.gc_strategy),
             interner: Interner::new(),
 
@@ -584,8 +690,6 @@ impl VM {
             simd_class: ptr::null_mut(),
             simd4f_class: ptr::null_mut(),
             simd4i_class: ptr::null_mut(),
-
-            fiber: ptr::null_mut(),
             modules: HashMap::new(),
 
             engine: {
@@ -595,21 +699,13 @@ impl VM {
                 e.fibers_have_stacks = krio_fiber_active;
                 e
             },
-
-            api_stack: vec![Value::null(); 16],
             handles: Vec::new(),
             user_data: ptr::null_mut(),
 
             config,
-            has_error: false,
             output_buffer: None,
-            pending_fiber_action: None,
             module_sources: HashMap::new(),
-            error_fiber: ptr::null_mut(),
-            last_error: None,
-            sync_entry_fiber: std::ptr::null_mut(),
             loading_modules: HashSet::new(),
-            gc_requested: false,
             #[cfg(feature = "host")]
             krio_fiber_active,
             // Per-fiber arena. Off by default — see field comment
@@ -617,8 +713,6 @@ impl VM {
             // the default on. `WLIFT_FIBER_ARENA=1` opts in.
             #[cfg(feature = "host")]
             fiber_arena_active: std::env::var_os("WLIFT_FIBER_ARENA").is_some_and(|v| v == "1"),
-            register_pool: Vec::new(),
-            sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
             call_sym_flags: Vec::new(),
             hot_method_symbols: HotMethodSymbols::default(),
@@ -635,8 +729,6 @@ impl VM {
             before_reload_callbacks: Vec::new(),
             file_watches: Vec::new(),
             #[cfg(feature = "host")]
-            sched: None,
-            #[cfg(feature = "host")]
             isolate_factory: None,
             #[cfg(feature = "host")]
             isolate_arg: None,
@@ -645,6 +737,23 @@ impl VM {
             #[cfg(feature = "host")]
             channel_class: ptr::null_mut(),
             staged_hatch_modules: HashMap::new(),
+        };
+        let mut vm = Self {
+            shared: Arc::new(SharedCell(UnsafeCell::new(shared))),
+
+            fiber: ptr::null_mut(),
+
+            api_stack: vec![Value::null(); 16],
+            has_error: false,
+            pending_fiber_action: None,
+            error_fiber: ptr::null_mut(),
+            last_error: None,
+            sync_entry_fiber: std::ptr::null_mut(),
+            gc_requested: false,
+            register_pool: Vec::new(),
+            sync_fiber_pool: Vec::new(),
+            #[cfg(feature = "host")]
+            sched: None,
         };
 
         // Bootstrap core classes.
@@ -2290,7 +2399,10 @@ impl VM {
                 .map(|mir| should_eager_compile_entry(mir, &self.interner))
                 .unwrap_or(false)
         {
-            let _ = self.engine.tier_up(func_id, &self.interner);
+            let _ = {
+                let s = self.shared_mut();
+                s.engine.tier_up(func_id, &s.interner)
+            };
         }
 
         // 9. Create a fiber and push the initial call frame
@@ -4179,27 +4291,28 @@ impl VM {
         }
 
         // Write back core class pointers
+        let shared = self.shared_mut();
         let class_fields: [&mut *mut ObjClass; 20] = [
-            &mut self.object_class,
-            &mut self.class_class,
-            &mut self.bool_class,
-            &mut self.num_class,
-            &mut self.string_class,
-            &mut self.list_class,
-            &mut self.map_class,
-            &mut self.range_class,
-            &mut self.null_class,
-            &mut self.fn_class,
-            &mut self.fiber_class,
-            &mut self.system_class,
-            &mut self.sequence_class,
-            &mut self.map_sequence_class,
-            &mut self.skip_sequence_class,
-            &mut self.take_sequence_class,
-            &mut self.where_sequence_class,
-            &mut self.string_byte_seq_class,
-            &mut self.string_code_point_seq_class,
-            &mut self.map_entry_class,
+            &mut shared.object_class,
+            &mut shared.class_class,
+            &mut shared.bool_class,
+            &mut shared.num_class,
+            &mut shared.string_class,
+            &mut shared.list_class,
+            &mut shared.map_class,
+            &mut shared.range_class,
+            &mut shared.null_class,
+            &mut shared.fn_class,
+            &mut shared.fiber_class,
+            &mut shared.system_class,
+            &mut shared.sequence_class,
+            &mut shared.map_sequence_class,
+            &mut shared.skip_sequence_class,
+            &mut shared.take_sequence_class,
+            &mut shared.where_sequence_class,
+            &mut shared.string_byte_seq_class,
+            &mut shared.string_code_point_seq_class,
+            &mut shared.map_entry_class,
         ];
         for (i, field) in class_fields.into_iter().enumerate() {
             let val = roots[classes_start + i];
@@ -6222,10 +6335,10 @@ impl VM {
     }
 }
 
-impl Drop for VM {
+impl Drop for Shared {
     fn drop(&mut self) {
         if std::env::var_os("WLIFT_TIER_STATS").is_some() {
-            self.engine.dump_tier_stats(&self.interner);
+            self.dump_tier_stats();
         }
         // The heap drops before the engine; a compile still running
         // would read freed objects.

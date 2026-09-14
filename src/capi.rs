@@ -1771,7 +1771,7 @@ pub extern "C" fn wrenSetSlotNewForeign(
     }
     let data = vec![0u8; size];
     unsafe {
-        let obj = (*vm).gc.alloc_foreign(data);
+        let obj = (&mut *vm).gc.alloc_foreign(data);
         let val = Value::object(obj as *mut u8);
         (*vm).set_slot(slot as usize, val);
         (*obj).data.as_mut_ptr() as *mut c_void
@@ -1854,7 +1854,7 @@ pub extern "C" fn wrenSetListElement(
         // value from a plugin write. Without this barrier the
         // edge never enters the remembered_set and the next
         // minor GC drops the young object behind the list.
-        (*vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
+        (&mut *vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
     }
 }
 
@@ -1889,7 +1889,7 @@ pub extern "C" fn wrenInsertInList(
         let idx = idx.min(list.len());
         list.insert(idx, elem);
         // Inter-gen edge — same shape as wrenSetListElement.
-        (*vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
+        (&mut *vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
     }
 }
 
@@ -1977,8 +1977,8 @@ pub extern "C" fn wrenSetMapValue(
         // can drag a young object into an old-gen container.
         // Mirrors wren_map_set in runtime_fns.rs.
         let hdr = ptr as *mut ObjHeader;
-        (*vm).gc.write_barrier(hdr, key);
-        (*vm).gc.write_barrier(hdr, val);
+        (&mut *vm).gc.write_barrier(hdr, key);
+        (&mut *vm).gc.write_barrier(hdr, val);
     }
 }
 
@@ -2015,7 +2015,7 @@ pub extern "C" fn wrenHasModule(vm: *mut WrenVM, module: *const c_char) -> bool 
         return false;
     }
     let name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("");
-    unsafe { (*vm).engine.modules.contains_key(name) }
+    unsafe { (&mut *vm).engine.modules.contains_key(name) }
 }
 
 #[no_mangle]
@@ -2096,7 +2096,7 @@ pub extern "C" fn wrenGetUserData(vm: *mut WrenVM) -> *mut c_void {
     if vm.is_null() {
         return ptr::null_mut();
     }
-    unsafe { (*vm).user_data }
+    unsafe { (&mut *vm).user_data }
 }
 
 #[no_mangle]
@@ -2105,7 +2105,7 @@ pub extern "C" fn wrenSetUserData(vm: *mut WrenVM, user_data: *mut c_void) {
         return;
     }
     unsafe {
-        (*vm).user_data = user_data;
+        (&mut *vm).user_data = user_data;
     }
 }
 

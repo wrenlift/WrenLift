@@ -70,7 +70,7 @@ fn isolate_arg(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     if vm.is_null() {
         return Value::null();
     }
-    let arg = unsafe { (*vm).isolate_arg.clone() };
+    let arg = unsafe { (&mut *vm).isolate_arg.clone() };
     arg.map_or_else(Value::null, |x| isolate::import(ctx, &x))
 }
 

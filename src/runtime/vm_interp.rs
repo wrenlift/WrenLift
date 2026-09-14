@@ -533,8 +533,7 @@ fn try_enter_loop_osr(
     let Some(entry) = vm.engine.active_osr_entry(func_id, point.target_block) else {
         // A loop compiled cold has no entry; once it proves hot here, ask
         // for the next tier so its caches make it into the code.
-        vm.engine
-            .osr_entry_is_cold(func_id, point.target_block, &vm.interner);
+        vm.osr_entry_is_cold(func_id, point.target_block);
         if env_osr_trace() {
             eprintln!(
                 "osr-trace: no entry FuncId({}) bb{}",
@@ -545,10 +544,7 @@ fn try_enter_loop_osr(
     };
     // Code compiled before this loop ever ran has generic call sites;
     // keep interpreting so the caches fill and a recompile can use them.
-    if vm
-        .engine
-        .osr_entry_is_cold(func_id, point.target_block, &vm.interner)
-    {
+    if vm.osr_entry_is_cold(func_id, point.target_block) {
         if env_osr_trace() {
             eprintln!(
                 "osr-trace: cold entry FuncId({}) bb{}, interpreting",
@@ -1670,7 +1666,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                 && crate::mir::threaded::threaded_depth_ok()
                 && crate::mir::threaded::threaded_enabled()
             {
-                let _ = vm.engine.ensure_threaded_code(func_id, &vm.interner);
+                let _ = vm.ensure_threaded_code(func_id);
                 let has_tc = vm
                     .engine
                     .threaded_code
@@ -1697,12 +1693,12 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         ctx.jit_code_base = vm.engine.jit_code.as_ptr();
                         ctx.jit_code_len = vm.engine.jit_code.len() as u32;
                     });
+                    let recycled = vm.register_pool.pop();
                     let tc = vm.engine.threaded_code[fn_idx_tc]
                         .as_ref()
                         .unwrap()
                         .as_ref()
                         .unwrap();
-                    let recycled = vm.register_pool.pop();
                     let (result, regs_back) = crate::mir::threaded::execute_threaded(
                         tc, &values, mv_ptr, mv_count, vm_ptr, None, recycled,
                     );
@@ -1765,7 +1761,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         vm.engine.invalidate_inline_caches();
                     }
                     vm.engine.poll_compilations();
-                    vm.engine.drain_compile_queue(&vm.interner);
+                    vm.drain_compile_queue();
                     fiber = vm.fiber;
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -3120,7 +3116,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 if !jit_ptr.is_null() || {
                                     let should_tier_up = vm.engine.record_call(target_func_id);
                                     if should_tier_up {
-                                        vm.engine.request_tier_up(target_func_id, &vm.interner);
+                                        vm.request_tier_up(target_func_id);
                                     }
                                     vm.engine.poll_compilations();
                                     // Re-check after poll
@@ -3237,7 +3233,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             if vm.engine.mode != ExecutionMode::Interpreter {
                                 let should_tier_up = vm.engine.record_call(target_func_id);
                                 if should_tier_up {
-                                    vm.engine.request_tier_up(target_func_id, &vm.interner);
+                                    vm.request_tier_up(target_func_id);
                                 }
                                 vm.engine.poll_compilations();
                             }
@@ -4172,7 +4168,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             );
                         }
                         if should_tier_up {
-                            vm.engine.request_tier_up(func_id, &vm.interner);
+                            vm.request_tier_up(func_id);
                         }
                         if should_tier_up
                             || vm.engine.has_pending_compilations()
@@ -4187,7 +4183,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     }
                                 }
                                 vm.engine.poll_compilations();
-                                vm.engine.drain_compile_queue(&vm.interner);
+                                vm.drain_compile_queue();
                                 unsafe {
                                     if let Some(frame) = (*fiber).mir_frames.last_mut() {
                                         values = std::mem::take(&mut frame.values);
@@ -4319,7 +4315,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             );
                         }
                         if should_tier_up {
-                            vm.engine.request_tier_up(func_id, &vm.interner);
+                            vm.request_tier_up(func_id);
                         }
                         if should_tier_up
                             || vm.engine.has_pending_compilations()
@@ -4333,7 +4329,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     }
                                 }
                                 vm.engine.poll_compilations();
-                                vm.engine.drain_compile_queue(&vm.interner);
+                                vm.drain_compile_queue();
                                 unsafe {
                                     if let Some(frame) = (*fiber).mir_frames.last_mut() {
                                         values = std::mem::take(&mut frame.values);
@@ -4649,7 +4645,7 @@ fn dispatch_closure_bc_inner(
             // Not yet compiled: do tier-up profiling.
             let should_tier_up = vm.engine.record_call(target_func_id);
             if should_tier_up {
-                vm.engine.request_tier_up(target_func_id, &vm.interner);
+                vm.request_tier_up(target_func_id);
             }
         }
         // Always poll — and always re-read jit_code AFTER poll to avoid
@@ -4804,7 +4800,7 @@ fn dispatch_closure_bc_inner(
     if vm.engine.mode != ExecutionMode::Interpreter {
         let should_tier_up = vm.engine.record_call(target_func_id);
         if should_tier_up {
-            vm.engine.request_tier_up(target_func_id, &vm.interner);
+            vm.request_tier_up(target_func_id);
         }
         vm.engine.poll_compilations();
     }
@@ -4855,7 +4851,7 @@ fn dispatch_closure_bc_inner(
         && crate::mir::threaded::threaded_enabled()
     {
         // Ensure threaded code exists (lazy init).
-        let _ = vm.engine.ensure_threaded_code(target_func_id, &vm.interner);
+        let _ = vm.ensure_threaded_code(target_func_id);
         // Now borrow the threaded code immutably + modules separately.
         let has_tc = vm
             .engine
@@ -4914,12 +4910,12 @@ fn dispatch_closure_bc_inner(
                 ctx.jit_code_base = vm.engine.jit_code.as_ptr();
                 ctx.jit_code_len = vm.engine.jit_code.len() as u32;
             });
+            let recycled = vm.register_pool.pop();
             let tc = vm.engine.threaded_code[fn_idx]
                 .as_ref()
                 .unwrap()
                 .as_ref()
                 .unwrap();
-            let recycled = vm.register_pool.pop();
             let (result, regs_back) = crate::mir::threaded::execute_threaded(
                 tc,
                 arg_vals,

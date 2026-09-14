@@ -867,7 +867,9 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
                     // young object. Without the barrier the next
                     // minor GC won't trace err through fiber.error
                     // and the slot dangles.
-                    (*vm_ptr).gc.write_barrier(target as *mut ObjHeader, err);
+                    (&mut *vm_ptr)
+                        .gc
+                        .write_barrier(target as *mut ObjHeader, err);
                 }
             }
             unsafe {
@@ -962,7 +964,7 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
                 };
                 let err_val = (*vm_ptr).new_string(message);
                 (*target_ptr).error = err_val;
-                (*vm_ptr)
+                (&mut *vm_ptr)
                     .gc
                     .write_barrier(target_ptr as *mut ObjHeader, err_val);
                 (*target_ptr).krio_return_value = Value::null();

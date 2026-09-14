@@ -953,7 +953,7 @@ fn maybe_upgrade_closure_ic_to_leaf(
     if jit_ptr.is_null() {
         let should_tier_up = vm.engine.record_call(func_id);
         if should_tier_up {
-            vm.engine.request_tier_up(func_id, &vm.interner);
+            vm.request_tier_up(func_id);
         }
         if vm.engine.has_pending_compilations() {
             vm.engine.poll_compilations();
@@ -996,7 +996,7 @@ fn maybe_request_next_tier(
     }
     let should_tier_up = vm.engine.record_call(func_id);
     if should_tier_up {
-        vm.engine.request_tier_up(func_id, &vm.interner);
+        vm.request_tier_up(func_id);
     }
     // NOTE: poll_compilations is NOT called here. Installing a new compiled
     // version during an IC hit path would invalidate the IC entry we just
@@ -1368,8 +1368,7 @@ pub extern "C" fn wren_tier_tick(func_id: u64) -> u64 {
     // SAFETY: the context's vm pointer is the running VM; compiled code
     // only runs while it is alive.
     let vm = unsafe { &mut *vm };
-    vm.engine
-        .native_tick(crate::runtime::engine::FuncId(func_id as u32), &vm.interner);
+    vm.native_tick(crate::runtime::engine::FuncId(func_id as u32));
     0
 }
 
@@ -2900,7 +2899,7 @@ pub fn call_found_closure(
             if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter
                 && vm.engine.record_call(func_id)
             {
-                vm.engine.request_tier_up(func_id, &vm.interner);
+                vm.request_tier_up(func_id);
             }
         }
         return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
@@ -3007,7 +3006,7 @@ fn dispatch_method(
                 if needs_tier_up {
                     let should_tier_up = vm.engine.record_call(func_id);
                     if should_tier_up {
-                        vm.engine.request_tier_up(func_id, &vm.interner);
+                        vm.request_tier_up(func_id);
                     }
                 }
             }
@@ -5289,7 +5288,7 @@ fn deopt_impl(func_id: u32, args: &[u64]) -> u64 {
     // The bailout reloads the bead to interpreted first, so the
     // recompile can go through the broker.
     let _decision = vm.engine.tier.record_bailout(id, 0, 0);
-    vm.engine.note_speculation_failed(id, &vm.interner);
+    vm.note_speculation_failed(id);
     run_interpreted(vm, func_id, args)
 }
 
@@ -5435,7 +5434,7 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
         );
     }
     let _decision = vm.engine.tier.record_bailout(id, 0, 0);
-    vm.engine.note_speculation_failed(id, &vm.interner);
+    vm.note_speculation_failed(id);
     vm.engine.deopt_exits += 1;
     // The running closure when the dispatcher recorded one for this
     // function, else the one the method was bound with.
