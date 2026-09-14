@@ -3308,11 +3308,13 @@ pub fn call_found_closure(
     let j = jit_state();
     let state = unsafe { &mut *j };
     if !compiled || args.len() > 8 || state.disabled {
-        if fn_ptr.is_null()
-            && vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter
-            && vm.engine.record_call(func_id)
-        {
-            vm.engine.request_tier_up(func_id, &vm.interner);
+        if fn_ptr.is_null() {
+            vm.engine.note_interpreted_entry(func_id);
+            if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter
+                && vm.engine.record_call(func_id)
+            {
+                vm.engine.request_tier_up(func_id, &vm.interner);
+            }
         }
         return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
     }
