@@ -697,7 +697,8 @@ impl VM {
         crate::codegen::runtime_fns::clear_jit_roots();
         crate::runtime::gc_ringbuf::init_if_enabled();
 
-        let shared = Shared {
+        #[cfg_attr(not(feature = "host"), allow(unused_mut))]
+        let mut shared = Shared {
             gc: GcImpl::new(config.gc_strategy),
             interner: Interner::new(),
 
@@ -788,6 +789,10 @@ impl VM {
         };
         #[cfg(feature = "host")]
         let thread = shared.world.join();
+        #[cfg(feature = "host")]
+        {
+            shared.engine.safepoint_page = shared.world.page.address();
+        }
         let mut vm = Self {
             shared: Arc::new(SharedCell(UnsafeCell::new(shared))),
             #[cfg(feature = "host")]
@@ -4668,6 +4673,7 @@ impl VM {
         // (probe, host top, current fiber id) per thread.
         let mut threads: Vec<(usize, usize, u64)> =
             vec![(probe, host_top, krio_fiber::current_fiber_id().unwrap_or(0))];
+        let mut extra: Vec<(usize, usize)> = Vec::new();
         for other in self.world.others(&self.thread) {
             let sp = other.sp.load(std::sync::atomic::Ordering::Relaxed);
             let top = other.stack_top.load(std::sync::atomic::Ordering::Relaxed);
@@ -4677,6 +4683,11 @@ impl VM {
                     top,
                     other.fiber_id.load(std::sync::atomic::Ordering::Relaxed),
                 ));
+            }
+            let lo = other.extra_lo.load(std::sync::atomic::Ordering::Relaxed);
+            let hi = other.extra_hi.load(std::sync::atomic::Ordering::Relaxed);
+            if lo != 0 && hi > lo {
+                extra.push((lo, hi));
             }
         }
         // (id, lo, hi, saved_sp, caller_sp) per live krio fiber.
@@ -4699,6 +4710,7 @@ impl VM {
             ));
         });
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(fibers.len() + threads.len());
+        ranges.extend(extra);
         let mut on_chain = vec![false; fibers.len()];
         for &(probe, host_top, current) in &threads {
             // Walk the running chain from the innermost fiber outward.
@@ -6571,6 +6583,81 @@ impl VM {
             _ => live_instance,
         }
     }
+}
+
+/// Whether a fault at `addr` is a load from a safepoint page: this
+/// thread's program's, or the static one AOT code loads from.
+#[cfg(feature = "host")]
+pub fn fault_is_a_safepoint(addr: usize) -> bool {
+    if super::stw::poll_page::static_page().contains(addr) {
+        return true;
+    }
+    let vm = crate::codegen::runtime_fns::read_jit_ctx().vm as *mut VM;
+    let vm = if vm.is_null() { current_vm_ptr() } else { vm };
+    !vm.is_null() && unsafe { (&*vm).world.page.contains(addr) }
+}
+
+/// A thread stopped by the fault at a compiled loop header: park it
+/// where it stands, its stack from `sp` and its registers in a
+/// buffer the collector also scans. A page held by another program
+/// (the static one, shared by AOT isolates) is waited out.
+#[cfg(feature = "host")]
+pub fn park_interrupted(addr: usize, sp: usize, regs: &[usize]) {
+    thread_local! {
+        static REGS: std::cell::UnsafeCell<[usize; 32]> = const { std::cell::UnsafeCell::new([0; 32]) };
+    }
+    let vm = crate::codegen::runtime_fns::read_jit_ctx().vm as *mut VM;
+    let vm = if vm.is_null() { current_vm_ptr() } else { vm };
+    if vm.is_null() {
+        return;
+    }
+    // SAFETY: the view is this thread's; the fault came from its own
+    // compiled code at a loop header, where nothing of the runtime is
+    // half done.
+    let vm = unsafe { &mut *vm };
+    if !vm.world.requested() {
+        let page = super::stw::poll_page::static_page();
+        if page.contains(addr) {
+            while page.is_protected() {
+                std::thread::yield_now();
+            }
+        }
+        return;
+    }
+    let (lo, hi) = REGS.with(|cell| {
+        let buf = unsafe { &mut *cell.get() };
+        let n = regs.len().min(32);
+        buf[..n].copy_from_slice(&regs[..n]);
+        let lo = buf.as_ptr() as usize;
+        (lo, lo + std::mem::size_of::<[usize; 32]>())
+    });
+    if vm
+        .thread
+        .stack_top
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+    {
+        vm.thread.stack_top.store(
+            super::stack_scan::thread_stack_top(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    vm.thread
+        .extra_lo
+        .store(lo, std::sync::atomic::Ordering::Relaxed);
+    vm.thread
+        .extra_hi
+        .store(hi, std::sync::atomic::Ordering::Relaxed);
+    let fiber_id = krio_fiber::current_fiber_id().unwrap_or(0);
+    let roots = vm.thread_roots();
+    vm.world.become_safe(&vm.thread, sp, fiber_id, roots);
+    vm.leave_safe();
+    vm.thread
+        .extra_lo
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    vm.thread
+        .extra_hi
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The world stopped for a structural change; resumed on drop.

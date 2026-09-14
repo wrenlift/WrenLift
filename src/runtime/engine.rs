@@ -861,6 +861,8 @@ pub struct ExecutionEngine {
     /// that sees it stops the world and installs.
     #[cfg(feature = "host")]
     pub results_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// The program's safepoint page, baked into compiled loop headers.
+    pub safepoint_page: usize,
     /// The VM's fibers run on stacks of their own, so a compiled body
     /// may yield.
     pub fibers_have_stacks: bool,
@@ -1227,6 +1229,7 @@ impl ExecutionEngine {
             tier_lock: super::stw::ReentrantLock::new(),
             #[cfg(feature = "host")]
             results_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            safepoint_page: 0,
             fibers_have_stacks: false,
             collect_tier_stats: std::env::var_os("WLIFT_TIER_STATS").is_some(),
             functions: Vec::new(),
@@ -2984,6 +2987,11 @@ impl ExecutionEngine {
     /// The running VM's Immix bump region, for compiles requested while
     /// it runs; 0 when there is none to allocate from inline.
     #[cfg(feature = "host")]
+    /// The compiling program's safepoint page, for its loop headers.
+    fn safepoint_page_for_compile(&self) -> usize {
+        self.safepoint_page
+    }
+
     fn bump_region_for_compile() -> usize {
         if crate::runtime::gc_trait::jit_needs_write_barriers() {
             return 0;
@@ -4016,6 +4024,7 @@ impl ExecutionEngine {
         let modvars_cell = self.modvars_cell_addr(id);
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
         crate::codegen::set_jit_bump_region(Self::bump_region_for_compile());
+        crate::codegen::set_jit_safepoint_page(self.safepoint_page_for_compile());
         crate::codegen::set_jit_list_class(Self::list_class_for_compile());
         let compiled_result =
             crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
@@ -4033,6 +4042,7 @@ impl ExecutionEngine {
             );
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
         crate::codegen::set_jit_bump_region(0);
+        crate::codegen::set_jit_safepoint_page(0);
         crate::codegen::set_jit_list_class(0);
         let compiled = match compiled_result {
             Ok(compiled) => compiled,
@@ -4246,6 +4256,7 @@ impl ExecutionEngine {
         };
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let bump_region = Self::bump_region_for_compile();
+        let safepoint_page = self.safepoint_page_for_compile();
         let list_class = Self::list_class_for_compile();
         // The finished compile brings the baseline code's next tick
         // forward so the install lands at its next entry or outermost
@@ -4320,6 +4331,7 @@ impl ExecutionEngine {
             cl::set_jit_tier_hook(tier_hook.clone());
             cl::set_jit_func_id(id.0);
             crate::codegen::set_jit_bump_region(bump_region);
+            crate::codegen::set_jit_safepoint_page(safepoint_page);
             crate::codegen::set_jit_list_class(list_class);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
@@ -4337,6 +4349,7 @@ impl ExecutionEngine {
             cl::set_jit_cold_headers(Default::default());
             cl::set_jit_tier_hook(None);
             crate::codegen::set_jit_bump_region(0);
+            crate::codegen::set_jit_safepoint_page(0);
             crate::codegen::set_jit_list_class(0);
             cl::set_jit_modvars_cell(0);
             let result = result

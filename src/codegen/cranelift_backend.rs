@@ -1417,6 +1417,31 @@ pub mod cl {
     const TIER_CELL_COUNTDOWN: i32 = 0;
     const TIER_CELL_RETIER: i32 = 4;
 
+    /// Load a word from the safepoint page: unreadable while a
+    /// collector waits, so the load faults and the fault handler parks
+    /// the thread. The load may trap, so nothing removes it.
+    fn emit_safepoint_poll(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        aot_config: Option<&AotLoweringConfig>,
+    ) {
+        let addr = match aot_config {
+            // An AOT binary finds the runtime's page by symbol.
+            Some(cfg) => {
+                let gv = module.declare_data_in_func(cfg.safepoint_data, builder.func);
+                builder.ins().symbol_value(types::I64, gv)
+            }
+            None => {
+                let page = crate::codegen::jit_safepoint_page();
+                if page == 0 {
+                    return;
+                }
+                builder.ins().iconst(types::I64, page as i64)
+            }
+        };
+        builder.ins().load(types::I32, MemFlags::new(), addr, 0);
+    }
+
     /// Count down the cell and call `wren_tier_tick` when it reaches
     /// zero.
     #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
@@ -2545,6 +2570,11 @@ pub mod cl {
         /// `slot * 8`, killing both helper calls and the TLS read.
         pub modvars_data: cranelift_module::DataId,
 
+        /// `DataId` of the runtime's safepoint page
+        /// (`wlift_safepoint_page`), imported: loop headers load
+        /// from it.
+        pub safepoint_data: cranelift_module::DataId,
+
         /// `DataId` for this module's string-constant slot array
         /// (`wlift_consts_<n>`). The body addresses
         /// `slots[dedup[sym_idx]]` to load a `*mut ObjString` —
@@ -3104,7 +3134,6 @@ pub mod cl {
         // entries each iteration; Cranelift's stack maps cover
         // anything still live across the back-edge, so the GC
         // still sees those values.
-        #[cfg(feature = "aot")]
         let loop_headers: std::collections::HashSet<BlockId> = {
             let mut headers = std::collections::HashSet::new();
             for block in &mir.blocks {
@@ -3433,6 +3462,11 @@ pub mod cl {
             // Cranelift's stack maps cover anything still live
             // across the back-edge so the GC still sees those
             // values.
+            // A loop that allocates nothing and never ticks would
+            // otherwise keep a collector on another thread waiting.
+            if loop_headers.contains(&bid) {
+                emit_safepoint_poll(builder, module, aot_config);
+            }
             #[cfg(feature = "aot")]
             if loop_headers.contains(&bid) {
                 if let Some(cfg) = aot_config {

@@ -1236,8 +1236,13 @@ fn emit_aot_module(
         .declare_data(&closures_symbol, Linkage::Export, true, false)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
+    let safepoint_data = module
+        .declare_data("wlift_safepoint_page", Linkage::Import, false, false)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+
     let aot_cfg = AotLoweringConfig {
         modvars_data,
+        safepoint_data,
         consts_data,
         const_strings: std::cell::RefCell::new(Vec::new()),
         symbols_data,

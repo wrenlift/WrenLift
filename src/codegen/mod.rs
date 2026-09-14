@@ -2144,6 +2144,20 @@ pub fn set_jit_bump_region(addr: usize) {
 }
 
 thread_local! {
+    /// The program's safepoint page, for the loop headers of the
+    /// function this thread is compiling; 0 emits no poll.
+    static JIT_SAFEPOINT_PAGE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub fn set_jit_safepoint_page(addr: usize) {
+    JIT_SAFEPOINT_PAGE.with(|c| c.set(addr));
+}
+
+pub fn jit_safepoint_page() -> usize {
+    JIT_SAFEPOINT_PAGE.with(|c| c.get())
+}
+
+thread_local! {
     /// The VM's List class, for lists compiled code lays out itself;
     /// 0 keeps the helper.
     static JIT_LIST_CLASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

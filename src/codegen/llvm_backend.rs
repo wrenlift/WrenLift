@@ -1097,6 +1097,29 @@ pub mod llvm {
             self.icmp(IntPredicate::EQ, m, self.c64(QNAN))
         }
 
+        /// At a loop header: load a word from the safepoint page,
+        /// unreadable while a collector waits, so the load faults and
+        /// the fault handler parks the thread. Volatile, so it stays.
+        fn safepoint_poll(&mut self) -> Result<(), String> {
+            let page = crate::codegen::jit_safepoint_page();
+            if page == 0 {
+                return Ok(());
+            }
+            let p = self
+                .b
+                .build_int_to_ptr(self.c64(page as u64), self.ptrt(), "spp")
+                .map_err(|e| e.to_string())?;
+            let load = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), p, "sp")
+                .map_err(|e| e.to_string())?;
+            load.as_instruction_value()
+                .ok_or_else(|| "safepoint load".to_string())?
+                .set_volatile(true)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
         fn new_block(&mut self, base: &str) -> BasicBlock<'ctx> {
             let n = self.name(base);
             self.sh.ctx.append_basic_block(self.f, &n)
@@ -1338,6 +1361,13 @@ pub mod llvm {
             let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
             self.class_facts = class_facts(mir);
+            let loop_headers: HashSet<usize> = mir
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| b.predecessors.iter().any(|p| p.0 as usize >= *i))
+                .map(|(i, _)| i)
+                .collect();
             for &bi in &rpo {
                 let bb = self.blocks[bi];
                 self.b.position_at_end(bb);
@@ -1346,6 +1376,9 @@ pub mod llvm {
                     continue;
                 }
                 self.cur_block = bi;
+                if loop_headers.contains(&bi) {
+                    self.safepoint_poll()?;
+                }
                 self.lower_block(bi)?;
             }
             for bb in self.blocks.iter() {

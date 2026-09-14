@@ -30,6 +30,11 @@ pub struct ThreadState {
     pub stack_top: AtomicUsize,
     /// The krio fiber the thread was inside when it became safe, or 0.
     pub fiber_id: AtomicU64,
+    /// A second range to scan while safe: the registers saved when
+    /// the thread was stopped at a compiled loop header. Empty when
+    /// both are 0.
+    pub extra_lo: AtomicUsize,
+    pub extra_hi: AtomicUsize,
     /// What the thread holds outside any stack: its fiber, api stack,
     /// pools, compiled-code roots. Published when it becomes safe.
     pub roots: Mutex<Vec<Value>>,
@@ -42,6 +47,8 @@ impl ThreadState {
             sp: AtomicUsize::new(0),
             stack_top: AtomicUsize::new(0),
             fiber_id: AtomicU64::new(0),
+            extra_lo: AtomicUsize::new(0),
+            extra_hi: AtomicUsize::new(0),
             roots: Mutex::new(Vec::new()),
         })
     }
@@ -55,6 +62,8 @@ impl ThreadState {
 pub struct World {
     threads: Mutex<Vec<Arc<ThreadState>>>,
     requested: AtomicBool,
+    /// The page this program's compiled loops load from.
+    pub page: poll_page::PollPage,
     /// Held by the collecting thread for the length of a collection.
     collector: Mutex<()>,
     /// Signalled when a thread becomes safe and when the request
@@ -74,6 +83,7 @@ impl World {
         World {
             threads: Mutex::new(Vec::new()),
             requested: AtomicBool::new(false),
+            page: poll_page::PollPage::new(),
             collector: Mutex::new(()),
             changed: Condvar::new(),
             gate: Mutex::new(()),
@@ -155,6 +165,11 @@ impl World {
     pub fn stop(&self, t: &ThreadState) -> std::sync::MutexGuard<'_, ()> {
         let guard = self.collector.lock().unwrap_or_else(|e| e.into_inner());
         self.requested.store(true, Ordering::SeqCst);
+        // The program's own page for its compiled loops, and the
+        // process's static one for an AOT binary's.
+        poll_page::install_handler();
+        self.page.protect(true);
+        poll_page::static_page().protect(true);
         t.state.store(RUNNING, Ordering::SeqCst);
         let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -175,6 +190,8 @@ impl World {
     /// Let the world go after a collection.
     pub fn resume(&self, guard: std::sync::MutexGuard<'_, ()>) {
         self.requested.store(false, Ordering::SeqCst);
+        self.page.protect(false);
+        poll_page::static_page().protect(false);
         {
             let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             self.changed.notify_all();
@@ -242,5 +259,272 @@ impl Drop for ReentrantGuard<'_> {
             lock.owner.store(0, Ordering::Release);
             lock.changed.notify_one();
         }
+    }
+}
+
+/// A page compiled loop headers load a word from. Readable until a
+/// collector wants the world stopped, then unreadable, so the load
+/// faults and the fault handler parks the thread where it stands:
+/// one plain load per iteration, and nothing else. Each program maps
+/// one for the code it compiles; an AOT binary's code names the
+/// static one by symbol.
+pub mod poll_page {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+
+    pub const PAGE: usize = 1 << 14;
+
+    /// The static page, for AOT code.
+    #[repr(C, align(16384))]
+    pub struct Page(pub std::cell::UnsafeCell<[u8; PAGE]>);
+
+    // SAFETY: nothing reads or writes the page's contents; only its
+    // protection changes.
+    unsafe impl Sync for Page {}
+
+    #[no_mangle]
+    pub static wlift_safepoint_page: Page = Page(std::cell::UnsafeCell::new([0; PAGE]));
+
+    /// A page and the count of stops holding it unreadable.
+    pub struct PollPage {
+        addr: usize,
+        mapped: bool,
+        stops: AtomicU32,
+    }
+
+    static STATIC_PAGE: OnceLock<PollPage> = OnceLock::new();
+
+    /// The page AOT code loads from.
+    pub fn static_page() -> &'static PollPage {
+        STATIC_PAGE.get_or_init(|| PollPage {
+            addr: &wlift_safepoint_page as *const Page as usize,
+            mapped: false,
+            stops: AtomicU32::new(0),
+        })
+    }
+
+    impl PollPage {
+        /// A page of this program's own.
+        pub fn new() -> PollPage {
+            PollPage {
+                addr: map(),
+                mapped: true,
+                stops: AtomicU32::new(0),
+            }
+        }
+
+        pub fn address(&self) -> usize {
+            self.addr
+        }
+
+        pub fn contains(&self, addr: usize) -> bool {
+            self.addr != 0 && addr >= self.addr && addr < self.addr + PAGE
+        }
+
+        /// Whether a stop holds the page unreadable.
+        pub fn is_protected(&self) -> bool {
+            self.stops.load(Ordering::Acquire) != 0
+        }
+
+        /// One more stop holds the page (`on`), or one fewer.
+        pub fn protect(&self, on: bool) {
+            if self.addr == 0 {
+                return;
+            }
+            let change = if on {
+                self.stops.fetch_add(1, Ordering::SeqCst) == 0
+            } else {
+                self.stops.fetch_sub(1, Ordering::SeqCst) == 1
+            };
+            if !change {
+                return;
+            }
+            #[cfg(all(unix, feature = "host"))]
+            unsafe {
+                let prot = if on {
+                    libc::PROT_NONE
+                } else {
+                    libc::PROT_READ | libc::PROT_WRITE
+                };
+                libc::mprotect(self.addr as *mut libc::c_void, PAGE, prot);
+            }
+        }
+    }
+
+    impl Default for PollPage {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for PollPage {
+        fn drop(&mut self) {
+            #[cfg(all(unix, feature = "host"))]
+            if self.mapped && self.addr != 0 {
+                unsafe { libc::munmap(self.addr as *mut libc::c_void, PAGE) };
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "host"))]
+    fn map() -> usize {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            0
+        } else {
+            p as usize
+        }
+    }
+
+    #[cfg(not(all(unix, feature = "host")))]
+    fn map() -> usize {
+        0
+    }
+
+    #[cfg(all(unix, feature = "host"))]
+    static PREVIOUS: OnceLock<[libc::sigaction; 2]> = OnceLock::new();
+
+    /// Install the fault handler once.
+    pub fn install_handler() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(install);
+    }
+
+    #[cfg(all(unix, feature = "host"))]
+    fn install() {
+        unsafe {
+            let mut previous: [libc::sigaction; 2] = std::mem::zeroed();
+            for (i, sig) in [libc::SIGSEGV, libc::SIGBUS].into_iter().enumerate() {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_fault as *const () as usize;
+                action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(sig, &action, &mut previous[i]);
+            }
+            let _ = PREVIOUS.set(previous);
+        }
+    }
+
+    #[cfg(not(all(unix, feature = "host")))]
+    fn install() {}
+
+    /// The fault handler: a load from a safepoint page parks the
+    /// thread; any other fault goes to whoever handled it before.
+    #[cfg(all(unix, feature = "host"))]
+    extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+        let addr = unsafe { (*info).si_addr() as usize };
+        if crate::runtime::vm::fault_is_a_safepoint(addr) {
+            let (sp, regs) = interrupted_state(ctx);
+            crate::runtime::vm::park_interrupted(addr, sp, &regs);
+            return;
+        }
+        let i = if sig == libc::SIGSEGV { 0 } else { 1 };
+        let prev = PREVIOUS.get().map(|p| p[i]);
+        unsafe {
+            match prev {
+                Some(p) if p.sa_sigaction == libc::SIG_DFL || p.sa_sigaction == 0 => {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+                Some(p) if p.sa_sigaction == libc::SIG_IGN => {}
+                Some(p) if p.sa_flags & libc::SA_SIGINFO != 0 => {
+                    let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                        std::mem::transmute(p.sa_sigaction);
+                    f(sig, info, ctx);
+                }
+                Some(p) => {
+                    let f: extern "C" fn(libc::c_int) = std::mem::transmute(p.sa_sigaction);
+                    f(sig);
+                }
+                None => {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
+            }
+        }
+    }
+
+    /// The interrupted thread's stack pointer and general registers.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "host"))]
+    fn interrupted_state(ctx: *mut libc::c_void) -> (usize, [usize; 32]) {
+        let uc = ctx as *const libc::ucontext_t;
+        let ss = unsafe { &(*(*uc).uc_mcontext).__ss };
+        let mut regs = [0usize; 32];
+        for (i, r) in ss.__x.iter().enumerate() {
+            regs[i] = *r as usize;
+        }
+        regs[29] = ss.__fp as usize;
+        regs[30] = ss.__lr as usize;
+        (ss.__sp as usize, regs)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "host"))]
+    fn interrupted_state(ctx: *mut libc::c_void) -> (usize, [usize; 32]) {
+        let uc = ctx as *const libc::ucontext_t;
+        let mc = unsafe { &(*uc).uc_mcontext };
+        let mut regs = [0usize; 32];
+        for (i, r) in mc.regs.iter().enumerate() {
+            regs[i] = *r as usize;
+        }
+        (mc.sp as usize, regs)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "host"))]
+    fn interrupted_state(ctx: *mut libc::c_void) -> (usize, [usize; 32]) {
+        let uc = ctx as *const libc::ucontext_t;
+        let g = unsafe { &(*uc).uc_mcontext.gregs };
+        let mut regs = [0usize; 32];
+        for (i, r) in g.iter().enumerate().take(23) {
+            regs[i] = *r as usize;
+        }
+        (g[libc::REG_RSP as usize] as usize, regs)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64", feature = "host"))]
+    fn interrupted_state(ctx: *mut libc::c_void) -> (usize, [usize; 32]) {
+        let uc = ctx as *const libc::ucontext_t;
+        let ss = unsafe { &(*(*uc).uc_mcontext).__ss };
+        let regs = [
+            ss.__rax as usize,
+            ss.__rbx as usize,
+            ss.__rcx as usize,
+            ss.__rdx as usize,
+            ss.__rdi as usize,
+            ss.__rsi as usize,
+            ss.__rbp as usize,
+            ss.__rsp as usize,
+            ss.__r8 as usize,
+            ss.__r9 as usize,
+            ss.__r10 as usize,
+            ss.__r11 as usize,
+            ss.__r12 as usize,
+            ss.__r13 as usize,
+            ss.__r14 as usize,
+            ss.__r15 as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        (ss.__rsp as usize, regs)
     }
 }

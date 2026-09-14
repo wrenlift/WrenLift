@@ -6098,6 +6098,53 @@ System.print("fib %(s) workers>1 %(Thread.count > 1)")
 }
 
 #[test]
+fn e2e_compiled_loop_answers_a_collector_on_another_thread() {
+    // A task spinning in a compiled loop that allocates nothing
+    // reaches the safepoint at its loop header, so collections
+    // driven by the main thread's churn complete.
+    if !scheduler_available() {
+        return;
+    }
+    let src = r#"
+import "thread" for Thread, Mutex, Lock
+var gate = Mutex.new()
+gate.acquire()
+var done = Lock.new()
+var spun = 0
+Thread.create {
+  var i = 0
+  while (!gate.tryAcquire()) i = i + 1
+  spun = i
+  done.release()
+}
+var junk = []
+for (k in 0...300000) {
+  junk.add("x%(k)")
+  if (junk.count > 1000) junk = []
+}
+gate.release()
+done.wait()
+System.print("spun>0 %(spun > 0)")
+"#;
+    // A hang here is the failure; do not let it hold the suite.
+    let watchdog = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        eprintln!("compiled loop never answered the collector");
+        std::process::abort();
+    });
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "spun>0 true");
+    drop(watchdog);
+}
+
+#[test]
 fn e2e_compiled_bodies_yield_from_fiber_stacks() {
     // With fibers on stacks of their own, a body that yields is
     // compiled like any other. Two fibers run the same closure code
