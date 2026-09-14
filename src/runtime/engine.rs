@@ -909,8 +909,9 @@ pub struct ExecutionEngine {
     pub func_modules: Vec<Option<Rc<String>>>,
     /// Per function, the address of its module's variable cell once
     /// resolved (0 until then); the cell is leaked per module, so the
-    /// address never goes stale.
-    func_modvars_cell: std::cell::RefCell<Vec<usize>>,
+    /// address never goes stale. One slot per function, grown with
+    /// `functions`, so a read on the call path is an index and a load.
+    func_modvars_cell: Vec<std::sync::atomic::AtomicUsize>,
     pub runtime_call_stats: RuntimeCallStats,
     /// Cached field index for trivial getters of the form `{ _field }`.
     pub trivial_getter_fields: Vec<Option<u16>>,
@@ -1211,7 +1212,7 @@ impl ExecutionEngine {
             tier_states: Vec::new(),
             tier_stats: Vec::new(),
             func_modules: Vec::new(),
-            func_modvars_cell: std::cell::RefCell::new(Vec::new()),
+            func_modvars_cell: Vec::new(),
             runtime_call_stats: RuntimeCallStats::default(),
             trivial_getter_fields: Vec::new(),
             trivial_setter_fields: Vec::new(),
@@ -1285,6 +1286,8 @@ impl ExecutionEngine {
         self.tier_states.push(TierState::Interpreted);
         self.tier_stats.push(FuncTierStats::default());
         self.func_modules.push(module);
+        self.func_modvars_cell
+            .push(std::sync::atomic::AtomicUsize::new(0));
         self.trivial_getter_fields.push(trivial_getter);
         self.trivial_setter_fields.push(trivial_setter);
         self.baseline_code.push(std::ptr::null());
@@ -2531,12 +2534,16 @@ impl ExecutionEngine {
 
     /// Address of the module variable cell for `id`'s defining module,
     /// or 0 when the module is not recorded.
+    #[inline]
     fn modvars_cell_addr(&self, id: FuncId) -> usize {
+        use std::sync::atomic::Ordering;
         let idx = id.0 as usize;
-        if let Some(&addr) = self.func_modvars_cell.borrow().get(idx) {
-            if addr != 0 {
-                return addr;
-            }
+        let Some(slot) = self.func_modvars_cell.get(idx) else {
+            return 0;
+        };
+        let addr = slot.load(Ordering::Relaxed);
+        if addr != 0 {
+            return addr;
         }
         let addr = self
             .func_modules
@@ -2546,11 +2553,7 @@ impl ExecutionEngine {
             .map(|e| e.cell as *const ModuleVarsCell as usize)
             .unwrap_or(0);
         if addr != 0 {
-            let mut cache = self.func_modvars_cell.borrow_mut();
-            if cache.len() <= idx {
-                cache.resize(idx + 1, 0);
-            }
-            cache[idx] = addr;
+            slot.store(addr, Ordering::Relaxed);
         }
         addr
     }
