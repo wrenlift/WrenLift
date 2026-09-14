@@ -451,6 +451,11 @@ fn fiber_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 fn fiber_suspend(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    // A suspended fiber hands its caller null and resumes where it
+    // stopped if called again: on a krio stack, a yield of null.
+    if let Some(v) = try_krio_yield(Value::null()) {
+        return v;
+    }
     ctx.set_fiber_action_suspend();
     Value::null()
 }
