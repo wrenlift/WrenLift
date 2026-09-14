@@ -1,8 +1,8 @@
 //! `Thread`, `Mutex`, `Lock` and `Deque`, the built-in module
 //! `thread`: tasks on the program's worker threads and the ways they
-//! wait for each other, in the shape of Haxe's `sys.thread`. A wait
-//! parks the task on its world, never the OS thread; a release from
-//! any thread wakes it through the scheduler's registry.
+//! wait for each other. A wait parks the task on its world, never the
+//! OS thread; a release from any thread wakes it through the
+//! scheduler's registry.
 //!
 //! The primitives keep all their state in instance fields, so the
 //! collector traces what they hold: a guard word spun on with atomic

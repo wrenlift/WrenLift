@@ -1,9 +1,9 @@
 //! Built-in module `thread` — `import "thread" for Thread, Mutex, Lock, Deque`.
-//! Tasks on the program's worker threads, one heap, in the shape of
-//! Haxe's `sys.thread`: `Thread.create` runs a function on a worker;
-//! `Mutex`, `Lock` and `Deque` let tasks wait for each other. A wait
-//! parks the task on its worker's scheduler, never the OS thread, so
-//! the worker runs other tasks meanwhile.
+//! Tasks on the program's worker threads, one heap: `Thread.create`
+//! runs a function on a worker; `Mutex`, `Lock` and `Deque` let tasks
+//! wait for each other. A wait parks the task on its worker's
+//! scheduler, never the OS thread, so the worker runs other tasks
+//! meanwhile.
 
 class Thread {
   /// Run `body` as a task on a worker thread. The workers start on

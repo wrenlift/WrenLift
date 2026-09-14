@@ -6098,6 +6098,108 @@ System.print("fib %(s) workers>1 %(Thread.count > 1)")
 }
 
 #[test]
+fn e2e_threads_fibers_and_isolates_compose() {
+    // A task spawns scheduler fibers on its worker and waits on them;
+    // a main-thread fiber parks on a Lock a thread releases; an
+    // isolate runs threads that drive fibers; a task receives from
+    // the isolate's channel.
+    if !scheduler_available() {
+        return;
+    }
+    fn module_source(name: &str) -> Option<String> {
+        (name == "worker").then(|| {
+            r#"
+import "isolate" for Isolate
+import "thread" for Thread, Lock, Deque
+var arg = Isolate.arg
+var parts = Deque.new()
+var done = Lock.new()
+for (t in 0...3) {
+  Thread.create {
+    var gen = Fiber.new {
+      for (i in 0...4) Fiber.yield(t * 10 + i)
+    }
+    var s = 0
+    while (!gen.isDone) {
+      var v = gen.call()
+      if (v != null) s = s + v
+    }
+    parts.add(s)
+    done.release()
+  }
+}
+for (t in 0...3) done.wait()
+var total = 0
+while (parts.count > 0) total = total + parts.pop(false)
+arg["reply"].send(total)
+"#
+            .to_string()
+        })
+    }
+    fn make() -> VM {
+        VM::new(VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            opt_threshold: 4,
+            load_module_fn: Some(Box::new(|name: &str, _from: &str| module_source(name))),
+            ..VMConfig::default()
+        })
+    }
+    let src = r#"
+import "thread" for Thread, Lock, Deque
+import "isolate" for Isolate, Channel
+var log = Deque.new()
+var done = Lock.new()
+Thread.create {
+  var got = Lock.new()
+  var acc = []
+  for (i in 0...3) {
+    Fiber.spawn {
+      Fiber.sleep(5 * i)
+      acc.add(i)
+      got.release()
+    }
+  }
+  for (i in 0...3) got.wait()
+  log.add("task fibers %(acc)")
+  done.release()
+}
+var handoff = Lock.new()
+Fiber.spawn {
+  handoff.wait()
+  log.add("main fiber woke")
+  done.release()
+}
+Thread.create {
+  Fiber.sleep(10)
+  handoff.release()
+}
+var reply = Channel.new()
+var iso = Isolate.spawn("worker", {"reply": reply})
+Thread.create {
+  log.add("isolate said %(reply.receive())")
+  done.release()
+}
+for (i in 0...3) done.wait()
+iso.join()
+var lines = []
+while (log.count > 0) lines.add(log.pop(false))
+lines.sort {|a, b| a.count < b.count }
+for (l in lines) System.print(l)
+"#;
+    let mut vm = make();
+    vm.isolate_factory = Some(std::sync::Arc::new(make));
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(
+        output.trim(),
+        "main fiber woke\nisolate said 138\ntask fibers [0, 1, 2]"
+    );
+}
+
+#[test]
 fn e2e_compiled_loop_answers_a_collector_on_another_thread() {
     // A task spinning in a compiled loop that allocates nothing
     // reaches the safepoint at its loop header, so collections
