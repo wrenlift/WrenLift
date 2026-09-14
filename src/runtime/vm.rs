@@ -5896,12 +5896,9 @@ impl VM {
                 match callee_module {
                     Some(mn) => {
                         let bytes = mn.as_bytes();
-                        let (mv_ptr, mv_count) = self
-                            .engine
-                            .modules
-                            .get(mn.as_str())
-                            .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
-                            .unwrap_or((std::ptr::null_mut(), 0));
+                        // Through the module's cell, cached per function:
+                        // no lookup of the module by name per call.
+                        let (mv_ptr, mv_count) = self.engine.module_vars_for(func_id);
                         (mv_ptr, mv_count, bytes.as_ptr(), bytes.len() as u32)
                     }
                     None => (
