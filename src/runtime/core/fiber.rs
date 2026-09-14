@@ -1198,7 +1198,7 @@ fn fiber_live(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 
 #[cfg(not(feature = "host"))]
 fn fiber_no_sched(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    ctx.runtime_error("The scheduler is not available on this target.".to_string());
+    ctx.runtime_error("The scheduler has not reached this target yet.".to_string());
     Value::null()
 }
 

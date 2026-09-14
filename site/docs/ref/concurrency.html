@@ -317,7 +317,7 @@ for (k in 0...Isolate.cpus) {
 for (w in workers) w.join()</code></pre>
       <p>
         These values can cross: <code>null</code>, booleans, numbers, strings, lists and maps of those, and <code>Channel</code> and <code>Isolate</code> handles. Anything else is an error at the send: an instance, a fiber, a function.
-        <code>Isolate.spawn(module)</code> finds the module the same way <code>import</code> does. Under <code>hatch run</code> the program's own modules are available to it. Under <code>wlift</code> its loader and spec dependencies carry over. An AOT binary has no loader for the child, so its isolates end with an error.
+        <code>Isolate.spawn(module)</code> finds the module the same way <code>import</code> does. Under <code>hatch run</code> the program's own modules are available to it. Under <code>wlift</code> its loader and spec dependencies carry over. An AOT binary does not yet carry a loader for the child module.
       </p>
 
       <h2 id="which">Which one</h2>
@@ -378,8 +378,16 @@ Thread.create {
 
 for (i in 0...3) done.wait()
 iso.join()</code></pre>
+      <h2 id="wasm">In the browser</h2>
       <p>
-        In the browser there is one thread. <code>Fiber</code> and the scheduler work as described. The <code>thread</code> and <code>isolate</code> modules are not available there.
+        A wasm module runs on one agent, so the three models change shape but keep their meaning.
+        A <code>Fiber</code> suspends the same way it does anywhere else.
+        The scheduler and the <code>thread</code> module run on that one agent: tasks take turns, a wait parks the task, and a release wakes it.
+        A producer and consumer work as they do natively. Nothing runs at the same time, and <code>Thread.count</code> is 1.
+        An <code>Isolate</code> is a Worker with memory of its own, and values still cross as copies. That is the part that runs in parallel in the browser.
+      </p>
+      <p>
+        The browser build has fibers today. The scheduler, threads and isolates follow in that order.
       </p>
     </div>
   </main>
@@ -393,6 +401,7 @@ iso.join()</code></pre>
       <li><a href="#isolates">Isolates</a></li>
       <li><a href="#which">Which one</a></li>
       <li><a href="#compose">How they compose</a></li>
+      <li><a href="#wasm">In the browser</a></li>
     </ul>
   </aside>
 
