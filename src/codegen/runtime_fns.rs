@@ -3316,13 +3316,6 @@ pub fn call_found_closure(
         }
         return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
     }
-    // A leaf reads no module variable, calls nothing and allocates
-    // nothing, so it runs on the caller's context as an inline-cache hit
-    // calls it: no context to swap or depth to count.
-    if vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false) {
-        vm.engine.note_native_entry(func_id);
-        return unsafe { call_jit_cached_st(&mut (*j).ctx, fn_ptr, args) };
-    }
     if state.depth >= MAX_JIT_DEPTH {
         return call_closure_jit_or_sync(vm, closure, args, Some(defining_class));
     }
