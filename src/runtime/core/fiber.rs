@@ -537,7 +537,13 @@ fn try_krio_yield(value: Value) -> Option<Value> {
     // (see `project_krio_box_per_yield_leak` memory note). The u64
     // fast path stores the bits in a fixed Cell<Option<u64>> — zero
     // allocation per round-trip.
+    // The thread's JIT state belongs to this activation; whoever runs
+    // while it is suspended leaves their own behind.
+    let jit_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+    let jit_depth = crate::codegen::runtime_fns::jit_depth();
     let received: Option<u64> = krio_fiber::yield_u64(value.to_bits());
+    crate::codegen::runtime_fns::set_jit_context(jit_ctx);
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
     // Back on the fiber stack — host has reinstalled this fiber's
     // saved roots into JIT_ROOTS_STORE before resuming us.
@@ -707,10 +713,16 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // so a collection in between sees both.
     let outgoing = krio_fiber::current_fiber_id().unwrap_or(0);
     unsafe { crate::runtime::rt::stack_suspended(outgoing, super::super::stack_scan::approx_sp()) };
+    // The thread's JIT state is the caller's; the fiber restores its
+    // own when it resumes and leaves it behind when it yields.
+    let jit_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+    let jit_depth = crate::codegen::runtime_fns::jit_depth();
     // `resume_with_u64` is the alloc-free counterpart of the
     // generic `resume_with::<u64>` — see the matching comment on
     // `krio_fiber::yield_u64` in `try_krio_yield`.
     let step = unsafe { (*krio_ptr).resume_with_u64(input.to_bits()) };
+    crate::codegen::runtime_fns::set_jit_context(jit_ctx);
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
     unsafe {
         crate::runtime::rt::stack_suspended((*krio_ptr).id(), (*krio_ptr).saved_sp() as usize);
     }
