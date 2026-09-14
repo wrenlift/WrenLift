@@ -514,6 +514,10 @@ struct FileWatch {
 impl VM {
     /// Create a new VM with the given configuration.
     pub fn new(config: VMConfig) -> Self {
+        #[cfg(feature = "host")]
+        let krio_fiber_active = std::env::var_os("WLIFT_KRIO_FIBER").is_none_or(|v| v != "0");
+        #[cfg(not(feature = "host"))]
+        let krio_fiber_active = false;
         // Reset thread-local JIT state to avoid stale data from previous VM instances
         // (critical for test isolation when multiple VMs are created in the same process).
         crate::codegen::runtime_fns::set_jit_context(
@@ -563,6 +567,7 @@ impl VM {
                 let mut e = ExecutionEngine::new(config.execution_mode);
                 e.jit_threshold = config.jit_threshold;
                 e.opt_threshold = config.opt_threshold;
+                e.fibers_have_stacks = krio_fiber_active;
                 e
             },
 
@@ -581,7 +586,7 @@ impl VM {
             loading_modules: HashSet::new(),
             gc_requested: false,
             #[cfg(feature = "host")]
-            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER").is_none_or(|v| v != "0"),
+            krio_fiber_active,
             // Per-fiber arena. Off by default — see field comment
             // for the escape-barrier requirements that gate flipping
             // the default on. `WLIFT_FIBER_ARENA=1` opts in.

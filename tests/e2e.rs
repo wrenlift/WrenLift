@@ -5593,3 +5593,68 @@ System.print(x)
         "300000 45000000000\n1399998 5 1400000\n50000 1250000000 233330 6 233333"
     );
 }
+
+#[test]
+fn e2e_compiled_bodies_yield_from_fiber_stacks() {
+    // With fibers on stacks of their own, a body that yields is
+    // compiled like any other. Two fibers run the same closure code
+    // with different upvalues and yield in turn from inside its
+    // loop; each must resume with its own closure's upvalues.
+    let src = r#"
+class Source {
+  static reader(tag, n) {
+    var i = 0
+    return Fn.new {
+      var out = null
+      while (out == null) {
+        i = i + 1
+        if (i % 3 == 0) {
+          out = i > n ? "done" : "%(tag)%(i)"
+        } else {
+          Fiber.yield()
+        }
+      }
+      return out
+    }
+  }
+  static drain(tag, n) {
+    var read = Source.reader(tag, n)
+    return Fiber.new {
+      var s = ""
+      while (true) {
+        var chunk = read.call()
+        if (chunk == "done") break
+        s = s + chunk + ","
+      }
+      return s
+    }
+  }
+}
+var a = Source.drain("a", 9)
+var b = Source.drain("b", 6)
+var ra = null
+var rb = null
+while (!a.isDone || !b.isDone) {
+  if (!a.isDone) ra = a.call()
+  if (!b.isDone) rb = b.call()
+}
+System.print("%(ra) %(rb)")
+var total = 0
+for (k in 0...200) {
+  var f = Source.drain("x", 30)
+  var r = null
+  while (!f.isDone) r = f.call()
+  total = total + r.count
+}
+System.print(total)
+"#;
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "a3,a6,a9, b3,b6,\n7400");
+}

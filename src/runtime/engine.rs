@@ -699,33 +699,38 @@ pub fn trace_clock_ms() -> f64 {
 fn mir_calls_jit_unsafe_fiber_method(
     mir: &MirFunction,
     interner: &crate::intern::Interner,
+    fibers_have_stacks: bool,
 ) -> bool {
-    direct_yield_method_names()
+    direct_yield_method_names(fibers_have_stacks)
         .iter()
         .any(|n| mir_calls_method_named(mir, interner, n))
 }
 
-/// Method names that directly suspend the running fiber via
-/// `Fiber.yield` / `.suspend` / `.try` / `.transfer*`. The JIT can't
-/// currently unwind across these — the C-stack frame holding the
-/// JIT'd function's locals isn't part of the saved fiber state, so
-/// after the resume the spilled receiver register decays to the
-/// uninitialized-slot sentinel (`TAG_UNDEFINED`) and the next method
-/// call surfaces as `Object does not implement '...'`.
+/// Method names that switch fibers without a stack to switch: with
+/// fibers on stacks of their own, a yield, suspend or try from a
+/// compiled body is a native call that switches and comes back, and
+/// only `transfer*`, which still goes through the interpreter's
+/// pending action, keeps a body off the JIT. Without them, every
+/// switch does: the C-stack frame holding the JIT'd function's locals
+/// isn't part of the saved fiber state.
 ///
 /// `call()` / `call(_)` is intentionally NOT here — see the doc
 /// comment on `mir_calls_jit_unsafe_fiber_method`.
-fn direct_yield_method_names() -> &'static [&'static str] {
-    &[
-        "yield()",
-        "yield(_)",
-        "suspend()",
-        "try()",
-        "try(_)",
-        "transfer()",
-        "transfer(_)",
-        "transferError(_)",
-    ]
+fn direct_yield_method_names(fibers_have_stacks: bool) -> &'static [&'static str] {
+    if fibers_have_stacks {
+        &["transfer()", "transfer(_)", "transferError(_)"]
+    } else {
+        &[
+            "yield()",
+            "yield(_)",
+            "suspend()",
+            "try()",
+            "try(_)",
+            "transfer()",
+            "transfer(_)",
+            "transferError(_)",
+        ]
+    }
 }
 
 fn mir_calls_method_named(
@@ -846,6 +851,9 @@ fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
 pub struct ExecutionEngine {
     /// Current execution mode.
     pub mode: ExecutionMode,
+    /// The VM's fibers run on stacks of their own, so a compiled body
+    /// may yield.
+    pub fibers_have_stacks: bool,
     /// Whether to collect per-call tier telemetry.
     pub collect_tier_stats: bool,
     /// All registered functions, indexed by FuncId.
@@ -1187,6 +1195,7 @@ impl ExecutionEngine {
         let (tx, rx) = mpsc::channel();
         Self {
             mode,
+            fibers_have_stacks: false,
             collect_tier_stats: std::env::var_os("WLIFT_TIER_STATS").is_some(),
             functions: Vec::new(),
             jit_threshold: 100,
@@ -2000,7 +2009,7 @@ impl ExecutionEngine {
 
         use std::collections::HashSet;
         let mut tainted: HashSet<crate::intern::SymbolId> = HashSet::new();
-        for n in direct_yield_method_names() {
+        for n in direct_yield_method_names(self.fibers_have_stacks) {
             if let Some(sym) = interner.lookup(n) {
                 tainted.insert(sym);
             }
@@ -2822,7 +2831,7 @@ impl ExecutionEngine {
                 if callee_module != caller_module && mir_touches_module_vars(&body) {
                     continue;
                 }
-                if mir_calls_jit_unsafe_fiber_method(&body, interner)
+                if mir_calls_jit_unsafe_fiber_method(&body, interner, self.fibers_have_stacks)
                     || mir_calls_any_tainted_method(&body, &tainted)
                 {
                     continue;
@@ -3892,7 +3901,7 @@ impl ExecutionEngine {
         // borrow conflict.
         let tainted = self.compute_may_yield_methods(interner);
         let body = &self.functions[idx];
-        if mir_calls_jit_unsafe_fiber_method(body.mir(), interner) {
+        if mir_calls_jit_unsafe_fiber_method(body.mir(), interner, self.fibers_have_stacks) {
             return false;
         }
         if mir_calls_any_tainted_method(body.mir(), &tainted) {
@@ -4043,7 +4052,9 @@ impl ExecutionEngine {
         let direct_unsafe = self
             .functions
             .get(idx)
-            .map(|body| mir_calls_jit_unsafe_fiber_method(body.mir(), interner))
+            .map(|body| {
+                mir_calls_jit_unsafe_fiber_method(body.mir(), interner, self.fibers_have_stacks)
+            })
             .unwrap_or(false);
         if direct_unsafe {
             return;

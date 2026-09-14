@@ -255,6 +255,7 @@ pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
     // A compiled body suspends only on a stack of its own, so the
     // fibers of an AOT program always get one.
     vm.krio_fiber_active = true;
+    vm.engine.fibers_have_stacks = true;
     Box::into_raw(Box::new(vm))
 }
 
