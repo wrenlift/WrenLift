@@ -8,6 +8,8 @@ pub mod gc_immix_heap;
 pub mod gc_marksweep;
 pub mod gc_ringbuf;
 pub mod gc_trait;
+#[cfg(feature = "host")]
+pub mod isolate;
 pub mod live_regs;
 pub mod object;
 pub mod object_layout;

@@ -213,6 +213,13 @@ impl Sched {
         token
     }
 
+    /// Forget a token that will not be parked on.
+    pub fn discard_waiter(&self, token: Token) {
+        with_registry(|reg| {
+            reg.remove(&token);
+        });
+    }
+
     /// Where the calling stack stands relative to the step in progress.
     pub fn context(&self) -> Context {
         if self.active.is_some() {

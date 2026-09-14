@@ -391,6 +391,21 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub sched: Option<Box<crate::runtime::sched::Sched>>,
 
+    /// How to build a VM for an isolate this one spawns: the
+    /// embedder's, with its module loader and packages. Without one
+    /// an isolate gets this VM's execution settings and only the
+    /// built-in modules.
+    #[cfg(feature = "host")]
+    pub isolate_factory: Option<crate::runtime::isolate::Factory>,
+
+    /// The value this VM was spawned with, read by `IsolateCore.arg`.
+    #[cfg(feature = "host")]
+    pub isolate_arg: Option<crate::runtime::isolate::Xfer>,
+
+    /// Compiled modules of a staged hatch, by name: each is installed
+    /// and run the first time it is imported (see `stage_hatch_modules`).
+    staged_hatch_modules: HashMap<String, Vec<u8>>,
+
     /// Use per-fiber bump-allocator regions for short-lived Wren
     /// allocations (`wren_make_string`, eventually `wren_make_list`
     /// + `wren_make_map`). When on, every fiber gets an
@@ -615,6 +630,11 @@ impl VM {
             file_watches: Vec::new(),
             #[cfg(feature = "host")]
             sched: None,
+            #[cfg(feature = "host")]
+            isolate_factory: None,
+            #[cfg(feature = "host")]
+            isolate_arg: None,
+            staged_hatch_modules: HashMap::new(),
         };
 
         // Bootstrap core classes.
@@ -625,6 +645,22 @@ impl VM {
     }
 
     /// Create a new VM with default configuration.
+    /// This VM's execution settings as a config for a fresh VM, with
+    /// no module loader or host callbacks.
+    #[cfg(feature = "host")]
+    pub fn isolate_config(&self) -> VMConfig {
+        VMConfig {
+            execution_mode: self.config.execution_mode,
+            jit_threshold: self.config.jit_threshold,
+            opt_threshold: self.config.opt_threshold,
+            fiber_stack_traces: self.config.fiber_stack_traces,
+            step_limit: self.config.step_limit,
+            max_call_depth: self.config.max_call_depth,
+            gc_strategy: self.config.gc_strategy,
+            ..VMConfig::default()
+        }
+    }
+
     pub fn new_default() -> Self {
         Self::new(VMConfig::default())
     }
@@ -819,6 +855,75 @@ impl VM {
             return InterpretResult::CompileError;
         }
         self.install_hatch_sections(&hatch)
+    }
+
+    /// Make a hatch's modules importable without running any of them:
+    /// its native libraries are registered and each compiled module
+    /// waits for its first `import`. An isolate stages the program's
+    /// bundle this way and imports only the module it was spawned on.
+    pub fn stage_hatch_modules(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
+        let hatch = match crate::hatch::load(hatch_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                self.report_error(&format!("failed to load hatch: {}", e));
+                return InterpretResult::CompileError;
+            }
+        };
+        let runtime = crate::hatch::current_runtime_target();
+        if let Err(e) = crate::hatch::check_target_compat(hatch.manifest.target.as_deref(), runtime)
+        {
+            self.report_error(&format!("failed to load hatch: {}", e));
+            return InterpretResult::CompileError;
+        }
+        #[cfg(feature = "host")]
+        {
+            self.apply_hatch_native_manifest(&hatch.manifest);
+            let result = self.extract_hatch_native_sections(&hatch);
+            if !matches!(result, InterpretResult::Success) {
+                return result;
+            }
+        }
+        for section in &hatch.sections {
+            match section.kind {
+                crate::hatch::SectionKind::Source => {
+                    if let Ok(text) = std::str::from_utf8(&section.data) {
+                        self.module_sources
+                            .insert(section.name.clone(), text.to_string());
+                    }
+                }
+                crate::hatch::SectionKind::Wlbc
+                    if hatch.manifest.modules.contains(&section.name)
+                        && !self.engine.modules.contains_key(&section.name) =>
+                {
+                    self.staged_hatch_modules
+                        .insert(section.name.clone(), section.data.clone());
+                }
+                _ => {}
+            }
+        }
+        InterpretResult::Success
+    }
+
+    /// Install and run a staged module, if `name` is one.
+    fn load_staged_hatch_module(&mut self, name: &str) -> Option<InterpretResult> {
+        let data = self.staged_hatch_modules.remove(name)?;
+        Some(match crate::serialize::load(&data) {
+            Ok(blob) => self.install_module_mir_and_run_with_sources(
+                name,
+                &blob.interner,
+                blob.module,
+                blob.var_names,
+                blob.var_sources,
+                blob.class_field_names,
+            ),
+            Err(e) => {
+                self.report_error(&format!(
+                    "hatch module '{}' failed to load its wlbc payload: {}",
+                    name, e
+                ));
+                InterpretResult::CompileError
+            }
+        })
     }
 
     /// Fold a hatch manifest's native-library declarations into the
@@ -1271,6 +1376,11 @@ impl VM {
                     // Check for built-in optional modules first
                     if self.try_load_builtin_module(&canonical) {
                         // Built-in module registered successfully
+                    } else if let Some(result) = self.load_staged_hatch_module(&canonical) {
+                        if result != InterpretResult::Success {
+                            self.loading_modules.remove(&module_key);
+                            return result;
+                        }
                     } else {
                         // Resolve module source via config callback.
                         // Pass the canonical name so the loader's
@@ -1767,6 +1877,7 @@ impl VM {
             ("CryptoCore", "crypto"),
             ("ZipCore", "zip"),
             ("SocketCore", "socket"),
+            ("IsolateCore", "isolate"),
             ("Hatch", "hatch"),
         ];
         for name in &var_names {
@@ -3133,6 +3244,20 @@ impl VM {
                         super::engine::FuncId(u32::MAX),
                         vec![class_value],
                         vec!["ZipCore".to_string()],
+                    ),
+                );
+                true
+            }
+            #[cfg(feature = "host")]
+            "isolate" => {
+                let class = super::core::isolate::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "isolate".to_string(),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["IsolateCore".to_string()],
                     ),
                 );
                 true

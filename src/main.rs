@@ -21,7 +21,7 @@ use wren_lift::sema;
 // ---------------------------------------------------------------------------
 
 /// WrenLift — Lightning fast JIT runtime for the Wren programming language.
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "wlift", version, about)]
 struct Cli {
     /// Wren source file to compile/run. Omit to start the REPL.
@@ -558,6 +558,16 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         eprintln!("error: {}", e);
         process::exit(1);
     }
+    // An isolate gets the same loader and spec dependencies.
+    let factory_cli = cli.clone();
+    let factory_dir = source_dir.clone();
+    vm.isolate_factory = Some(std::sync::Arc::new(move || {
+        let mut vm = make_vm_with_loader(&factory_cli, Some(factory_dir.clone()));
+        if let Err(e) = preinstall_spec_dependencies(&mut vm, &factory_dir) {
+            eprintln!("error: {}", e);
+        }
+        vm
+    }));
 
     let module_name = filename.strip_suffix(".wren").unwrap_or(filename);
 

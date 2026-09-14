@@ -1706,21 +1706,25 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
     // messages so a flaky route handler doesn't show up in logs as
     // a one-line "Object does not implement 'split(_)'" with no
     // caller context.
-    let mut config = wren_lift::runtime::vm::VMConfig {
-        step_limit: 0,
-        fiber_stack_traces: true,
-        ..Default::default()
+    let run_config = || {
+        let mut config = wren_lift::runtime::vm::VMConfig {
+            step_limit: 0,
+            fiber_stack_traces: true,
+            ..Default::default()
+        };
+        if std::env::var("WLIFT_MODE")
+            .map(|m| m == "interpreter" || m == "interp")
+            .unwrap_or(false)
+        {
+            config.execution_mode = wren_lift::runtime::engine::ExecutionMode::Interpreter;
+        }
+        config
     };
-    if std::env::var("WLIFT_MODE")
-        .map(|m| m == "interpreter" || m == "interp")
-        .unwrap_or(false)
-    {
-        config.execution_mode = wren_lift::runtime::engine::ExecutionMode::Interpreter;
-    }
-    let mut vm = VM::new(config);
+    let mut vm = VM::new(run_config());
 
     // Preload dependency hatches in CLI order. Manifest-driven
     // resolution against a registry lands in later hatch-cli work.
+    let mut dep_bundles: Vec<Vec<u8>> = Vec::new();
     for dep_path in withs {
         let dep_bytes = match std::fs::read(dep_path) {
             Ok(b) => b,
@@ -1734,7 +1738,23 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
             InterpretResult::CompileError => process::exit(65),
             InterpretResult::RuntimeError => process::exit(70),
         }
+        dep_bundles.push(dep_bytes);
     }
+
+    // An isolate gets the dependencies installed and the program's
+    // own modules staged, so it can import the one it was spawned on.
+    let dep_bundles = std::sync::Arc::new(dep_bundles);
+    let main_bundle = std::sync::Arc::new(main_bytes.to_vec());
+    vm.isolate_factory = Some(std::sync::Arc::new(move || {
+        let mut vm = VM::new(run_config());
+        for dep in dep_bundles.iter() {
+            if !matches!(vm.install_hatch_modules(dep), InterpretResult::Success) {
+                return vm;
+            }
+        }
+        vm.stage_hatch_modules(&main_bundle);
+        vm
+    }));
 
     // When the target is a workspace directory, chdir into it before
     // running so `Fs.cwd` at runtime points at the hatchfile's

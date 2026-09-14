@@ -5614,20 +5614,20 @@ Fiber.spawn {
   log.add("a1")
   Fiber.yield()
   log.add("a2")
-  Fiber.sleep(30)
+  Fiber.sleep(150)
   log.add("a3")
 }
 Fiber.spawn {
   log.add("b1")
-  Fiber.sleep(10)
+  Fiber.sleep(50)
   log.add("b2")
 }
 var w = Fiber.waiter
 var c = Fiber.spawn {
-  log.add("c %(Fiber.park(w, 1000))")
+  log.add("c %(Fiber.park(w, 5000))")
 }
 Fiber.spawn {
-  Fiber.sleep(5)
+  Fiber.yield()
   log.add("wake %(Fiber.wake(w))")
   log.add("again %(Fiber.wake(w))")
 }
@@ -5640,7 +5640,7 @@ var order = []
 Fiber.spawn {
   var f = Fiber.new {
     order.add("n1")
-    Fiber.sleep(20)
+    Fiber.sleep(100)
     order.add("n2")
     "ret"
   }
@@ -5740,6 +5740,147 @@ fn e2e_scheduler_wake_from_another_thread() {
     assert_eq!(vm.take_output().trim(), "true");
     assert!(start.elapsed() < std::time::Duration::from_secs(4));
     assert!(waker.join().unwrap());
+}
+
+/// A VM whose isolates can import `worker` and `ticker` from memory.
+fn vm_with_isolate_modules() -> VM {
+    fn module_source(name: &str) -> Option<String> {
+        match name {
+            "worker" => Some(
+                r#"
+import "isolate" for IsolateCore
+var arg = IsolateCore.arg
+var sum = 0
+for (i in 0...arg["n"]) sum = sum + i
+IsolateCore.send(arg["reply"], {"who": arg["who"], "sum": sum, "list": [1, "two", null, true]})
+"#
+                .to_string(),
+            ),
+            "ticker" => Some(
+                r#"
+import "isolate" for IsolateCore
+var a = IsolateCore.arg
+for (k in 0...2) {
+  Fiber.spawn {
+    for (i in 0...3) {
+      Fiber.sleep(2)
+      IsolateCore.send(a["out"], "%(a["name"])-%(k)-%(i)")
+    }
+  }
+}
+while (Fiber.tick(0)) Fiber.idle(50)
+IsolateCore.send(a["out"], "done")
+"#
+                .to_string(),
+            ),
+            _ => None,
+        }
+    }
+    fn make() -> VM {
+        let config = VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            opt_threshold: 4,
+            load_module_fn: Some(Box::new(|name: &str, _from: &str| module_source(name))),
+            ..VMConfig::default()
+        };
+        VM::new(config)
+    }
+    let mut vm = make();
+    vm.isolate_factory = Some(std::sync::Arc::new(make));
+    vm
+}
+
+#[test]
+fn e2e_isolates_run_on_threads_and_pass_values_by_copy() {
+    if !scheduler_available() {
+        return;
+    }
+    let src = r#"
+import "isolate" for IsolateCore
+var reply = IsolateCore.channel()
+var ids = []
+for (k in 0...4) {
+  ids.add(IsolateCore.spawn("worker", {"who": k, "n": 100000, "reply": reply}))
+}
+var got = []
+for (k in 0...4) {
+  var r = IsolateCore.receive(reply, 5000)[0]
+  got.add(r["who"])
+  if (r["who"] == 0) System.print("sum %(r["sum"]) list %(r["list"])")
+}
+got.sort()
+System.print(got)
+for (id in ids) System.print("join %(IsolateCore.join(id, 5000)) err %(IsolateCore.error(id))")
+var bad = IsolateCore.spawn("nope", null)
+IsolateCore.join(bad, 5000)
+System.print("bad: %(IsolateCore.error(bad))")
+System.print(IsolateCore.receive(reply, 10))
+IsolateCore.close(reply)
+System.print("%(IsolateCore.send(reply, 1)) %(IsolateCore.receive(reply, null)) %(IsolateCore.isClosed(reply))")
+var f = Fiber.new { IsolateCore.send(IsolateCore.channel(), Fiber.current) }
+f.try()
+System.print(f.error)
+"#;
+    let mut vm = vm_with_isolate_modules();
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    let expected = [
+        "sum 4999950000 list [1, two, null, true]",
+        "[0, 1, 2, 3]",
+        "join true err null",
+        "join true err null",
+        "join true err null",
+        "join true err null",
+        "bad: compile error in \"nope\"",
+        "null",
+        "false null true",
+        "IsolateCore.send: cannot send a Fiber across isolates.",
+    ]
+    .join("\n");
+    assert_eq!(output.trim(), expected);
+}
+
+#[test]
+fn e2e_isolate_receive_parks_a_task() {
+    // A task parked on a channel is woken by a send from another
+    // isolate's thread while the world keeps running its other tasks.
+    if !scheduler_available() {
+        return;
+    }
+    let src = r#"
+import "isolate" for IsolateCore
+var out = IsolateCore.channel()
+var ids = []
+for (name in ["x", "y"]) ids.add(IsolateCore.spawn("ticker", {"name": name, "out": out}))
+var got = []
+var ticks = 0
+Fiber.spawn {
+  var dones = 0
+  while (dones < 2) {
+    var r = IsolateCore.receive(out, 5000)
+    if (r == null) break
+    if (r[0] == "done") dones = dones + 1 else got.add(r[0])
+  }
+}
+Fiber.spawn {
+  while (Fiber.live > 1) {
+    ticks = ticks + 1
+    Fiber.sleep(1)
+  }
+}
+while (Fiber.tick(0)) Fiber.idle(100)
+System.print("%(got.count) %(ticks > 0)")
+for (id in ids) System.print(IsolateCore.join(id, 5000))
+"#;
+    let mut vm = vm_with_isolate_modules();
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "12 true\ntrue\ntrue");
 }
 
 #[test]

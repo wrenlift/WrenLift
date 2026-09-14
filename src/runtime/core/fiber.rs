@@ -986,7 +986,7 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
 /// The VM behind `ctx`, or an error: the scheduler runs tasks on
 /// their own stacks, so it needs the krio backing.
 #[cfg(feature = "host")]
-fn sched_vm(ctx: &mut dyn NativeContext, what: &str) -> Option<*mut VM> {
+pub(crate) fn sched_vm(ctx: &mut dyn NativeContext, what: &str) -> Option<*mut VM> {
     let vm = ctx.krio_vm_raw_ptr() as *mut VM;
     if vm.is_null() {
         ctx.runtime_error(format!(
@@ -998,13 +998,13 @@ fn sched_vm(ctx: &mut dyn NativeContext, what: &str) -> Option<*mut VM> {
 }
 
 #[cfg(feature = "host")]
-fn sched_of<'a>(vm: *mut VM) -> &'a mut crate::runtime::sched::Sched {
+pub(crate) fn sched_of<'a>(vm: *mut VM) -> &'a mut crate::runtime::sched::Sched {
     unsafe { (*vm).sched.get_or_insert_with(Default::default) }
 }
 
 /// `ms` as an optional deadline: null is forever.
 #[cfg(feature = "host")]
-fn deadline_arg(
+pub(crate) fn deadline_arg(
     ctx: &mut dyn NativeContext,
     what: &str,
     v: Value,
@@ -1025,33 +1025,38 @@ fn deadline_arg(
 /// `true` when woken. On a task this yields to the world; anywhere
 /// else the caller drives the world meanwhile.
 #[cfg(feature = "host")]
-fn park_on(
+pub(crate) fn park_on(
     ctx: &mut dyn NativeContext,
     vm: *mut VM,
     token: u64,
     deadline: Option<std::time::Instant>,
-) -> Value {
+) -> Option<bool> {
     use crate::runtime::sched::Context;
     let sched = sched_of(vm);
     match sched.check_token(token) {
         Err(msg) => {
             ctx.runtime_error(msg);
-            return Value::null();
+            return None;
         }
-        Ok(true) => return Value::bool(true),
+        Ok(true) => return Some(true),
         Ok(false) => {}
     }
     match sched.context() {
-        Context::Driver => Value::bool(sched.drive_until(token, deadline)),
+        Context::Driver => Some(sched.drive_until(token, deadline)),
         Context::Task => {
             sched.request_park(token, deadline);
             if try_krio_yield(Value::null()).is_none() {
                 ctx.runtime_error("Fiber.park: not on a fiber stack.".to_string());
-                return Value::null();
+                return None;
             }
-            Value::bool(sched_of(vm).resume_woken())
+            Some(sched_of(vm).resume_woken())
         }
     }
+}
+
+#[cfg(feature = "host")]
+fn park_value(woken: Option<bool>) -> Value {
+    woken.map_or_else(Value::null, Value::bool)
 }
 
 #[cfg(feature = "host")]
@@ -1089,7 +1094,7 @@ fn fiber_waiter(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 #[cfg(feature = "host")]
-fn token_arg(ctx: &mut dyn NativeContext, what: &str, v: Value) -> Option<u64> {
+pub(crate) fn token_arg(ctx: &mut dyn NativeContext, what: &str, v: Value) -> Option<u64> {
     match v.as_num() {
         Some(t) if t >= 0.0 && t.is_finite() => Some(t as u64),
         _ => {
@@ -1110,7 +1115,7 @@ fn fiber_park(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Ok(deadline) = deadline_arg(ctx, "Fiber.park", args[2]) else {
         return Value::null();
     };
-    park_on(ctx, vm, token, deadline)
+    park_value(park_on(ctx, vm, token, deadline))
 }
 
 #[cfg(feature = "host")]

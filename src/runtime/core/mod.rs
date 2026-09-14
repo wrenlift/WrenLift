@@ -43,6 +43,8 @@ pub mod hash;
 #[cfg(feature = "host")]
 pub mod http;
 #[cfg(feature = "host")]
+pub mod isolate;
+#[cfg(feature = "host")]
 pub mod os;
 #[cfg(feature = "host")]
 pub mod proc;
