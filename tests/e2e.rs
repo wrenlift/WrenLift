@@ -5914,15 +5914,16 @@ fn e2e_two_threads_allocate_and_collect_one_heap() {
                 vm.collect_garbage();
             }
         }
-        let mut spill = Spill::new();
-        vm.enter_safe(&mut spill);
         let out: Vec<String> = vm.api_stack[vm.api_stack.len() - kept.len()..]
             .iter()
             .map(|&v| wren_lift::runtime::core::as_string(v).to_owned())
             .collect();
-        vm.leave_safe();
-        std::hint::black_box(&spill);
         assert_eq!(out, kept);
+        // Done with the heap: safe from here, so the other thread's
+        // collections need not wait for this one.
+        let mut spill = Spill::new();
+        vm.enter_safe(&mut spill);
+        std::hint::black_box(&spill);
         kept
     }
     let worker = a.spawn_thread(|b| churn(b, "b"));
@@ -5934,6 +5935,68 @@ fn e2e_two_threads_allocate_and_collect_one_heap() {
         a.gc.stats().major_collections >= 8,
         "{}",
         a.gc.stats().major_collections
+    );
+}
+
+#[test]
+fn e2e_two_threads_run_wren_on_one_heap() {
+    // Two views run Wren at once: both allocate, call a shared class,
+    // tier up and load modules while the other runs.
+    if !scheduler_available() {
+        return;
+    }
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    };
+    let mut a = VM::new(config);
+    a.output_buffer = Some(String::new());
+    let result = a.interpret(
+        "main",
+        "class Acc {\n  static sum(n) {\n    var s = 0\n    for (i in 0...n) s = s + i\n    return s\n  }\n}\n",
+    );
+    assert!(matches!(result, InterpretResult::Success));
+    let body = |tag: &str| {
+        format!(
+            r#"import "main" for Acc
+class Box_{tag} {{
+  construct new(v) {{ _v = v }}
+  v {{ _v }}
+  double {{ Box_{tag}.new(_v * 2) }}
+}}
+var t = 0
+var seen = {{}}
+for (k in 0...300) {{
+  var l = []
+  for (i in 0...400) l.add("{tag}%(i)")
+  var gen = Fiber.new {{
+    for (x in l) Fiber.yield(x)
+  }}
+  var n = 0
+  while (!gen.isDone) {{
+    var x = gen.call()
+    if (x != null) n = n + 1
+  }}
+  var f = Fn.new {{|a| Box_{tag}.new(a).double.v }}
+  seen["k%(k % 7)"] = f.call(k)
+  t = t + Acc.sum(1000) + l.count + n
+}}
+System.print("{tag} %(t) %(seen.count)")
+"#
+        )
+    };
+    let worker_src = body("w");
+    let worker = a.spawn_thread(move |b| b.interpret("worker", &worker_src));
+    let result = a.interpret("main2", &body("m"));
+    assert!(matches!(result, InterpretResult::Success));
+    assert!(matches!(worker.join().unwrap(), InterpretResult::Success));
+    let mut lines: Vec<String> = a.take_output().lines().map(String::from).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec!["m 150090000 7".to_string(), "w 150090000 7".to_string()]
     );
 }
 

@@ -60,6 +60,14 @@ pub fn forget_stack(id: u64) {
     LIVE.with(|l| l.borrow_mut().retain(|&(s, _)| s != id));
 }
 
+/// Drop every registration on a fiber stack not in `live`: a
+/// collection on another thread freed those stacks with their
+/// activations unfinished, and this thread's registry still names
+/// them.
+pub fn retain_stacks(live: &std::collections::HashSet<u64>) {
+    LIVE.with(|l| l.borrow_mut().retain(|&(s, _)| s == 0 || live.contains(&s)));
+}
+
 /// Append every live register file's values to `out`.
 pub fn collect_live_values(out: &mut Vec<Value>) {
     LIVE.with(|l| {

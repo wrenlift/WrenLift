@@ -1246,6 +1246,10 @@ pub struct ObjFiber {
     /// (BC interp, JIT, WASM), or anywhere the toggle is off.
     #[cfg(feature = "host")]
     pub krio_fiber: Option<KrioStack>,
+    /// The OS thread the fiber runs on: its stack was made there and
+    /// its interpreter state is registered there. 0 for any.
+    #[cfg(feature = "host")]
+    pub thread: u64,
 
     /// Per-fiber bump-allocator region. Allocations made by the
     /// fiber (via `wren_make_string` / `wren_make_list` / etc.) route
@@ -1318,6 +1322,8 @@ impl ObjFiber {
             deadline_ms: None,
             #[cfg(feature = "host")]
             krio_fiber: None,
+            #[cfg(feature = "host")]
+            thread: 0,
             #[cfg(feature = "host")]
             region: None,
             #[cfg(feature = "host")]

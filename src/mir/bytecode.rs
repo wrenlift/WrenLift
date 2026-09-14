@@ -190,6 +190,85 @@ impl Default for CallSiteIC {
     }
 }
 
+/// Bits of `kind` that hold the kind; the rest count the writes, so a
+/// reader can tell a fill that happened under it.
+const KIND_MASK: u64 = 0xFF;
+
+impl CallSiteIC {
+    /// A consistent copy of the entry, or `None` while another thread
+    /// is filling it. The entry is a seqlock: `kind` goes to 0 before
+    /// the fields change and comes back with a fresh count after, so
+    /// equal counts around the field reads mean the fields belong
+    /// together. The copy's `kind` is the kind alone.
+    #[inline(always)]
+    pub fn snapshot(&self) -> Option<CallSiteIC> {
+        use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+        let kind_cell = unsafe { AtomicU64::from_ptr(&self.kind as *const u64 as *mut u64) };
+        let k1 = kind_cell.load(Ordering::Acquire);
+        if k1 & KIND_MASK == 0 {
+            return None;
+        }
+        let class = unsafe { AtomicUsize::from_ptr(&self.class as *const usize as *mut usize) }
+            .load(Ordering::Relaxed);
+        let jit_ptr =
+            unsafe { AtomicUsize::from_ptr(&self.jit_ptr as *const *const u8 as *mut usize) }
+                .load(Ordering::Relaxed);
+        let closure =
+            unsafe { AtomicUsize::from_ptr(&self.closure as *const *const u8 as *mut usize) }
+                .load(Ordering::Relaxed);
+        let func_id = unsafe { AtomicU64::from_ptr(&self.func_id as *const u64 as *mut u64) }
+            .load(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if kind_cell.load(Ordering::Relaxed) != k1 {
+            return None;
+        }
+        Some(CallSiteIC {
+            class,
+            jit_ptr: jit_ptr as *const u8,
+            closure: closure as *const u8,
+            func_id,
+            kind: k1 & KIND_MASK,
+        })
+    }
+
+    /// The kind alone, without the write count.
+    #[inline(always)]
+    pub fn kind(&self) -> u64 {
+        unsafe { AtomicU64::from_ptr(&self.kind as *const u64 as *mut u64) }
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & KIND_MASK
+    }
+
+    /// Fill the entry with `new` so a concurrent `snapshot` sees the
+    /// old entry, nothing, or the new entry, never a mix.
+    #[inline]
+    pub fn store(&self, new: CallSiteIC) {
+        use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+        let kind_cell = unsafe { AtomicU64::from_ptr(&self.kind as *const u64 as *mut u64) };
+        let count = kind_cell.load(Ordering::Relaxed) & !KIND_MASK;
+        kind_cell.store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        unsafe { AtomicUsize::from_ptr(&self.class as *const usize as *mut usize) }
+            .store(new.class, Ordering::Relaxed);
+        unsafe { AtomicUsize::from_ptr(&self.jit_ptr as *const *const u8 as *mut usize) }
+            .store(new.jit_ptr as usize, Ordering::Relaxed);
+        unsafe { AtomicUsize::from_ptr(&self.closure as *const *const u8 as *mut usize) }
+            .store(new.closure as usize, Ordering::Relaxed);
+        unsafe { AtomicU64::from_ptr(&self.func_id as *const u64 as *mut u64) }
+            .store(new.func_id, Ordering::Relaxed);
+        let next = count.wrapping_add(KIND_MASK + 1) & !KIND_MASK;
+        kind_cell.store(next | (new.kind & KIND_MASK), Ordering::Release);
+    }
+
+    /// Empty the entry.
+    #[inline]
+    pub fn clear(&self) {
+        self.store(CallSiteIC::default());
+    }
+}
+
+use std::sync::atomic::AtomicU64;
+
 // SAFETY: IC entries are only accessed from a single interpreter thread.
 // The UnsafeCell is needed for interior mutability through Arc.
 // Send is needed because BytecodeFunction is sent from the compilation thread.

@@ -355,9 +355,6 @@ pub struct Shared {
     // -- Source code storage (for runtime error reporting with ariadne) --
     pub module_sources: HashMap<String, String>,
 
-    /// Modules currently being loaded (for circular import detection).
-    loading_modules: HashSet<String>,
-
     /// Fibers run on stacks of their own (krio) rather than through
     /// the interpreter's stackless switch. On by default on native;
     /// `WLIFT_KRIO_FIBER=0` keeps the stackless path, which only the
@@ -380,6 +377,12 @@ pub struct Shared {
     /// The program's threads and the collector's request to them.
     #[cfg(feature = "host")]
     pub world: super::stw::World,
+    /// Collections so far, for a view to notice one it slept through.
+    #[cfg(feature = "host")]
+    pub collections: std::sync::atomic::AtomicU64,
+    /// Serialises output once the program has several threads.
+    #[cfg(feature = "host")]
+    pub output_lock: std::sync::Mutex<()>,
 
     /// The `isolate` module's classes, null until it is imported.
     #[cfg(feature = "host")]
@@ -406,9 +409,6 @@ pub struct Shared {
     /// plain bool field, mirroring `krio_fiber_active`.
     #[cfg(feature = "host")]
     pub fiber_arena_active: bool,
-
-    /// Global inline method cache for fast monomorphic dispatch.
-    pub method_cache: super::vm_interp::MethodCache,
 
     /// Bitset: `call_sym_flags[sym.index()]` is true for call()/call(_)/... symbols.
     /// Used for O(1) "is this a closure call?" check in the dispatch hot path.
@@ -518,6 +518,14 @@ pub struct VM {
     /// where the thread becomes running and safe again.
     #[cfg(feature = "host")]
     interpret_depth: u32,
+    /// Collections this view has seen; a collection while it was safe
+    /// means its address-keyed cache is stale.
+    #[cfg(feature = "host")]
+    collections_seen: u64,
+    /// This thread's method cache for fast monomorphic dispatch.
+    pub method_cache: super::vm_interp::MethodCache,
+    /// Modules currently being loaded (for circular import detection).
+    loading_modules: HashSet<String>,
 
     // -- Execution state --
     pub fiber: *mut ObjFiber,
@@ -632,6 +640,10 @@ impl VM {
             thread: self.world.join(),
             #[cfg(feature = "host")]
             interpret_depth: 0,
+            #[cfg(feature = "host")]
+            collections_seen: 0,
+            method_cache: super::vm_interp::MethodCache::new(),
+            loading_modules: HashSet::new(),
             fiber: ptr::null_mut(),
             api_stack: Vec::new(),
             has_error: false,
@@ -720,7 +732,6 @@ impl VM {
             config,
             output_buffer: None,
             module_sources: HashMap::new(),
-            loading_modules: HashSet::new(),
             #[cfg(feature = "host")]
             krio_fiber_active,
             // Per-fiber arena. Off by default — see field comment
@@ -728,7 +739,6 @@ impl VM {
             // the default on. `WLIFT_FIBER_ARENA=1` opts in.
             #[cfg(feature = "host")]
             fiber_arena_active: std::env::var_os("WLIFT_FIBER_ARENA").is_some_and(|v| v == "1"),
-            method_cache: super::vm_interp::MethodCache::new(),
             call_sym_flags: Vec::new(),
             hot_method_symbols: HotMethodSymbols::default(),
             native_libs: Vec::new(),
@@ -750,6 +760,10 @@ impl VM {
             #[cfg(feature = "host")]
             world: super::stw::World::new(),
             #[cfg(feature = "host")]
+            collections: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "host")]
+            output_lock: std::sync::Mutex::new(()),
+            #[cfg(feature = "host")]
             isolate_class: ptr::null_mut(),
             #[cfg(feature = "host")]
             channel_class: ptr::null_mut(),
@@ -763,6 +777,10 @@ impl VM {
             thread,
             #[cfg(feature = "host")]
             interpret_depth: 0,
+            #[cfg(feature = "host")]
+            collections_seen: 0,
+            method_cache: super::vm_interp::MethodCache::new(),
+            loading_modules: HashSet::new(),
 
             fiber: ptr::null_mut(),
 
@@ -1472,9 +1490,14 @@ impl VM {
             return InterpretResult::CompileError;
         }
 
-        // 0b. Store source for runtime error reporting
-        self.module_sources
-            .insert(module_name.to_string(), source.to_string());
+        // 0b. Store source for runtime error reporting; other threads
+        // read the table for theirs.
+        {
+            #[cfg(feature = "host")]
+            let _stopped = self.stop_world();
+            self.module_sources
+                .insert(module_name.to_string(), source.to_string());
+        }
 
         // 1. Parse
         let parse_result = parser::parse(source);
@@ -1936,6 +1959,9 @@ impl VM {
         for (cls, layout) in class_field_names {
             self.field_layouts.insert(cls, layout);
         }
+        // The other threads read the tables this install grows.
+        #[cfg(feature = "host")]
+        let stopped = self.stop_world();
         use crate::mir::BlockId;
         // 6. Remap symbols: the source interner and VM interner have different
         // indices for the same strings. Build a mapping and rewrite the MIR.
@@ -2450,6 +2476,12 @@ impl VM {
             };
         }
 
+        #[cfg(feature = "host")]
+        {
+            self.reserve_closure_fns();
+            drop(stopped);
+        }
+
         // 9. Create a fiber and push the initial call frame
         let fiber = self.gc.alloc_fiber();
         let reg_size = self
@@ -2931,6 +2963,13 @@ impl VM {
 
     /// Write to output (captured buffer if set, otherwise stdout).
     pub fn vm_write(&mut self, s: &str) {
+        #[cfg(feature = "host")]
+        let _guard = if self.engine.threaded {
+            let lock: *const std::sync::Mutex<()> = &self.output_lock;
+            Some(unsafe { (*lock).lock().unwrap_or_else(|e| e.into_inner()) })
+        } else {
+            None
+        };
         if let Some(ref mut buf) = self.output_buffer {
             buf.push_str(s);
         } else {
@@ -4152,11 +4191,30 @@ impl VM {
             // the borrow of `self` the collection needs.
             let world: *const super::stw::World = &self.world;
             let guard = unsafe { (*world).stop(&self.thread) };
+            // Results the broker has ready are installed here too,
+            // while the world is already stopped.
+            if self
+                .engine
+                .results_ready
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                super::engine::with_installs_open(|| {
+                    self.engine.poll_compilations();
+                    self.drain_compile_queue();
+                });
+            }
             Some((guard, spill))
         } else {
             None
         };
         self.collect_garbage_stopped();
+        #[cfg(feature = "host")]
+        {
+            self.collections_seen = self
+                .collections
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
+        }
         #[cfg(feature = "host")]
         if let Some((guard, spill)) = stopped {
             self.world.resume(guard);
@@ -5415,7 +5473,10 @@ impl VM {
             .top_level
             .remap_symbols(|old| sym_map[old.index() as usize]);
 
-        // 5. Register closures if any
+        // 5. Register closures if any. The other threads read the
+        // function table this grows.
+        #[cfg(feature = "host")]
+        let stopped = self.stop_world();
         let eval_module_rc = std::rc::Rc::new(module_name.to_string());
         let mut closure_func_ids: Vec<u32> = Vec::new();
         for closure in module_mir.closures.drain(..) {
@@ -5430,6 +5491,11 @@ impl VM {
         let func_id = self
             .engine
             .register_function_in(module_mir.top_level, Some(eval_module_rc));
+        #[cfg(feature = "host")]
+        {
+            self.reserve_closure_fns();
+            drop(stopped);
+        }
 
         // Build eval module vars in the order the resolver expects, looking up
         // values by name from the calling module (to match slot indices).
@@ -5642,6 +5708,9 @@ impl VM {
         for closure in &mut module_mir.closures {
             patch_closure_ids(closure, &closure_func_ids);
         }
+        // The other threads read the function table this grows.
+        #[cfg(feature = "host")]
+        let stopped = self.stop_world();
         for (i, closure) in module_mir.closures.drain(..).enumerate() {
             let fid = self
                 .engine
@@ -5661,6 +5730,11 @@ impl VM {
             module_key,
             super::engine::ModuleEntry::new(func_id, compiled_vars, compiled_var_names),
         );
+        #[cfg(feature = "host")]
+        {
+            self.reserve_closure_fns();
+            drop(stopped);
+        }
         let fn_name = self.interner.intern("<compiled>");
         let fn_ptr = self.gc.alloc_fn(fn_name, 0, 0, func_id.0);
         unsafe {
@@ -6436,6 +6510,27 @@ impl VM {
     }
 }
 
+/// The world stopped for a structural change; resumed on drop.
+#[cfg(feature = "host")]
+pub struct StoppedWorld {
+    vm: *mut VM,
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+    /// Lives here so the thread's registers stay in a scanned frame.
+    #[allow(dead_code)]
+    spill: Spill,
+}
+
+#[cfg(feature = "host")]
+impl Drop for StoppedWorld {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            // SAFETY: the view outlives the change it stopped the
+            // world for; the guard came from its world.
+            unsafe { (&*self.vm).world.resume(guard) };
+        }
+    }
+}
+
 /// The register spill a thread leaves in its own frame while it is
 /// safe; the collector's scan of that thread starts at it.
 #[cfg(feature = "host")]
@@ -6507,9 +6602,25 @@ impl VM {
         self.world.become_safe(&self.thread, sp, fiber_id, roots);
     }
 
-    /// Back to running Wren, once no collection is waiting.
+    /// Back to running Wren, once no collection is waiting. A
+    /// collection that ran meanwhile may have freed what the method
+    /// cache points at.
     pub fn leave_safe(&mut self) {
         self.world.become_running(&self.thread);
+        let collections = self.collections.load(std::sync::atomic::Ordering::Acquire);
+        if collections != self.collections_seen {
+            self.collections_seen = collections;
+            self.method_cache.invalidate();
+            // Fibers of this thread freed by that collection took
+            // their register files with them.
+            let mut live = std::collections::HashSet::new();
+            self.gc.for_each_fiber(|f| unsafe {
+                if let Some(k) = (*f).krio_fiber.as_deref() {
+                    live.insert(k.id());
+                }
+            });
+            super::live_regs::retain_stacks(&live);
+        }
     }
 
     /// Run `body` on a new OS thread with a view of this program of
@@ -6527,11 +6638,71 @@ impl VM {
         // under the collector's discipline.
         unsafe impl Send for Sent {}
         self.gc.set_multithreaded();
+        self.engine.threaded = true;
         let sent = Sent(self.new_thread());
         std::thread::spawn(move || {
             let mut sent = sent;
             body(&mut sent.0)
         })
+    }
+
+    /// Size the shared closure-function table for every function
+    /// registered, so a thread creating a closure never grows it.
+    fn reserve_closure_fns(&mut self) {
+        let n = self.engine.functions.len();
+        if self.closure_fns.len() < n {
+            self.closure_fns.resize(n, ptr::null_mut());
+        }
+    }
+
+    /// Stop the other threads for a structural change: a module
+    /// install, a class or function table growing. Nothing to do
+    /// while the program has one thread. Resumes them on drop.
+    pub fn stop_world(&mut self) -> StoppedWorld {
+        if !(self.gc.is_immix() && self.world.thread_count() > 1) {
+            return StoppedWorld {
+                vm: std::ptr::null_mut(),
+                guard: None,
+                spill: Spill::new(),
+            };
+        }
+        let mut spill = Spill::new();
+        self.enter_safe(&mut spill);
+        let world: *const super::stw::World = &self.world;
+        let guard = unsafe { (*world).stop(&self.thread) };
+        StoppedWorld {
+            vm: self,
+            guard: Some(guard),
+            spill,
+        }
+    }
+
+    /// Install compile results the broker has ready, with the other
+    /// threads stopped: they read the function table the install
+    /// rewrites.
+    pub fn install_compilations(&mut self) {
+        if !self.engine.threaded {
+            self.engine.poll_compilations();
+            self.drain_compile_queue();
+            return;
+        }
+        if !self
+            .engine
+            .results_ready
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut spill = Spill::new();
+        self.enter_safe(&mut spill);
+        let world: *const super::stw::World = &self.world;
+        let guard = unsafe { (*world).stop(&self.thread) };
+        super::engine::with_installs_open(|| {
+            self.engine.poll_compilations();
+            self.drain_compile_queue();
+        });
+        self.world.resume(guard);
+        std::hint::black_box(&spill);
     }
 
     /// A safepoint: stop here while another thread collects.
@@ -6545,7 +6716,13 @@ impl VM {
     /// another thread is waiting to collect.
     #[inline(always)]
     pub fn safepoint_due(&self) -> bool {
-        self.gc.should_collect() || self.world.requested()
+        self.gc.should_collect()
+            || self.world.requested()
+            || (self.engine.threaded
+                && self
+                    .engine
+                    .results_ready
+                    .load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 

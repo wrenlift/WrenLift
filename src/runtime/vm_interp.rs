@@ -2554,8 +2554,12 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     // the cached `env_ic_jit_enabled()` reduces to a
                     // single load + branch the predictor pins as
                     // never-taken.
-                    if env_ic_jit_enabled() && ic_idx < ic_table.len() {
-                        let ic = &ic_table[ic_idx];
+                    let ic_snap = if env_ic_jit_enabled() && ic_idx < ic_table.len() {
+                        ic_table[ic_idx].snapshot()
+                    } else {
+                        None
+                    };
+                    if let Some(ic) = ic_snap.as_ref() {
                         if ic.kind == 1 && recv_val.is_object() {
                             let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
                             let recv_class =
@@ -2721,18 +2725,19 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             // function so the compiler can guard on that.
                             if vm.engine.mode != ExecutionMode::Interpreter {
                                 let function = unsafe { (*closure_ptr).function };
-                                let ic_table = unsafe { &mut *bc.ic_table.get() };
-                                if let Some(ic) = ic_table.get_mut(ic_idx) {
-                                    if ic.kind == 0
-                                        || (ic.kind == 7 && ic.class != function as usize)
-                                    {
-                                        *ic = crate::mir::bytecode::CallSiteIC {
+                                let ic_table = unsafe { &*bc.ic_table.get() };
+                                if let Some(ic) = ic_table.get(ic_idx) {
+                                    let seen = ic.snapshot();
+                                    if seen.is_none_or(|s| {
+                                        s.kind == 0 || (s.kind == 7 && s.class != function as usize)
+                                    }) {
+                                        ic.store(crate::mir::bytecode::CallSiteIC {
                                             class: function as usize,
                                             jit_ptr: std::ptr::null(),
                                             closure: closure_ptr as *const u8,
                                             func_id: unsafe { (*function).fn_id } as u64,
                                             kind: 7,
-                                        };
+                                        });
                                     }
                                 }
                             }
@@ -2775,15 +2780,16 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     // interpreter and JIT share a view of every
                     // monomorphic call site CHA covers.
                     let cha_method = if ic_idx < ic_table.len() {
-                        let ic = &ic_table[ic_idx];
-                        if ic.kind == 1
-                            && ic.class != 0
-                            && !ic.closure.is_null()
-                            && ic.class == cache_key_class as usize
-                        {
-                            Some(Method::Closure(ic.closure as *mut ObjClosure))
-                        } else {
-                            None
+                        match ic_table[ic_idx].snapshot() {
+                            Some(ic)
+                                if ic.kind == 1
+                                    && ic.class != 0
+                                    && !ic.closure.is_null()
+                                    && ic.class == cache_key_class as usize =>
+                            {
+                                Some(Method::Closure(ic.closure as *mut ObjClosure))
+                            }
+                            _ => None,
                         }
                     } else {
                         None
@@ -2891,20 +2897,22 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             // still warming up would otherwise leave the
                             // site with nothing to devirtualise.
                             if vm.engine.mode != ExecutionMode::Interpreter {
-                                let ic_table = unsafe { &mut *bc.ic_table.get() };
-                                if let Some(ic) = ic_table.get_mut(ic_idx) {
-                                    if ic.kind == 0
-                                        || (ic.kind == 2 && ic.class != cache_key_class as usize)
-                                    {
+                                let ic_table = unsafe { &*bc.ic_table.get() };
+                                if let Some(ic) = ic_table.get(ic_idx) {
+                                    let seen = ic.snapshot();
+                                    if seen.is_none_or(|s| {
+                                        s.kind == 0
+                                            || (s.kind == 2 && s.class != cache_key_class as usize)
+                                    }) {
                                         let fn_idx =
                                             unsafe { (*(*closure_ptr).function).fn_id } as usize;
-                                        *ic = crate::mir::bytecode::CallSiteIC {
+                                        ic.store(crate::mir::bytecode::CallSiteIC {
                                             class: cache_key_class as usize,
                                             jit_ptr: std::ptr::null(),
                                             closure: closure_ptr as *const u8,
                                             func_id: fn_idx as u64,
                                             kind: 2,
-                                        };
+                                        });
                                     }
                                 }
                             }
@@ -2938,15 +2946,15 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 }
                                 if jit_dispatch_ok {
                                     // Populate IC for this call site
-                                    let ic_table = unsafe { &mut *bc.ic_table.get() };
+                                    let ic_table = unsafe { &*bc.ic_table.get() };
                                     if ic_idx < ic_table.len() {
-                                        ic_table[ic_idx] = crate::mir::bytecode::CallSiteIC {
+                                        ic_table[ic_idx].store(crate::mir::bytecode::CallSiteIC {
                                             class: cache_key_class as usize,
                                             jit_ptr,
                                             closure: closure_ptr as *const u8,
                                             func_id: fn_idx as u64,
                                             kind: 1, // JIT leaf
-                                        };
+                                        });
                                     }
                                     // Swap in the callee's module context.
                                     // Cross-module calls (e.g. a hot-loop in

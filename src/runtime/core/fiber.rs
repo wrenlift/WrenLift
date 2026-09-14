@@ -190,6 +190,7 @@ fn fiber_new_inner(
                     });
                     unsafe {
                         (*fiber).krio_fiber = Some(crate::runtime::object::KrioStack::new(krio));
+                        (*fiber).thread = crate::runtime::stw::thread_key();
                     }
                     // Charge the krio mmap stack against GC pressure.
                     // Without this the Wren heap accounting only sees
@@ -677,6 +678,18 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // caller fall back to the stackless path.
     if unsafe { (*target).krio_fiber.is_none() } {
         return None;
+    }
+    // A fiber runs on the thread that made it: its stack is scanned
+    // and its register files registered there.
+    let owner = unsafe { (*target).thread };
+    if owner != 0 && owner != crate::runtime::stw::thread_key() {
+        let vm_ptr = crate::runtime::vm::current_vm_ptr();
+        if !vm_ptr.is_null() {
+            unsafe {
+                (*vm_ptr).runtime_error("A fiber runs on the thread that made it.".to_string())
+            };
+        }
+        return Some(Value::null());
     }
 
     // Save the caller's JIT roots and install this fiber's saved

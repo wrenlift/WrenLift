@@ -386,9 +386,9 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
         // we've decided it's stale, at which point we re-acquire the
         // slot as `&mut` and overwrite. Avoids holding `&` and `&mut`
         // to the same slot at once.
-        let (ic_kind, ic_class, ic_func_id, ic_jit_ptr) = {
-            let ic = &ic_table[ic_idx];
-            (ic.kind, ic.class, ic.func_id, ic.jit_ptr)
+        let (ic_kind, ic_class, ic_func_id, ic_jit_ptr) = match ic_table[ic_idx].snapshot() {
+            Some(ic) => (ic.kind, ic.class, ic.func_id, ic.jit_ptr),
+            None => (0, 0, 0, std::ptr::null()),
         };
         if ic_kind == 1 && recv.is_object() && crate::codegen::runtime_fns::ic_jit_kind1_enabled() {
             let obj_ptr = unsafe { recv.as_object().unwrap_unchecked() };
@@ -435,8 +435,7 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
                 if !is_leaf || jit_ptr.is_null() || live_ptr != jit_ptr {
                     // Stale or unsafe-without-roots: drop the IC and
                     // let the slow path redecide on the next call.
-                    let ic_mut = unsafe { &mut (&mut *state.ic_table)[ic_idx] };
-                    *ic_mut = crate::mir::bytecode::CallSiteIC::default();
+                    ic_table[ic_idx].clear();
                 } else {
                     // Direct JIT call — no bytecode decode overhead
                     let recv_bits = recv.to_bits();

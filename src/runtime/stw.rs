@@ -141,6 +141,8 @@ impl World {
             }
             t.state.store(SAFE, Ordering::SeqCst);
             let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            // The collector may have seen the thread running just now.
+            self.changed.notify_all();
             while self.requested() {
                 g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
             }
@@ -178,5 +180,67 @@ impl World {
             self.changed.notify_all();
         }
         drop(guard);
+    }
+}
+
+/// A lock a thread may take again while it holds it: the tier
+/// bookkeeping's entry points call each other.
+pub struct ReentrantLock {
+    mutex: Mutex<()>,
+    owner: AtomicU64,
+    depth: AtomicUsize,
+    changed: Condvar,
+}
+
+impl Default for ReentrantLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A number naming the calling OS thread, stable for its lifetime.
+pub fn thread_key() -> u64 {
+    thread_local! {
+        static KEY: u8 = const { 0 };
+    }
+    KEY.with(|k| k as *const u8 as u64)
+}
+
+impl ReentrantLock {
+    pub fn new() -> ReentrantLock {
+        ReentrantLock {
+            mutex: Mutex::new(()),
+            owner: AtomicU64::new(0),
+            depth: AtomicUsize::new(0),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub fn lock(&self) -> ReentrantGuard<'_> {
+        let me = thread_key();
+        if self.owner.load(Ordering::Acquire) == me {
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            return ReentrantGuard(self);
+        }
+        let mut g = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        while self.owner.load(Ordering::Acquire) != 0 {
+            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        self.owner.store(me, Ordering::Release);
+        self.depth.store(1, Ordering::Relaxed);
+        ReentrantGuard(self)
+    }
+}
+
+pub struct ReentrantGuard<'a>(&'a ReentrantLock);
+
+impl Drop for ReentrantGuard<'_> {
+    fn drop(&mut self) {
+        let lock = self.0;
+        if lock.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let _g = lock.mutex.lock().unwrap_or_else(|e| e.into_inner());
+            lock.owner.store(0, Ordering::Release);
+            lock.changed.notify_one();
+        }
     }
 }

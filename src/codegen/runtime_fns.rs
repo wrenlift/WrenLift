@@ -914,14 +914,11 @@ fn populate_callsite_ic(
         },
     };
 
-    unsafe {
-        *ic_ptr = entry;
-    }
+    unsafe { (*ic_ptr).store(entry) };
     trace_jit_ic(|| {
         format!(
             "jit-ic: populate kind={} ic_ptr=0x{:x}",
-            unsafe { (*ic_ptr).kind },
-            ic_ptr as usize
+            entry.kind, ic_ptr as usize
         )
     });
 }
@@ -974,13 +971,13 @@ fn maybe_upgrade_closure_ic_to_leaf(
     }
 
     unsafe {
-        *ic_ptr = crate::mir::bytecode::CallSiteIC {
+        (*ic_ptr).store(crate::mir::bytecode::CallSiteIC {
             class: cache_key_class as usize,
             jit_ptr,
             closure: closure_ptr as *const u8,
             func_id: func_id.0 as u64,
             kind: 1,
-        };
+        });
     }
     trace_jit_ic(|| format!("jit-ic: upgrade kind=1 func={}", func_id.0));
     true
@@ -1012,7 +1009,7 @@ fn try_dispatch_callsite_ic(
     args: &[Value],
     cache_key_class: *mut ObjClass,
 ) -> Option<u64> {
-    let ic = unsafe { &mut *ic_ptr };
+    let ic = unsafe { (*ic_ptr).snapshot()? };
     if ic.class != cache_key_class as usize || ic.class == 0 {
         vm.engine
             .note_runtime_call_stats(|s| s.dispatch_call_ic_class_misses += 1);
@@ -1028,7 +1025,7 @@ fn try_dispatch_callsite_ic(
             if args.len() > 4 {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return None;
             }
             let fn_idx = ic.func_id as usize;
@@ -1047,7 +1044,7 @@ fn try_dispatch_callsite_ic(
             {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return None;
             }
             vm.engine.note_ic_hit(func_id);
@@ -1060,7 +1057,7 @@ fn try_dispatch_callsite_ic(
             if closure_ptr.is_null() {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return None;
             }
             let func_id = crate::runtime::engine::FuncId(ic.func_id as u32);
@@ -1072,18 +1069,12 @@ fn try_dispatch_callsite_ic(
                 closure_ptr,
                 args.len(),
             ) {
-                let live_ptr = unsafe { (*ic_ptr).jit_ptr };
-                vm.engine
-                    .note_ic_hit(crate::runtime::engine::FuncId(unsafe {
-                        (*ic_ptr).func_id as u32
-                    }));
+                let up = unsafe { (*ic_ptr).snapshot() }?;
+                let live_ptr = up.jit_ptr;
+                let fid = crate::runtime::engine::FuncId(up.func_id as u32);
+                vm.engine.note_ic_hit(fid);
                 vm.engine.note_runtime_call_stats(|s| s.ic_kind1_hits += 1);
-                trace_jit_ic(|| {
-                    format!("jit-ic: hit upgraded kind=1 func={}", unsafe {
-                        (*ic_ptr).func_id
-                    })
-                });
-                let fid = crate::runtime::engine::FuncId(unsafe { (*ic_ptr).func_id as u32 });
+                trace_jit_ic(|| format!("jit-ic: hit upgraded kind=1 func={}", up.func_id));
                 return Some(unsafe { call_jit_with_shadow(vm, live_ptr, fid, args) });
             }
             vm.engine.note_ic_hit(func_id);
@@ -1107,7 +1098,7 @@ fn try_dispatch_callsite_ic(
             if closure_ptr.is_null() || class_ptr.is_null() || args.is_empty() {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return Some(Value::null().to_bits());
             }
             let func_id = crate::runtime::engine::FuncId(ic.func_id as u32);
@@ -1150,7 +1141,7 @@ fn try_dispatch_callsite_ic(
             if instance.is_null() {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return None;
             }
             if !ic.closure.is_null() {
@@ -1165,7 +1156,7 @@ fn try_dispatch_callsite_ic(
             if fields_ptr.is_null() {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return None;
             }
             Some(unsafe { (*fields_ptr.add(ic.func_id as usize)).to_bits() })
@@ -1188,7 +1179,7 @@ fn try_dispatch_callsite_ic(
             if live_ptr.is_null() || live_ptr != ic.jit_ptr || jit_disabled() {
                 vm.engine
                     .note_runtime_call_stats(|s| s.ic_invalidations += 1);
-                *ic = crate::mir::bytecode::CallSiteIC::default();
+                unsafe { (*ic_ptr).clear() };
                 return None;
             }
             vm.engine.note_ic_hit(func_id);
@@ -3932,7 +3923,7 @@ pub extern "C" fn wren_ic_call_3(ic_ptr: u64, recv: u64, a0: u64, a1: u64, a2: u
 
 fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     let ic_ptr = ic_ptr_raw as *mut crate::mir::bytecode::CallSiteIC;
-    let ic = unsafe { &*ic_ptr };
+    let ic = unsafe { (*ic_ptr).snapshot() }.unwrap_or_default();
     let jit_ptr = ic.jit_ptr;
     // Root every inbound arg before any dispatch. Args arrive in
     // CPU registers from the JIT'd caller, which means the GC has
@@ -4023,9 +4014,11 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
                     // reset the closure_for_fallback pointer outside the
                     // borrow so we don't double-borrow `vm` on the call.
                     closure_for_fallback = ic.closure as *mut ObjClosure;
-                    unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
+                    unsafe { (*ic_ptr).clear() };
                 } else if live != jit_ptr {
-                    unsafe { (*ic_ptr).jit_ptr = live };
+                    let mut fresh = ic;
+                    fresh.jit_ptr = live;
+                    unsafe { (*ic_ptr).store(fresh) };
                     call_ptr = live;
                 }
             }
@@ -4065,9 +4058,11 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
                 .unwrap_or(std::ptr::null());
             if live.is_null() {
                 closure_for_fallback = ic.closure as *mut ObjClosure;
-                unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
+                unsafe { (*ic_ptr).clear() };
             } else if live != jit_ptr {
-                unsafe { (*ic_ptr).jit_ptr = live };
+                let mut fresh = ic;
+                fresh.jit_ptr = live;
+                unsafe { (*ic_ptr).store(fresh) };
                 call_ptr = live;
             }
         }

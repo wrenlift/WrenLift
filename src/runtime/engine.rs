@@ -851,6 +851,17 @@ fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
 pub struct ExecutionEngine {
     /// Current execution mode.
     pub mode: ExecutionMode,
+    /// The program runs on several threads: the tier bookkeeping
+    /// locks, and compiled code is installed only with the world
+    /// stopped (`VM::install_compilations`).
+    #[cfg(feature = "host")]
+    pub threaded: bool,
+    #[cfg(feature = "host")]
+    tier_lock: super::stw::ReentrantLock,
+    /// Set by the broker when a compile result is waiting; a thread
+    /// that sees it stops the world and installs.
+    #[cfg(feature = "host")]
+    pub results_ready: Arc<std::sync::atomic::AtomicBool>,
     /// The VM's fibers run on stacks of their own, so a compiled body
     /// may yield.
     pub fibers_have_stacks: bool,
@@ -1189,12 +1200,34 @@ pub enum InterpretResult {
     RuntimeError,
 }
 
+#[cfg(feature = "host")]
+thread_local! {
+    /// Whether this thread may install compile results now: set while
+    /// it has the world stopped.
+    static INSTALL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with installs allowed on this thread.
+#[cfg(feature = "host")]
+pub fn with_installs_open<R>(f: impl FnOnce() -> R) -> R {
+    let prev = INSTALL_OPEN.with(|c| c.replace(true));
+    let r = f();
+    INSTALL_OPEN.with(|c| c.set(prev));
+    r
+}
+
 impl ExecutionEngine {
     /// Create a new engine with the given mode.
     pub fn new(mode: ExecutionMode) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
             mode,
+            #[cfg(feature = "host")]
+            threaded: false,
+            #[cfg(feature = "host")]
+            tier_lock: super::stw::ReentrantLock::new(),
+            #[cfg(feature = "host")]
+            results_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fibers_have_stacks: false,
             collect_tier_stats: std::env::var_os("WLIFT_TIER_STATS").is_some(),
             functions: Vec::new(),
@@ -1468,6 +1501,7 @@ impl ExecutionEngine {
         id: FuncId,
         interner: &crate::intern::Interner,
     ) -> Option<&crate::mir::threaded::ThreadedCode> {
+        let _guard = self.tier_guard();
         let idx = id.0 as usize;
         if idx >= self.threaded_code.len() {
             return None;
@@ -1542,6 +1576,15 @@ impl ExecutionEngine {
     #[inline(never)]
     fn ensure_bytecode_slow(&mut self, id: FuncId) -> Option<*const BytecodeFunction> {
         let idx = id.0 as usize;
+        // Two threads lowering the same function would each install
+        // theirs and drop the other's under its reader.
+        #[cfg(feature = "host")]
+        let _guard = self.tier_guard();
+        if let Some(&cached) = self.bc_cache.get(idx) {
+            if !cached.is_null() {
+                return Some(cached);
+            }
+        }
         // Slow path: compile bytecode if needed
         let ptr = match self.functions.get_mut(idx)? {
             FuncBody::Interpreted { mir, bytecode, .. } => {
@@ -1580,24 +1623,19 @@ impl ExecutionEngine {
     ) -> Option<(Vec<CallSiteIC>, Vec<usize>)> {
         let bc_ptr = self.ensure_bytecode(id)?;
         let bc = unsafe { &*bc_ptr };
-        let ic_table = unsafe { &mut *bc.ic_table.get() };
+        let ic_table = unsafe { &*bc.ic_table.get() };
 
-        // Snapshot for the compiler (used on background thread).
+        // Snapshot for the compiler (used on background thread); an
+        // entry being filled counts as empty.
         let snapshot: Vec<CallSiteIC> = ic_table
             .iter()
-            .map(|ic| CallSiteIC {
-                class: ic.class,
-                jit_ptr: ic.jit_ptr,
-                closure: ic.closure,
-                func_id: ic.func_id,
-                kind: ic.kind,
-            })
+            .map(|ic| ic.snapshot().unwrap_or_default())
             .collect();
         // Live pointers: address of each IC entry in the live table.
         // These are stable because the Vec doesn't reallocate after creation.
         let live_ptrs: Vec<usize> = ic_table
-            .iter_mut()
-            .map(|ic| ic as *mut CallSiteIC as usize)
+            .iter()
+            .map(|ic| ic as *const CallSiteIC as usize)
             .collect();
         if tier_trace_enabled() && !snapshot.is_empty() {
             let k5 = snapshot.iter().filter(|ic| ic.kind == 5).count();
@@ -2159,10 +2197,10 @@ impl ExecutionEngine {
                 }
             };
             let Some(bytecode) = bytecode else { continue };
-            let ic_table = unsafe { &mut *bytecode.ic_table.get() };
-            for entry in ic_table.iter_mut() {
-                if entry.func_id == target_id {
-                    *entry = CallSiteIC::default();
+            let ic_table = unsafe { &*bytecode.ic_table.get() };
+            for entry in ic_table.iter() {
+                if entry.snapshot().is_some_and(|e| e.func_id == target_id) {
+                    entry.clear();
                 }
             }
         }
@@ -2178,9 +2216,9 @@ impl ExecutionEngine {
             let Some(bytecode) = bytecode else {
                 continue;
             };
-            let ic_table = unsafe { &mut *bytecode.ic_table.get() };
-            for entry in ic_table.iter_mut() {
-                *entry = CallSiteIC::default();
+            let ic_table = unsafe { &*bytecode.ic_table.get() };
+            for entry in ic_table.iter() {
+                entry.clear();
             }
         }
     }
@@ -2368,6 +2406,7 @@ impl ExecutionEngine {
     /// it; the top tier may be proposed again for the unspeculated body.
     #[cfg(feature = "host")]
     pub fn note_speculation_failed(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        let _guard = self.tier_guard();
         let idx = id.0 as usize;
         if idx >= self.functions.len() || self.speculation_failed[idx] {
             return;
@@ -3715,6 +3754,7 @@ impl ExecutionEngine {
         if self.mode != ExecutionMode::Tiered {
             return;
         }
+        let _guard = self.tier_guard();
         let Some(count) = self.tier_cells.get(id.0 as usize).map(|c| c.tick()) else {
             return;
         };
@@ -4020,6 +4060,7 @@ impl ExecutionEngine {
 
     #[cfg(feature = "host")]
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        let _guard = self.tier_guard();
         let idx = id.0 as usize;
         let Some(tier) = self.next_compile_tier(idx) else {
             return;
@@ -4152,6 +4193,7 @@ impl ExecutionEngine {
         self.compiling_tier[idx] = Some(tier);
         self.pending_count += 1;
         let tx = self.compilation_tx.clone();
+        let results_ready = Arc::clone(&self.results_ready);
         let target = Self::native_target();
         let interner_clone = interner.clone();
         let trace_name_clone = trace_name.clone();
@@ -4351,6 +4393,7 @@ impl ExecutionEngine {
                 _ => (std::ptr::null_mut(), Vec::new()),
             };
             let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
+            results_ready.store(true, std::sync::atomic::Ordering::Release);
             if tier_cell_addr != 0 {
                 // SAFETY: the cell is boxed for the engine's lifetime and
                 // only ever read through atomics on other threads; the
@@ -4430,11 +4473,30 @@ impl ExecutionEngine {
     #[cfg(not(feature = "host"))]
     pub fn poll_compilations(&mut self) {}
 
+    /// The tier lock, when the program has several threads.
+    #[cfg(feature = "host")]
+    fn tier_guard(&self) -> Option<super::stw::ReentrantGuard<'static>> {
+        if !self.threaded {
+            return None;
+        }
+        // The lock lives as long as the engine, which outlives every
+        // call that takes it; the guard is not tied to the borrow of
+        // `self` the caller goes on to use.
+        let lock: *const super::stw::ReentrantLock = &self.tier_lock;
+        Some(unsafe { (*lock).lock() })
+    }
+
     #[cfg(feature = "host")]
     pub fn poll_compilations(&mut self) {
         if self.pending_count == 0 {
             return;
         }
+        // With several threads, a result is installed only with the
+        // world stopped; `VM::install_compilations` opens the gate.
+        if self.threaded && !INSTALL_OPEN.with(|c| c.get()) {
+            return;
+        }
+        let _guard = self.tier_guard();
         while let Ok(result) = self.compilation_rx.try_recv() {
             let idx = match result {
                 CompilationResult::Compiled { id, .. } | CompilationResult::Failed { id, .. } => {
@@ -4506,6 +4568,7 @@ impl ExecutionEngine {
         let bc = unsafe { &*bc_ptr };
         let ic_table = unsafe { &*bc.ic_table.get() };
         for ic in ic_table.iter() {
+            let Some(ic) = ic.snapshot() else { continue };
             if ic.kind == 1 && ic.func_id != 0 {
                 let callee_id = FuncId(ic.func_id as u32);
                 let callee_idx = callee_id.0 as usize;
@@ -4536,6 +4599,8 @@ impl ExecutionEngine {
     /// callees we stashed during the last install so they get compiled
     /// before the caller reaches them.
     pub fn drain_compile_queue(&mut self, interner: &crate::intern::Interner) {
+        #[cfg(feature = "host")]
+        let _guard = self.tier_guard();
         self.poll_compilations();
         let pending = std::mem::take(&mut self.pending_callee_precompile);
         for callee_id in pending {
