@@ -1224,7 +1224,7 @@ fn run_fiber_with_stop_depth(
         std::ptr::null_mut()
     };
     let prev = std::mem::replace(&mut vm.sync_entry_fiber, entry);
-    let result = run_fiber_loop(vm, stop_depth);
+    let result = run_guarded_loop(vm, stop_depth);
     vm.sync_entry_fiber = prev;
     // An unwinding error leaves the frames it was raised in on the
     // fiber; the bridge that pushed the entry frame reports the error
@@ -1240,6 +1240,49 @@ fn run_fiber_with_stop_depth(
         }
     }
     result
+}
+
+/// `run_fiber_loop` under the host's guard (`rt::run_guarded`). An
+/// error the host caught on the way out of its own code is taken here
+/// the way the loop takes one raised by a body: routed to the fiber's
+/// `try`, and the run goes on, else the run ends with it.
+fn run_guarded_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, RuntimeError> {
+    struct Run {
+        vm: *mut VM,
+        stop_depth: Option<usize>,
+        result: Option<Result<Value, RuntimeError>>,
+    }
+    unsafe extern "C" fn body(ctx: *mut std::ffi::c_void) {
+        let run = unsafe { &mut *(ctx as *mut Run) };
+        run.result = Some(run_fiber_loop(unsafe { &mut *run.vm }, run.stop_depth));
+    }
+    loop {
+        let mut run = Run {
+            vm,
+            stop_depth,
+            result: None,
+        };
+        let returned = unsafe {
+            crate::runtime::rt::run_guarded(
+                vm as *mut VM as *mut std::ffi::c_void,
+                body,
+                &mut run as *mut Run as *mut std::ffi::c_void,
+            )
+        };
+        if returned {
+            return run.result.take().unwrap_or(Err(RuntimeError::Unreachable));
+        }
+        vm.has_error = false;
+        let err = vm
+            .last_error
+            .take()
+            .unwrap_or_else(|| "error caught by the host".to_string());
+        let fiber = vm.fiber;
+        if fiber.is_null() || !may_route_try(vm, fiber) {
+            return Err(RuntimeError::Error(err));
+        }
+        unsafe { route_method_error_through_fiber_try(vm, fiber, err) };
+    }
 }
 
 /// Whether an error raised on `fiber` may be caught here by its

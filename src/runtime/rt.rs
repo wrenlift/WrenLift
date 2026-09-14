@@ -1,6 +1,6 @@
-//! The runtime seam: the memory under the Immix strategy, and the fiber
-//! stacks a host's collector scans, as one atomic function-pointer slot
-//! per operation.
+//! The runtime seam: the memory under the Immix strategy, the fiber
+//! stacks a host's collector scans, and the run a host guards, as one
+//! atomic function-pointer slot per operation.
 //!
 //! Every slot starts as wren_lift's own block allocator (`gc_immix_heap`)
 //! and is replaced entry by entry through [`wlift_rt_install`]; a `None`
@@ -185,6 +185,13 @@ runtime_table! {
     stack_suspended(id: u64, sp: usize) = stacks::stack_suspended;
     /// The stack `id` is about to be freed.
     stack_drop(id: u64) = stacks::stack_drop;
+    // ── Runs ────────────────────────────────────────────────────────────
+    /// Run `body(ctx)` as one run of `vm`'s active fiber. A host whose
+    /// code the run calls into, and which leaves that code by a long
+    /// jump, lands here instead of somewhere above: it puts back what it
+    /// keeps per thread, raises the error on `vm` as a runtime error,
+    /// and answers false. True when `body` returned.
+    run_guarded(vm: *mut c_void, body: unsafe extern "C" fn(*mut c_void), ctx: *mut c_void) -> bool = stacks::run_guarded;
     // ── wren_lift's, for a host's collector ─────────────────────────────
     /// `mark(child, ctx)` for every object `obj` refers to.
     object_trace(obj: *mut u8, mark: Visit, ctx: *mut c_void) = wren::object_trace;
@@ -196,8 +203,8 @@ runtime_table! {
 
 pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
-    heap_drop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, scan_range,
-    should_collect, stack_drop, stack_new, stack_suspended, track_external, watch,
+    heap_drop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, run_guarded,
+    scan_range, should_collect, stack_drop, stack_new, stack_suspended, track_external, watch,
 };
 
 /// Whether the built-in heap serves the memory slots, so a handle is an
@@ -296,9 +303,21 @@ pub extern "C" fn wlift_rt_object_drop() -> ObjectDrop {
 /// The stack slots' defaults: nothing, since wren_lift's collectors walk
 /// krio's fibers when they scan.
 mod stacks {
+    use std::ffi::c_void;
+
     pub unsafe extern "C" fn stack_new(_id: u64, _base: usize, _size: usize) {}
     pub unsafe extern "C" fn stack_suspended(_id: u64, _sp: usize) {}
     pub unsafe extern "C" fn stack_drop(_id: u64) {}
+
+    /// Nothing leaves wren_lift's own runs by a long jump.
+    pub unsafe extern "C" fn run_guarded(
+        _vm: *mut c_void,
+        body: unsafe extern "C" fn(*mut c_void),
+        ctx: *mut c_void,
+    ) -> bool {
+        body(ctx);
+        true
+    }
 }
 
 /// Adapters from the C slot signatures to `gc_immix_heap`.
