@@ -159,33 +159,6 @@ unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
                 );
                 let _ = i;
             }
-            check_vec_buf(
-                header,
-                f.aot_frames.as_ptr() as _,
-                f.aot_frames.capacity(),
-                "ObjFiber.aot_frames",
-                where_,
-            );
-            for (i, frame) in f.aot_frames.iter().enumerate() {
-                if frame.saved_values.capacity() == 0 {
-                    continue;
-                }
-                let buf = frame.saved_values.as_ptr() as *const std::ffi::c_void;
-                let sz = malloc_size(buf);
-                if sz == 0 {
-                    let cap = frame.saved_values.capacity();
-                    eprintln!(
-                        "ALIAS-DETECT [{where_}] ObjFiber@{:p} aot_frames[{i}].saved_values \
-                         buf=0x{:x} cap={} malloc_size=0",
-                        header, buf as usize, cap
-                    );
-                    panic!(
-                        "ObjFiber aot_frames[{i}].saved_values buffer 0x{:x} already free at \
-                         {} — buffer-aliasing bug",
-                        buf as usize, where_
-                    );
-                }
-            }
         }
         _ => {}
     }
@@ -1058,17 +1031,8 @@ impl Gc {
 
     pub fn alloc_fiber(&mut self) -> *mut ObjFiber {
         // Pin fibers in old gen for the same reason as ObjClass:
-        // AOT-compiled code passes `*mut ObjFiber` as a raw value
-        // through SM-poll calls and reads `(*fiber).aot_frames`
-        // directly. A nursery-then-promoted fiber would invalidate
-        // every such pointer at the next minor GC and produce
-        // buffer aliasing where the new old-gen fiber's
-        // `aot_frames[i].saved_values` Vec shares its heap buffer
-        // with the stale nursery fiber's identical Vec header (via
-        // `ptr::read` bitwise copy in `promote_typed`). Routing
-        // straight to old-gen keeps the fiber address stable for
-        // its lifetime, so the AOT code's raw pointer stays valid
-        // and only one Vec ever owns each saved_values buffer.
+        // compiled code and the krio stack hold `*mut ObjFiber`
+        // as a raw value, so the address must stay stable.
         self.alloc_old(ObjFiber::new())
     }
 
@@ -2158,13 +2122,6 @@ pub(super) unsafe fn for_each_child<F: FnMut(*mut ObjHeader)>(header: *mut ObjHe
                     child_ptr(class as *mut ObjHeader, f);
                 }
             }
-            // AOT frames hold values live across a suspension and the
-            // arguments of a cross-function call in flight.
-            for frame in &fiber.aot_frames {
-                for &val in &frame.saved_values {
-                    child_value(val, f);
-                }
-            }
             child_ptr(fiber.caller as *mut ObjHeader, f);
             child_value(fiber.error, f);
             child_value(fiber.context_map, f);
@@ -2434,13 +2391,6 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
                 }
                 if let Some(ref mut class) = frame.defining_class {
                     update_raw_ptr_inline(class, nursery);
-                }
-            }
-            // AOT state-machine frame slots — see trace_object's
-            // matching arm for why these need forwarding.
-            for frame in &mut fiber.aot_frames {
-                for val in frame.saved_values.iter_mut() {
-                    update_value_inline(val, nursery);
                 }
             }
             update_raw_ptr_inline(&mut fiber.caller, nursery);

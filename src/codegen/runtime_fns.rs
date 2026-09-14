@@ -2280,16 +2280,6 @@ pub extern "C" fn wren_load_jit_closure() -> u64 {
     ctx.closure as u64
 }
 
-/// Load the active JIT context's `vm` pointer. Used by the AOT
-/// state-machine cross-fn lowering to thread the VM through to
-/// `wlift_aot_invoke_sm_method`'s class lookup without baking a
-/// pointer constant at compile time.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_load_jit_vm() -> u64 {
-    let ctx = read_jit_ctx();
-    ctx.vm as u64
-}
-
 /// Returns 1 when the VM has an in-flight runtime error, 0 otherwise.
 /// AOT bodies poll this at every basic-block entry — without it,
 /// straight-line Cranelift code keeps running after `Fiber.abort`
@@ -2440,209 +2430,7 @@ pub fn call_closure_jit_or_sync(
     if args.len() <= 8 {
         let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
 
-        // AOT state-machine closures advertise a `(fiber: i64,
-        // resume_v: i64) -> i64` poll signature, not the regular
-        // `(receiver, ...args) -> i64` calling convention. Calling
-        // them through `call_jit_with_shadow` would pass user args
-        // as the fiber pointer and SIGSEGV on the first
-        // `wlift_aot_sm_load_state` (the io spec's
-        // `Reader.withTryFn`-style helper triggered exactly that —
-        // a yielding closure stored as `_readFn` and invoked via
-        // `_readFn.call(max)`). Route through the SM-aware
-        // dispatch instead: push a child frame on the running
-        // fiber, invoke the poll fn with `(vm.fiber, args[0])`,
-        // and propagate the kind/value back. Yields surface as
-        // `pending_fiber_action = Yield(value)` so the outer
-        // fiber-driver picks them up the same way the BC interp
-        // does after a primitive yield.
-        #[cfg(feature = "aot")]
-        let is_sm = vm
-            .engine
-            .aot_state_machine
-            .get(func_id.0 as usize)
-            .copied()
-            .unwrap_or(false);
-        #[cfg(not(feature = "aot"))]
-        let is_sm = false;
-        #[cfg(feature = "aot")]
-        {
-            if is_sm {
-                let fn_ptr = vm
-                    .engine
-                    .jit_code
-                    .get(func_id.0 as usize)
-                    .copied()
-                    .unwrap_or(std::ptr::null());
-                // The AOT bootstrap calls `wlift_aot_main` without
-                // running through `vm.interpret`, so `vm.fiber`
-                // can legitimately be null when an SM-tainted
-                // method is invoked from the top-level body.
-                // Allocate a root fiber on demand — the SM body
-                // only needs `(*fiber).aot_frames` and
-                // `aot_active_depth`; the fresh `ObjFiber` has
-                // both fields zeroed by default. Restore the
-                // previous (null) `vm.fiber` after the call so
-                // every later call re-runs the same lazy-alloc
-                // dance.
-                if !fn_ptr.is_null() && vm.fiber.is_null() {
-                    let lazy_fiber = vm.gc.alloc_fiber();
-                    unsafe {
-                        (*lazy_fiber).header.class = vm.fiber_class;
-                    }
-                    vm.fiber = lazy_fiber;
-                }
-                if !fn_ptr.is_null() && !vm.fiber.is_null() {
-                    let fiber = vm.fiber;
-                    // Root the fiber + closure on JIT_ROOTS_STORE
-                    // for the duration of the poll busy-loop. The
-                    // poll body may fire GC, which promotes nursery
-                    // fibers/closures to old gen and rewrites root
-                    // entries to the forwarded addresses. Without
-                    // rooting, the Rust locals here hold stale
-                    // post-promotion pointers and writes like
-                    // `(*fiber).aot_active_depth = saved_depth`
-                    // land on freed nursery memory — surfaces as
-                    // crash-on-second-request when the fiber's
-                    // state field reads garbage.
-                    let fiber_root_idx = jit_roots_snapshot_len();
-                    push_jit_root(Value::object(fiber as *mut u8));
-                    let closure_root_idx = jit_roots_snapshot_len();
-                    push_jit_root(Value::object(closure_ptr as *mut u8));
-                    let saved_depth = unsafe { (*fiber).aot_active_depth };
-                    // Detect whether the caller is itself running
-                    // inside a state-machine poll. The caller is
-                    // SM if `aot_frames` already holds at least
-                    // one frame; an empty frame stack means we're
-                    // called from a non-SM context — typically the
-                    // top-level AOT body running on the host stack.
-                    //
-                    // The distinction matters for yield handling:
-                    //   * SM caller → propagate kind=Yield up via
-                    //     `pending_fiber_action`. The caller's own
-                    //     poll fn surfaces a matching kind=Yield to
-                    //     ITS caller and so on until the outermost
-                    //     driver picks it up.
-                    //   * Non-SM caller → no driver above us. The
-                    //     yield can't unwind through the host stack,
-                    //     so we busy-resume the poll until it
-                    //     reaches kind=Done. Matches the krio
-                    //     wrapper's behaviour for top-level Wren
-                    //     fibers: yield + immediate-resume.
-                    let caller_is_sm = unsafe { !(*fiber).aot_frames.is_empty() };
-                    unsafe {
-                        (*fiber)
-                            .aot_frames
-                            .push(crate::runtime::object::AotFrameState::default());
-                        (*fiber).aot_active_depth = (*fiber).aot_frames.len().saturating_sub(1);
-                    }
-                    // Save the user-supplied args into the freshly-
-                    // pushed child frame's slot table so the SM
-                    // body's `wlift_aot_sm_load_arg(fiber, slot)`
-                    // sites pick them up. Without this every
-                    // BlockParam read fell through to a default
-                    // null and `tryReadStdoutBytes(pid, max)` got
-                    // `max=null` on first call, aborting before
-                    // any I/O happened.
-                    for (i, a) in args.iter().enumerate() {
-                        unsafe {
-                            crate::capi::wlift_aot_sm_save_arg(fiber, i as u64, a.to_bits());
-                        }
-                    }
-                    mutate_jit_ctx(|ctx| {
-                        if ctx.vm.is_null() {
-                            ctx.vm = vm as *mut _ as *mut u8;
-                        }
-                        ctx.current_func_id = func_id.0 as u64;
-                        ctx.closure = closure_ptr as *mut u8;
-                        ctx.defining_class = defining_class
-                            .map(|p| p as *mut u8)
-                            .unwrap_or(std::ptr::null_mut());
-                    });
-                    let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
-                        unsafe { std::mem::transmute(fn_ptr) };
-
-                    // Initial resume value is null (state == 0);
-                    // re-entries from busy-resume below thread the
-                    // previous yield's value back as the resume_v.
-                    let mut resume_v = Value::null().to_bits();
-                    let final_ret_bits = loop {
-                        let ret_bits = poll(fiber, resume_v);
-                        let kind = crate::capi::wlift_aot_sm_take_poll_kind();
-                        // Refresh `fiber` from JIT_ROOTS_STORE after
-                        // each poll so a promotion mid-iteration
-                        // doesn't leave us with a stale pointer for
-                        // the next iteration's `(*fiber).aot_active_depth`
-                        // read or for the kind=Yield propagation
-                        // below.
-                        let fiber = jit_root_at(fiber_root_idx)
-                            .as_object()
-                            .map(|p| p as *mut crate::runtime::object::ObjFiber)
-                            .unwrap_or(fiber);
-                        if kind == crate::capi::AotSmPollKind::Yield {
-                            if caller_is_sm {
-                                // Propagate up — outer SM driver
-                                // re-enters us on resume.
-                                unsafe {
-                                    (*fiber).aot_active_depth = saved_depth;
-                                }
-                                // Pop closure + fiber roots before
-                                // returning.
-                                let _ = pop_jit_root();
-                                let _ = pop_jit_root();
-                                restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
-                                let yield_val = Value::from_bits(ret_bits);
-                                vm.pending_fiber_action =
-                                    Some(crate::runtime::vm::FiberAction::Yield {
-                                        value: yield_val,
-                                    });
-                                return Value::null().to_bits();
-                            }
-                            // Non-SM caller: busy-resume. Thread
-                            // the yielded value back as resume_v so
-                            // Wren `var x = Fiber.yield(...)` sees
-                            // its own argument round-trip. Matches
-                            // the krio wrapper's
-                            // `FiberStep::Yielded => continue` arm.
-                            resume_v = ret_bits;
-                            continue;
-                        }
-                        break ret_bits;
-                    };
-                    // Final refresh + cleanup. Read forwarded
-                    // fiber/closure back from JIT_ROOTS_STORE
-                    // before any remaining dereferences.
-                    let fiber = jit_root_at(fiber_root_idx)
-                        .as_object()
-                        .map(|p| p as *mut crate::runtime::object::ObjFiber)
-                        .unwrap_or(fiber);
-                    let _ = closure_root_idx; // intentionally unused; closure isn't dereferenced after poll
-                    let _ = pop_jit_root();
-                    let _ = pop_jit_root();
-                    unsafe {
-                        (*fiber).aot_active_depth = saved_depth;
-                    }
-                    restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
-                    // Done: pop the child frame.
-                    unsafe {
-                        if !(*fiber).aot_frames.is_empty() {
-                            (*fiber).aot_frames.pop();
-                        }
-                    }
-                    return final_ret_bits;
-                }
-            }
-        }
-
-        // SM bodies advertise the `(fiber, resume_v) -> i64`
-        // poll ABI, so `call_jit_with_shadow` (which packs
-        // `(receiver, ...args)` into the same registers) would
-        // crash on first `wlift_aot_sm_load_state`. The SM
-        // branch above already handles every case where
-        // `vm.fiber` is non-null; if it's null, fall through
-        // to `call_closure_sync` (BC interp on the original
-        // MIR — the SM transform is JIT-only). Never let the
-        // native fast path catch an SM body.
-        let native_fn_ptr: Option<*const u8> = if jit_disabled() || is_sm {
+        let native_fn_ptr: Option<*const u8> = if jit_disabled() {
             None
         } else {
             vm.engine
@@ -2921,13 +2709,9 @@ fn handle_jit_fiber_action(
             // sites bypass the `fiber_try_*` / `fiber_call_*` foreign
             // methods entirely and emit a direct call to this helper —
             // so the krio routing that lives in those foreign methods
-            // never runs for AOT'd bodies. Without it, the body
-            // executes on the host stack via `run_fiber` below, and
-            // any `Fiber.yield` inside it falls through to the Yield
-            // arm of this same function (which historically returned
-            // the value without suspending — the Mechanism B leak).
-            // Routing through krio here lets the body run on its own
-            // mmap stack so yield can context-switch back.
+            // never runs for AOT'd bodies. Routing through krio here
+            // lets the body run on its own stack so yield can switch
+            // back.
             #[cfg(feature = "host")]
             {
                 if is_call
@@ -2951,188 +2735,6 @@ fn handle_jit_fiber_action(
                 }
             }
 
-            // AOT state-machine path. The target fiber's body
-            // FuncId is registered with `aot_state_machine[id] =
-            // true` when its closure was lowered as a stackless
-            // poll function. Invoke it directly with `(fiber,
-            // resume_v)` and read back the kind/value pair —
-            // there's no MIR / bytecode body to drive through
-            // `run_fiber`, so trying to interpret it would fall
-            // straight off the empty `mir_frames` and look like
-            // an immediately-finished fiber.
-            #[cfg(feature = "aot")]
-            {
-                let target_func_id =
-                    unsafe { (*target).mir_frames.first().map(|f| f.func_id.0 as usize) };
-                let is_sm = target_func_id
-                    .map(|idx| {
-                        vm.engine
-                            .aot_state_machine
-                            .get(idx)
-                            .copied()
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if is_sm {
-                    let func_id = target_func_id.unwrap();
-                    let fn_ptr = vm
-                        .engine
-                        .jit_code
-                        .get(func_id)
-                        .copied()
-                        .unwrap_or(std::ptr::null());
-                    if fn_ptr.is_null() {
-                        unsafe {
-                            (*target).state = FiberState::Done;
-                        }
-                        set_jit_context(saved_jit_ctx);
-                        set_jit_depth(saved_jit_depth);
-                        return Value::null().to_bits();
-                    }
-                    // Root `target` and `caller` (both *mut ObjFiber)
-                    // on JIT_ROOTS_STORE before the poll. The poll
-                    // may trigger GC, which promotes nursery
-                    // objects to old gen and rewrites root entries
-                    // to the forwarded addresses. Without rooting,
-                    // these Rust locals hold stale nursery
-                    // pointers post-GC and the post-poll
-                    // `(*target).state = Suspended` writes to
-                    // freed memory — the REAL (forwarded) fiber
-                    // stays stuck in `Running` and the next
-                    // `f.try()` fires "Fiber has already been
-                    // called." on the listen loop.
-                    let target_root_idx = jit_roots_snapshot_len();
-                    push_jit_root(Value::object(target as *mut u8));
-                    let caller_root_idx = if !caller.is_null() {
-                        let idx = jit_roots_snapshot_len();
-                        push_jit_root(Value::object(caller as *mut u8));
-                        Some(idx)
-                    } else {
-                        None
-                    };
-                    // First-call frame setup. If this is the
-                    // initial `fiber.call`, push the root
-                    // state-machine frame for the body. On
-                    // resume calls, the existing frame stack
-                    // is preserved (the previous yield left
-                    // it intact). Either way, point the
-                    // active-depth at the body's frame so the
-                    // body's poll reads its own state — even
-                    // when nested cross-fn calls left child
-                    // frames on top.
-                    unsafe {
-                        if (*target).aot_frames.is_empty() {
-                            (*target)
-                                .aot_frames
-                                .push(crate::runtime::object::AotFrameState::default());
-                        }
-                        (*target).aot_active_depth = 0;
-                        (*target).state = FiberState::Running;
-                    }
-                    // Set the JIT context's `closure` slot
-                    // before invoking the poll fn, same shape
-                    // as the AOT-stub fast path (Phase 2). The
-                    // body's `wren_load_jit_closure` (every
-                    // GetUpvalue / SetUpvalue site) reads it;
-                    // without this a yielding fiber whose body
-                    // captured a function-local upvalue
-                    // dereferenced null on first upvalue read.
-                    let target_closure =
-                        unsafe { (*target).mir_frames.first().and_then(|f| f.closure) };
-                    if let Some(c) = target_closure {
-                        mutate_jit_ctx(|ctx| {
-                            if ctx.vm.is_null() {
-                                ctx.vm = vm as *mut _ as *mut u8;
-                            }
-                            ctx.current_func_id = func_id as u64;
-                            ctx.closure = c as *mut u8;
-                            ctx.defining_class = std::ptr::null_mut();
-                        });
-                    }
-                    vm.fiber = target;
-                    let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
-                        unsafe { std::mem::transmute(fn_ptr) };
-                    let ret_bits = poll(target, value.to_bits());
-                    let kind = crate::capi::wlift_aot_sm_take_poll_kind();
-                    // Read back forwarded pointers from JIT_ROOTS_STORE
-                    // before any further dereferences. Any GC fired
-                    // inside `poll` has rewritten these entries to
-                    // point at the new (post-promotion) addresses.
-                    let target = jit_root_at(target_root_idx)
-                        .as_object()
-                        .map(|p| p as *mut crate::runtime::object::ObjFiber)
-                        .unwrap_or(target);
-                    let caller = caller_root_idx
-                        .map(|idx| {
-                            jit_root_at(idx)
-                                .as_object()
-                                .map(|p| p as *mut crate::runtime::object::ObjFiber)
-                                .unwrap_or(caller)
-                        })
-                        .unwrap_or(caller);
-                    // Pop in reverse-push order so the snapshot
-                    // length restores to its pre-poll value.
-                    if caller_root_idx.is_some() {
-                        let _ = pop_jit_root();
-                    }
-                    let _ = pop_jit_root();
-                    // Restore caller-side context regardless of outcome.
-                    if !caller.is_null() {
-                        unsafe {
-                            (*caller).state = FiberState::Running;
-                        }
-                        vm.fiber = caller;
-                    } else {
-                        vm.fiber = std::ptr::null_mut();
-                    }
-                    set_jit_context(saved_jit_ctx);
-                    set_jit_depth(saved_jit_depth);
-                    match kind {
-                        crate::capi::AotSmPollKind::Yield => unsafe {
-                            (*target).state = FiberState::Suspended;
-                        },
-                        crate::capi::AotSmPollKind::Done => unsafe {
-                            // Root frame done — clear the
-                            // frame stack so a subsequent
-                            // `fiber.call` (which would error
-                            // anyway) doesn't trip over stale
-                            // state.
-                            (*target).aot_frames.clear();
-                            (*target).state = FiberState::Done;
-                        },
-                        crate::capi::AotSmPollKind::None => {
-                            // Body returned without stamping —
-                            // treat as Done to avoid leaking a
-                            // stuck Running state. The bare
-                            // value is whatever the function
-                            // returned, which the caller will
-                            // observe.
-                            unsafe {
-                                (*target).aot_frames.clear();
-                                (*target).state = FiberState::Done;
-                            }
-                        }
-                    }
-                    // If the body aborted under is_try, route the
-                    // error to fib.error so the caller's `.try()`
-                    // returns the error string instead of leaking
-                    // the abort to the host. Mirrors the BC interp's
-                    // post-method-dispatch hook in run_fiber.
-                    if vm.has_error {
-                        let msg = vm.last_error.clone().unwrap_or_default();
-                        if let Some(routed) = unsafe {
-                            crate::runtime::vm_interp::route_method_error_through_fiber_try(
-                                vm, target, msg,
-                            )
-                        } {
-                            vm.has_error = false;
-                            vm.last_error = None;
-                            return routed.to_bits();
-                        }
-                    }
-                    return ret_bits;
-                }
-            }
             let target_state = unsafe { (*target).state };
             if target_state == FiberState::Suspended {
                 // Resuming a suspended fiber: deliver the value.
@@ -3249,12 +2851,6 @@ fn handle_jit_fiber_action(
         }
         FiberAction::Yield { value } => {
             // Yield from JIT context — the fiber should return the value.
-            #[cfg(feature = "aot")]
-            if crate::capi::aot_trace_sm_enabled() {
-                eprintln!(
-                    "SM-LEAK FiberAction::Yield reached handle_jit_fiber_action — taint set is incomplete (this is the Mechanism B leak)"
-                );
-            }
             value.to_bits()
         }
         FiberAction::Suspend => {
@@ -3289,21 +2885,12 @@ pub fn call_found_closure(
         .get(fn_idx)
         .copied()
         .unwrap_or(std::ptr::null());
-    #[cfg(feature = "aot")]
-    let is_sm = vm
-        .engine
-        .aot_state_machine
-        .get(fn_idx)
-        .copied()
-        .unwrap_or(false);
-    #[cfg(not(feature = "aot"))]
-    let is_sm = false;
     #[cfg(feature = "cranelift")]
-    let compiled = !fn_ptr.is_null() && !is_sm;
+    let compiled = !fn_ptr.is_null();
     #[cfg(not(feature = "cranelift"))]
     let compiled = {
         let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-        !fn_ptr.is_null() && is_leaf && !is_sm
+        !fn_ptr.is_null() && is_leaf
     };
     let j = jit_state();
     let state = unsafe { &mut *j };
@@ -3432,38 +3019,16 @@ fn dispatch_method(
                     .get(fn_idx)
                     .copied()
                     .unwrap_or(std::ptr::null());
-                // AOT state-machine bodies advertise the
-                // `(fiber, resume_v) -> i64` poll ABI, NOT the
-                // regular `(receiver, ...args) -> i64` calling
-                // convention. `call_jit_with_shadow` blindly
-                // packs `(receiver, ...args)` into the registers
-                // the body expects to read as `(fiber, resume_v)`,
-                // so the receiver is dereferenced as `*mut
-                // ObjFiber` on first `wlift_aot_sm_load_state` →
-                // SIGSEGV. Drop into the SM-aware
-                // `call_closure_jit_or_sync` slow path; it pushes
-                // a child aot_frame, saves args via
-                // `wlift_aot_sm_save_arg`, and drives the poll fn
-                // until Done (or surfaces Yield to the BC loop).
-                #[cfg(feature = "aot")]
-                let is_sm = vm
-                    .engine
-                    .aot_state_machine
-                    .get(fn_idx)
-                    .copied()
-                    .unwrap_or(false);
-                #[cfg(not(feature = "aot"))]
-                let is_sm = false;
                 // With Cranelift, allow non-leaf JIT dispatch — Cranelift
                 // handles register allocation and call conventions correctly.
                 // The non-cranelift fallback still gates on is_leaf to avoid
                 // spill-slot bugs.
                 #[cfg(feature = "cranelift")]
-                let allow_jit = !fn_ptr.is_null() && !is_sm;
+                let allow_jit = !fn_ptr.is_null();
                 #[cfg(not(feature = "cranelift"))]
                 let allow_jit = {
                     let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-                    !fn_ptr.is_null() && is_leaf && !is_sm
+                    !fn_ptr.is_null() && is_leaf
                 };
                 if allow_jit {
                     let saved_ctx = read_jit_ctx();
@@ -6388,7 +5953,6 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Known-function dispatch (devirtualized)
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
         "wren_load_jit_closure" => Some(wren_load_jit_closure as *const () as usize),
-        "wren_load_jit_vm" => Some(wren_load_jit_vm as *const () as usize),
         "wren_aot_check_error" => Some(wren_aot_check_error as *const () as usize),
         "wren_jit_roots_snapshot" => Some(wren_jit_roots_snapshot as *const () as usize),
         "wren_jit_roots_restore" => Some(wren_jit_roots_restore as *const () as usize),

@@ -402,14 +402,9 @@ fn nested_closures_share_upvalues() {
 }
 
 #[test]
-fn fiber_yield_state_machine() {
-    // Pure-AOT Fiber.yield support — no interpreter fallback.
-    // The closure body is lowered with the stackless 2-arg
-    // poll signature; each yield advances the state ID and
-    // stamps `kind=Yield`, the dispatcher reads back the kind
-    // to suspend the fiber and surface the value to the
-    // caller. Three `f.call()`s drain the body's three states:
-    // 10, 20, 30 (the final return).
+fn fiber_yield_suspends() {
+    // A compiled fiber body suspends on its own stack; three
+    // `f.call()`s drain it: 10, 20, 30 (the final return).
     let r = compile_link_run(
         "var f = Fiber.new {\n  \
            System.print(\"step 1\")\n  \
@@ -429,16 +424,8 @@ fn fiber_yield_state_machine() {
 
 #[test]
 fn fiber_yield_in_loop_with_branch_and_live_loop_var() {
-    // v2-cap1 + cap-2: yield inside an `if` inside a `while`,
-    // with the loop counter `i` live across the suspension.
-    // Exercises:
-    //   - tail-duplication of the post-yield code path so the
-    //     non-yielding side (i odd) still flows through the
-    //     original block,
-    //   - save/load of `i` (bb1's block param) via the fiber's
-    //     saved-slot table,
-    //   - the back-edge branch arg correctly threading the
-    //     loaded value back into the loop header.
+    // A yield inside an `if` inside a `while`, with the loop
+    // variable live across it.
     // Expected: yields at i=0 and i=2, then returns "done"
     // when i hits 4 and exits the while.
     let r = compile_link_run(
@@ -467,11 +454,10 @@ fn fiber_yield_in_loop_with_branch_and_live_loop_var() {
 
 #[test]
 fn cross_function_fiber_yield_propagation() {
-    // v2-cap3: a class method that yields, called from inside
-    // a fiber body. The yield must propagate up through the
-    // cross-fn poll path so the caller's fiber.call observes
-    // the yield, and a subsequent fiber.call resumes the
-    // method at its post-yield state. Two `c.step()`
+    // A class method that yields, called from inside a fiber
+    // body: the caller's fiber.call observes the yield, and a
+    // later fiber.call resumes the method where it stopped. Two
+    // `c.step()`
     // invocations chain yield->return->yield->return:
     //
     //   c.step() #1: _v=1, yield 1.

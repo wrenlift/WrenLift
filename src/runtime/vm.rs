@@ -381,7 +381,9 @@ pub struct VM {
 
     /// Fibers run on stacks of their own (krio) rather than through
     /// the interpreter's stackless switch. On by default on native;
-    /// `WLIFT_KRIO_FIBER=0` keeps the stackless path.
+    /// `WLIFT_KRIO_FIBER=0` keeps the stackless path, which only the
+    /// interpreter can suspend on, so an AOT program sets it
+    /// regardless.
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
 

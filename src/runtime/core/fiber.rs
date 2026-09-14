@@ -1125,14 +1125,8 @@ fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             match state {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
-                    // Full krio routing for both fresh and suspended
-                    // fibers. Required on AOT: handle_jit_fiber_action's
-                    // Yield arm is a no-op (the Mechanism B leak), so
-                    // any fiber whose body calls Fiber.yield needs the
-                    // krio context-switch to actually suspend. Falling
-                    // through to set_fiber_action_call on a New fiber
-                    // runs the body on the main stack and yields are
-                    // silently dropped.
+                    // A compiled body cannot suspend on the host stack:
+                    // a fiber with a stack of its own runs there.
                     if let Some(v) = try_krio_call(f, Value::null()) {
                         return v;
                     }
