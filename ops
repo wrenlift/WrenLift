@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1789341705,"nonce":"1NXsN3nuOsTvGYWZSl1ES6D2vsk=","status":2}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789376923,"nonce":"BmT+Pu/G46awkkmmymKa3TBb/UM=","message":"And 9ba2876: a compiled leaf is entered from call_found_closure on the caller's context, as IC kind 1 enters it.","files":null}]}
