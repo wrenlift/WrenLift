@@ -5748,28 +5748,28 @@ fn vm_with_isolate_modules() -> VM {
         match name {
             "worker" => Some(
                 r#"
-import "isolate" for IsolateCore
-var arg = IsolateCore.arg
+import "isolate" for Isolate
+var arg = Isolate.arg
 var sum = 0
 for (i in 0...arg["n"]) sum = sum + i
-IsolateCore.send(arg["reply"], {"who": arg["who"], "sum": sum, "list": [1, "two", null, true]})
+arg["reply"].send({"who": arg["who"], "sum": sum, "list": [1, "two", null, true]})
 "#
                 .to_string(),
             ),
             "ticker" => Some(
                 r#"
-import "isolate" for IsolateCore
-var a = IsolateCore.arg
+import "isolate" for Isolate
+var a = Isolate.arg
 for (k in 0...2) {
   Fiber.spawn {
     for (i in 0...3) {
       Fiber.sleep(2)
-      IsolateCore.send(a["out"], "%(a["name"])-%(k)-%(i)")
+      a["out"].send("%(a["name"])-%(k)-%(i)")
     }
   }
 }
 while (Fiber.tick(0)) Fiber.idle(50)
-IsolateCore.send(a["out"], "done")
+a["out"].send("done")
 "#
                 .to_string(),
             ),
@@ -5797,30 +5797,33 @@ fn e2e_isolates_run_on_threads_and_pass_values_by_copy() {
         return;
     }
     let src = r#"
-import "isolate" for IsolateCore
-var reply = IsolateCore.channel()
-var ids = []
-for (k in 0...4) {
-  ids.add(IsolateCore.spawn("worker", {"who": k, "n": 100000, "reply": reply}))
-}
+import "isolate" for Isolate, Channel
+var reply = Channel.new()
+var workers = []
+for (k in 0...4) workers.add(Isolate.spawn("worker", {"who": k, "n": 100000, "reply": reply}))
 var got = []
 for (k in 0...4) {
-  var r = IsolateCore.receive(reply, 5000)[0]
+  var r = reply.receive(5000)
   got.add(r["who"])
   if (r["who"] == 0) System.print("sum %(r["sum"]) list %(r["list"])")
 }
 got.sort()
 System.print(got)
-for (id in ids) System.print("join %(IsolateCore.join(id, 5000)) err %(IsolateCore.error(id))")
-var bad = IsolateCore.spawn("nope", null)
-IsolateCore.join(bad, 5000)
-System.print("bad: %(IsolateCore.error(bad))")
-System.print(IsolateCore.receive(reply, 10))
-IsolateCore.close(reply)
-System.print("%(IsolateCore.send(reply, 1)) %(IsolateCore.receive(reply, null)) %(IsolateCore.isClosed(reply))")
-var f = Fiber.new { IsolateCore.send(IsolateCore.channel(), Fiber.current) }
+for (w in workers) System.print("join %(w.join()) done %(w.isDone) err %(w.error)")
+var bad = Isolate.spawn("nope")
+bad.join(5000)
+System.print("bad: %(bad.error)")
+System.print(reply.receive(10))
+reply.close()
+System.print("%(reply.send(1)) %(reply.receive()) %(reply.isClosed) %(reply.count)")
+var f = Fiber.new { Channel.new().send(Fiber.current) }
 f.try()
 System.print(f.error)
+var ch = Channel.new()
+var w = Isolate.spawn("worker", {"who": 9, "n": 10, "reply": ch})
+ch.send(w)
+System.print(ch.receive() is Isolate)
+System.print(ch.receive()["who"])
 "#;
     let mut vm = vm_with_isolate_modules();
     vm.output_buffer = Some(String::new());
@@ -5830,14 +5833,16 @@ System.print(f.error)
     let expected = [
         "sum 4999950000 list [1, two, null, true]",
         "[0, 1, 2, 3]",
-        "join true err null",
-        "join true err null",
-        "join true err null",
-        "join true err null",
+        "join true done true err null",
+        "join true done true err null",
+        "join true done true err null",
+        "join true done true err null",
         "bad: compile error in \"nope\"",
         "null",
-        "false null true",
-        "IsolateCore.send: cannot send a Fiber across isolates.",
+        "false null true 0",
+        "Channel.send: cannot send a Fiber across isolates.",
+        "true",
+        "9",
     ]
     .join("\n");
     assert_eq!(output.trim(), expected);
@@ -5851,18 +5856,18 @@ fn e2e_isolate_receive_parks_a_task() {
         return;
     }
     let src = r#"
-import "isolate" for IsolateCore
-var out = IsolateCore.channel()
-var ids = []
-for (name in ["x", "y"]) ids.add(IsolateCore.spawn("ticker", {"name": name, "out": out}))
+import "isolate" for Isolate, Channel
+var out = Channel.new()
+var tickers = []
+for (name in ["x", "y"]) tickers.add(Isolate.spawn("ticker", {"name": name, "out": out}))
 var got = []
 var ticks = 0
 Fiber.spawn {
   var dones = 0
   while (dones < 2) {
-    var r = IsolateCore.receive(out, 5000)
+    var r = out.receive(5000)
     if (r == null) break
-    if (r[0] == "done") dones = dones + 1 else got.add(r[0])
+    if (r == "done") dones = dones + 1 else got.add(r)
   }
 }
 Fiber.spawn {
@@ -5873,7 +5878,7 @@ Fiber.spawn {
 }
 while (Fiber.tick(0)) Fiber.idle(100)
 System.print("%(got.count) %(ticks > 0)")
-for (id in ids) System.print(IsolateCore.join(id, 5000))
+for (t in tickers) System.print(t.join(5000))
 "#;
     let mut vm = vm_with_isolate_modules();
     vm.output_buffer = Some(String::new());

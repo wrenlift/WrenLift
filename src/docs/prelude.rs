@@ -42,6 +42,7 @@ const STUBS: &[(&str, &str)] = &[
     ("Map", include_str!("../runtime/prelude/map.wren")),
     ("Fiber", include_str!("../runtime/prelude/fiber.wren")),
     ("Fn", include_str!("../runtime/prelude/fn.wren")),
+    ("isolate", include_str!("../runtime/prelude/isolate.wren")),
     (
         "TypedArrays",
         include_str!("../runtime/prelude/typed_arrays.wren"),

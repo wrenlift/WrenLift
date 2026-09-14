@@ -27,10 +27,14 @@ pub enum Xfer {
     Str(String),
     List(Vec<Xfer>),
     Map(Vec<(Xfer, Xfer)>),
+    /// A `Channel` or `Isolate` instance, by its handle.
+    Channel(u64),
+    Isolate(u64),
 }
 
 /// Copy `v` out of the heap. Only data crosses: null, booleans,
-/// numbers, strings, and lists and maps of those.
+/// numbers, strings, lists and maps of those, and channel and
+/// isolate handles.
 pub fn export(ctx: &dyn NativeContext, v: Value) -> Result<Xfer, String> {
     if v.is_null() {
         return Ok(Xfer::Null);
@@ -63,6 +67,20 @@ pub fn export(ctx: &dyn NativeContext, v: Value) -> Result<Xfer, String> {
                 .collect::<Result<Vec<_>, String>>()
                 .map(Xfer::Map)
         }
+        ObjType::Instance => {
+            let class = ctx.get_class_of(v);
+            let id = crate::runtime::core::isolate::handle_of(v);
+            if !class.is_null() && Some(class) == ctx.lookup_class("Channel") {
+                Ok(Xfer::Channel(id))
+            } else if !class.is_null() && Some(class) == ctx.lookup_class("Isolate") {
+                Ok(Xfer::Isolate(id))
+            } else {
+                Err(format!(
+                    "cannot send a {} across isolates",
+                    ctx.get_class_name_of(v)
+                ))
+            }
+        }
         _ => Err(format!(
             "cannot send a {} across isolates",
             ctx.get_class_name_of(v)
@@ -83,6 +101,8 @@ pub fn import(ctx: &mut dyn NativeContext, x: &Xfer) -> Value {
             let elements = items.iter().map(|e| import(ctx, e)).collect();
             ctx.alloc_list(elements)
         }
+        Xfer::Channel(id) => crate::runtime::core::isolate::wrap_handle(ctx, "Channel", *id),
+        Xfer::Isolate(id) => crate::runtime::core::isolate::wrap_handle(ctx, "Isolate", *id),
         Xfer::Map(entries) => {
             let map = ctx.alloc_map();
             for (k, v) in entries {

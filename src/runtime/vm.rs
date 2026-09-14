@@ -402,6 +402,12 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub isolate_arg: Option<crate::runtime::isolate::Xfer>,
 
+    /// The `isolate` module's classes, null until it is imported.
+    #[cfg(feature = "host")]
+    pub isolate_class: *mut ObjClass,
+    #[cfg(feature = "host")]
+    pub channel_class: *mut ObjClass,
+
     /// Compiled modules of a staged hatch, by name: each is installed
     /// and run the first time it is imported (see `stage_hatch_modules`).
     staged_hatch_modules: HashMap<String, Vec<u8>>,
@@ -634,6 +640,10 @@ impl VM {
             isolate_factory: None,
             #[cfg(feature = "host")]
             isolate_arg: None,
+            #[cfg(feature = "host")]
+            isolate_class: ptr::null_mut(),
+            #[cfg(feature = "host")]
+            channel_class: ptr::null_mut(),
             staged_hatch_modules: HashMap::new(),
         };
 
@@ -1877,7 +1887,8 @@ impl VM {
             ("CryptoCore", "crypto"),
             ("ZipCore", "zip"),
             ("SocketCore", "socket"),
-            ("IsolateCore", "isolate"),
+            ("Isolate", "isolate"),
+            ("Channel", "isolate"),
             ("Hatch", "hatch"),
         ];
         for name in &var_names {
@@ -3250,14 +3261,18 @@ impl VM {
             }
             #[cfg(feature = "host")]
             "isolate" => {
-                let class = super::core::isolate::register(self);
-                let class_value = Value::object(class as *mut u8);
+                let (isolate, channel) = super::core::isolate::register(self);
+                self.isolate_class = isolate;
+                self.channel_class = channel;
                 self.engine.modules.insert(
                     "isolate".to_string(),
                     super::engine::ModuleEntry::new(
                         super::engine::FuncId(u32::MAX),
-                        vec![class_value],
-                        vec!["IsolateCore".to_string()],
+                        vec![
+                            Value::object(isolate as *mut u8),
+                            Value::object(channel as *mut u8),
+                        ],
+                        vec!["Isolate".to_string(), "Channel".to_string()],
                     ),
                 );
                 true
@@ -4998,6 +5013,10 @@ impl NativeContext for VM {
             "StringByteSequence" => self.string_byte_seq_class,
             "StringCodePointSequence" => self.string_code_point_seq_class,
             "MapEntry" => self.map_entry_class,
+            #[cfg(feature = "host")]
+            "Isolate" => self.isolate_class,
+            #[cfg(feature = "host")]
+            "Channel" => self.channel_class,
             "Object" => self.object_class,
             "Sequence" => self.sequence_class,
             "String" => self.string_class,
