@@ -379,13 +379,9 @@ pub struct VM {
     /// Flag set by System.gc() — actual collection happens at next safepoint.
     pub gc_requested: bool,
 
-    /// Use krio-fiber stackful coroutines as the AOT fiber backing
-    /// instead of the SM-transform-based stackless approach. Read
-    /// once at VM construction from `WLIFT_KRIO_FIBER` env var so
-    /// hot-path checks are a plain bool field. Off by default; the
-    /// existing stackless path remains the supported default until
-    /// the integration is validated against the full spec audit.
-    /// See `project_krio_fiber_integration_plan.md`.
+    /// Fibers run on stacks of their own (krio) rather than through
+    /// the interpreter's stackless switch. On by default on native;
+    /// `WLIFT_KRIO_FIBER=0` keeps the stackless path.
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
 
@@ -582,29 +578,8 @@ impl VM {
             sync_entry_fiber: std::ptr::null_mut(),
             loading_modules: HashSet::new(),
             gc_requested: false,
-            // krio (stackful fiber) backings are required by the
-            // AOT path — they replace the stackless state-machine
-            // MIR transform that previously implemented Wren's
-            // `Fiber.yield`. The AOT install path flips this on at
-            // module-startup time via the dedicated entry point.
-            // Tiered / JIT / interpreter modes don't need krio:
-            // Wren-side fiber state lives in `ObjFiber.mir_frames`
-            // (heap), so the legacy stackless dispatch handles
-            // `Fiber.yield` without the per-fiber mmap'd stack.
-            //
-            // Default to OFF. Krio-on-by-default regressed the
-            // tiered hatch-site path with a malloc SIGABRT in
-            // `vm_interp::run_fiber_with_stop_depth`'s `Vec<Value>`
-            // drop — the GC's native-stack walker treats a stale
-            // return address (left on a krio stack across a fiber
-            // yield) as a Cranelift safepoint, applies that
-            // function's spill offsets to an unrelated frame
-            // pointer, and writes Wren Value bits into a Rust
-            // local's `data_ptr` field. AOT bodies opt in via
-            // `WLIFT_KRIO_FIBER=1`; production deployments that
-            // need the AOT path set it explicitly.
             #[cfg(feature = "host")]
-            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER").is_some_and(|v| v == "1"),
+            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER").is_none_or(|v| v != "0"),
             // Per-fiber arena. Off by default — see field comment
             // for the escape-barrier requirements that gate flipping
             // the default on. `WLIFT_FIBER_ARENA=1` opts in.

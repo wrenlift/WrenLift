@@ -153,7 +153,7 @@ fn fiber_new_inner(
                 Value::object(closure as *mut u8),
             );
 
-            // krio-fiber backing: when WLIFT_KRIO_FIBER is on, attach
+            // krio-fiber backing: when the VM gives fibers stacks, attach
             // a per-fiber mmap stack and a body closure that runs the
             // Wren-level fiber body on that stack. Fiber.call drives
             // krio.resume_with(input); Fiber.yield inside calls

@@ -1095,17 +1095,9 @@ pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String
     // Every method in the set gets `transform_to_state_machine`
     // applied; everything else compiles as plain native code.
     //
-    // Pre-option-A history: the krio-fiber stackful path was the
-    // AOT default, and this function short-circuited to an empty
-    // set unless `WLIFT_FORCE_AOT_SM=1` was passed. That gate is
-    // removed — SM is now the only AOT yield mechanism. For the
-    // krio fallback (kept for A/B testing and as a regression
-    // baseline until the SM corpus is fully proven), set
-    // `WLIFT_USE_KRIO_FIBERS=1`. The krio path's own conditional
-    // initialization (`vm.krio_fiber_active`) gates on the same
-    // env var, so a single flag swaps both halves of the runtime
-    // in lockstep.
-    if std::env::var_os("WLIFT_USE_KRIO_FIBERS").is_some_and(|v| v == "1") {
+    // Fibers run on krio stacks unless `WLIFT_KRIO_FIBER=0`, in which
+    // case the transform is what lets an AOT body yield.
+    if std::env::var_os("WLIFT_KRIO_FIBER").is_none_or(|v| v != "0") {
         return HashSet::new();
     }
     let mut tainted: HashSet<String> = aot_direct_yield_method_names()
@@ -2768,14 +2760,6 @@ fn emit_aot_bootstrap_main(
         None,
     )?;
     let exit_ctx = declare_import(module, "wlift_aot_exit", &[ptr_ty], None)?;
-    // Module body invocation indirection: under WLIFT_KRIO_FIBER=1
-    // this helper wraps the per-module top-level call in a krio
-    // fiber so Fiber.yield from inside the body (or fibers spawned
-    // by it) routes through krio::yield_value instead of leaking
-    // into Mechanism B (vm_interp's handle_jit_fiber_action Yield
-    // arm, which can't unwind an AOT body). With the toggle off,
-    // the helper short-circuits to a direct fn-pointer call so the
-    // hot-path overhead is one branch.
     let invoke_module_body = declare_import(
         module,
         "wlift_aot_invoke_module_body",

@@ -1250,7 +1250,7 @@ pub struct ObjFiber {
     pub aot_active_depth: usize,
 
     /// Stackful coroutine backing under the krio-fiber integration
-    /// (off by default; enabled with `WLIFT_KRIO_FIBER=1`). When
+    /// (the native default; `WLIFT_KRIO_FIBER=0` turns it off). When
     /// present, this fiber's body runs on a per-fiber mmap stack via
     /// `krio_fiber::Fiber::resume`; suspension is a synchronous
     /// context switch rather than the stackless `pending_fiber_action`
@@ -1625,7 +1625,7 @@ pub trait NativeContext {
     fn krio_vm_raw_ptr(&mut self) -> *mut u8 {
         std::ptr::null_mut()
     }
-    /// `true` when `WLIFT_KRIO_FIBER` was set at VM construction.
+    /// `true` when the VM gives its fibers krio stacks.
     /// `fiber_new` checks this to decide whether to allocate a
     /// krio-fiber backing for the new fiber.
     fn krio_fiber_active(&self) -> bool {
