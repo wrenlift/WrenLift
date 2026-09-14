@@ -438,6 +438,15 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
     unsafe { call_jit_cached_st(&mut (*jit_state()).ctx, fn_ptr, args) }
 }
 
+/// Call compiled code with the context of the JIT state `j`, which the
+/// caller fetched once with `jit_state`.
+///
+/// # Safety
+/// As `call_jit_cached_st`: `fn_ptr` takes `args.len()` word arguments.
+pub unsafe fn call_jit_at(j: *mut JitThread, fn_ptr: *const u8, args: &[Value]) -> u64 {
+    unsafe { call_jit_cached_st(&mut (*j).ctx, fn_ptr, args) }
+}
+
 #[inline(always)]
 unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
     #[cfg(not(target_arch = "aarch64"))]

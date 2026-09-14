@@ -5792,36 +5792,21 @@ impl VM {
         closure_ptr: *mut ObjClosure,
         ctor_args: &[Value], // args WITHOUT the class receiver (just the user args)
     ) -> Value {
-        // Allocate the new instance. This may trigger a minor GC.
+        use crate::codegen::runtime_fns::{call_jit_at, jit_state};
         let instance_raw = self.gc.alloc_instance(class_ptr);
         let instance_val = Value::object(instance_raw as *mut u8);
 
-        // Root the instance across any GC that may occur inside alloc_fiber below.
-        let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
-        crate::codegen::runtime_fns::push_jit_root(instance_val);
+        // The thread's JIT state, read once: the instance and the
+        // arguments are rooted through it, and the compiled body runs on
+        // its context.
+        let j = jit_state();
+        let root_len_before = unsafe { (*j).roots.len() };
+        unsafe { (*j).roots.push(instance_val) };
 
         let func_id = crate::runtime::engine::FuncId(unsafe {
             let fn_ptr = (*closure_ptr).function;
             (*fn_ptr).fn_id
         });
-
-        self.call_constructor_sync_impl(class_ptr, closure_ptr, ctor_args, func_id, root_len_before)
-    }
-
-    fn call_constructor_sync_impl(
-        &mut self,
-        class_ptr: *mut crate::runtime::object::ObjClass,
-        closure_ptr: *mut ObjClosure,
-        ctor_args: &[Value],
-        func_id: crate::runtime::engine::FuncId,
-        root_len_before: usize,
-    ) -> Value {
-        use crate::mir::{BlockId, Instruction};
-        // Try JIT dispatch: if the constructor body is compiled,
-        // call it directly with the new instance as `this`.
-        // Don't use JIT if this constructor has active interpreter frames
-        // on the fiber stack — dispatching to JIT mid-recursion while
-        // interpreter frames are still executing causes incorrect results.
         let fn_idx = func_id.0 as usize;
         let has_active_interp_frames = if !self.fiber.is_null() {
             let fiber = unsafe { &*self.fiber };
@@ -5839,65 +5824,25 @@ impl VM {
             std::ptr::null()
         };
         if !jit_ptr.is_null() && ctor_args.len() <= 15 {
-            // Push every ctor arg as a JIT root so a GC fired during
-            // the constructor body (allocations, foreign calls, etc.)
-            // updates each pointer through the shared roots Vec
-            // before the body dereferences it. The instance itself
-            // was already rooted at root_len_before by
-            // `call_constructor_sync`. Without this, any pointer arg
-            // staled to freed memory while the JIT'd ctor ran with
-            // the args already loaded into registers — which is the
-            // class of "Constructor JIT SIGSEGV under GC pressure"
-            // bug logged in CLAUDE.md / project_cranelift_fixes.
-            //
-            // Cap at 15 user args (16 total with the implicit
-            // instance receiver) to match `call_jit_fn`'s arity
-            // ladder, which has explicit arms 0..=16. Beyond that
-            // the caller still falls through to the MIR walker —
-            // but with empty-blocks AOT stubs that path silently
-            // returns the uninitialised instance, so widening this
-            // gate restores correct construction for high-arity
-            // ctors like `GltfMaterial.new_(name, baseColor, ..., 15 args)`.
-            for arg in ctor_args.iter() {
-                crate::codegen::runtime_fns::push_jit_root(*arg);
-            }
-            // Re-read the instance + args from roots after the
-            // pushes (the Vec may have grown / moved its backing
-            // buffer; the underlying Value bits are stable, but
-            // reading via `jit_root_at` keeps every value in
-            // lockstep with the GC's view).
-            let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
-            // Sized to fit the widest call_jit_fn arm (instance + 15
-            // user args = 16 slots).
-            let mut jit_args = [Value::null(); 16];
-            jit_args[0] = live_instance;
-            for i in 0..ctor_args.len() {
-                jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1 + i);
-            }
+            // Every argument rooted before the body runs, and read back
+            // from the roots, so a collection inside the body updates
+            // what the body was handed. Sized for the widest arm of the
+            // call ladder: the instance and 15 arguments.
+            unsafe { (*j).roots.extend_from_slice(ctor_args) };
             let n = ctor_args.len() + 1;
-            let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
-            // Swap JitContext.module_vars to the callee's defining
-            // module before entering its JIT'd body. The body's
-            // `GetModuleVar @N` ops resolve against whatever
-            // `module_vars` is currently published — without this
-            // swap they hit the *caller's* slot table, which is a
-            // different module's variables. Concretely: a `main`
-            // function calling `Camera2D.new(...)` (in
-            // `@hatch:gpu`) leaves the constructor body reading
-            // `Vec3` from main's slot N — main doesn't import
-            // `Vec3`, so the slot is undefined and the JIT'd body
-            // produces `_origin = null` even though the BC version
-            // works fine. The other JIT entry points
-            // (`call_jit_with_shadow`, the BC interpreter's
-            // `Method::Closure` JIT-leaf path) already do this
-            // swap; the constructor path was missing it.
-            let callee_module = self.engine.func_module(func_id);
+            let mut jit_args = [std::mem::MaybeUninit::<Value>::uninit(); 16];
+            for (i, slot) in jit_args.iter_mut().enumerate().take(n) {
+                slot.write(unsafe { (&(*j).roots)[root_len_before + i] });
+            }
+            let jit_args = unsafe { jit_args[..n].assume_init_ref() };
+            // The callee's module's variables and name go into the
+            // context for the body's module-variable ops; the context is
+            // restored whole after.
+            let saved_ctx = unsafe { (*j).ctx };
             let (callee_mv_ptr, callee_mv_count, callee_name_ptr, callee_name_len) =
-                match callee_module {
+                match self.engine.func_module(func_id) {
                     Some(mn) => {
                         let bytes = mn.as_bytes();
-                        // Through the module's cell, cached per function:
-                        // no lookup of the module by name per call.
                         let (mv_ptr, mv_count) = self.engine.module_vars_for(func_id);
                         (mv_ptr, mv_count, bytes.as_ptr(), bytes.len() as u32)
                     }
@@ -5908,7 +5853,8 @@ impl VM {
                         saved_ctx.module_name_len,
                     ),
                 };
-            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+            unsafe {
+                let ctx = &mut (*j).ctx;
                 ctx.current_func_id = func_id.0 as u64;
                 ctx.closure = closure_ptr as *mut u8;
                 ctx.defining_class = class_ptr as *mut u8;
@@ -5916,21 +5862,31 @@ impl VM {
                 ctx.module_var_count = callee_mv_count;
                 ctx.module_name = callee_name_ptr;
                 ctx.module_name_len = callee_name_len;
-            });
+            }
             self.engine.note_native_entry(func_id);
-            // Use call_jit_fn which sets x20 (JitContext pointer).
-            // The constructor body's internal calls go through wren_call_N
-            // which registers the JIT frame for GC via #[naked] wrappers.
-            let _ = unsafe { super::vm_interp::call_jit_fn_pub(jit_ptr, &jit_args[..n]) };
-            crate::codegen::runtime_fns::set_jit_context(saved_ctx);
-            // Constructor returns the instance (possibly GC-forwarded
-            // — read from the root slot, not the result register).
-            let result = crate::codegen::runtime_fns::jit_root_at(root_len_before);
-
-            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            // The body's own calls go through `wren_call_N`, which registers
+            // its frame for the collector.
+            let _ = unsafe { call_jit_at(j, jit_ptr, jit_args) };
+            unsafe { (*j).ctx = saved_ctx };
+            // The instance as the roots hold it, forwarded if it moved.
+            let result = unsafe { (&(*j).roots)[root_len_before] };
+            unsafe { (*j).roots.truncate(root_len_before) };
             return result;
         }
+        self.call_constructor_sync_impl(class_ptr, closure_ptr, ctor_args, func_id, root_len_before)
+    }
 
+    /// The constructor through the interpreter: the compiled body is
+    /// absent or already active on this fiber.
+    fn call_constructor_sync_impl(
+        &mut self,
+        class_ptr: *mut crate::runtime::object::ObjClass,
+        closure_ptr: *mut ObjClosure,
+        ctor_args: &[Value],
+        func_id: crate::runtime::engine::FuncId,
+        root_len_before: usize,
+    ) -> Value {
+        use crate::mir::{BlockId, Instruction};
         let mir = self.engine.get_mir(func_id);
         if mir.is_none() {
             // Read the instance BEFORE truncating; `restore_len` drops
