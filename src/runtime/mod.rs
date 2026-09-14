@@ -12,6 +12,8 @@ pub mod live_regs;
 pub mod object;
 pub mod object_layout;
 pub mod rt;
+#[cfg(feature = "host")]
+pub mod sched;
 pub mod stack_scan;
 pub mod value;
 pub mod vm;

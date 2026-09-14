@@ -387,6 +387,10 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
 
+    /// The VM's scheduler world, made on the first `Fiber.spawn`.
+    #[cfg(feature = "host")]
+    pub sched: Option<Box<crate::runtime::sched::Sched>>,
+
     /// Use per-fiber bump-allocator regions for short-lived Wren
     /// allocations (`wren_make_string`, eventually `wren_make_list`
     /// + `wren_make_map`). When on, every fiber gets an
@@ -609,6 +613,8 @@ impl VM {
             reload_callbacks: Vec::new(),
             before_reload_callbacks: Vec::new(),
             file_watches: Vec::new(),
+            #[cfg(feature = "host")]
+            sched: None,
         };
 
         // Bootstrap core classes.
@@ -3999,6 +4005,12 @@ impl VM {
             roots.push(fw.callback);
         }
         let file_watch_end = roots.len();
+
+        // 10d. Fibers the scheduler holds as tasks.
+        #[cfg(feature = "host")]
+        if let Some(sched) = &self.sched {
+            roots.extend(sched.fibers().map(|f| Value::object(f as *mut u8)));
+        }
 
         // `WLIFT_VALIDATE_BARRIERS=1` opts the GC into a pre-collect
         // sanity check covering both directions of the remembered-set

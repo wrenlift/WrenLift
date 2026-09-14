@@ -423,6 +423,34 @@ fn fiber_yield_suspends() {
 }
 
 #[test]
+fn scheduler_tasks_take_turns_and_park() {
+    // Compiled task bodies yield to the world at a turn, a sleep and
+    // a park, and a fiber a task calls parks the task with it.
+    let r = compile_link_run(
+        "var log = []\n\
+         Fiber.spawn {\n  log.add(\"a1\")\n  Fiber.yield()\n  log.add(\"a2\")\n  \
+           Fiber.sleep(30)\n  log.add(\"a3\")\n}\n\
+         Fiber.spawn {\n  log.add(\"b1\")\n  Fiber.sleep(10)\n  log.add(\"b2\")\n}\n\
+         var w = Fiber.waiter\n\
+         var c = Fiber.spawn {\n  log.add(\"c %(Fiber.park(w, 1000))\")\n}\n\
+         Fiber.spawn {\n  Fiber.sleep(5)\n  log.add(\"wake %(Fiber.wake(w))\")\n}\n\
+         Fiber.spawn {\n  var f = Fiber.new {\n    Fiber.sleep(20)\n    \"ret\"\n  }\n  \
+           log.add(\"task %(f.call())\")\n}\n\
+         while (Fiber.tick(0)) Fiber.idle(100)\n\
+         System.print(log.join(\",\"))\n\
+         System.print(\"%(Fiber.live) %(c.isDone)\")\n\
+         var bad = Fiber.spawn { Fiber.abort(\"boom\") }\n\
+         Fiber.tick(0)\n\
+         System.print(bad.error)\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "a1,b1,a2,wake true,c true,b2,task ret,a3\n0 true\nboom\n"
+    );
+}
+
+#[test]
 fn fiber_yield_in_loop_with_branch_and_live_loop_var() {
     // A yield inside an `if` inside a `while`, with the loop
     // variable live across it.

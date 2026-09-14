@@ -55,6 +55,66 @@ class Fiber {
   /// @returns {Object}
   static context {}
 
+  /// Hand a fiber to the scheduler. It runs when the driver ticks,
+  /// a turn at a time: until it yields, sleeps, parks or finishes.
+  /// An abort ends the task and stays in its `error`, as under `try`.
+  ///
+  /// @param   {Fn}    body — closure to run as the task
+  /// @returns {Fiber} the task's fiber
+  ///
+  /// ```wren
+  /// var t = Fiber.spawn { Fiber.sleep(10); System.print("later") }
+  /// while (Fiber.tick(0)) Fiber.idle(100)
+  /// ```
+  static spawn(body) {}
+
+  /// Wait `ms` milliseconds. On a task this parks on a timer and
+  /// the other tasks run meanwhile; anywhere else the caller drives
+  /// the scheduler until the time is up.
+  ///
+  /// @param {Num} ms — milliseconds; null waits forever
+  static sleep(ms) {}
+
+  /// A fresh wait token for `park`. Single use.
+  ///
+  /// @returns {Num}
+  static waiter {}
+
+  /// Park until `token` is woken or `ms` milliseconds pass. A wake
+  /// that came before the park returns at once.
+  ///
+  /// @param   {Num}  token — from `Fiber.waiter`
+  /// @param   {Num}  ms — timeout in milliseconds; null waits forever
+  /// @returns {Bool} true when woken, false on timeout
+  static park(token, ms) {}
+
+  /// Wake the fiber parked on `token`, from any thread. Only the first
+  /// wake of a token counts.
+  ///
+  /// @param   {Num}  token
+  /// @returns {Bool} true when the wake was delivered
+  static wake(token) {}
+
+  /// Run the tasks that are ready, a turn each, and again while some
+  /// are still ready and `ms` milliseconds have not passed. Cannot
+  /// be called from a task.
+  ///
+  /// @param   {Num}  ms — time budget; 0 runs one round, null runs
+  ///                      until nothing is ready
+  /// @returns {Bool} true while tasks remain
+  static tick(ms) {}
+
+  /// Block until a task is ready, a timer is due, a wake arrives or
+  /// `ms` milliseconds pass. Cannot be called from a task.
+  ///
+  /// @param {Num} ms — null waits forever
+  static idle(ms) {}
+
+  /// Tasks that have not finished.
+  ///
+  /// @returns {Num}
+  static live {}
+
   /// Run this fiber to its next yield / return / abort.
   call() {}
   /// @param {Object} arg — value made available as the body's

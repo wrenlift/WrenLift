@@ -653,6 +653,25 @@ unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
 
 #[cfg(feature = "host")]
 fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
+    let mut input = input;
+    loop {
+        let v = krio_call_once(target, input)?;
+        let vm_ptr = crate::runtime::vm::current_vm_ptr();
+        let travelling = !vm_ptr.is_null()
+            && unsafe { (*vm_ptr).sched.as_ref() }.is_some_and(|s| s.park_travels_through_here());
+        if !travelling {
+            return Some(v);
+        }
+        // The target parked on the scheduler from under this task:
+        // this fiber suspends with it and re-enters the target when
+        // the task is resumed.
+        try_krio_yield(Value::null());
+        input = Value::null();
+    }
+}
+
+#[cfg(feature = "host")]
+fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // Establish that target has a krio backing before we start
     // doing any save/restore work. Early-return None lets the
     // caller fall back to the stackless path.
@@ -958,6 +977,202 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
     }
 }
 
+// --- Scheduler ---
+//
+// `Fiber.spawn(fn)` hands a fiber to the VM's world; `Fiber.tick(ms)`
+// and `Fiber.idle(ms)` drive it from outside a task, and `sleep` /
+// `park` on a task yield to the world until a timer or a `wake`.
+
+/// The VM behind `ctx`, or an error: the scheduler runs tasks on
+/// their own stacks, so it needs the krio backing.
+#[cfg(feature = "host")]
+fn sched_vm(ctx: &mut dyn NativeContext, what: &str) -> Option<*mut VM> {
+    let vm = ctx.krio_vm_raw_ptr() as *mut VM;
+    if vm.is_null() {
+        ctx.runtime_error(format!(
+            "{what}: the scheduler needs fibers with stacks (WLIFT_KRIO_FIBER=0 is set)."
+        ));
+        return None;
+    }
+    Some(vm)
+}
+
+#[cfg(feature = "host")]
+fn sched_of<'a>(vm: *mut VM) -> &'a mut crate::runtime::sched::Sched {
+    unsafe { (*vm).sched.get_or_insert_with(Default::default) }
+}
+
+/// `ms` as an optional deadline: null is forever.
+#[cfg(feature = "host")]
+fn deadline_arg(
+    ctx: &mut dyn NativeContext,
+    what: &str,
+    v: Value,
+) -> Result<Option<std::time::Instant>, ()> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    match v.as_num() {
+        Some(ms) if ms.is_finite() => Ok(crate::runtime::sched::Sched::deadline_from_ms(Some(ms))),
+        _ => {
+            ctx.runtime_error(format!("{what}: ms must be a number or null."));
+            Err(())
+        }
+    }
+}
+
+/// Park the caller on `token` until it is woken or `deadline` passes.
+/// `true` when woken. On a task this yields to the world; anywhere
+/// else the caller drives the world meanwhile.
+#[cfg(feature = "host")]
+fn park_on(
+    ctx: &mut dyn NativeContext,
+    vm: *mut VM,
+    token: u64,
+    deadline: Option<std::time::Instant>,
+) -> Value {
+    use crate::runtime::sched::Context;
+    let sched = sched_of(vm);
+    match sched.check_token(token) {
+        Err(msg) => {
+            ctx.runtime_error(msg);
+            return Value::null();
+        }
+        Ok(true) => return Value::bool(true),
+        Ok(false) => {}
+    }
+    match sched.context() {
+        Context::Driver => Value::bool(sched.drive_until(token, deadline)),
+        Context::Task => {
+            sched.request_park(token, deadline);
+            if try_krio_yield(Value::null()).is_none() {
+                ctx.runtime_error("Fiber.park: not on a fiber stack.".to_string());
+                return Value::null();
+            }
+            Value::bool(sched_of(vm).resume_woken())
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn fiber_spawn(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(vm) = sched_vm(ctx, "Fiber.spawn") else {
+        return Value::null();
+    };
+    let fiber_val = fiber_new_inner(ctx, args[1], None);
+    let Some(fiber) = (unsafe { as_fiber(fiber_val) }) else {
+        return Value::null();
+    };
+    sched_of(vm).spawn(fiber);
+    fiber_val
+}
+
+#[cfg(feature = "host")]
+fn fiber_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(vm) = sched_vm(ctx, "Fiber.sleep") else {
+        return Value::null();
+    };
+    let Ok(deadline) = deadline_arg(ctx, "Fiber.sleep", args[1]) else {
+        return Value::null();
+    };
+    let token = sched_of(vm).new_waiter();
+    park_on(ctx, vm, token, deadline);
+    Value::null()
+}
+
+#[cfg(feature = "host")]
+fn fiber_waiter(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let Some(vm) = sched_vm(ctx, "Fiber.waiter") else {
+        return Value::null();
+    };
+    Value::num(sched_of(vm).new_waiter() as f64)
+}
+
+#[cfg(feature = "host")]
+fn token_arg(ctx: &mut dyn NativeContext, what: &str, v: Value) -> Option<u64> {
+    match v.as_num() {
+        Some(t) if t >= 0.0 && t.is_finite() => Some(t as u64),
+        _ => {
+            ctx.runtime_error(format!("{what}: expected a waiter token."));
+            None
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn fiber_park(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(vm) = sched_vm(ctx, "Fiber.park") else {
+        return Value::null();
+    };
+    let Some(token) = token_arg(ctx, "Fiber.park", args[1]) else {
+        return Value::null();
+    };
+    let Ok(deadline) = deadline_arg(ctx, "Fiber.park", args[2]) else {
+        return Value::null();
+    };
+    park_on(ctx, vm, token, deadline)
+}
+
+#[cfg(feature = "host")]
+fn fiber_wake(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(token) = token_arg(ctx, "Fiber.wake", args[1]) else {
+        return Value::null();
+    };
+    Value::bool(crate::runtime::sched::wake(token))
+}
+
+#[cfg(feature = "host")]
+fn driver_sched<'a>(
+    ctx: &mut dyn NativeContext,
+    what: &str,
+) -> Option<&'a mut crate::runtime::sched::Sched> {
+    let vm = sched_vm(ctx, what)?;
+    let sched = sched_of(vm);
+    if sched.context() == crate::runtime::sched::Context::Task {
+        ctx.runtime_error(format!("{what}: a task cannot drive the scheduler."));
+        return None;
+    }
+    Some(sched)
+}
+
+#[cfg(feature = "host")]
+fn fiber_tick(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Ok(deadline) = deadline_arg(ctx, "Fiber.tick", args[1]) else {
+        return Value::null();
+    };
+    let Some(sched) = driver_sched(ctx, "Fiber.tick") else {
+        return Value::null();
+    };
+    sched.tick(deadline);
+    Value::bool(sched.live() > 0)
+}
+
+#[cfg(feature = "host")]
+fn fiber_idle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Ok(deadline) = deadline_arg(ctx, "Fiber.idle", args[1]) else {
+        return Value::null();
+    };
+    let Some(sched) = driver_sched(ctx, "Fiber.idle") else {
+        return Value::null();
+    };
+    sched.idle(deadline);
+    Value::null()
+}
+
+#[cfg(feature = "host")]
+fn fiber_live(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let Some(vm) = sched_vm(ctx, "Fiber.live") else {
+        return Value::null();
+    };
+    Value::num(sched_of(vm).live() as f64)
+}
+
+#[cfg(not(feature = "host"))]
+fn fiber_no_sched(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    ctx.runtime_error("The scheduler is not available on this target.".to_string());
+    Value::null()
+}
+
 // --- Instance methods ---
 
 fn fiber_call_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -1205,6 +1420,32 @@ pub fn bind(vm: &mut VM) {
     vm.primitive_static(class, "cancel()", fiber_cancel_static);
     vm.primitive_static(class, "deadlineMs", fiber_deadline_ms_static);
     vm.primitive_static(class, "setDeadlineMs(_)", fiber_set_deadline_ms_static);
+
+    // Scheduler.
+    #[cfg(feature = "host")]
+    {
+        vm.primitive_static(class, "spawn(_)", fiber_spawn);
+        vm.primitive_static(class, "sleep(_)", fiber_sleep);
+        vm.primitive_static(class, "waiter", fiber_waiter);
+        vm.primitive_static(class, "park(_,_)", fiber_park);
+        vm.primitive_static(class, "wake(_)", fiber_wake);
+        vm.primitive_static(class, "tick(_)", fiber_tick);
+        vm.primitive_static(class, "idle(_)", fiber_idle);
+        vm.primitive_static(class, "live", fiber_live);
+    }
+    #[cfg(not(feature = "host"))]
+    for sig in [
+        "spawn(_)",
+        "sleep(_)",
+        "waiter",
+        "park(_,_)",
+        "wake(_)",
+        "tick(_)",
+        "idle(_)",
+        "live",
+    ] {
+        vm.primitive_static(class, sig, fiber_no_sched);
+    }
 
     // Instance methods
     vm.primitive(class, "call()", fiber_call_0);

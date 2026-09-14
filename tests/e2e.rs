@@ -5594,6 +5594,154 @@ System.print(x)
     );
 }
 
+/// The scheduler runs tasks on their own stacks, so it is absent
+/// under `WLIFT_KRIO_FIBER=0`.
+fn scheduler_available() -> bool {
+    VM::new_default().krio_fiber_active
+}
+
+#[test]
+fn e2e_scheduler_runs_tasks_by_turns_timers_and_wakes() {
+    if !scheduler_available() {
+        return;
+    }
+    // Tasks run a turn each per tick; a sleep is a timer park that
+    // lets the others run, a park resolves on the first wake only,
+    // and a fiber a task calls parks the task with it.
+    let src = r#"
+var log = []
+Fiber.spawn {
+  log.add("a1")
+  Fiber.yield()
+  log.add("a2")
+  Fiber.sleep(30)
+  log.add("a3")
+}
+Fiber.spawn {
+  log.add("b1")
+  Fiber.sleep(10)
+  log.add("b2")
+}
+var w = Fiber.waiter
+var c = Fiber.spawn {
+  log.add("c %(Fiber.park(w, 1000))")
+}
+Fiber.spawn {
+  Fiber.sleep(5)
+  log.add("wake %(Fiber.wake(w))")
+  log.add("again %(Fiber.wake(w))")
+}
+System.print("live %(Fiber.live)")
+while (Fiber.tick(0)) Fiber.idle(100)
+System.print(log.join(","))
+System.print("live %(Fiber.live) done %(c.isDone)")
+
+var order = []
+Fiber.spawn {
+  var f = Fiber.new {
+    order.add("n1")
+    Fiber.sleep(20)
+    order.add("n2")
+    "ret"
+  }
+  order.add("task %(f.call())")
+}
+Fiber.spawn {
+  Fiber.sleep(5)
+  order.add("other")
+}
+while (Fiber.tick(0)) Fiber.idle(100)
+System.print(order.join(","))
+
+var bad = Fiber.spawn { Fiber.abort("boom") }
+Fiber.tick(0)
+System.print("bad: %(bad.error) %(bad.isDone)")
+
+var pre = Fiber.waiter
+System.print("%(Fiber.wake(pre)) %(Fiber.park(pre, 0)) %(Fiber.wake(pre))")
+var t = Fiber.spawn { Fiber.tick(0) }
+Fiber.tick(0)
+System.print(t.error)
+"#;
+    let expected = [
+        "live 4",
+        "a1,b1,a2,wake true,again false,c true,b2,a3",
+        "live 0 done true",
+        "n1,other,n2,task ret",
+        "bad: boom true",
+        "true true false",
+        "Fiber.tick: a task cannot drive the scheduler.",
+    ]
+    .join("\n");
+    for (jit_threshold, opt_threshold) in [(u32::MAX, u32::MAX), (1, 4)] {
+        let config = VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold,
+            opt_threshold,
+            ..VMConfig::default()
+        };
+        let (result, output, _) = run_with_config(src, config);
+        assert!(matches!(result, InterpretResult::Success), "{output}");
+        assert_eq!(output.trim(), expected);
+    }
+}
+
+#[test]
+fn e2e_scheduler_tasks_survive_collections() {
+    if !scheduler_available() {
+        return;
+    }
+    // Task fibers are roots of the world that holds them (the suite
+    // runs under WLIFT_GC_STRESS=1 too).
+    let src = r#"
+var total = 0
+for (i in 0...200) {
+  Fiber.spawn {
+    var acc = []
+    for (j in 0...50) {
+      acc.add("s%(j)" * 3)
+      if (j % 10 == 0) Fiber.yield()
+      if (j == 25) Fiber.sleep(1)
+    }
+    total = total + acc.count
+  }
+}
+while (Fiber.tick(0)) Fiber.idle(50)
+System.print(total)
+"#;
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "10000");
+}
+
+#[test]
+fn e2e_scheduler_wake_from_another_thread() {
+    if !scheduler_available() {
+        return;
+    }
+    // A waiter's token can be woken by any thread; the driver parked
+    // on it returns as soon as the wake lands.
+    let mut vm = VM::new_default();
+    vm.output_buffer = Some(String::new());
+    let token = vm.sched.get_or_insert_with(Default::default).new_waiter();
+    let waker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        wren_lift::runtime::sched::wake(token)
+    });
+    let start = Instant::now();
+    let result = vm.interpret("main", &format!("System.print(Fiber.park({token}, 5000))"));
+    assert!(matches!(result, InterpretResult::Success));
+    assert_eq!(vm.take_output().trim(), "true");
+    assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    assert!(waker.join().unwrap());
+}
+
 #[test]
 fn e2e_compiled_bodies_yield_from_fiber_stacks() {
     // With fibers on stacks of their own, a body that yields is
