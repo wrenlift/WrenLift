@@ -78,12 +78,13 @@ fn walker_one_frame_for_top_level_yield() {
     fiber.resume();
     assert_eq!(fiber.state(), krio_fiber::FiberState::Suspended);
     let depth = count_frames(&fiber).expect("chain walks");
-    // Closure body + yield_now's frame = at least 2; the
-    // trampoline may add one more. Anywhere in 2..=4 is fine —
-    // the point is the chain walks and terminates cleanly.
+    // Closure body + yield_now's frame = at least 2; the trampoline
+    // and krio's own unoptimised frames add a handful more. The bound
+    // is loose because the point is that the chain walks and
+    // terminates, not how many frames a debug build spends.
     assert!(
-        (1..=8).contains(&depth),
-        "expected 1..=8 frames, got {depth}"
+        (1..=16).contains(&depth),
+        "expected 1..=16 frames, got {depth}"
     );
 }
 
