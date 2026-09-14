@@ -3555,8 +3555,8 @@ impl VM {
         });
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         for fiber_ptr in pass3_fibers {
-            let krio = match unsafe { (*fiber_ptr).krio_fiber.as_ref() } {
-                Some(b) => b.as_ref(),
+            let krio = match unsafe { (*fiber_ptr).krio_fiber.as_deref() } {
+                Some(k) => k,
                 None => continue,
             };
             let Some(saved_fp_ptr) = krio.saved_fp() else {

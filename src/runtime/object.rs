@@ -1156,6 +1156,44 @@ impl std::fmt::Display for StackFrame {
     }
 }
 
+/// A fiber's krio backing, told to the runtime seam for the life of its
+/// stack: `stack_new` when made, `stack_drop` before the stack is freed
+/// (see `rt`). Boxed because krio_fiber's trampoline holds raw pointers
+/// that must stay at a stable address even if the `ObjFiber` moves.
+#[cfg(feature = "host")]
+pub struct KrioStack(Box<krio_fiber::Fiber>);
+
+#[cfg(feature = "host")]
+impl KrioStack {
+    pub fn new(fiber: krio_fiber::Fiber) -> Self {
+        let (base, size) = fiber.stack_range();
+        unsafe { crate::runtime::rt::stack_new(fiber.id(), base as usize, size) };
+        KrioStack(Box::new(fiber))
+    }
+}
+
+#[cfg(feature = "host")]
+impl std::ops::Deref for KrioStack {
+    type Target = krio_fiber::Fiber;
+    fn deref(&self) -> &krio_fiber::Fiber {
+        &self.0
+    }
+}
+
+#[cfg(feature = "host")]
+impl std::ops::DerefMut for KrioStack {
+    fn deref_mut(&mut self) -> &mut krio_fiber::Fiber {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "host")]
+impl Drop for KrioStack {
+    fn drop(&mut self) {
+        unsafe { crate::runtime::rt::stack_drop(self.0.id()) };
+    }
+}
+
 /// A fiber (lightweight coroutine / green thread).
 #[repr(C)]
 pub struct ObjFiber {
@@ -1222,7 +1260,7 @@ pub struct ObjFiber {
     /// `None` for fibers created under the existing stackless path
     /// (BC interp, JIT, WASM), or anywhere the toggle is off.
     #[cfg(feature = "host")]
-    pub krio_fiber: Option<Box<krio_fiber::Fiber>>,
+    pub krio_fiber: Option<KrioStack>,
 
     /// Per-fiber bump-allocator region. Allocations made by the
     /// fiber (via `wren_make_string` / `wren_make_list` / etc.) route

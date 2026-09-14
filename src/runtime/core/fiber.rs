@@ -189,7 +189,7 @@ fn fiber_new_inner(
                         krio_fiber_body(vm_ptr_usize, target_ptr_usize);
                     });
                     unsafe {
-                        (*fiber).krio_fiber = Some(Box::new(krio));
+                        (*fiber).krio_fiber = Some(crate::runtime::object::KrioStack::new(krio));
                     }
                     // Charge the krio mmap stack against GC pressure.
                     // Without this the Wren heap accounting only sees
@@ -693,10 +693,19 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // call boundary because the body's first statement is a
     // context switch onto the fiber's stack.
     let krio_ptr: *mut krio_fiber::Fiber = unsafe { (*target).krio_fiber.as_deref_mut().unwrap() };
+    // The stack this switches away from is suspended from here, and the
+    // target's from wherever it yields, for a host that scans stacks
+    // itself (see `rt`). Told before the switch and after the return,
+    // so a collection in between sees both.
+    let outgoing = krio_fiber::current_fiber_id().unwrap_or(0);
+    unsafe { crate::runtime::rt::stack_suspended(outgoing, super::super::stack_scan::approx_sp()) };
     // `resume_with_u64` is the alloc-free counterpart of the
     // generic `resume_with::<u64>` — see the matching comment on
     // `krio_fiber::yield_u64` in `try_krio_yield`.
     let step = unsafe { (*krio_ptr).resume_with_u64(input.to_bits()) };
+    unsafe {
+        crate::runtime::rt::stack_suspended((*krio_ptr).id(), (*krio_ptr).saved_sp() as usize);
+    }
 
     // Restore host's vm.fiber. Even if the body's own restore line
     // already ran (natural-completion path), re-asserting it here

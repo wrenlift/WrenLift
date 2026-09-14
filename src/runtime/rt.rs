@@ -1,5 +1,6 @@
-//! The runtime seam: the memory under the Immix strategy, as one atomic
-//! function-pointer slot per operation.
+//! The runtime seam: the memory under the Immix strategy, and the fiber
+//! stacks a host's collector scans, as one atomic function-pointer slot
+//! per operation.
 //!
 //! Every slot starts as wren_lift's own block allocator (`gc_immix_heap`)
 //! and is replaced entry by entry through [`wlift_rt_install`]; a `None`
@@ -30,7 +31,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Bumped whenever a slot is added, removed or changes signature.
-pub const RT_VERSION: u32 = 1;
+pub const RT_VERSION: u32 = 2;
 
 /// Largest size `alloc_raw` is ever asked for.
 pub const MAX_ALLOC: usize = 32 * 1024;
@@ -172,6 +173,18 @@ runtime_table! {
     /// allocate from `heap`.
     for_each_allocation(heap: *mut c_void, visit: Visit, ctx: *mut c_void) = immix::for_each_allocation;
     stats(heap: *mut c_void, out: *mut RtStats) = immix::stats;
+    // ── Stacks ──────────────────────────────────────────────────────────
+    // A fiber's stack is a root a host's collector scans itself, from
+    // where the stack is suspended. wren_lift's own collectors find the
+    // stacks through krio at collection time, so its defaults do nothing.
+    /// A fiber's stack came to be: `[base, base + size)`, under the id
+    /// krio gave the fiber.
+    stack_new(id: u64, base: usize, size: usize) = stacks::stack_new;
+    /// The stack `id` is suspended with its stack pointer at `sp`. `0`
+    /// is the thread's own stack, suspended while a fiber runs.
+    stack_suspended(id: u64, sp: usize) = stacks::stack_suspended;
+    /// The stack `id` is about to be freed.
+    stack_drop(id: u64) = stacks::stack_drop;
     // ── wren_lift's, for a host's collector ─────────────────────────────
     /// `mark(child, ctx)` for every object `obj` refers to.
     object_trace(obj: *mut u8, mark: Visit, ctx: *mut c_void) = wren::object_trace;
@@ -184,7 +197,7 @@ runtime_table! {
 pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
     heap_drop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, scan_range,
-    should_collect, track_external, watch,
+    should_collect, stack_drop, stack_new, stack_suspended, track_external, watch,
 };
 
 /// Whether the built-in heap serves the memory slots, so a handle is an
@@ -279,6 +292,14 @@ pub extern "C" fn wlift_rt_object_drop() -> ObjectDrop {
 }
 
 // ── wren_lift's own implementations, C-shaped ───────────────────────────
+
+/// The stack slots' defaults: nothing, since wren_lift's collectors walk
+/// krio's fibers when they scan.
+mod stacks {
+    pub unsafe extern "C" fn stack_new(_id: u64, _base: usize, _size: usize) {}
+    pub unsafe extern "C" fn stack_suspended(_id: u64, _sp: usize) {}
+    pub unsafe extern "C" fn stack_drop(_id: u64) {}
+}
 
 /// Adapters from the C slot signatures to `gc_immix_heap`.
 mod immix {
