@@ -664,7 +664,7 @@ pub unsafe extern "C" fn wlift_aot_install_class(
         (*class_ptr).num_fields = num_fields + inherited;
     }
 
-    let module_rc = std::rc::Rc::new(String::new());
+    let module_rc = std::sync::Arc::new(String::new());
     for i in 0..methods_count {
         let desc = unsafe { &*methods.add(i) };
         if desc.sig.is_null() || desc.fn_ptr.is_null() {
@@ -693,7 +693,7 @@ pub unsafe extern "C" fn wlift_aot_install_class(
             sig_sym,
             desc.arity,
             desc.fn_ptr,
-            Some(std::rc::Rc::clone(&module_rc)),
+            Some(std::sync::Arc::clone(&module_rc)),
         );
 
         let fn_obj = vm_ref.gc.alloc_fn(sig_sym, 0, 0, func_id.0);

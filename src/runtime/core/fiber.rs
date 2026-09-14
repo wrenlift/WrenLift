@@ -35,7 +35,7 @@ unsafe fn as_closure(val: Value) -> Option<*mut ObjClosure> {
 unsafe fn setup_fiber_from_closure(
     fiber: *mut ObjFiber,
     closure: *mut ObjClosure,
-    module_name: std::rc::Rc<String>,
+    module_name: std::sync::Arc<String>,
 ) {
     let fn_ptr = (*closure).function;
     let func_id = FuncId((*fn_ptr).fn_id);
@@ -60,16 +60,16 @@ unsafe fn setup_fiber_from_closure(
 /// Pull the module name from the caller's topmost frame so a
 /// newly-spawned fiber resolves `Greet` (etc.) against the module
 /// where it was defined, not a hardcoded "main".
-unsafe fn current_module_name(ctx: &mut dyn NativeContext) -> std::rc::Rc<String> {
+unsafe fn current_module_name(ctx: &mut dyn NativeContext) -> std::sync::Arc<String> {
     let caller = ctx.get_current_fiber();
     if caller.is_null() {
-        return std::rc::Rc::new(String::from("main"));
+        return std::sync::Arc::new(String::from("main"));
     }
     (*caller)
         .mir_frames
         .last()
         .map(|f| f.module_name.clone())
-        .unwrap_or_else(|| std::rc::Rc::new(String::from("main")))
+        .unwrap_or_else(|| std::sync::Arc::new(String::from("main")))
 }
 
 // --- Static methods ---
@@ -97,7 +97,7 @@ fn fiber_new_with_stack(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     fiber_new_inner(ctx, args[1], stack_kb)
 }
 
-fn fiber_new_inner(
+pub(crate) fn fiber_new_inner(
     ctx: &mut dyn NativeContext,
     closure_val: Value,
     parent_stack_request: Option<usize>,
@@ -581,6 +581,12 @@ fn try_krio_yield(_value: Value) -> Option<Value> {
 /// `target` is dereferenced; caller ensures it's a valid ObjFiber
 /// pointer (the caller already validated via `as_fiber`).
 #[cfg(feature = "host")]
+/// `try_krio_yield` for the thread module.
+#[cfg(feature = "host")]
+pub(crate) fn try_krio_yield_pub(value: Value) -> Option<Value> {
+    try_krio_yield(value)
+}
+
 /// Public wrapper around `try_krio_call` so the AOT/JIT fiber-action
 /// helper in `runtime_fns::handle_jit_fiber_action` can route fresh-
 /// fiber Calls through krio without duplicating its body.

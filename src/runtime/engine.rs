@@ -12,7 +12,6 @@
 /// thread. The interpreter continues using bytecode until compilation
 /// finishes, then swaps to native code on the next dispatch.
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -925,7 +924,7 @@ pub struct ExecutionEngine {
     /// module A keeps resolving its sibling classes against A even
     /// when invoked from module B. `None` is only used by isolated
     /// unit-test paths that don't run through the full VM pipeline.
-    pub func_modules: Vec<Option<Rc<String>>>,
+    pub func_modules: Vec<Option<Arc<String>>>,
     /// Per function, the address of its module's variable cell once
     /// resolved (0 until then); the cell is leaked per module, so the
     /// address never goes stale. One slot per function, grown with
@@ -1303,7 +1302,11 @@ impl ExecutionEngine {
     }
 
     /// Register a MIR function bound to the given defining module.
-    pub fn register_function_in(&mut self, mir: MirFunction, module: Option<Rc<String>>) -> FuncId {
+    pub fn register_function_in(
+        &mut self,
+        mir: MirFunction,
+        module: Option<Arc<String>>,
+    ) -> FuncId {
         let id = FuncId(self.functions.len() as u32);
         let trivial_getter = Self::mir_trivial_getter_field(&mir);
         let trivial_setter = Self::mir_trivial_setter_field(&mir);
@@ -1354,7 +1357,7 @@ impl ExecutionEngine {
     /// frames using this rather than propagating the caller's module
     /// so `GetModuleVar` binds against the slots the function was
     /// compiled against.
-    pub fn func_module(&self, id: FuncId) -> Option<&Rc<String>> {
+    pub fn func_module(&self, id: FuncId) -> Option<&Arc<String>> {
         self.func_modules
             .get(id.0 as usize)
             .and_then(|m| m.as_ref())
@@ -1371,7 +1374,7 @@ impl ExecutionEngine {
         name: SymbolId,
         arity: u8,
         fn_ptr: *const u8,
-        module: Option<Rc<String>>,
+        module: Option<Arc<String>>,
     ) -> FuncId {
         let mir = MirFunction::new(name, arity);
         let id = self.register_function_in(mir, module);

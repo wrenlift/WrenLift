@@ -9,7 +9,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -50,11 +50,47 @@ struct Registration {
     status: WaitStatus,
 }
 
-/// The world's mailbox: wakes from other threads land here, and the
-/// idle driver sleeps on the condvar.
-struct Endpoint {
+/// The world's mailbox: wakes and closures to run from other threads
+/// land here, and the idle driver sleeps on the condvar.
+pub struct Endpoint {
     wakes: Mutex<VecDeque<Token>>,
+    /// Closures another thread asked this world to run as tasks;
+    /// roots of the program until the world takes them.
+    spawns: Mutex<VecDeque<Value>>,
+    /// Tasks not yet finished plus closures not yet taken, for
+    /// placing new ones.
+    live: AtomicUsize,
     changed: Condvar,
+}
+
+impl Endpoint {
+    /// Ask the world to run `closure` as a task.
+    pub fn push_spawn(&self, closure: Value) {
+        self.spawns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(closure);
+        self.live.fetch_add(1, Ordering::Relaxed);
+        // The idle wait checks the mailbox under the wakes lock, so
+        // the notice is given under it too, or could fall between
+        // that check and the wait.
+        let _wakes = self.wakes.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+
+    /// Closures waiting to become tasks: roots for the collector.
+    pub fn pending_spawns(&self) -> Vec<Value> {
+        self.spawns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
 }
 
 struct Task {
@@ -154,6 +190,8 @@ impl Sched {
         let world = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
         let endpoint = Arc::new(Endpoint {
             wakes: Mutex::new(VecDeque::new()),
+            spawns: Mutex::new(VecDeque::new()),
+            live: AtomicUsize::new(0),
             changed: Condvar::new(),
         });
         with_worlds(|w| {
@@ -177,6 +215,46 @@ impl Sched {
         self.tasks.len()
     }
 
+    /// The world's mailbox, for another thread to reach it.
+    pub fn endpoint(&self) -> Arc<Endpoint> {
+        Arc::clone(&self.endpoint)
+    }
+
+    /// Closures other threads asked this world to run.
+    pub fn take_spawns(&self) -> Vec<Value> {
+        let taken: Vec<Value> = self
+            .endpoint
+            .spawns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        // Each becomes a task at once, so the count carries over.
+        self.endpoint.live.store(
+            self.tasks.len() + taken.iter().filter(|v| !v.is_null()).count(),
+            Ordering::Relaxed,
+        );
+        taken
+    }
+
+    /// Whether anything waits in the mailbox.
+    pub fn has_mail(&self) -> bool {
+        let ep = &self.endpoint;
+        !ep.wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || !ep
+                .spawns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    pub fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
     /// Fibers the world holds, for the collector's roots.
     pub fn fibers(&self) -> impl Iterator<Item = *mut ObjFiber> + '_ {
         self.tasks.values().map(|t| t.fiber)
@@ -194,6 +272,9 @@ impl Sched {
             },
         );
         self.ready.push_back(id);
+        self.endpoint
+            .live
+            .store(self.tasks.len(), Ordering::Relaxed);
         self.endpoint.changed.notify_all();
         id
     }
@@ -350,6 +431,9 @@ impl Sched {
             );
         if done {
             self.tasks.remove(&id);
+            self.endpoint
+                .live
+                .store(self.tasks.len(), Ordering::Relaxed);
             return;
         }
         let task = self.tasks.get_mut(&id).expect("task");
@@ -394,7 +478,15 @@ impl Sched {
             .wakes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        while wakes.is_empty() {
+        let spawns_waiting = || {
+            !self
+                .endpoint
+                .spawns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        };
+        while wakes.is_empty() && !spawns_waiting() {
             match until {
                 Some(until) => {
                     let now = Instant::now();

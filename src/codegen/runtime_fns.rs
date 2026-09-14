@@ -1698,7 +1698,7 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
     if vm.gc.is_immix() {
         if vm.safepoint_due() && !collect_suppressed() {
             let pinned = std::hint::black_box(val);
-            vm.collect_garbage();
+            vm.safepoint_work(false);
             if vm.gc.take_freed_code_objects() {
                 vm.method_cache.invalidate();
                 vm.engine.invalidate_inline_caches();

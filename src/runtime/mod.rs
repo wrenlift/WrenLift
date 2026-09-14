@@ -13,6 +13,8 @@ pub mod isolate;
 pub mod live_regs;
 pub mod object;
 pub mod object_layout;
+#[cfg(feature = "host")]
+pub mod pool;
 pub mod rt;
 #[cfg(feature = "host")]
 pub mod sched;

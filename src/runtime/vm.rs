@@ -383,6 +383,14 @@ pub struct Shared {
     /// Serialises output once the program has several threads.
     #[cfg(feature = "host")]
     pub output_lock: std::sync::Mutex<()>,
+    /// The worker threads `Thread.create` places tasks on; started on
+    /// first use, stopped when the main view goes.
+    #[cfg(feature = "host")]
+    pub pool: std::sync::Mutex<super::pool::Pool>,
+
+    /// The `thread` module's classes, null until it is imported.
+    #[cfg(feature = "host")]
+    pub thread_classes: [*mut ObjClass; 4],
 
     /// The `isolate` module's classes, null until it is imported.
     #[cfg(feature = "host")]
@@ -518,6 +526,9 @@ pub struct VM {
     /// where the thread becomes running and safe again.
     #[cfg(feature = "host")]
     interpret_depth: u32,
+    /// The view `VM::new` made: when it goes, the pool stops.
+    #[cfg(feature = "host")]
+    is_main: bool,
     /// Collections this view has seen; a collection while it was safe
     /// means its address-keyed cache is stale.
     #[cfg(feature = "host")]
@@ -640,6 +651,8 @@ impl VM {
             thread: self.world.join(),
             #[cfg(feature = "host")]
             interpret_depth: 0,
+            #[cfg(feature = "host")]
+            is_main: true,
             #[cfg(feature = "host")]
             collections_seen: 0,
             method_cache: super::vm_interp::MethodCache::new(),
@@ -764,6 +777,10 @@ impl VM {
             #[cfg(feature = "host")]
             output_lock: std::sync::Mutex::new(()),
             #[cfg(feature = "host")]
+            pool: std::sync::Mutex::new(super::pool::Pool::default()),
+            #[cfg(feature = "host")]
+            thread_classes: [ptr::null_mut(); 4],
+            #[cfg(feature = "host")]
             isolate_class: ptr::null_mut(),
             #[cfg(feature = "host")]
             channel_class: ptr::null_mut(),
@@ -777,6 +794,8 @@ impl VM {
             thread,
             #[cfg(feature = "host")]
             interpret_depth: 0,
+            #[cfg(feature = "host")]
+            is_main: false,
             #[cfg(feature = "host")]
             collections_seen: 0,
             method_cache: super::vm_interp::MethodCache::new(),
@@ -2002,7 +2021,7 @@ impl VM {
         // `GetModuleVar @idx` resolve against the slots the MIR was
         // compiled against, even when the caller lives in a different
         // module.
-        let module_rc = std::rc::Rc::new(module_name.to_string());
+        let module_rc = std::sync::Arc::new(module_name.to_string());
         let closure_count = module_mir.closures.len();
         let base_fid = self.engine.functions.len() as u32;
         let closure_func_ids: Vec<u32> = (0..closure_count as u32).map(|i| base_fid + i).collect();
@@ -2025,7 +2044,7 @@ impl VM {
         for (i, closure) in module_mir.closures.drain(..).enumerate() {
             let fid = self
                 .engine
-                .register_function_in(closure, Some(std::rc::Rc::clone(&module_rc)));
+                .register_function_in(closure, Some(std::sync::Arc::clone(&module_rc)));
             debug_assert_eq!(
                 fid.0, closure_func_ids[i],
                 "closure fid drift: expected {}, got {}",
@@ -2034,9 +2053,10 @@ impl VM {
         }
 
         // 7b. Register top-level function with the engine
-        let func_id = self
-            .engine
-            .register_function_in(module_mir.top_level, Some(std::rc::Rc::clone(&module_rc)));
+        let func_id = self.engine.register_function_in(
+            module_mir.top_level,
+            Some(std::sync::Arc::clone(&module_rc)),
+        );
 
         // 8. Create module var storage, pre-populated with core class values
         // and imported module vars.
@@ -2069,6 +2089,10 @@ impl VM {
             ("SocketCore", "socket"),
             ("Isolate", "isolate"),
             ("Channel", "isolate"),
+            ("Thread", "thread"),
+            ("Mutex", "thread"),
+            ("Lock", "thread"),
+            ("Deque", "thread"),
             ("Hatch", "hatch"),
         ];
         for name in &var_names {
@@ -2282,7 +2306,7 @@ impl VM {
             for method_mir in class_mir.methods {
                 let method_func_id = self
                     .engine
-                    .register_function_in(method_mir.mir, Some(std::rc::Rc::clone(&module_rc)));
+                    .register_function_in(method_mir.mir, Some(std::sync::Arc::clone(&module_rc)));
 
                 // Create ObjFn + ObjClosure for the method
                 let sig_sym = self.interner.intern(&method_mir.signature);
@@ -2497,7 +2521,7 @@ impl VM {
                 ip: 0,
                 pc: 0,
                 values: vec![Value::UNDEFINED; reg_size],
-                module_name: std::rc::Rc::new(module_key.clone()),
+                module_name: std::sync::Arc::new(module_key.clone()),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
@@ -3474,6 +3498,26 @@ impl VM {
                 true
             }
             #[cfg(feature = "host")]
+            "thread" => {
+                let classes = super::core::thread::register(self);
+                self.thread_classes = classes;
+                self.engine.modules.insert(
+                    "thread".to_string(),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        classes
+                            .iter()
+                            .map(|&c| Value::object(c as *mut u8))
+                            .collect(),
+                        ["Thread", "Mutex", "Lock", "Deque"]
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect(),
+                    ),
+                );
+                true
+            }
+            #[cfg(feature = "host")]
             "socket" => {
                 let class = super::core::socket::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -4403,6 +4447,17 @@ impl VM {
             roots.extend_from_slice(&other.roots.lock().unwrap_or_else(|e| e.into_inner()));
         }
 
+        // 10f. Closures on their way to a worker's world.
+        #[cfg(feature = "host")]
+        for endpoint in self
+            .pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .endpoints()
+        {
+            roots.extend(endpoint.pending_spawns());
+        }
+
         // `WLIFT_VALIDATE_BARRIERS=1` opts the GC into a pre-collect
         // sanity check covering both directions of the remembered-set
         // invariant — missed barriers (old→young not recorded) and
@@ -5059,7 +5114,7 @@ impl NativeContext for VM {
 
     fn poll_gc(&mut self) {
         if self.safepoint_due() {
-            self.collect_garbage();
+            self.safepoint_work(false);
             self.method_cache.invalidate();
             self.engine.invalidate_inline_caches();
         }
@@ -5289,6 +5344,14 @@ impl NativeContext for VM {
             "Isolate" => self.isolate_class,
             #[cfg(feature = "host")]
             "Channel" => self.channel_class,
+            #[cfg(feature = "host")]
+            "Thread" => self.thread_classes[0],
+            #[cfg(feature = "host")]
+            "Mutex" => self.thread_classes[1],
+            #[cfg(feature = "host")]
+            "Lock" => self.thread_classes[2],
+            #[cfg(feature = "host")]
+            "Deque" => self.thread_classes[3],
             "Object" => self.object_class,
             "Sequence" => self.sequence_class,
             "String" => self.string_class,
@@ -5313,7 +5376,7 @@ impl NativeContext for VM {
         }
     }
 
-    fn func_module(&self, func_id: u32) -> Option<std::rc::Rc<String>> {
+    fn func_module(&self, func_id: u32) -> Option<std::sync::Arc<String>> {
         self.engine
             .func_module(crate::runtime::engine::FuncId(func_id))
             .cloned()
@@ -5477,12 +5540,12 @@ impl VM {
         // function table this grows.
         #[cfg(feature = "host")]
         let stopped = self.stop_world();
-        let eval_module_rc = std::rc::Rc::new(module_name.to_string());
+        let eval_module_rc = std::sync::Arc::new(module_name.to_string());
         let mut closure_func_ids: Vec<u32> = Vec::new();
         for closure in module_mir.closures.drain(..) {
             let fid = self
                 .engine
-                .register_function_in(closure, Some(std::rc::Rc::clone(&eval_module_rc)));
+                .register_function_in(closure, Some(std::sync::Arc::clone(&eval_module_rc)));
             closure_func_ids.push(fid.0);
         }
         patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
@@ -5548,7 +5611,7 @@ impl VM {
                 ip: 0,
                 pc: 0,
                 values: vec![Value::UNDEFINED; reg_size],
-                module_name: std::rc::Rc::new(eval_module_name.clone()),
+                module_name: std::sync::Arc::new(eval_module_name.clone()),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
@@ -5689,7 +5752,7 @@ impl VM {
         // name keeps repeat `Meta.compile` calls from stomping each
         // other's slot tables.
         let module_key = format!("<compiled#{}>", self.engine.functions.len());
-        let compile_module_rc = std::rc::Rc::new(module_key.clone());
+        let compile_module_rc = std::sync::Arc::new(module_key.clone());
 
         let mut compiled_vars: Vec<Value> =
             Vec::with_capacity(crate::sema::CORE_PRELUDE_NAMES.len());
@@ -5714,7 +5777,7 @@ impl VM {
         for (i, closure) in module_mir.closures.drain(..).enumerate() {
             let fid = self
                 .engine
-                .register_function_in(closure, Some(std::rc::Rc::clone(&compile_module_rc)));
+                .register_function_in(closure, Some(std::sync::Arc::clone(&compile_module_rc)));
             debug_assert_eq!(fid.0, closure_func_ids[i]);
         }
 
@@ -5923,7 +5986,7 @@ impl VM {
                         .last()
                         .map(|f| f.module_name.clone())
                         .unwrap_or_else(|| {
-                            std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                            std::sync::Arc::new(crate::codegen::runtime_fns::module_name())
                         })
                 });
             let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
@@ -6055,10 +6118,10 @@ impl VM {
                             .last()
                             .map(|f| f.module_name.clone())
                             .unwrap_or_else(|| {
-                                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                                std::sync::Arc::new(crate::codegen::runtime_fns::module_name())
                             })
                     } else {
-                        std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                        std::sync::Arc::new(crate::codegen::runtime_fns::module_name())
                     }
                 });
 
@@ -6162,7 +6225,7 @@ impl VM {
             .engine
             .func_module(func_id)
             .cloned()
-            .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()));
+            .unwrap_or_else(|| std::sync::Arc::new(crate::codegen::runtime_fns::module_name()));
         let frame = MirCallFrame {
             func_id,
             current_block: BlockId(0),
@@ -6370,7 +6433,7 @@ impl VM {
                         .last()
                         .map(|f| f.module_name.clone())
                         .unwrap_or_else(|| {
-                            std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                            std::sync::Arc::new(crate::codegen::runtime_fns::module_name())
                         })
                 });
             let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
@@ -6456,10 +6519,10 @@ impl VM {
                             .last()
                             .map(|f| f.module_name.clone())
                             .unwrap_or_else(|| {
-                                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                                std::sync::Arc::new(crate::codegen::runtime_fns::module_name())
                             })
                     } else {
-                        std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                        std::sync::Arc::new(crate::codegen::runtime_fns::module_name())
                     }
                 });
 
@@ -6705,6 +6768,24 @@ impl VM {
         std::hint::black_box(&spill);
     }
 
+    /// What a safepoint does: install compile results, answer a
+    /// collector's request, and collect when it is time (or `force`).
+    pub fn safepoint_work(&mut self, force: bool) {
+        if self.engine.threaded
+            && self
+                .engine
+                .results_ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.install_compilations();
+        }
+        if force || self.gc.should_collect() {
+            self.collect_garbage();
+        } else if self.world.requested() {
+            self.park();
+        }
+    }
+
     /// A safepoint: stop here while another thread collects.
     pub fn park(&mut self) {
         let mut spill = Spill::new();
@@ -6732,11 +6813,32 @@ impl VM {
     pub fn safepoint_due(&self) -> bool {
         self.gc.should_collect()
     }
+
+    pub fn safepoint_work(&mut self, force: bool) {
+        if force || self.gc.should_collect() {
+            self.collect_garbage();
+        }
+    }
 }
 
 #[cfg(feature = "host")]
 impl Drop for VM {
     fn drop(&mut self) {
+        if self.is_main {
+            let workers = self
+                .pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shutdown();
+            // The workers may be stopped for a collection this view
+            // has to answer; it is safe while it waits for them.
+            let mut spill = Spill::new();
+            self.enter_safe(&mut spill);
+            for w in workers {
+                let _ = w.join();
+            }
+            std::hint::black_box(&spill);
+        }
         let thread = self.thread.clone();
         self.world.leave(&thread);
     }

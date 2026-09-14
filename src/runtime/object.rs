@@ -1118,7 +1118,7 @@ pub struct MirCallFrame {
     /// Uninitialized slots hold Value::UNDEFINED.
     pub values: Vec<crate::runtime::value::Value>,
     /// Module variable storage for this frame's module (Rc to avoid clone per call).
-    pub module_name: std::rc::Rc<String>,
+    pub module_name: std::sync::Arc<String>,
     /// The ValueId in the *caller* frame that should receive our return value.
     pub return_dst: Option<crate::mir::ValueId>,
     /// The closure being executed (if any), for upvalue access.
@@ -1581,7 +1581,7 @@ pub trait NativeContext {
     /// Defining module for the function with this id, if one was
     /// recorded at registration. `None` for isolated-test functions
     /// registered without a module binding.
-    fn func_module(&self, func_id: u32) -> Option<std::rc::Rc<String>>;
+    fn func_module(&self, func_id: u32) -> Option<std::sync::Arc<String>>;
 
     // -- krio-fiber integration (off by default; see VM::krio_fiber_active) --
     /// Raw pointer to the VM, for callers that need it from inside a

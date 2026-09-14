@@ -43,6 +43,7 @@ const STUBS: &[(&str, &str)] = &[
     ("Fiber", include_str!("../runtime/prelude/fiber.wren")),
     ("Fn", include_str!("../runtime/prelude/fn.wren")),
     ("isolate", include_str!("../runtime/prelude/isolate.wren")),
+    ("thread", include_str!("../runtime/prelude/thread.wren")),
     (
         "TypedArrays",
         include_str!("../runtime/prelude/typed_arrays.wren"),

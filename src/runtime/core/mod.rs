@@ -51,6 +51,8 @@ pub mod proc;
 #[cfg(feature = "host")]
 pub mod socket;
 #[cfg(feature = "host")]
+pub mod thread;
+#[cfg(feature = "host")]
 pub mod zip;
 
 use super::vm::VM;

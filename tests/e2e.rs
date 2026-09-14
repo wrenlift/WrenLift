@@ -6001,6 +6001,103 @@ System.print("{tag} %(t) %(seen.count)")
 }
 
 #[test]
+fn e2e_threads_share_one_heap_through_a_deque_mutex_and_lock() {
+    // Tasks on the worker threads produce into a Deque and consume
+    // from it under a Mutex, signal a Lock, wait with a timeout, and
+    // run compiled code in parallel.
+    if !scheduler_available() {
+        return;
+    }
+    let src = r#"
+import "thread" for Thread, Mutex, Lock, Deque
+var q = Deque.new()
+var produced = Lock.new()
+var done = Lock.new()
+var m = Mutex.new()
+var total = 0
+var log = []
+for (p in 0...4) {
+  Thread.create {
+    for (i in 0...250) {
+      q.add([p, i])
+      if (i % 50 == 0) Thread.yield()
+    }
+    produced.release()
+  }
+}
+for (c in 0...3) {
+  Thread.create {
+    while (true) {
+      var item = q.pop(true)
+      if (item == null) break
+      m.acquire()
+      total = total + item[1]
+      m.release()
+    }
+    m.acquire()
+    log.add("end%(c)")
+    m.release()
+    done.release()
+  }
+}
+for (i in 0...4) produced.wait()
+for (i in 0...3) q.add(null)
+for (i in 0...3) done.wait()
+System.print("total %(total) leftover %(q.count) log %(log.count)")
+var l = Lock.new()
+System.print(l.wait(20))
+Thread.create {
+  Fiber.sleep(10)
+  l.release()
+}
+System.print(l.wait(5000))
+var held = Mutex.new()
+held.acquire()
+System.print(held.tryAcquire())
+held.release()
+System.print(held.tryAcquire())
+class F {
+  static fib(n) {
+    if (n < 2) return n
+    return fib(n - 1) + fib(n - 2)
+  }
+}
+var sums = Deque.new()
+for (i in 0...8) {
+  Thread.create { sums.add(F.fib(22)) }
+}
+var s = 0
+for (i in 0...8) s = s + sums.pop(true)
+System.print("fib %(s) workers>1 %(Thread.count > 1)")
+"#;
+    let (jit_threshold, opt_threshold) = if std::env::var_os("E2E_THREADS_HOT").is_some() {
+        (1, 4)
+    } else {
+        (u32::MAX, u32::MAX)
+    };
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold,
+        opt_threshold,
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(
+        output.trim(),
+        [
+            "total 124500 leftover 0 log 3",
+            "false",
+            "true",
+            "false",
+            "true",
+            "fib 141688 workers>1 true",
+        ]
+        .join("\n")
+    );
+}
+
+#[test]
 fn e2e_compiled_bodies_yield_from_fiber_stacks() {
     // With fibers on stacks of their own, a body that yields is
     // compiled like any other. Two fibers run the same closure code

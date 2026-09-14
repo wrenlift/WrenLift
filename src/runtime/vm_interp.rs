@@ -13,8 +13,6 @@ use smallvec::SmallVec;
 /// comparisons, guards, box/unbox, bitwise, constants, moves) is inlined.
 /// VM-specific instructions (calls, collections, module vars, string
 /// allocation, fields, closures) have full VM access.
-use std::rc::Rc;
-
 use crate::intern::SymbolId;
 use crate::mir::bytecode::{read_u16, read_u32, read_u8, BcConst, BytecodeFunction, Op};
 use crate::mir::interp::InterpError;
@@ -24,6 +22,7 @@ use crate::runtime::engine::FuncId;
 use crate::runtime::object::*;
 use crate::runtime::value::Value;
 use crate::runtime::vm::{FiberAction, VM};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Cached process-wide env flags
@@ -377,7 +376,7 @@ fn try_run_root_frame_native(
     vm: &mut VM,
     fiber: *mut ObjFiber,
     func_id: FuncId,
-    module_name: &Rc<String>,
+    module_name: &Arc<String>,
 ) -> Result<RootNative, RuntimeError> {
     #[inline(always)]
     fn trace_root_native(msg: impl FnOnce() -> String) {
@@ -504,7 +503,7 @@ fn try_enter_loop_osr(
     vm: &mut VM,
     fiber: *mut ObjFiber,
     func_id: FuncId,
-    module_name: &Rc<String>,
+    module_name: &Arc<String>,
     closure: Option<*mut ObjClosure>,
     defining_class: Option<*mut ObjClass>,
     return_dst: Option<ValueId>,
@@ -860,7 +859,7 @@ pub enum RuntimeError {
 #[derive(Debug, Clone)]
 pub struct SourceLoc {
     pub span: crate::ast::Span,
-    pub module: Rc<String>,
+    pub module: Arc<String>,
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -1591,7 +1590,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
         // the pointer changes or a module was added (which can rehash the
         // table and move entries).
         let module_entry_ptr: *mut super::engine::ModuleEntry = {
-            let key = (Rc::as_ptr(&module_name) as usize, vm.engine.modules.len());
+            let key = (Arc::as_ptr(&module_name) as usize, vm.engine.modules.len());
             match module_cache.iter().find(|(k, _)| *k == key) {
                 Some((_, ptr)) => *ptr,
                 None => {
@@ -1748,6 +1747,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     return Err(RuntimeError::StepLimitExceeded);
                 }
                 if vm.safepoint_due() || vm.gc_requested {
+                    let force = vm.gc_requested;
                     vm.gc_requested = false;
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -1755,7 +1755,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             frame.pc = pc;
                         }
                     }
-                    vm.collect_garbage();
+                    vm.safepoint_work(force);
                     if vm.gc.take_freed_code_objects() {
                         vm.method_cache.invalidate();
                         vm.engine.invalidate_inline_caches();
@@ -3207,7 +3207,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 .engine
                                 .func_module(target_func_id)
                                 .cloned()
-                                .unwrap_or_else(|| Rc::clone(&module_name));
+                                .unwrap_or_else(|| Arc::clone(&module_name));
                             unsafe {
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
@@ -3345,7 +3345,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     .engine
                                     .func_module(target_func_id)
                                     .cloned()
-                                    .unwrap_or_else(|| Rc::clone(&module_name));
+                                    .unwrap_or_else(|| Arc::clone(&module_name));
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
                                     current_block: BlockId(0),
@@ -4204,7 +4204,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             let (cur_module_name, cur_closure, cur_defining_class, cur_return_dst) = unsafe {
                                 let frame = (*fiber).mir_frames.last().unwrap();
                                 (
-                                    Rc::clone(&frame.module_name),
+                                    Arc::clone(&frame.module_name),
                                     frame.closure,
                                     frame.defining_class,
                                     frame.return_dst,
@@ -4347,7 +4347,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             let (cur_module_name, cur_closure, cur_defining_class, cur_return_dst) = unsafe {
                                 let frame = (*fiber).mir_frames.last().unwrap();
                                 (
-                                    Rc::clone(&frame.module_name),
+                                    Arc::clone(&frame.module_name),
                                     frame.closure,
                                     frame.defining_class,
                                     frame.return_dst,
@@ -4413,7 +4413,7 @@ pub fn eval_in_vm(
         .map(|bc| bc.register_count as usize)
         .unwrap_or(func.next_value as usize);
 
-    let module_name_rc = Rc::new(module_name.clone());
+    let module_name_rc = Arc::new(module_name.clone());
     let fiber = vm.gc.alloc_fiber();
     unsafe {
         (*fiber).header.class = vm.fiber_class;
@@ -4514,7 +4514,7 @@ fn dispatch_closure_bc(
     arg_vals: &[Value],
     pc: u32,
     values: Vec<Value>,
-    module_name: &Rc<String>,
+    module_name: &Arc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
     caller_bc_ptr: *const BytecodeFunction,
@@ -4545,7 +4545,7 @@ fn dispatch_closure_bc_inner(
     arg_vals: &[Value],
     pc: u32,
     mut values: Vec<Value>,
-    module_name: &Rc<String>,
+    module_name: &Arc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
     caller_bc_ptr: *const BytecodeFunction,
@@ -4703,7 +4703,7 @@ fn dispatch_closure_bc_inner(
                     .engine
                     .func_module(target_func_id)
                     .cloned()
-                    .unwrap_or_else(|| Rc::clone(module_name));
+                    .unwrap_or_else(|| Arc::clone(module_name));
                 let mod_name_bytes = callee_module_name.as_bytes();
                 let (mv_ptr, mv_count) = vm.engine.module_vars_for(target_func_id);
                 crate::codegen::runtime_fns::set_jit_context(
@@ -4884,7 +4884,7 @@ fn dispatch_closure_bc_inner(
                 .engine
                 .func_module(target_func_id)
                 .cloned()
-                .unwrap_or_else(|| Rc::clone(module_name));
+                .unwrap_or_else(|| Arc::clone(module_name));
             let (mv_ptr, mv_count) = vm
                 .engine
                 .modules
@@ -5007,12 +5007,12 @@ fn dispatch_closure_bc_inner(
 
     // Push new frame. Use the callee's defining module if recorded so
     // `GetModuleVar` inside reads against its own module's slots, not
-    // the caller's (Rc::clone is cheap — just a refcount bump).
+    // the caller's (Arc::clone is cheap — just a refcount bump).
     let frame_module = vm
         .engine
         .func_module(target_func_id)
         .cloned()
-        .unwrap_or_else(|| Rc::clone(module_name));
+        .unwrap_or_else(|| Arc::clone(module_name));
     unsafe {
         (*fiber).mir_frames.push(MirCallFrame {
             func_id: target_func_id,
@@ -5543,7 +5543,7 @@ fn try_operator_dispatch(
     pc: &mut u32,
     values: &mut Vec<Value>,
     dst: u16,
-    module_name: &Rc<String>,
+    module_name: &Arc<String>,
     caller_bc_ptr: *const BytecodeFunction,
 ) -> Result<Dispatch, RuntimeError> {
     let method_sym = vm.interner.intern(method_str);
@@ -6196,7 +6196,7 @@ mod tests {
                 ip: 0,
                 pc: 0,
                 values: vec![UNDEF; reg_size],
-                module_name: Rc::new("__test__".to_string()),
+                module_name: Arc::new("__test__".to_string()),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
@@ -6230,7 +6230,7 @@ mod tests {
                 ip: 0,
                 pc: 0,
                 values: vec![UNDEF; reg_size],
-                module_name: Rc::new("__test__".to_string()),
+                module_name: Arc::new("__test__".to_string()),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
