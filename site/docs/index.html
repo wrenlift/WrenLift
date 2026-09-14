@@ -150,6 +150,7 @@
       <ul>
         <li><a href="/docs/ref/system.html">System</a></li>
         <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/concurrency.html">Concurrency</a></li>
         <li><a href="/docs/ref/future.html">Future</a></li>
         <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
         <li><a href="/docs/ref/simd.html">SIMD</a></li>
@@ -215,7 +216,7 @@
       <h2>Built-in reference</h2>
       <p>
         Wrenlift extends stock Wren with a small set of classes for
-        async, typed buffers, SIMD, and foreign-function calls. The
+        async, threads, typed buffers, SIMD, and foreign-function calls. The
         rest of the standard library lives in
         <a href="https://hatch.wrenlift.com/packages">Hatch packages</a>
         — fetched on first use, versioned, and documented separately.
@@ -228,6 +229,10 @@
         <a class="docs-card" href="/docs/ref/fiber.html">
           <h3><code>Fiber</code></h3>
           <p>Suspension, <code>.try</code>, async-bridge handoff.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/concurrency.html">
+          <h3>Concurrency</h3>
+          <p>Fibers and the scheduler, threads on one heap, isolates with their own.</p>
         </a>
         <a class="docs-card" href="/docs/ref/future.html">
           <h3><code>Future</code></h3>

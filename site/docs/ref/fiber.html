@@ -130,6 +130,7 @@
       <ul>
         <li><a href="/docs/ref/system.html">System</a></li>
         <li><a href="/docs/ref/fiber.html" class="active">Fiber</a></li>
+        <li><a href="/docs/ref/concurrency.html">Concurrency</a></li>
         <li><a href="/docs/ref/future.html">Future</a></li>
         <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
         <li><a href="/docs/ref/simd.html">SIMD</a></li>
@@ -218,6 +219,34 @@ System.print(r)                 // null</code></pre>
 }
 work.call()</code></pre>
 
+      <h2 id="scheduler">Scheduler</h2>
+      <p>
+        When many fibers wait on timers or on each other, let the built-in scheduler run them instead of calling each one by hand.
+      </p>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>Fiber.spawn(fn)</code></td><td>Hand a fiber to the scheduler. It runs a turn at a time. If it aborts, the task ends and the error stays in its <code>.error</code>. Returns the fiber.</td></tr>
+          <tr><td><code>Fiber.tick(ms)</code></td><td>Give every ready task a turn. Keep going while tasks are ready and <code>ms</code> has not passed; <code>0</code> means one round. Returns <code>true</code> while tasks remain.</td></tr>
+          <tr><td><code>Fiber.idle(ms)</code></td><td>Block until a task is ready, a timer is due, a wake arrives, or <code>ms</code> passes.</td></tr>
+          <tr><td><code>Fiber.sleep(ms)</code></td><td>Inside a task, park on a timer while the other tasks run. At module top level, run the scheduler until the time is up.</td></tr>
+          <tr><td><code>Fiber.waiter</code> &middot; <code>Fiber.park(token, ms)</code> &middot; <code>Fiber.wake(token)</code></td><td>A wait token you use once. <code>park</code> returns <code>true</code> when woken and <code>false</code> on timeout. <code>wake</code> works from any thread.</td></tr>
+          <tr><td><code>Fiber.live</code></td><td>Tasks not yet finished.</td></tr>
+        </tbody>
+      </table>
+<pre><code class="language-wren">Fiber.spawn {
+  Fiber.sleep(30)          // a timer park; the others run meanwhile
+  System.print("a")
+}
+Fiber.spawn {
+  Fiber.yield()            // let the other tasks have a turn
+  System.print("b")
+}
+while (Fiber.tick(0)) Fiber.idle(100)   // prints b, then a</code></pre>
+      <p>
+        A task is still a fiber, and it runs on the thread that made it. To run tasks in parallel on other threads, or in a separate VM, see <a href="/docs/ref/concurrency.html">Concurrency</a>.
+      </p>
+
       <h2 id="async">Async-bridge integration</h2>
       <p>
         Browser bridges &mdash; <code>Browser.fetch</code>,
@@ -248,6 +277,7 @@ page.try()</code></pre>
       <li><a href="#yield">Yield &amp; resume</a></li>
       <li><a href="#try">.call vs .try</a></li>
       <li><a href="#cancel">Cancellation &amp; deadlines</a></li>
+      <li><a href="#scheduler">Scheduler</a></li>
       <li><a href="#async">Async-bridge integration</a></li>
     </ul>
   </aside>
