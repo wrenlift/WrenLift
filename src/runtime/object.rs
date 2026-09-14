@@ -1190,6 +1190,7 @@ impl std::ops::DerefMut for KrioStack {
 #[cfg(feature = "host")]
 impl Drop for KrioStack {
     fn drop(&mut self) {
+        crate::runtime::live_regs::forget_stack(self.0.id());
         unsafe { crate::runtime::rt::stack_drop(self.0.id()) };
     }
 }
