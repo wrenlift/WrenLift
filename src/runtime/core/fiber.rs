@@ -808,7 +808,7 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             // An error `try` did not ask for aborts the caller too, as
             // Wren does: raised here, on the caller's own run.
             if !err.is_null() && !was_try && !vm_ptr.is_null() {
-                let message = unsafe { crate::runtime::core::as_string(v) }.to_owned();
+                let message = crate::runtime::core::as_string(v).to_owned();
                 unsafe { (*vm_ptr).runtime_error(message) };
                 return Some(Value::null());
             }
