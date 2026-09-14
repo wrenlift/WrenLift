@@ -510,3 +510,26 @@ fn nested_class_method_calls() {
     assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "1024\n");
 }
+
+#[test]
+fn equality_honours_a_class_operator() {
+    // `==` on an instance dispatches the class's own operator; the
+    // class install marks the class so the compiled identity fast path
+    // stands aside.
+    let r = compile_link_run(
+        "class P {\n  \
+           construct new(x) { _x = x }\n  \
+           x { _x }\n  \
+           ==(o) { o is P && _x == o.x }\n  \
+           !=(o) { !(this == o) }\n\
+         }\n\
+         class Q {\n  construct new() {}\n}\n\
+         System.print(P.new(1) == P.new(1))\n\
+         System.print(P.new(1) != P.new(2))\n\
+         System.print(Q.new() == Q.new())\n\
+         var q = Q.new()\n\
+         System.print(q == q)\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr:\n{}", r.stderr);
+    assert_eq!(r.stdout, "true\ntrue\nfalse\ntrue\n");
+}

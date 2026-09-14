@@ -718,6 +718,7 @@ pub unsafe extern "C" fn wlift_aot_install_class(
                     cls.methods.resize(idx + 1, None);
                 }
                 cls.methods[idx] = Some(method);
+                cls.note_bound_signature(sig);
             }
             // The class is pinned in old gen (`alloc_class`)
             // and the closure was just allocated — possibly in
