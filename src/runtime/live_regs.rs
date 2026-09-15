@@ -68,6 +68,29 @@ pub fn retain_stacks(live: &std::collections::HashSet<u64>) {
     LIVE.with(|l| l.borrow_mut().retain(|&(s, _)| s == 0 || live.contains(&s)));
 }
 
+/// Registrations on fiber stack `id` (0 for the thread's own): what a
+/// host notes before a run whose frames a throw may abandon.
+pub fn count_on(id: u64) -> usize {
+    LIVE.with(|l| l.borrow().iter().filter(|&&(s, _)| s == id).count())
+}
+
+/// Drop the registrations on fiber stack `id` past the first `count`:
+/// the activations that made them are gone by a long jump, their guards
+/// never dropped.
+pub fn truncate_on(id: u64, count: usize) {
+    LIVE.with(|l| {
+        let mut l = l.borrow_mut();
+        let mut seen = 0;
+        l.retain(|&(s, _)| {
+            if s != id {
+                return true;
+            }
+            seen += 1;
+            seen <= count
+        });
+    });
+}
+
 /// Append every live register file's values to `out`.
 pub fn collect_live_values(out: &mut Vec<Value>) {
     LIVE.with(|l| {

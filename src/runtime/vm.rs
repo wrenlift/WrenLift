@@ -574,6 +574,11 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub sched: Option<Box<crate::runtime::sched::Sched>>,
 
+    /// Runs of this view set aside by a host's world, by the id it was
+    /// given; their roots are the view's until each is taken up again.
+    #[cfg(feature = "host")]
+    aside: Vec<(u64, Activation)>,
+
     // (Earlier iterations used a side-table `krio_backed_fibers`
     // here, but it accumulated dangling pointers after the GC
     // swept short-lived fibers. Pass 3 now enumerates via
@@ -688,6 +693,8 @@ impl VM {
             gc_requested: false,
             #[cfg(feature = "host")]
             sched: None,
+            #[cfg(feature = "host")]
+            aside: Vec::new(),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
         }
@@ -842,6 +849,8 @@ impl VM {
             sync_fiber_pool: Vec::new(),
             #[cfg(feature = "host")]
             sched: None,
+            #[cfg(feature = "host")]
+            aside: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -4463,10 +4472,15 @@ impl VM {
         }
         let file_watch_end = roots.len();
 
-        // 10d. Fibers the scheduler holds as tasks.
+        // 10d. Fibers the scheduler holds as tasks, and the runs set
+        // aside by a host's world.
         #[cfg(feature = "host")]
         if let Some(sched) = &self.sched {
             roots.extend(sched.roots());
+        }
+        #[cfg(feature = "host")]
+        for (_, a) in &self.aside {
+            a.roots(&mut roots);
         }
 
         // 10e. What the other threads published when they stopped.
@@ -6748,8 +6762,92 @@ impl Spill {
     }
 }
 
+/// A run of the view set aside: the fiber it was in, its error state
+/// and pending fiber action, and the JIT's per-thread state. A host's
+/// world sets the run aside when it switches the thread to another
+/// context (`set_aside`) and takes it up again on the way back
+/// (`take_up`); meanwhile its roots stay the view's.
+#[cfg(feature = "host")]
+pub struct Activation {
+    fiber: *mut ObjFiber,
+    sync_entry_fiber: *mut ObjFiber,
+    error_fiber: *mut ObjFiber,
+    has_error: bool,
+    last_error: Option<String>,
+    pending_fiber_action: Option<FiberAction>,
+    jit_ctx: crate::codegen::runtime_fns::JitContext,
+    jit_roots: Vec<Value>,
+    jit_frames: Vec<(usize, u32, usize)>,
+    jit_depth: u32,
+    jit_disabled: bool,
+}
+
+#[cfg(feature = "host")]
+impl Activation {
+    fn roots(&self, out: &mut Vec<Value>) {
+        for f in [self.fiber, self.error_fiber, self.sync_entry_fiber] {
+            if !f.is_null() {
+                out.push(Value::object(f as *mut u8));
+            }
+        }
+        out.extend_from_slice(&self.jit_roots);
+        for p in [self.jit_ctx.closure, self.jit_ctx.defining_class] {
+            if !p.is_null() {
+                out.push(Value::object(p));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+static NEXT_ASIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[cfg(feature = "host")]
 impl VM {
+    /// Set the run this thread is in aside, leaving the view in no run,
+    /// and give the id to take it up again by.
+    pub fn set_aside(&mut self) -> u64 {
+        let jit = unsafe { &mut *crate::codegen::runtime_fns::jit_state() };
+        let activation = Activation {
+            fiber: std::mem::replace(&mut self.fiber, ptr::null_mut()),
+            sync_entry_fiber: std::mem::replace(&mut self.sync_entry_fiber, ptr::null_mut()),
+            error_fiber: std::mem::replace(&mut self.error_fiber, ptr::null_mut()),
+            has_error: std::mem::take(&mut self.has_error),
+            last_error: self.last_error.take(),
+            pending_fiber_action: self.pending_fiber_action.take(),
+            jit_ctx: std::mem::take(&mut jit.ctx),
+            jit_roots: std::mem::take(&mut jit.roots),
+            jit_frames: std::mem::take(&mut jit.frames),
+            jit_depth: std::mem::take(&mut jit.depth),
+            jit_disabled: jit.disabled,
+        };
+        let id = NEXT_ASIDE.fetch_add(1, Ordering::Relaxed);
+        self.aside.push((id, activation));
+        id
+    }
+
+    /// Take the run set aside as `id` up again. False when there is
+    /// none.
+    pub fn take_up(&mut self, id: u64) -> bool {
+        let Some(i) = self.aside.iter().position(|(k, _)| *k == id) else {
+            return false;
+        };
+        let (_, a) = self.aside.remove(i);
+        let jit = unsafe { &mut *crate::codegen::runtime_fns::jit_state() };
+        self.fiber = a.fiber;
+        self.sync_entry_fiber = a.sync_entry_fiber;
+        self.error_fiber = a.error_fiber;
+        self.has_error = a.has_error;
+        self.last_error = a.last_error;
+        self.pending_fiber_action = a.pending_fiber_action;
+        jit.ctx = a.jit_ctx;
+        jit.roots = a.jit_roots;
+        jit.frames = a.jit_frames;
+        jit.depth = a.jit_depth;
+        jit.disabled = a.jit_disabled;
+        true
+    }
+
     /// Values this thread holds outside any stack.
     fn thread_roots(&self) -> Vec<Value> {
         let mut roots = Vec::new();
@@ -6764,6 +6862,9 @@ impl VM {
                 .iter()
                 .map(|&f| Value::object(f as *mut u8)),
         );
+        for (_, a) in &self.aside {
+            a.roots(&mut roots);
+        }
         if let Some(sched) = &self.sched {
             roots.extend(sched.roots());
         }

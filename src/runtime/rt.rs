@@ -33,7 +33,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Bumped whenever a slot is added, removed or changes signature.
-pub const RT_VERSION: u32 = 5;
+pub const RT_VERSION: u32 = 6;
 
 /// Largest size `alloc_raw` is ever asked for.
 pub const MAX_ALLOC: usize = 32 * 1024;
@@ -200,6 +200,11 @@ runtime_table! {
     stack_suspended(id: u64, sp: usize) = stacks::stack_suspended;
     /// The stack `id` is about to be freed.
     stack_drop(id: u64) = stacks::stack_drop;
+    /// The thread is switching from the stack `from` to the stack `to`,
+    /// both by krio's id, 0 the thread's own: what a host keeps per
+    /// stack, a chain of frames of its own, goes with it. Told before
+    /// the switch and again, the other way, after the return.
+    stack_switch(from: u64, to: u64) = stacks::stack_switch;
     // ── Threads ─────────────────────────────────────────────────────────
     // A host's collector stops every thread that touches its heap. These
     // tell it which threads run Wren and when each is safe: a safe thread
@@ -299,7 +304,7 @@ pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
     heap_drop, host_poll, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop,
     object_trace, run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended,
-    task_step, task_suspend, thread_running, thread_safe, thread_start, thread_stop,
+    stack_switch, task_step, task_suspend, thread_running, thread_safe, thread_start, thread_stop,
     track_external, watch, world_idle, world_live, world_park_drive, world_park_pending,
     world_park_request, world_resume_woken, world_spawn, world_tick, world_waiter_discard,
     world_waiter_new, world_waiter_ready, world_wake, world_workers,
@@ -531,6 +536,7 @@ mod stacks {
     pub unsafe extern "C" fn stack_new(_id: u64, _base: usize, _size: usize) {}
     pub unsafe extern "C" fn stack_suspended(_id: u64, _sp: usize) {}
     pub unsafe extern "C" fn stack_drop(_id: u64) {}
+    pub unsafe extern "C" fn stack_switch(_from: u64, _to: u64) {}
 
     /// Nothing leaves wren_lift's own runs by a long jump.
     pub unsafe extern "C" fn run_guarded(

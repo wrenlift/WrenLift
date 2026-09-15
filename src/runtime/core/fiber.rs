@@ -752,6 +752,9 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // so a collection in between sees both.
     let outgoing = krio_fiber::current_fiber_id().unwrap_or(0);
     unsafe { crate::runtime::rt::stack_suspended(outgoing, super::super::stack_scan::approx_sp()) };
+    // A host's state per stack goes with the switch, both ways.
+    let target_id = unsafe { (*krio_ptr).id() };
+    unsafe { crate::runtime::rt::stack_switch(outgoing, target_id) };
     // The thread's JIT state is the caller's; the fiber restores its
     // own when it resumes and leaves it behind when it yields.
     let jit_ctx = crate::codegen::runtime_fns::read_jit_ctx();
@@ -763,7 +766,8 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     crate::codegen::runtime_fns::set_jit_context(jit_ctx);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
     unsafe {
-        crate::runtime::rt::stack_suspended((*krio_ptr).id(), (*krio_ptr).saved_sp() as usize);
+        crate::runtime::rt::stack_switch(target_id, outgoing);
+        crate::runtime::rt::stack_suspended(target_id, (*krio_ptr).saved_sp() as usize);
     }
 
     // Restore host's vm.fiber. Even if the body's own restore line
