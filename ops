@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789489090,"nonce":"m6siA22Ro48vzq3dAihlipLiovA=","message":"Fixed in ff04b0c95e3c732e4744797f023024fed3385f7b. Not fiber-specific: LICM hoisted get_static_field out of any loop (a plain static method loop printed 0 0 0 too); the closure cases in the report had no loop.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1789489090,"nonce":"GJqUI3rSlcvW9VZ2aErtwG8rZL0=","status":2}]}
