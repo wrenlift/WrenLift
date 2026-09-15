@@ -1791,9 +1791,10 @@ impl VM {
         }
 
         // Drop the module entry + loading guard so `interpret`
-        // re-installs cleanly. `self.module_sources` gets overwritten
-        // in `interpret` itself.
-        self.engine.modules.remove(name);
+        // re-installs cleanly; both kept, for a load that fails.
+        // `self.module_sources` gets overwritten in `interpret` itself.
+        let previous = self.engine.modules.remove(name);
+        let previous_source = self.module_sources.get(name).cloned();
         self.loading_modules.remove(name);
 
         if std::env::var_os("WLIFT_RELOAD_TRACE").is_some() {
@@ -1821,11 +1822,26 @@ impl VM {
                 }
                 Ok(())
             }
-            InterpretResult::CompileError => {
-                Err(format!("Reload of '{}' failed: compile error.", name))
-            }
-            InterpretResult::RuntimeError => {
-                Err(format!("Reload of '{}' failed: runtime error.", name))
+            failed => {
+                // A source that does not compile installs nothing: the
+                // module stays as it was, and reloads again next time.
+                if !self.engine.modules.contains_key(name) {
+                    if let Some(entry) = previous {
+                        self.engine.modules.insert(name.to_string(), entry);
+                    }
+                    if let Some(source) = previous_source {
+                        self.module_sources.insert(name.to_string(), source);
+                    }
+                }
+                Err(format!(
+                    "Reload of '{}' failed: {}.",
+                    name,
+                    if failed == InterpretResult::CompileError {
+                        "compile error"
+                    } else {
+                        "runtime error"
+                    }
+                ))
             }
         }
     }
