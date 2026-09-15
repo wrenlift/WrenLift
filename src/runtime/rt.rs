@@ -1,7 +1,8 @@
 //! The runtime seam: the memory under the Immix strategy, the fiber
 //! stacks a host's collector scans, the threads that run Wren and when
-//! each is safe, and the run a host guards, as one atomic
-//! function-pointer slot per operation.
+//! each is safe, the run a host guards, and the world the scheduler's
+//! tasks and waits go to, as one atomic function-pointer slot per
+//! operation.
 //!
 //! Every slot starts as wren_lift's own block allocator (`gc_immix_heap`)
 //! and is replaced entry by entry through [`wlift_rt_install`]; a `None`
@@ -32,7 +33,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Bumped whenever a slot is added, removed or changes signature.
-pub const RT_VERSION: u32 = 3;
+pub const RT_VERSION: u32 = 4;
 
 /// Largest size `alloc_raw` is ever asked for.
 pub const MAX_ALLOC: usize = 32 * 1024;
@@ -49,6 +50,13 @@ pub type ObjectDrop = unsafe extern "C" fn(*mut u8);
 
 /// `host_stop`'s shape, for a host storing it.
 pub type HostStop = unsafe extern "C" fn(bool);
+
+/// `task_step`'s shape, for a host storing it.
+pub type TaskStep = unsafe extern "C" fn(*mut c_void) -> bool;
+
+/// A deadline as the world slots carry it: nanoseconds from now, or
+/// this for none.
+pub const NO_DEADLINE: u64 = u64::MAX;
 
 /// What the memory side reports; `GcStats` takes its byte counters from
 /// here.
@@ -227,14 +235,66 @@ runtime_table! {
     /// and undoes once its collection is over. A thread reaching one
     /// passes through `thread_safe` and `thread_running`.
     host_stop(on: bool) = wren::host_stop;
+    /// Run one turn of the task `task` (a context `world_spawn` was
+    /// given): up to its next park or yield. False once the task is
+    /// done, and the context is released with it. Called on the world
+    /// the task was placed on, from no task.
+    task_step(task: *mut c_void) = wren::task_step;
+    // ── World ───────────────────────────────────────────────────────────
+    // The scheduler's world: where its tasks run and its waits park. A
+    // host with a world of its own fills these so a Wren fiber or thread
+    // is a task of that world beside the host's; the defaults are
+    // wren_lift's own world, one per view (`sched::local`). Every slot
+    // takes the view `vm` it is asked on. A deadline is nanoseconds from
+    // now, `NO_DEADLINE` for none.
+    /// A fresh wait token for the calling context.
+    world_waiter_new(vm: *mut c_void) -> u64 = world::waiter_new;
+    /// Forget a token that will not be parked on.
+    world_waiter_discard(vm: *mut c_void, token: u64) = world::waiter_discard;
+    /// Notify `token`; false when it is unknown or already resolved.
+    /// From any thread.
+    world_wake(token: u64) -> bool = world::wake;
+    /// Before a park: 1 when `token` was woken already, which consumes
+    /// it; 0 when it waits; -1 when it is not one this world may park.
+    world_waiter_ready(vm: *mut c_void, token: u64) -> i32 = world::waiter_ready;
+    /// Record the stepped task's park on `token`; it takes effect when
+    /// the task yields back to the world.
+    world_park_request(vm: *mut c_void, token: u64, deadline_ns: u64) = world::park_request;
+    /// Whether the stepped task has a park recorded.
+    world_park_pending(vm: *mut c_void) -> bool = world::park_pending;
+    /// How the stepped task's last park ended: woken, or timed out.
+    world_resume_woken(vm: *mut c_void) -> bool = world::resume_woken;
+    /// The park of a stack that is no task: drive the world until
+    /// `token` is woken or the deadline passes. True when woken.
+    world_park_drive(vm: *mut c_void, token: u64, deadline_ns: u64) -> bool = world::park_drive;
+    /// Make `task` a task of this world, or of the least-loaded worker
+    /// world when `on_pool`; the world steps it through `task_step`.
+    world_spawn(vm: *mut c_void, task: *mut c_void, on_pool: bool) = world::spawn;
+    /// Step every ready task once and keep going until none is or the
+    /// deadline passes; true while the world holds live tasks.
+    world_tick(vm: *mut c_void, deadline_ns: u64) -> bool = world::tick;
+    /// Wait for a wake, a timer or the deadline, with nothing ready.
+    world_idle(vm: *mut c_void, deadline_ns: u64) = world::idle;
+    /// Tasks not yet finished on this world.
+    world_live(vm: *mut c_void) -> usize = world::live;
+    /// Worker worlds tasks may be placed on.
+    world_workers(vm: *mut c_void) -> usize = world::workers;
 }
 
 pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
     heap_drop, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace,
-    run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended,
-    thread_running, thread_safe, thread_start, thread_stop, track_external, watch,
+    run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended, task_step,
+    thread_running, thread_safe, thread_start, thread_stop, track_external, watch, world_idle,
+    world_live, world_park_drive, world_park_pending, world_park_request, world_resume_woken,
+    world_spawn, world_tick, world_waiter_discard, world_waiter_new, world_waiter_ready,
+    world_wake, world_workers,
 };
+
+/// Whether wren_lift's own world serves the world slots.
+pub fn world_is_builtin() -> bool {
+    slot::world_spawn.load(Ordering::Relaxed) == world::spawn as *mut ()
+}
 
 /// Whether the built-in heap serves the memory slots, so a handle is an
 /// `ImmixHeap` whose bump region compiled code may advance itself.
@@ -334,6 +394,13 @@ pub extern "C" fn wlift_rt_host_stop() -> HostStop {
     unsafe { std::mem::transmute(slot::host_stop.load(Ordering::Relaxed)) }
 }
 
+/// What the `task_step` slot dispatches to: one turn of a task, for a
+/// host's world that runs Wren's tasks.
+#[no_mangle]
+pub extern "C" fn wlift_rt_task_step() -> TaskStep {
+    unsafe { std::mem::transmute(slot::task_step.load(Ordering::Relaxed)) }
+}
+
 // ── wren_lift's own implementations, C-shaped ───────────────────────────
 
 /// The stack slots' defaults: nothing, since wren_lift's collectors walk
@@ -343,6 +410,97 @@ mod threads {
     pub unsafe extern "C" fn thread_stop() {}
     pub unsafe extern "C" fn thread_safe(_sp: usize, _extra_lo: usize, _extra_hi: usize) {}
     pub unsafe extern "C" fn thread_running() {}
+}
+
+/// The world slots' defaults: wren_lift's own world on the view.
+#[cfg(feature = "host")]
+mod world {
+    use std::ffi::c_void;
+
+    use crate::runtime::sched::local;
+    use crate::runtime::vm::VM;
+
+    pub unsafe extern "C" fn waiter_new(vm: *mut c_void) -> u64 {
+        local::waiter_new(vm as *mut VM)
+    }
+    pub unsafe extern "C" fn waiter_discard(vm: *mut c_void, token: u64) {
+        local::waiter_discard(vm as *mut VM, token)
+    }
+    pub unsafe extern "C" fn wake(token: u64) -> bool {
+        local::wake(token)
+    }
+    pub unsafe extern "C" fn waiter_ready(vm: *mut c_void, token: u64) -> i32 {
+        local::waiter_ready(vm as *mut VM, token)
+    }
+    pub unsafe extern "C" fn park_request(vm: *mut c_void, token: u64, deadline_ns: u64) {
+        local::park_request(vm as *mut VM, token, deadline_ns)
+    }
+    pub unsafe extern "C" fn park_pending(vm: *mut c_void) -> bool {
+        local::park_pending(vm as *mut VM)
+    }
+    pub unsafe extern "C" fn resume_woken(vm: *mut c_void) -> bool {
+        local::resume_woken(vm as *mut VM)
+    }
+    pub unsafe extern "C" fn park_drive(vm: *mut c_void, token: u64, deadline_ns: u64) -> bool {
+        local::park_drive(vm as *mut VM, token, deadline_ns)
+    }
+    pub unsafe extern "C" fn spawn(vm: *mut c_void, task: *mut c_void, on_pool: bool) {
+        local::spawn(
+            vm as *mut VM,
+            task as *mut crate::runtime::sched::TaskCtx,
+            on_pool,
+        )
+    }
+    pub unsafe extern "C" fn tick(vm: *mut c_void, deadline_ns: u64) -> bool {
+        local::tick(vm as *mut VM, deadline_ns)
+    }
+    pub unsafe extern "C" fn idle(vm: *mut c_void, deadline_ns: u64) {
+        local::idle(vm as *mut VM, deadline_ns)
+    }
+    pub unsafe extern "C" fn live(vm: *mut c_void) -> usize {
+        local::live(vm as *mut VM)
+    }
+    pub unsafe extern "C" fn workers(vm: *mut c_void) -> usize {
+        local::workers(vm as *mut VM)
+    }
+}
+
+/// Without a host there is no scheduler: every world slot is a no-op.
+#[cfg(not(feature = "host"))]
+mod world {
+    use std::ffi::c_void;
+
+    pub unsafe extern "C" fn waiter_new(_vm: *mut c_void) -> u64 {
+        0
+    }
+    pub unsafe extern "C" fn waiter_discard(_vm: *mut c_void, _token: u64) {}
+    pub unsafe extern "C" fn wake(_token: u64) -> bool {
+        false
+    }
+    pub unsafe extern "C" fn waiter_ready(_vm: *mut c_void, _token: u64) -> i32 {
+        -1
+    }
+    pub unsafe extern "C" fn park_request(_vm: *mut c_void, _token: u64, _deadline_ns: u64) {}
+    pub unsafe extern "C" fn park_pending(_vm: *mut c_void) -> bool {
+        false
+    }
+    pub unsafe extern "C" fn resume_woken(_vm: *mut c_void) -> bool {
+        false
+    }
+    pub unsafe extern "C" fn park_drive(_vm: *mut c_void, _token: u64, _deadline_ns: u64) -> bool {
+        false
+    }
+    pub unsafe extern "C" fn spawn(_vm: *mut c_void, _task: *mut c_void, _on_pool: bool) {}
+    pub unsafe extern "C" fn tick(_vm: *mut c_void, _deadline_ns: u64) -> bool {
+        false
+    }
+    pub unsafe extern "C" fn idle(_vm: *mut c_void, _deadline_ns: u64) {}
+    pub unsafe extern "C" fn live(_vm: *mut c_void) -> usize {
+        0
+    }
+    pub unsafe extern "C" fn workers(_vm: *mut c_void) -> usize {
+        0
+    }
 }
 
 mod stacks {
@@ -460,8 +618,22 @@ mod wren {
         crate::runtime::gc_immix::object_drop(obj);
     }
 
+    #[cfg(feature = "host")]
     pub unsafe extern "C" fn host_stop(on: bool) {
         crate::runtime::stw::host_stop(on);
+    }
+
+    #[cfg(not(feature = "host"))]
+    pub unsafe extern "C" fn host_stop(_on: bool) {}
+
+    #[cfg(feature = "host")]
+    pub unsafe extern "C" fn task_step(task: *mut c_void) -> bool {
+        crate::runtime::sched::task_step(task as *mut crate::runtime::sched::TaskCtx)
+    }
+
+    #[cfg(not(feature = "host"))]
+    pub unsafe extern "C" fn task_step(_task: *mut c_void) -> bool {
+        false
     }
 }
 

@@ -9,7 +9,7 @@
 //! operations on the field, a count or a list of items, and a list of
 //! waiter tokens.
 
-use crate::runtime::core::fiber::{deadline_arg, park_on, sched_of, sched_vm};
+use crate::runtime::core::fiber::{deadline_arg, park_on, sched_vm};
 use crate::runtime::core::sequence::{instance_field, set_instance_field};
 use crate::runtime::object::{NativeContext, ObjFiber, ObjInstance, ObjList};
 use crate::runtime::sched;
@@ -123,7 +123,7 @@ fn thread_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let handle = init(ctx, "Thread", Value::num(0.0));
     set_instance_field(ctx, handle, ERROR, Value::null());
     set_instance_field(ctx, handle, FIBER, Value::null());
-    unsafe { (*vm).create_thread(args[1], handle) };
+    sched::spawn_on_pool(vm, args[1], handle);
     handle
 }
 
@@ -168,15 +168,10 @@ pub(crate) fn finish(handle: Value, fiber: *mut ObjFiber) {
 /// outside one.
 fn thread_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     let vm = ctx.krio_vm_raw_ptr() as *mut VM;
-    if vm.is_null() {
+    if vm.is_null() || unsafe { (*vm).sched.is_none() } {
         return Value::null();
     }
-    unsafe {
-        (*vm)
-            .sched
-            .as_ref()
-            .map_or_else(Value::null, |s| s.active_handle())
-    }
+    sched::active_handle(vm)
 }
 
 /// `join()` / `join(ms)`: wait for the task to end; false when `ms`
@@ -195,7 +190,7 @@ fn thread_join(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         unguard(t);
         return Value::bool(true);
     }
-    let token = sched_of(vm).new_waiter();
+    let token = sched::new_waiter(vm);
     push_waiter(t, token);
     unguard(t);
     match park_on(ctx, vm, token, deadline) {
@@ -233,15 +228,7 @@ fn thread_count(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     if vm.is_null() {
         return Value::num(0.0);
     }
-    let n = unsafe {
-        (&*vm)
-            .pool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .endpoints()
-            .len()
-    };
-    Value::num(n as f64)
+    Value::num(sched::workers(vm) as f64)
 }
 
 // -- Mutex --------------------------------------------------------------------
@@ -262,7 +249,7 @@ fn mutex_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             unguard(m);
             return Value::null();
         }
-        let token = sched_of(vm).new_waiter();
+        let token = sched::new_waiter(vm);
         push_waiter(m, token);
         unguard(m);
         if park_on(ctx, vm, token, None).is_none() {
@@ -318,7 +305,7 @@ fn lock_wait(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         unguard(l);
         return Value::bool(true);
     }
-    let token = sched_of(vm).new_waiter();
+    let token = sched::new_waiter(vm);
     push_waiter(l, token);
     unguard(l);
     match park_on(ctx, vm, token, deadline) {
@@ -411,7 +398,7 @@ fn deque_pop(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             unguard(d);
             return Value::null();
         }
-        let token = sched_of(vm).new_waiter();
+        let token = sched::new_waiter(vm);
         push_waiter(d, token);
         unguard(d);
         if park_on(ctx, vm, token, None).is_none() {

@@ -6,15 +6,27 @@
 //! endpoint, and a timer park is a min-heap entry, never a thread
 //! sleep. Every notification is claimed before it is delivered, so a
 //! stale timer or a second wake for the same token is harmless.
+//!
+//! The world is behind the runtime seam (`rt`'s World slots). The
+//! functions at the top of this module are what the natives call; each
+//! goes to the slot, whose default is the world here (`local`), one
+//! per view. A host with a world of its own fills the slots, and then
+//! a task is one of the host's: the host holds a [`TaskCtx`] and steps
+//! it through [`task_step`], on the world it placed it on. The view's
+//! [`Sched`] stays the registry of the tasks stepped on it, whichever
+//! world steps them: their fibers and handles are its roots.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::runtime::object::{FiberState, ObjFiber};
+use crate::runtime::object::{FiberState, NativeContext, ObjFiber};
+use crate::runtime::rt::{self, NO_DEADLINE};
 use crate::runtime::value::Value;
+use crate::runtime::vm::{SharedCell, VM};
 
 pub type TaskId = u64;
 pub type Token = u64;
@@ -105,6 +117,290 @@ struct Task {
     woken: bool,
 }
 
+/// A task on its way to a world and, once there, what the world steps:
+/// the program, the closure until the fiber is made on the thread that
+/// will run it, the fiber after, and the `Thread` handle to finish. The
+/// program's `transit` list roots it until its first step; the view's
+/// registry does from then on.
+pub struct TaskCtx {
+    shared: Weak<SharedCell>,
+    closure: Value,
+    handle: Value,
+    fiber: *mut ObjFiber,
+}
+
+impl TaskCtx {
+    /// The values a context in transit holds.
+    pub fn roots(&self) -> [Value; 3] {
+        [
+            self.closure,
+            self.handle,
+            if self.fiber.is_null() {
+                Value::null()
+            } else {
+                Value::object(self.fiber as *mut u8)
+            },
+        ]
+    }
+}
+
+// ── The front: what the natives call, each one slot ─────────────────────
+
+fn to_ns(deadline: Option<Instant>) -> u64 {
+    deadline.map_or(NO_DEADLINE, |d| {
+        d.saturating_duration_since(Instant::now()).as_nanos() as u64
+    })
+}
+
+fn from_ns(ns: u64) -> Option<Instant> {
+    (ns != NO_DEADLINE).then(|| Instant::now() + Duration::from_nanos(ns))
+}
+
+fn vm_ptr(vm: *mut VM) -> *mut std::ffi::c_void {
+    vm as *mut std::ffi::c_void
+}
+
+/// A fresh token, waiting on this world.
+pub fn new_waiter(vm: *mut VM) -> Token {
+    unsafe { rt::world_waiter_new(vm_ptr(vm)) }
+}
+
+/// Forget a token that will not be parked on.
+pub fn discard_waiter(vm: *mut VM, token: Token) {
+    unsafe { rt::world_waiter_discard(vm_ptr(vm), token) }
+}
+
+/// Mark `token` notified and tell its world. `false` when the token
+/// is unknown or already resolved, so a duplicate wake does nothing.
+pub fn wake(token: Token) -> bool {
+    unsafe { rt::world_wake(token) }
+}
+
+/// Check a token belongs to this world; `Ok(true)` when it was
+/// woken before the park, which consumes it.
+pub fn waiter_ready(vm: *mut VM, token: Token) -> Result<bool, String> {
+    match unsafe { rt::world_waiter_ready(vm_ptr(vm), token) } {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(format!("Fiber.park: unknown waiter {token}.")),
+    }
+}
+
+/// Record the active task's park; it takes effect when the task
+/// yields back to the world.
+pub fn request_park(vm: *mut VM, token: Token, deadline: Option<Instant>) {
+    unsafe { rt::world_park_request(vm_ptr(vm), token, to_ns(deadline)) }
+}
+
+/// How the active task's last park ended.
+pub fn resume_woken(vm: *mut VM) -> bool {
+    unsafe { rt::world_resume_woken(vm_ptr(vm)) }
+}
+
+/// Drive the world until `token` is woken or `deadline` passes: the
+/// park of a stack that is not a task.
+pub fn park_drive(vm: *mut VM, token: Token, deadline: Option<Instant>) -> bool {
+    unsafe { rt::world_park_drive(vm_ptr(vm), token, to_ns(deadline)) }
+}
+
+/// Make a task of `fiber`, made on this thread, with `handle` finished
+/// when it ends.
+pub fn spawn_fiber(vm: *mut VM, fiber: *mut ObjFiber, handle: Value) {
+    spawn_ctx(vm, Value::null(), handle, fiber, false)
+}
+
+/// Make a task of `closure` on a worker world; its fiber is made
+/// there, and `handle` is finished when it ends.
+pub fn spawn_on_pool(vm: *mut VM, closure: Value, handle: Value) {
+    spawn_ctx(vm, closure, handle, std::ptr::null_mut(), true)
+}
+
+fn spawn_ctx(vm: *mut VM, closure: Value, handle: Value, fiber: *mut ObjFiber, on_pool: bool) {
+    let vm_ref = unsafe { &mut *vm };
+    if on_pool {
+        // Another thread will run Wren from here on.
+        vm_ref.mark_threaded();
+    }
+    let ctx = Box::into_raw(Box::new(TaskCtx {
+        shared: vm_ref.shared_weak(),
+        closure,
+        handle,
+        fiber,
+    }));
+    vm_ref
+        .transit
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(ctx);
+    unsafe { rt::world_spawn(vm_ptr(vm), ctx as *mut std::ffi::c_void, on_pool) }
+}
+
+/// Where the calling stack stands relative to a step in progress on
+/// this view.
+pub fn context(vm: *mut VM) -> Context {
+    sched_of(vm).context()
+}
+
+/// A step is in progress and the calling stack is neither the stepped
+/// task's nor the one the step was started from: a park that reaches
+/// it belongs to the task above it.
+pub fn park_travels_through_here(vm: *mut VM) -> bool {
+    let sched = sched_of(vm);
+    match sched.active {
+        Some((_, host)) => {
+            let pending = unsafe { rt::world_park_pending(vm_ptr(vm)) };
+            pending && current_stack_id() != host
+        }
+        None => false,
+    }
+}
+
+/// The handle of the task being stepped, or null.
+pub fn active_handle(vm: *mut VM) -> Value {
+    sched_of(vm).active_handle()
+}
+
+/// Step until nothing is ready or `deadline` passes; whether live
+/// tasks remain.
+pub fn tick(vm: *mut VM, deadline: Option<Instant>) -> bool {
+    unsafe { rt::world_tick(vm_ptr(vm), to_ns(deadline)) }
+}
+
+/// Wait until a wake arrives, a timer is due, or `deadline` passes.
+pub fn idle(vm: *mut VM, deadline: Option<Instant>) {
+    unsafe { rt::world_idle(vm_ptr(vm), to_ns(deadline)) }
+}
+
+/// Tasks not yet finished.
+pub fn live(vm: *mut VM) -> usize {
+    unsafe { rt::world_live(vm_ptr(vm)) }
+}
+
+/// Worker worlds tasks may be placed on.
+pub fn workers(vm: *mut VM) -> usize {
+    unsafe { rt::world_workers(vm_ptr(vm)) }
+}
+
+/// Wait for `ms` milliseconds from now, or forever when `None`.
+pub fn deadline_from_ms(ms: Option<f64>) -> Option<Instant> {
+    ms.map(|ms| Instant::now() + Duration::from_secs_f64(ms.max(0.0) / 1000.0))
+}
+
+fn sched_of<'a>(vm: *mut VM) -> &'a mut Sched {
+    unsafe { (*vm).sched.get_or_insert_with(Default::default) }
+}
+
+/// Views a host's world made on this thread to step tasks of programs
+/// the thread had no view of, by program. They go with the thread, and
+/// the seam hears the thread stop once for each.
+#[derive(Default)]
+struct HostViews(Vec<(*const SharedCell, Box<VM>)>);
+
+impl Drop for HostViews {
+    fn drop(&mut self) {
+        for (_, vm) in self.0.drain(..) {
+            drop(vm);
+            unsafe { rt::thread_stop() };
+        }
+    }
+}
+
+thread_local! {
+    static HOST_VIEWS: RefCell<HostViews> = RefCell::new(HostViews::default());
+}
+
+/// One step of `ctx` on the calling thread, for a host's world: the
+/// view of the program on this thread (made if the thread has none),
+/// the fiber on its first step, and one run to its next park or yield.
+/// The view is safe for wren_lift's collector outside the step when it
+/// was found safe, as a worker's is between steps. False once the task
+/// is done, and `ctx` is released.
+///
+/// # Safety
+/// `ctx` is one `world_spawn` was given, not yet released, on the world
+/// it was placed on, from no task.
+pub unsafe fn task_step(ctx: *mut TaskCtx) -> bool {
+    let shared = match unsafe { (*ctx).shared.upgrade() } {
+        Some(shared) => shared,
+        None => {
+            drop(unsafe { Box::from_raw(ctx) });
+            return false;
+        }
+    };
+    let vm = view_for(&shared);
+    let prev = crate::runtime::vm::__set_thread_local_current_vm(vm);
+    let was_safe = unsafe { (*vm).thread.is_safe() };
+    if was_safe {
+        unsafe { (*vm).leave_safe_here() };
+    }
+    let id = ctx as u64;
+    let sched = sched_of(vm);
+    if let std::collections::hash_map::Entry::Vacant(entry) = sched.tasks.entry(id) {
+        let (closure, handle) = unsafe { ((*ctx).closure, (*ctx).handle) };
+        let fiber = if unsafe { (*ctx).fiber.is_null() } {
+            let vm_ctx: &mut dyn NativeContext = unsafe { &mut *vm };
+            let made = crate::runtime::core::fiber::fiber_new_inner(vm_ctx, closure, None);
+            let fiber = made
+                .as_object()
+                .map_or(std::ptr::null_mut(), |p| p as *mut ObjFiber);
+            if !fiber.is_null() {
+                crate::runtime::core::thread::attach(vm_ctx, handle, fiber);
+            }
+            fiber
+        } else {
+            unsafe { (*ctx).fiber }
+        };
+        unsafe {
+            (*ctx).fiber = fiber;
+            (*ctx).closure = Value::null();
+        }
+        entry.insert(Task {
+            fiber,
+            handle,
+            state: RunState::Runnable,
+            woken: false,
+        });
+        unsafe { &*vm }
+            .transit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&c| c != ctx);
+    }
+    let done = sched.tasks[&id].fiber.is_null() || sched.step_task(id);
+    if done {
+        sched.tasks.remove(&id);
+        drop(unsafe { Box::from_raw(ctx) });
+    }
+    if was_safe {
+        let mut spill = crate::runtime::vm::Spill::new();
+        unsafe { (*vm).enter_safe_here(&mut spill) };
+        std::hint::black_box(&spill);
+    }
+    crate::runtime::vm::__set_thread_local_current_vm(prev);
+    !done
+}
+
+/// This thread's view of `shared`: the one it runs, else one a host's
+/// world had made here, made now if neither.
+fn view_for(shared: &Arc<SharedCell>) -> *mut VM {
+    let current = crate::runtime::vm::current_vm_ptr();
+    if !current.is_null() && unsafe { (*current).is_view_of(shared) } {
+        return current;
+    }
+    HOST_VIEWS.with(|views| {
+        let key = Arc::as_ptr(shared);
+        let mut views = views.borrow_mut();
+        if let Some((_, vm)) = views.0.iter_mut().find(|(k, _)| *k == key) {
+            return &mut **vm as *mut VM;
+        }
+        unsafe { rt::thread_start() };
+        let mut vm = Box::new(VM::view_of(shared));
+        let ptr: *mut VM = &mut *vm;
+        views.0.push((key, vm));
+        ptr
+    })
+}
+
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORLD: AtomicU64 = AtomicU64::new(1);
 static WAIT_REGISTRY: Mutex<Option<HashMap<Token, Registration>>> = Mutex::new(None);
@@ -122,7 +418,7 @@ fn with_worlds<R>(f: impl FnOnce(&mut HashMap<WorldId, Weak<Endpoint>>) -> R) ->
 
 /// Mark `token` notified and tell its world. `false` when the token
 /// is unknown or already resolved, so a duplicate wake does nothing.
-pub fn wake(token: Token) -> bool {
+fn wake_local(token: Token) -> bool {
     let world = with_registry(|reg| {
         let entry = reg.get_mut(&token)?;
         if entry.status != WaitStatus::Waiting {
@@ -172,6 +468,7 @@ fn current_stack_id() -> u64 {
 pub struct Sched {
     world: WorldId,
     endpoint: Arc<Endpoint>,
+    /// The tasks stepped on this view, by whichever world steps them.
     tasks: HashMap<TaskId, Task>,
     ready: VecDeque<TaskId>,
     /// Tokens parked by tasks of this world.
@@ -432,33 +729,45 @@ impl Sched {
         }
     }
 
-    fn resume(&mut self, id: TaskId) {
-        let Some(task) = self.tasks.get_mut(&id) else {
-            return;
-        };
+    /// One run of task `id`'s fiber, to its next park or yield. True
+    /// when the task is done, its handle finished; the registry entry
+    /// stays for the caller to remove.
+    fn step_task(&mut self, id: TaskId) -> bool {
+        let task = self.tasks.get_mut(&id).expect("task");
         task.state = RunState::Running;
         let fiber = task.fiber;
         self.active = Some((id, current_stack_id()));
-        self.pending_park = None;
         // An abort ends the task and stays on its fiber, as under
         // `try`; the driver is not the one to unwind.
         unsafe { (*fiber).is_try = true };
         let stepped = crate::runtime::core::fiber::try_krio_call_pub(fiber, Value::null());
         self.active = None;
-        let park = self.pending_park.take();
         let done = stepped.is_none()
             || matches!(
                 unsafe { (*fiber).state },
                 FiberState::Done | FiberState::Error
             );
         if done {
-            let task = self.tasks.remove(&id).expect("task");
+            let handle = self.tasks[&id].handle;
+            if !handle.is_null() {
+                crate::runtime::core::thread::finish(handle, fiber);
+            }
+        }
+        done
+    }
+
+    fn resume(&mut self, id: TaskId) {
+        if !self.tasks.contains_key(&id) {
+            return;
+        }
+        self.pending_park = None;
+        let done = self.step_task(id);
+        let park = self.pending_park.take();
+        if done {
+            self.tasks.remove(&id);
             self.endpoint
                 .live
                 .store(self.tasks.len(), Ordering::Relaxed);
-            if !task.handle.is_null() {
-                crate::runtime::core::thread::finish(task.handle, fiber);
-            }
             return;
         }
         let task = self.tasks.get_mut(&id).expect("task");
@@ -566,10 +875,88 @@ impl Sched {
             unsafe { self.idle(deadline, vm) };
         }
     }
+}
 
-    /// Wait for `ms` milliseconds from now, or forever when `None`.
-    pub fn deadline_from_ms(ms: Option<f64>) -> Option<Instant> {
-        ms.map(|ms| Instant::now() + Duration::from_secs_f64(ms.max(0.0) / 1000.0))
+/// wren_lift's own world, the World slots' defaults: the `Sched` of
+/// the view, and the view's pool for placement.
+pub(crate) mod local {
+    use super::*;
+
+    pub(crate) unsafe fn waiter_new(vm: *mut VM) -> Token {
+        sched_of(vm).new_waiter()
+    }
+
+    pub(crate) unsafe fn waiter_discard(vm: *mut VM, token: Token) {
+        sched_of(vm).discard_waiter(token)
+    }
+
+    pub(crate) fn wake(token: Token) -> bool {
+        super::wake_local(token)
+    }
+
+    pub(crate) unsafe fn waiter_ready(vm: *mut VM, token: Token) -> i32 {
+        match sched_of(vm).check_token(token) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -1,
+        }
+    }
+
+    pub(crate) unsafe fn park_request(vm: *mut VM, token: Token, deadline_ns: u64) {
+        sched_of(vm).request_park(token, from_ns(deadline_ns))
+    }
+
+    pub(crate) unsafe fn park_pending(vm: *mut VM) -> bool {
+        sched_of(vm).pending_park.is_some()
+    }
+
+    pub(crate) unsafe fn resume_woken(vm: *mut VM) -> bool {
+        sched_of(vm).resume_woken()
+    }
+
+    pub(crate) unsafe fn park_drive(vm: *mut VM, token: Token, deadline_ns: u64) -> bool {
+        unsafe { sched_of(vm).drive_until(token, from_ns(deadline_ns), vm) }
+    }
+
+    /// A pooled task's closure goes to a worker, which makes the
+    /// fiber; a local one's fiber is made already. Either way the
+    /// context, the one `world_spawn` was just given, has served.
+    pub(crate) unsafe fn spawn(vm: *mut VM, ctx: *mut TaskCtx, on_pool: bool) {
+        let ctx = unsafe { Box::from_raw(ctx) };
+        let ctx_ptr: *const TaskCtx = &*ctx;
+        unsafe { &*vm }
+            .transit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&c| !std::ptr::eq(c, ctx_ptr));
+        if on_pool {
+            unsafe { (*vm).create_thread(ctx.closure, ctx.handle) };
+        } else {
+            sched_of(vm).spawn_with(ctx.fiber, ctx.handle);
+        }
+    }
+
+    pub(crate) unsafe fn tick(vm: *mut VM, deadline_ns: u64) -> bool {
+        let sched = sched_of(vm);
+        sched.tick(from_ns(deadline_ns));
+        sched.live() > 0
+    }
+
+    pub(crate) unsafe fn idle(vm: *mut VM, deadline_ns: u64) {
+        unsafe { sched_of(vm).idle(from_ns(deadline_ns), vm) }
+    }
+
+    pub(crate) unsafe fn live(vm: *mut VM) -> usize {
+        sched_of(vm).live()
+    }
+
+    pub(crate) unsafe fn workers(vm: *mut VM) -> usize {
+        unsafe { &*vm }
+            .pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .endpoints()
+            .len()
     }
 }
 
@@ -595,8 +982,8 @@ mod tests {
     fn a_wake_is_claimed_once() {
         let sched = Sched::new();
         let token = sched.new_waiter();
-        assert!(wake(token));
-        assert!(!wake(token));
+        assert!(wake_local(token));
+        assert!(!wake_local(token));
         assert_eq!(sched.check_token(token), Ok(true));
         assert!(sched.check_token(token).is_err());
     }
@@ -613,7 +1000,7 @@ mod tests {
         let token = sched.new_waiter();
         let woken = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(5));
-            wake(token)
+            wake_local(token)
         });
         assert!(unsafe {
             sched.drive_until(token, Some(Instant::now() + Duration::from_secs(5)), vm_ptr)

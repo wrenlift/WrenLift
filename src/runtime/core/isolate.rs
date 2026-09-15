@@ -3,7 +3,7 @@
 //! instances with one field, the runtime handle; an instance itself
 //! crosses between isolates as that handle.
 
-use crate::runtime::core::fiber::{deadline_arg, park_on, sched_of, sched_vm};
+use crate::runtime::core::fiber::{deadline_arg, park_on, sched_vm};
 use crate::runtime::core::sequence::{instance_field, set_instance_field};
 use crate::runtime::isolate::{self, Receive, Xfer};
 use crate::runtime::object::NativeContext;
@@ -115,9 +115,9 @@ fn isolate_join(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         return Value::null();
     };
     loop {
-        let token = sched_of(vm).new_waiter();
+        let token = crate::runtime::sched::new_waiter(vm);
         if i.join_with(token) {
-            sched_of(vm).discard_waiter(token);
+            crate::runtime::sched::discard_waiter(vm, token);
             return Value::bool(true);
         }
         match park_on(ctx, vm, token, deadline) {
@@ -182,14 +182,14 @@ fn channel_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         return Value::null();
     };
     loop {
-        let token = sched_of(vm).new_waiter();
+        let token = crate::runtime::sched::new_waiter(vm);
         match ch.wait_with(token) {
             Receive::Value(x) => {
-                sched_of(vm).discard_waiter(token);
+                crate::runtime::sched::discard_waiter(vm, token);
                 return isolate::import(ctx, &x);
             }
             Receive::Closed => {
-                sched_of(vm).discard_waiter(token);
+                crate::runtime::sched::discard_waiter(vm, token);
                 return Value::null();
             }
             Receive::Parked => {}

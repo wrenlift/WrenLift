@@ -131,14 +131,7 @@ impl World {
     /// Mark `t` safe with its stack and roots published, and tell a
     /// waiting collector; the runtime seam hears of it too.
     pub fn become_safe(&self, t: &ThreadState, sp: usize, fiber_id: u64, roots: Vec<Value>) {
-        *t.roots.lock().unwrap_or_else(|e| e.into_inner()) = roots;
-        t.sp.store(sp, Ordering::Relaxed);
-        t.fiber_id.store(fiber_id, Ordering::Relaxed);
-        t.state.store(SAFE, Ordering::SeqCst);
-        {
-            let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-            self.changed.notify_all();
-        }
+        self.become_safe_here(t, sp, fiber_id, roots);
         unsafe {
             crate::runtime::rt::thread_safe(
                 sp,
@@ -146,6 +139,17 @@ impl World {
                 t.extra_hi.load(Ordering::Relaxed),
             )
         };
+    }
+
+    /// `become_safe` for a thread a host's world goes on running: the
+    /// seam hears nothing, since the thread is not in a wait.
+    pub fn become_safe_here(&self, t: &ThreadState, sp: usize, fiber_id: u64, roots: Vec<Value>) {
+        *t.roots.lock().unwrap_or_else(|e| e.into_inner()) = roots;
+        t.sp.store(sp, Ordering::Relaxed);
+        t.fiber_id.store(fiber_id, Ordering::Relaxed);
+        t.state.store(SAFE, Ordering::SeqCst);
+        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
     }
 
     /// Wait out any collection in progress, then mark `t` running.
@@ -158,7 +162,9 @@ impl World {
         unsafe { crate::runtime::rt::thread_running() };
     }
 
-    fn become_running_here(&self, t: &ThreadState) {
+    /// `become_running` for a thread a host's world ran meanwhile: the
+    /// seam hears nothing, as it heard nothing of the safe state.
+    pub fn become_running_here(&self, t: &ThreadState) {
         loop {
             t.state.store(RUNNING, Ordering::SeqCst);
             if !self.requested.load(Ordering::SeqCst) {

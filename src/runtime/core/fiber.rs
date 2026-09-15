@@ -665,7 +665,8 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
         let v = krio_call_once(target, input)?;
         let vm_ptr = crate::runtime::vm::current_vm_ptr();
         let travelling = !vm_ptr.is_null()
-            && unsafe { (*vm_ptr).sched.as_ref() }.is_some_and(|s| s.park_travels_through_here());
+            && unsafe { (*vm_ptr).sched.is_some() }
+            && crate::runtime::sched::park_travels_through_here(vm_ptr);
         if !travelling {
             return Some(v);
         }
@@ -1018,11 +1019,6 @@ pub(crate) fn sched_vm(ctx: &mut dyn NativeContext, what: &str) -> Option<*mut V
     Some(vm)
 }
 
-#[cfg(feature = "host")]
-pub(crate) fn sched_of<'a>(vm: *mut VM) -> &'a mut crate::runtime::sched::Sched {
-    unsafe { (*vm).sched.get_or_insert_with(Default::default) }
-}
-
 /// `ms` as an optional deadline: null is forever.
 #[cfg(feature = "host")]
 pub(crate) fn deadline_arg(
@@ -1034,7 +1030,7 @@ pub(crate) fn deadline_arg(
         return Ok(None);
     }
     match v.as_num() {
-        Some(ms) if ms.is_finite() => Ok(crate::runtime::sched::Sched::deadline_from_ms(Some(ms))),
+        Some(ms) if ms.is_finite() => Ok(crate::runtime::sched::deadline_from_ms(Some(ms))),
         _ => {
             ctx.runtime_error(format!("{what}: ms must be a number or null."));
             Err(())
@@ -1052,9 +1048,8 @@ pub(crate) fn park_on(
     token: u64,
     deadline: Option<std::time::Instant>,
 ) -> Option<bool> {
-    use crate::runtime::sched::Context;
-    let sched = sched_of(vm);
-    match sched.check_token(token) {
+    use crate::runtime::sched::{self, Context};
+    match sched::waiter_ready(vm, token) {
         Err(msg) => {
             ctx.runtime_error(msg);
             return None;
@@ -1062,15 +1057,15 @@ pub(crate) fn park_on(
         Ok(true) => return Some(true),
         Ok(false) => {}
     }
-    match sched.context() {
-        Context::Driver => Some(unsafe { sched.drive_until(token, deadline, vm) }),
+    match sched::context(vm) {
+        Context::Driver => Some(sched::park_drive(vm, token, deadline)),
         Context::Task => {
-            sched.request_park(token, deadline);
+            sched::request_park(vm, token, deadline);
             if try_krio_yield(Value::null()).is_none() {
                 ctx.runtime_error("Fiber.park: not on a fiber stack.".to_string());
                 return None;
             }
-            Some(sched_of(vm).resume_woken())
+            Some(sched::resume_woken(vm))
         }
     }
 }
@@ -1089,7 +1084,7 @@ fn fiber_spawn(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(fiber) = (unsafe { as_fiber(fiber_val) }) else {
         return Value::null();
     };
-    sched_of(vm).spawn(fiber);
+    crate::runtime::sched::spawn_fiber(vm, fiber, Value::null());
     fiber_val
 }
 
@@ -1101,7 +1096,7 @@ fn fiber_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Ok(deadline) = deadline_arg(ctx, "Fiber.sleep", args[1]) else {
         return Value::null();
     };
-    let token = sched_of(vm).new_waiter();
+    let token = crate::runtime::sched::new_waiter(vm);
     park_on(ctx, vm, token, deadline);
     Value::null()
 }
@@ -1111,7 +1106,7 @@ fn fiber_waiter(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     let Some(vm) = sched_vm(ctx, "Fiber.waiter") else {
         return Value::null();
     };
-    Value::num(sched_of(vm).new_waiter() as f64)
+    Value::num(crate::runtime::sched::new_waiter(vm) as f64)
 }
 
 #[cfg(feature = "host")]
@@ -1147,18 +1142,15 @@ fn fiber_wake(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::bool(crate::runtime::sched::wake(token))
 }
 
+/// The VM, when no task of its world is being stepped here.
 #[cfg(feature = "host")]
-fn driver_sched<'a>(
-    ctx: &mut dyn NativeContext,
-    what: &str,
-) -> Option<&'a mut crate::runtime::sched::Sched> {
+fn driver_vm(ctx: &mut dyn NativeContext, what: &str) -> Option<*mut VM> {
     let vm = sched_vm(ctx, what)?;
-    let sched = sched_of(vm);
-    if sched.context() == crate::runtime::sched::Context::Task {
+    if crate::runtime::sched::context(vm) == crate::runtime::sched::Context::Task {
         ctx.runtime_error(format!("{what}: a task cannot drive the scheduler."));
         return None;
     }
-    Some(sched)
+    Some(vm)
 }
 
 #[cfg(feature = "host")]
@@ -1166,11 +1158,10 @@ fn fiber_tick(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Ok(deadline) = deadline_arg(ctx, "Fiber.tick", args[1]) else {
         return Value::null();
     };
-    let Some(sched) = driver_sched(ctx, "Fiber.tick") else {
+    let Some(vm) = driver_vm(ctx, "Fiber.tick") else {
         return Value::null();
     };
-    sched.tick(deadline);
-    Value::bool(sched.live() > 0)
+    Value::bool(crate::runtime::sched::tick(vm, deadline))
 }
 
 #[cfg(feature = "host")]
@@ -1178,13 +1169,10 @@ fn fiber_idle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Ok(deadline) = deadline_arg(ctx, "Fiber.idle", args[1]) else {
         return Value::null();
     };
-    let Some(vm) = sched_vm(ctx, "Fiber.idle") else {
+    let Some(vm) = driver_vm(ctx, "Fiber.idle") else {
         return Value::null();
     };
-    let Some(sched) = driver_sched(ctx, "Fiber.idle") else {
-        return Value::null();
-    };
-    unsafe { sched.idle(deadline, vm) };
+    crate::runtime::sched::idle(vm, deadline);
     Value::null()
 }
 
@@ -1193,7 +1181,7 @@ fn fiber_live(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     let Some(vm) = sched_vm(ctx, "Fiber.live") else {
         return Value::null();
     };
-    Value::num(sched_of(vm).live() as f64)
+    Value::num(crate::runtime::sched::live(vm) as f64)
 }
 
 #[cfg(not(feature = "host"))]

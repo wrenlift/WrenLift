@@ -387,6 +387,10 @@ pub struct Shared {
     /// first use, stopped when the main view goes.
     #[cfg(feature = "host")]
     pub pool: std::sync::Mutex<super::pool::Pool>,
+    /// Tasks on their way to a world, not yet stepped: roots until
+    /// the world that took each makes its fiber.
+    #[cfg(feature = "host")]
+    pub transit: std::sync::Mutex<Vec<*mut super::sched::TaskCtx>>,
 
     /// The `thread` module's classes, null until it is imported.
     #[cfg(feature = "host")]
@@ -645,10 +649,27 @@ impl VM {
 
     /// Another thread's view of the same program.
     pub fn new_thread(&self) -> VM {
+        VM::view_of(&self.shared)
+    }
+
+    /// Whether this is a view of `shared`.
+    pub fn is_view_of(&self, shared: &Arc<SharedCell>) -> bool {
+        Arc::ptr_eq(&self.shared, shared)
+    }
+
+    /// The program, for a task to find its way back to a view of it.
+    pub fn shared_weak(&self) -> std::sync::Weak<SharedCell> {
+        Arc::downgrade(&self.shared)
+    }
+
+    /// A view of the program `shared`, for the calling thread.
+    pub fn view_of(shared: &Arc<SharedCell>) -> VM {
+        #[cfg(feature = "host")]
+        let thread = unsafe { &*shared.0.get() }.world.join();
         VM {
-            shared: Arc::clone(&self.shared),
+            shared: Arc::clone(shared),
             #[cfg(feature = "host")]
-            thread: self.world.join(),
+            thread,
             #[cfg(feature = "host")]
             interpret_depth: 0,
             #[cfg(feature = "host")]
@@ -779,6 +800,8 @@ impl VM {
             output_lock: std::sync::Mutex::new(()),
             #[cfg(feature = "host")]
             pool: std::sync::Mutex::new(super::pool::Pool::default()),
+            #[cfg(feature = "host")]
+            transit: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "host")]
             thread_classes: [ptr::null_mut(); 4],
             #[cfg(feature = "host")]
@@ -4452,7 +4475,8 @@ impl VM {
             roots.extend_from_slice(&other.roots.lock().unwrap_or_else(|e| e.into_inner()));
         }
 
-        // 10f. Closures on their way to a worker's world.
+        // 10f. Closures on their way to a worker's world, and tasks on
+        // their way to a host's.
         #[cfg(feature = "host")]
         for endpoint in self
             .pool
@@ -4461,6 +4485,15 @@ impl VM {
             .endpoints()
         {
             roots.extend(endpoint.pending_spawns());
+        }
+        #[cfg(feature = "host")]
+        for &ctx in self
+            .transit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            roots.extend(unsafe { (*ctx).roots() });
         }
 
         // `WLIFT_VALIDATE_BARRIERS=1` opts the GC into a pre-collect
@@ -6738,6 +6771,21 @@ impl VM {
     /// caller's frame for as long as the thread stays safe, its stack
     /// and its precise roots. Pair with `leave_safe`.
     pub fn enter_safe(&mut self, spill: &mut Spill) {
+        let (sp, fiber_id, roots) = self.safe_state(spill);
+        self.world.become_safe(&self.thread, sp, fiber_id, roots);
+    }
+
+    /// `enter_safe` for a thread a host's world goes on running: the
+    /// view is safe for wren_lift's collector, and the runtime seam
+    /// hears nothing, since the thread is in no wait. Pair with
+    /// `leave_safe_here`.
+    pub fn enter_safe_here(&mut self, spill: &mut Spill) {
+        let (sp, fiber_id, roots) = self.safe_state(spill);
+        self.world
+            .become_safe_here(&self.thread, sp, fiber_id, roots);
+    }
+
+    fn safe_state(&mut self, spill: &mut Spill) -> (usize, u64, Vec<Value>) {
         super::stack_scan::spill_callee_saved(&mut spill.0);
         let sp = (spill.0.as_ptr() as usize).min(super::stack_scan::approx_sp());
         if self
@@ -6752,8 +6800,7 @@ impl VM {
             );
         }
         let fiber_id = krio_fiber::current_fiber_id().unwrap_or(0);
-        let roots = self.thread_roots();
-        self.world.become_safe(&self.thread, sp, fiber_id, roots);
+        (sp, fiber_id, self.thread_roots())
     }
 
     /// Back to running Wren, once no collection is waiting. A
@@ -6761,6 +6808,16 @@ impl VM {
     /// cache points at.
     pub fn leave_safe(&mut self) {
         self.world.become_running(&self.thread);
+        self.after_safe();
+    }
+
+    /// `leave_safe` after `enter_safe_here`.
+    pub fn leave_safe_here(&mut self) {
+        self.world.become_running_here(&self.thread);
+        self.after_safe();
+    }
+
+    fn after_safe(&mut self) {
         let collections = self.collections.load(std::sync::atomic::Ordering::Acquire);
         if collections != self.collections_seen {
             self.collections_seen = collections;
@@ -6791,8 +6848,7 @@ impl VM {
         // what it shares is `Shared`, which every thread reaches
         // under the collector's discipline.
         unsafe impl Send for Sent {}
-        self.gc.set_multithreaded();
-        self.engine.threaded = true;
+        self.mark_threaded();
         let sent = Sent(self.new_thread());
         std::thread::spawn(move || {
             let mut sent = sent;
@@ -6804,6 +6860,17 @@ impl VM {
             unsafe { super::rt::thread_stop() };
             r
         })
+    }
+
+    /// Another thread is about to run Wren on this program: from here
+    /// every thread allocates through the runtime and installs code
+    /// with the others stopped. Called by the one running thread
+    /// before it starts, or places a task on, another.
+    pub fn mark_threaded(&mut self) {
+        if !self.engine.threaded {
+            self.gc.set_multithreaded();
+            self.engine.threaded = true;
+        }
     }
 
     /// Size the shared closure-function table for every function
