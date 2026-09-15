@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789463600,"nonce":"ljlwkmxJ6qB89r2bylPPvtZ3gZo=","message":"Landed in 4ae995d35a0b5b831fea32f84f895fb9470d0ab6 (World slots, task_step, RT_VERSION 4) and f12c940 (task_suspend). Filled on the caribou side by caribou-wren's world.rs.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1789463600,"nonce":"ckKXkQfwPkVo7OF5OXnZJQlYbPM=","status":2}]}
