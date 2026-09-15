@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":5,"timestamp":1789469568,"nonce":"k9LNfjU97mZy2btxfGThAvWizw0=","added":["bug","area:runtime","area:gc"],"removed":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789469796,"nonce":"HKtTe+fnptT7n0v60pfnXyuoQtk=","message":"Landed in 2290a66 (RT_VERSION 5: host_poll slot; thread_stack_bounds; host views per program's tasks; the main view's drop balanced).","files":null}]}
