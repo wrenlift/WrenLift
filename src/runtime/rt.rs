@@ -54,6 +54,9 @@ pub type HostStop = unsafe extern "C" fn(bool);
 /// `task_step`'s shape, for a host storing it.
 pub type TaskStep = unsafe extern "C" fn(*mut c_void) -> bool;
 
+/// `task_suspend`'s shape, for a host storing it.
+pub type TaskSuspend = unsafe extern "C" fn() -> bool;
+
 /// A deadline as the world slots carry it: nanoseconds from now, or
 /// this for none.
 pub const NO_DEADLINE: u64 = u64::MAX;
@@ -239,7 +242,12 @@ runtime_table! {
     /// given): up to its next park or yield. False once the task is
     /// done, and the context is released with it. Called on the world
     /// the task was placed on, from no task.
-    task_step(task: *mut c_void) = wren::task_step;
+    task_step(task: *mut c_void) -> bool = wren::task_step;
+    /// Suspend the task being stepped from inside its step, through
+    /// wren_lift's own switch, so its step returns to the host's world
+    /// as at a park; the host resumes it with the next `task_step`. False
+    /// when the calling stack cannot leave from here.
+    task_suspend() -> bool = wren::task_suspend;
     // ── World ───────────────────────────────────────────────────────────
     // The scheduler's world: where its tasks run and its waits park. A
     // host with a world of its own fills these so a Wren fiber or thread
@@ -285,10 +293,10 @@ pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
     heap_drop, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace,
     run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended, task_step,
-    thread_running, thread_safe, thread_start, thread_stop, track_external, watch, world_idle,
-    world_live, world_park_drive, world_park_pending, world_park_request, world_resume_woken,
-    world_spawn, world_tick, world_waiter_discard, world_waiter_new, world_waiter_ready,
-    world_wake, world_workers,
+    task_suspend, thread_running, thread_safe, thread_start, thread_stop, track_external, watch,
+    world_idle, world_live, world_park_drive, world_park_pending, world_park_request,
+    world_resume_woken, world_spawn, world_tick, world_waiter_discard, world_waiter_new,
+    world_waiter_ready, world_wake, world_workers,
 };
 
 /// Whether wren_lift's own world serves the world slots.
@@ -399,6 +407,13 @@ pub extern "C" fn wlift_rt_host_stop() -> HostStop {
 #[no_mangle]
 pub extern "C" fn wlift_rt_task_step() -> TaskStep {
     unsafe { std::mem::transmute(slot::task_step.load(Ordering::Relaxed)) }
+}
+
+/// What the `task_suspend` slot dispatches to: the switch a host's world
+/// suspends a Wren task by from inside its step.
+#[no_mangle]
+pub extern "C" fn wlift_rt_task_suspend() -> TaskSuspend {
+    unsafe { std::mem::transmute(slot::task_suspend.load(Ordering::Relaxed)) }
 }
 
 // ── wren_lift's own implementations, C-shaped ───────────────────────────
@@ -633,6 +648,16 @@ mod wren {
 
     #[cfg(not(feature = "host"))]
     pub unsafe extern "C" fn task_step(_task: *mut c_void) -> bool {
+        false
+    }
+
+    #[cfg(feature = "host")]
+    pub unsafe extern "C" fn task_suspend() -> bool {
+        crate::runtime::sched::task_suspend()
+    }
+
+    #[cfg(not(feature = "host"))]
+    pub unsafe extern "C" fn task_suspend() -> bool {
         false
     }
 }

@@ -380,6 +380,13 @@ pub unsafe fn task_step(ctx: *mut TaskCtx) -> bool {
     !done
 }
 
+/// Suspend the task being stepped from inside, through wren_lift's own
+/// switch: its `task_step` returns as at a park. False when the calling
+/// stack is no fiber that can leave from here.
+pub fn task_suspend() -> bool {
+    crate::runtime::core::fiber::try_krio_yield_pub(Value::null()).is_some()
+}
+
 /// This thread's view of `shared`: the one it runs, else one a host's
 /// world had made here, made now if neither.
 fn view_for(shared: &Arc<SharedCell>) -> *mut VM {
