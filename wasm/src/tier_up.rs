@@ -157,7 +157,7 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
     let module_result = if vm_ptr.is_null() {
         wren_lift::codegen::wasm::emit_mir(mir)
     } else {
-        let interner = unsafe { &(*vm_ptr).interner };
+        let interner = &unsafe { &*vm_ptr }.interner;
         // Bake the cdylib's `current_module_vars_cell::CURRENT`
         // address into the JIT'd module so `GetModuleVar` lowers
         // to inline `i32.load + i64.load` rather than crossing
@@ -209,7 +209,7 @@ fn mir_needs_unsupported_helpers(
     let interner = if vm_ptr.is_null() {
         None
     } else {
-        Some(unsafe { &(*vm_ptr).interner })
+        Some(&unsafe { &*vm_ptr }.interner)
     };
     let is_simd_intrinsic_call = |method: wren_lift::intern::SymbolId, arity: usize| -> bool {
         let Some(interner) = interner else {
