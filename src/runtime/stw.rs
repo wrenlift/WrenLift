@@ -129,21 +129,36 @@ impl World {
     }
 
     /// Mark `t` safe with its stack and roots published, and tell a
-    /// waiting collector.
+    /// waiting collector; the runtime seam hears of it too.
     pub fn become_safe(&self, t: &ThreadState, sp: usize, fiber_id: u64, roots: Vec<Value>) {
         *t.roots.lock().unwrap_or_else(|e| e.into_inner()) = roots;
         t.sp.store(sp, Ordering::Relaxed);
         t.fiber_id.store(fiber_id, Ordering::Relaxed);
         t.state.store(SAFE, Ordering::SeqCst);
-        let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.changed.notify_all();
+        {
+            let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            self.changed.notify_all();
+        }
+        unsafe {
+            crate::runtime::rt::thread_safe(
+                sp,
+                t.extra_lo.load(Ordering::Relaxed),
+                t.extra_hi.load(Ordering::Relaxed),
+            )
+        };
     }
 
     /// Wait out any collection in progress, then mark `t` running.
     /// The store and the check are both sequentially consistent
     /// against the collector's request and its read of the state, so
-    /// one side always sees the other.
+    /// one side always sees the other. The runtime seam hears of it
+    /// last, and may hold the thread for a collection of its own.
     pub fn become_running(&self, t: &ThreadState) {
+        self.become_running_here(t);
+        unsafe { crate::runtime::rt::thread_running() };
+    }
+
+    fn become_running_here(&self, t: &ThreadState) {
         loop {
             t.state.store(RUNNING, Ordering::SeqCst);
             if !self.requested.load(Ordering::SeqCst) {
@@ -197,6 +212,23 @@ impl World {
             self.changed.notify_all();
         }
         drop(guard);
+    }
+}
+
+/// A host's collector asks every thread running Wren, in any program,
+/// to reach a safepoint (`on`), or lets them go. Every program's page
+/// and the static one are held unreadable meanwhile, so a compiled
+/// loop faults into `park_interrupted` and passes through the seam's
+/// `thread_safe` and `thread_running`; a thread that polls does the
+/// same at its next poll. The host's own request is what holds a
+/// thread once it is safe; wren_lift's world asks nothing.
+pub fn host_stop(on: bool) {
+    if on {
+        poll_page::install_handler();
+    }
+    poll_page::static_page().protect(on);
+    for page in poll_page::live_pages() {
+        page.protect(on);
     }
 }
 
@@ -270,7 +302,7 @@ impl Drop for ReentrantGuard<'_> {
 /// static one by symbol.
 pub mod poll_page {
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     pub const PAGE: usize = 1 << 14;
 
@@ -285,8 +317,14 @@ pub mod poll_page {
     #[no_mangle]
     pub static wlift_safepoint_page: Page = Page(std::cell::UnsafeCell::new([0; PAGE]));
 
-    /// A page and the count of stops holding it unreadable.
+    /// A page and the count of stops holding it unreadable. The
+    /// state is shared with the list of live pages, so a host's stop
+    /// reaches every program's page by the same count.
     pub struct PollPage {
+        state: Arc<PageState>,
+    }
+
+    pub struct PageState {
         addr: usize,
         mapped: bool,
         stops: AtomicU32,
@@ -294,39 +332,66 @@ pub mod poll_page {
 
     static STATIC_PAGE: OnceLock<PollPage> = OnceLock::new();
 
+    /// The pages of the programs alive, for a host's stop.
+    static LIVE: Mutex<Vec<Arc<PageState>>> = Mutex::new(Vec::new());
+
+    pub fn live_pages() -> Vec<Arc<PageState>> {
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// The page AOT code loads from.
     pub fn static_page() -> &'static PollPage {
         STATIC_PAGE.get_or_init(|| PollPage {
-            addr: &wlift_safepoint_page as *const Page as usize,
-            mapped: false,
-            stops: AtomicU32::new(0),
+            state: Arc::new(PageState {
+                addr: &wlift_safepoint_page as *const Page as usize,
+                mapped: false,
+                stops: AtomicU32::new(0),
+            }),
         })
     }
 
     impl PollPage {
         /// A page of this program's own.
         pub fn new() -> PollPage {
-            PollPage {
+            let state = Arc::new(PageState {
                 addr: map(),
                 mapped: true,
                 stops: AtomicU32::new(0),
-            }
+            });
+            LIVE.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::clone(&state));
+            PollPage { state }
         }
 
         pub fn address(&self) -> usize {
-            self.addr
+            self.state.addr
         }
 
         pub fn contains(&self, addr: usize) -> bool {
-            self.addr != 0 && addr >= self.addr && addr < self.addr + PAGE
+            self.state.contains(addr)
         }
 
         /// Whether a stop holds the page unreadable.
         pub fn is_protected(&self) -> bool {
-            self.stops.load(Ordering::Acquire) != 0
+            self.state.is_protected()
         }
 
         /// One more stop holds the page (`on`), or one fewer.
+        pub fn protect(&self, on: bool) {
+            self.state.protect(on);
+        }
+    }
+
+    impl PageState {
+        pub fn contains(&self, addr: usize) -> bool {
+            self.addr != 0 && addr >= self.addr && addr < self.addr + PAGE
+        }
+
+        pub fn is_protected(&self) -> bool {
+            self.stops.load(Ordering::Acquire) != 0
+        }
+
         pub fn protect(&self, on: bool) {
             if self.addr == 0 {
                 return;
@@ -358,6 +423,18 @@ pub mod poll_page {
     }
 
     impl Drop for PollPage {
+        fn drop(&mut self) {
+            if !self.state.mapped {
+                return;
+            }
+            LIVE.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|p| !Arc::ptr_eq(p, &self.state));
+            // The page goes when the last stop holding it is gone too.
+        }
+    }
+
+    impl Drop for PageState {
         fn drop(&mut self) {
             #[cfg(all(unix, feature = "host"))]
             if self.mapped && self.addr != 0 {

@@ -1,6 +1,7 @@
 //! The runtime seam: the memory under the Immix strategy, the fiber
-//! stacks a host's collector scans, and the run a host guards, as one
-//! atomic function-pointer slot per operation.
+//! stacks a host's collector scans, the threads that run Wren and when
+//! each is safe, and the run a host guards, as one atomic
+//! function-pointer slot per operation.
 //!
 //! Every slot starts as wren_lift's own block allocator (`gc_immix_heap`)
 //! and is replaced entry by entry through [`wlift_rt_install`]; a `None`
@@ -31,7 +32,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Bumped whenever a slot is added, removed or changes signature.
-pub const RT_VERSION: u32 = 2;
+pub const RT_VERSION: u32 = 3;
 
 /// Largest size `alloc_raw` is ever asked for.
 pub const MAX_ALLOC: usize = 32 * 1024;
@@ -45,6 +46,9 @@ pub type ObjectTrace = unsafe extern "C" fn(*mut u8, Visit, *mut c_void);
 
 /// `object_drop`'s shape, for a host storing it.
 pub type ObjectDrop = unsafe extern "C" fn(*mut u8);
+
+/// `host_stop`'s shape, for a host storing it.
+pub type HostStop = unsafe extern "C" fn(bool);
 
 /// What the memory side reports; `GcStats` takes its byte counters from
 /// here.
@@ -185,6 +189,25 @@ runtime_table! {
     stack_suspended(id: u64, sp: usize) = stacks::stack_suspended;
     /// The stack `id` is about to be freed.
     stack_drop(id: u64) = stacks::stack_drop;
+    // ── Threads ─────────────────────────────────────────────────────────
+    // A host's collector stops every thread that touches its heap. These
+    // tell it which threads run Wren and when each is safe: a safe thread
+    // is in a wait or a native call, its stack published from `sp` up,
+    // and the collector need not wait for it. wren_lift's own collectors
+    // keep the same facts in `stw`, so the defaults do nothing.
+    /// This thread will run Wren on the program's heap: a worker of the
+    /// pool, from its start until `thread_stop`.
+    thread_start() = threads::thread_start;
+    /// This thread runs Wren no more.
+    thread_stop() = threads::thread_stop;
+    /// This thread is safe until `thread_running`, its stack standing at
+    /// `sp`, and `[extra_lo, extra_hi)` a second range to scan: the
+    /// registers saved when it was stopped at a compiled loop header,
+    /// empty when both are 0.
+    thread_safe(sp: usize, extra_lo: usize, extra_hi: usize) = threads::thread_safe;
+    /// This thread runs Wren again. A host whose collection is under way
+    /// holds the thread here until it is done.
+    thread_running() = threads::thread_running;
     // ── Runs ────────────────────────────────────────────────────────────
     /// Run `body(ctx)` as one run of `vm`'s active fiber. A host whose
     /// code the run calls into, and which leaves that code by a long
@@ -199,12 +222,18 @@ runtime_table! {
     /// intern-table entry is unlinked only while the VM that allocated it
     /// is closing a cycle on the calling thread.
     object_drop(obj: *mut u8) = wren::object_drop;
+    /// Have every thread running Wren reach a safepoint (`on`), or let
+    /// them go: what a host's collector asks when it stops the world,
+    /// and undoes once its collection is over. A thread reaching one
+    /// passes through `thread_safe` and `thread_running`.
+    host_stop(on: bool) = wren::host_stop;
 }
 
 pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
-    heap_drop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace, run_guarded,
-    scan_range, should_collect, stack_drop, stack_new, stack_suspended, track_external, watch,
+    heap_drop, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace,
+    run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended,
+    thread_running, thread_safe, thread_start, thread_stop, track_external, watch,
 };
 
 /// Whether the built-in heap serves the memory slots, so a handle is an
@@ -298,10 +327,24 @@ pub extern "C" fn wlift_rt_object_drop() -> ObjectDrop {
     unsafe { std::mem::transmute(slot::object_drop.load(Ordering::Relaxed)) }
 }
 
+/// What the `host_stop` slot dispatches to: how a host's collector asks
+/// every thread running Wren to reach a safepoint.
+#[no_mangle]
+pub extern "C" fn wlift_rt_host_stop() -> HostStop {
+    unsafe { std::mem::transmute(slot::host_stop.load(Ordering::Relaxed)) }
+}
+
 // ── wren_lift's own implementations, C-shaped ───────────────────────────
 
 /// The stack slots' defaults: nothing, since wren_lift's collectors walk
 /// krio's fibers when they scan.
+mod threads {
+    pub unsafe extern "C" fn thread_start() {}
+    pub unsafe extern "C" fn thread_stop() {}
+    pub unsafe extern "C" fn thread_safe(_sp: usize, _extra_lo: usize, _extra_hi: usize) {}
+    pub unsafe extern "C" fn thread_running() {}
+}
+
 mod stacks {
     use std::ffi::c_void;
 
@@ -416,6 +459,10 @@ mod wren {
     pub unsafe extern "C" fn object_drop(obj: *mut u8) {
         crate::runtime::gc_immix::object_drop(obj);
     }
+
+    pub unsafe extern "C" fn host_stop(on: bool) {
+        crate::runtime::stw::host_stop(on);
+    }
 }
 
 #[cfg(test)]
@@ -516,5 +563,97 @@ mod tests {
             wlift_rt_object_drop() as usize,
             wren::object_drop as ObjectDrop as usize
         );
+        assert_eq!(
+            wlift_rt_host_stop() as usize,
+            wren::host_stop as HostStop as usize
+        );
+    }
+
+    static STARTS: AtomicUsize = AtomicUsize::new(0);
+    static STOPS: AtomicUsize = AtomicUsize::new(0);
+    static SAFES: AtomicUsize = AtomicUsize::new(0);
+    static RUNNINGS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_start() {
+        STARTS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn count_stop() {
+        STOPS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn count_safe(sp: usize, _extra_lo: usize, _extra_hi: usize) {
+        assert_ne!(sp, 0, "a safe thread publishes where its stack stands");
+        SAFES.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn count_running() {
+        RUNNINGS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Every worker of the pool starts and stops through the seam, and
+    /// every wait and every collection passes through safe and running.
+    /// In a process of its own, as the install test is.
+    #[test]
+    fn the_threads_that_run_wren_and_their_waits_reach_the_seam() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::rt::tests::the_threads_that_run_wren_and_their_waits_reach_the_seam",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("re-run the test binary");
+            assert!(status.success(), "child test process failed: {status}");
+            return;
+        }
+        let mut table = RuntimeVTable::new();
+        table.thread_start = Some(count_start);
+        table.thread_stop = Some(count_stop);
+        table.thread_safe = Some(count_safe);
+        table.thread_running = Some(count_running);
+        assert!(unsafe { wlift_rt_install(&table) });
+
+        let mut vm = immix_vm();
+        let result = vm.interpret(
+            "main",
+            r#"
+                import "thread" for Thread, Lock
+                var done = Lock.new()
+                for (i in 0...4) {
+                  Thread.create {
+                    var xs = []
+                    for (k in 0...5000) xs.add([k])
+                    done.release()
+                  }
+                }
+                for (i in 0...4) done.wait()
+                System.print("done")
+            "#,
+        );
+        assert_eq!(result, InterpretResult::Success);
+        // The main thread's waits and the workers' collections.
+        assert!(SAFES.load(Ordering::SeqCst) >= 4);
+        assert!(RUNNINGS.load(Ordering::SeqCst) >= 4);
+        assert!(STARTS.load(Ordering::SeqCst) >= 1);
+        drop(vm);
+        // The pool stops with the main view; each worker told the seam.
+        assert_eq!(STOPS.load(Ordering::SeqCst), STARTS.load(Ordering::SeqCst));
+    }
+
+    /// A host's stop holds every live page unreadable until it lets go;
+    /// wren_lift's own stop on the same page is counted with it.
+    #[test]
+    fn a_host_stop_holds_the_pages() {
+        let page = crate::runtime::stw::poll_page::PollPage::new();
+        assert!(!page.is_protected());
+        unsafe { host_stop(true) };
+        assert!(page.is_protected());
+        assert!(crate::runtime::stw::poll_page::static_page().is_protected());
+        page.protect(true);
+        unsafe { host_stop(false) };
+        assert!(page.is_protected(), "wren_lift's own hold stays");
+        page.protect(false);
+        assert!(!page.is_protected());
+        assert!(!crate::runtime::stw::poll_page::static_page().is_protected());
     }
 }

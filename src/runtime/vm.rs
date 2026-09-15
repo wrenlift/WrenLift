@@ -652,7 +652,7 @@ impl VM {
             #[cfg(feature = "host")]
             interpret_depth: 0,
             #[cfg(feature = "host")]
-            is_main: true,
+            is_main: false,
             #[cfg(feature = "host")]
             collections_seen: 0,
             method_cache: super::vm_interp::MethodCache::new(),
@@ -800,7 +800,7 @@ impl VM {
             #[cfg(feature = "host")]
             interpret_depth: 0,
             #[cfg(feature = "host")]
-            is_main: false,
+            is_main: true,
             #[cfg(feature = "host")]
             collections_seen: 0,
             method_cache: super::vm_interp::MethodCache::new(),
@@ -6615,15 +6615,11 @@ pub fn park_interrupted(addr: usize, sp: usize, regs: &[usize]) {
     // compiled code at a loop header, where nothing of the runtime is
     // half done.
     let vm = unsafe { &mut *vm };
-    if !vm.world.requested() {
-        let page = super::stw::poll_page::static_page();
-        if page.contains(addr) {
-            while page.is_protected() {
-                std::thread::yield_now();
-            }
-        }
-        return;
-    }
+    // The fault is this world's stop, a host's (through the runtime
+    // seam, which holds the thread while safe), or another program's
+    // hold on the static page. The thread passes through safe and
+    // running for the first two, and waits out the third.
+    let requested = vm.world.requested();
     let (lo, hi) = REGS.with(|cell| {
         let buf = unsafe { &mut *cell.get() };
         let n = regs.len().min(32);
@@ -6658,6 +6654,14 @@ pub fn park_interrupted(addr: usize, sp: usize, regs: &[usize]) {
     vm.thread
         .extra_hi
         .store(0, std::sync::atomic::Ordering::Relaxed);
+    if !requested {
+        let page = super::stw::poll_page::static_page();
+        if page.contains(addr) {
+            while page.is_protected() {
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 /// The world stopped for a structural change; resumed on drop.
@@ -6792,7 +6796,13 @@ impl VM {
         let sent = Sent(self.new_thread());
         std::thread::spawn(move || {
             let mut sent = sent;
-            body(&mut sent.0)
+            // The runtime seam knows the thread for as long as it holds
+            // a view: the view goes before the thread is told to stop.
+            unsafe { super::rt::thread_start() };
+            let r = body(&mut sent.0);
+            drop(sent);
+            unsafe { super::rt::thread_stop() };
+            r
         })
     }
 

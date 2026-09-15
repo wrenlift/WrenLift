@@ -334,6 +334,7 @@ pub fn spawn(parent: &VM, module: String, arg: Xfer) -> Result<u64, String> {
     let spawned = std::thread::Builder::new()
         .name(format!("isolate-{id}"))
         .spawn(move || {
+            unsafe { crate::runtime::rt::thread_start() };
             let mut vm = factory();
             vm.isolate_factory = Some(factory);
             vm.isolate_arg = Some(arg);
@@ -349,6 +350,7 @@ pub fn spawn(parent: &VM, module: String, arg: Xfer) -> Result<u64, String> {
                 ),
             };
             drop(vm);
+            unsafe { crate::runtime::rt::thread_stop() };
             handle.finish(error);
         });
     match spawned {
