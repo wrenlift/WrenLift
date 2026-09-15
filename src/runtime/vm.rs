@@ -1886,6 +1886,13 @@ impl VM {
         self.drain_file_watches();
     }
 
+    /// Tell the program's `Hatch.onReload` callbacks that `module_path`
+    /// was reloaded, for a host that reloads modules through
+    /// `reload_module` itself rather than the signal.
+    pub fn notify_reloaded(&mut self, module_path: &str) {
+        self.invoke_reload_callbacks(module_path);
+    }
+
     /// Drive every registered `Hatch.onReload` callback with the just-
     /// reloaded module's path. Each callback is a Wren `Fn`; we
     /// dispatch synchronously through the standard `call(_)` path on
