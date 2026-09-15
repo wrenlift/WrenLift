@@ -222,7 +222,10 @@ impl World {
         guard
     }
 
-    /// Let the world go after a collection.
+    /// Let the world go after a collection. The stopping thread went
+    /// safe through the seam (`enter_safe`) and `stop` made it running
+    /// for its own world alone, so the seam hears of the running state
+    /// here, once, as it heard of the safe one.
     pub fn resume(&self, guard: std::sync::MutexGuard<'_, ()>) {
         self.requested.store(false, Ordering::SeqCst);
         self.page.protect(false);
@@ -233,6 +236,7 @@ impl World {
             self.changed.notify_all();
         }
         drop(guard);
+        unsafe { crate::runtime::rt::thread_running() };
     }
 }
 
