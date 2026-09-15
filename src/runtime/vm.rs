@@ -160,11 +160,19 @@ pub type ResolveModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 /// The second argument is empty for the root file.
 pub type LoadModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 
-/// Callback to load a module's compiled form, the bytes of a `.wlbc`,
-/// with the arguments of [`LoadModuleFn`]. Asked before the source
-/// loader: a host that keeps compiled modules answers here and leaves
-/// the rest to the source loader.
-pub type LoadBytecodeFn = Box<dyn Fn(&str, &str) -> Option<Vec<u8>>>;
+/// A module's compiled form, the bytes of a `.wlbc`, with the source it
+/// was compiled from when the host kept it: what a runtime error in the
+/// module renders its line from.
+pub struct CompiledModule {
+    pub bytes: Vec<u8>,
+    pub source: Option<String>,
+}
+
+/// Callback to load a module's compiled form, with the arguments of
+/// [`LoadModuleFn`]. Asked before the source loader: a host that keeps
+/// compiled modules answers here and leaves the rest to the source
+/// loader.
+pub type LoadBytecodeFn = Box<dyn Fn(&str, &str) -> Option<CompiledModule>>;
 
 /// Callback to bind a foreign method.
 pub type BindForeignMethodFn = Box<dyn Fn(&str, &str, bool, &str) -> Option<NativeFn>>;
@@ -1048,13 +1056,17 @@ impl VM {
                 .then_some(())
                 .ok_or(result);
         }
-        if let Some(bytes) = self
+        if let Some(compiled) = self
             .config
             .load_bytecode_fn
             .as_ref()
             .and_then(|load_fn| load_fn(&canonical, importer))
         {
-            let result = self.interpret_bytecode(&canonical, &bytes);
+            let result = self.interpret_bytecode_with_source(
+                &canonical,
+                &compiled.bytes,
+                compiled.source.as_deref(),
+            );
             return (result == InterpretResult::Success)
                 .then_some(())
                 .ok_or(result);
@@ -1081,6 +1093,25 @@ impl VM {
                 Err(InterpretResult::CompileError)
             }
         }
+    }
+
+    /// [`Self::interpret_bytecode`], keeping `source` as the module's for
+    /// its runtime errors to render from, as `interpret` keeps what it
+    /// runs.
+    pub fn interpret_bytecode_with_source(
+        &mut self,
+        module_name: &str,
+        bytes: &[u8],
+        source: Option<&str>,
+    ) -> InterpretResult {
+        if let Some(source) = source {
+            // Other threads read the table for theirs.
+            #[cfg(feature = "host")]
+            let _stopped = self.stop_world();
+            self.module_sources
+                .insert(module_name.to_string(), source.to_string());
+        }
+        self.interpret_bytecode(module_name, bytes)
     }
 
     pub fn interpret_bytecode(&mut self, module_name: &str, bytes: &[u8]) -> InterpretResult {
