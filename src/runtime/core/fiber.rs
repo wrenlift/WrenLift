@@ -51,7 +51,7 @@ unsafe fn setup_fiber_from_closure(
         module_name,
         return_dst: None,
         closure: Some(closure),
-        defining_class: None,
+        defining_class: (*closure).defining_class_opt(),
         bc_ptr: std::ptr::null(),
     });
     (*fiber).state = FiberState::New;

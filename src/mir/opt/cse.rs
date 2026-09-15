@@ -176,6 +176,7 @@ fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Opt
         inst,
         Instruction::BlockParam(_)
             | Instruction::GetModuleVar(_)
+            | Instruction::GetStaticField(_)
             | Instruction::GetUpvalue(_)
             | Instruction::GetField(..)
             | Instruction::MakeClosure { .. }

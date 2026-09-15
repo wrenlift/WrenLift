@@ -1356,7 +1356,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
         // cache derived from it) always match the active frame —
         // crucial when the callee lives in a different module than the
         // caller.
-        let (func_id, mut pc, module_name, closure, _defining_class, return_dst) = unsafe {
+        let (func_id, mut pc, module_name, closure, defining_class, return_dst) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
             values = std::mem::take(&mut frame.values);
             (
@@ -1420,7 +1420,8 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         }
                         ctx.current_func_id = func_id.0 as u64;
                         ctx.closure = c as *mut u8;
-                        ctx.defining_class = std::ptr::null_mut();
+                        ctx.defining_class =
+                            defining_class.map_or(std::ptr::null_mut(), |p| p as *mut u8);
                     });
                 }
                 if let Some(mn) = callee_module.as_ref() {
@@ -4012,6 +4013,17 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
                     unsafe {
                         (*closure_ptr).header.class = vm.fn_class;
+                        // The body reaches the static fields of the
+                        // class whose method is making it.
+                        if let Some(class) =
+                            (*fiber).mir_frames.last().and_then(|f| f.defining_class)
+                        {
+                            (*closure_ptr).defining_class = class;
+                            vm.gc.write_barrier(
+                                closure_ptr as *mut ObjHeader,
+                                Value::object(class as *mut u8),
+                            );
+                        }
                     }
 
                     for i in 0..uv_count {
@@ -4554,6 +4566,7 @@ fn dispatch_closure_bc_inner(
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
     let fn_idx = target_func_id.0 as usize;
+    let defining_class = defining_class.or_else(|| unsafe { (*closure_ptr).defining_class_opt() });
 
     // Wasm tier-up dispatch + trigger. On wasm builds, hot Wren
     // methods get compiled to a per-function wasm module

@@ -1320,6 +1320,35 @@ pub unsafe extern "C" fn wlift_aot_resolve_runtime_import(
     }
 }
 
+/// Record on `closure_bits` the class whose method made it, so its
+/// body reaches that class's static fields. Returns the closure.
+///
+/// # Safety
+///
+/// `closure_bits` must be the NaN-boxed `Value` of an `ObjClosure`
+/// and `class_bits` that of an `ObjClass`, as the AOT lowering emits
+/// them.
+#[no_mangle]
+#[cfg(feature = "aot")]
+pub unsafe extern "C" fn wlift_aot_set_closure_class(closure_bits: u64, class_bits: u64) -> u64 {
+    use crate::codegen::runtime_fns::read_jit_ctx;
+    use crate::runtime::object::{ObjClass, ObjClosure};
+    use crate::runtime::value::Value;
+    let closure_val = Value::from_bits(closure_bits);
+    let class_val = Value::from_bits(class_bits);
+    if let (Some(closure), Some(class)) = (closure_val.as_object(), class_val.as_object()) {
+        unsafe {
+            (*(closure as *mut ObjClosure)).defining_class = class as *mut ObjClass;
+            let ctx = read_jit_ctx();
+            if !ctx.vm.is_null() {
+                let vm = &mut *(ctx.vm as *mut crate::runtime::vm::VM);
+                vm.gc.write_barrier(closure as *mut ObjHeader, class_val);
+            }
+        }
+    }
+    closure_bits
+}
+
 /// Read a static field off a class without consulting the
 /// thread-local `JitContext.defining_class`. The AOT lowering
 /// loads the class pointer from this module's modvars at the

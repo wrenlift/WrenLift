@@ -2400,6 +2400,7 @@ pub fn call_closure_jit_or_sync(
     let callee_func_id =
         crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
     let callee_module = vm.engine.func_module(callee_func_id).cloned();
+    let defining_class = defining_class.or_else(|| unsafe { (*closure_ptr).defining_class_opt() });
     mutate_jit_ctx(|ctx| {
         if ctx.vm.is_null() {
             ctx.vm = vm as *mut _ as *mut u8;
@@ -4556,8 +4557,18 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
 
     let fn_ptr = vm.closure_fn(fn_id as u32, upvalue_vals.len() as u16);
     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
+    let defining_class = read_jit_ctx().defining_class as *mut ObjClass;
     unsafe {
         (*closure_ptr).header.class = vm.fn_class;
+        // The body reaches the static fields of the class whose
+        // method is making it.
+        (*closure_ptr).defining_class = defining_class;
+        if !defining_class.is_null() {
+            vm.gc.write_barrier(
+                closure_ptr as *mut ObjHeader,
+                Value::object(defining_class as *mut u8),
+            );
+        }
     }
     // Root the closure before upvalue allocations.
     push_jit_root(Value::object(closure_ptr as *mut u8));

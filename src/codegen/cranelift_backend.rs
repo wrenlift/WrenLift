@@ -6055,6 +6055,27 @@ pub mod cl {
             // startup, populating the slot.
             Instruction::MakeClosure { fn_id, upvalues } => {
                 let n = upvalues.len();
+                // Under AOT a method's closure records the class whose
+                // static fields its body names; the JIT helper reads it
+                // from the context instead.
+                let stamp_class = aot_config
+                    .and_then(|cfg| cfg.current_defining_class.borrow().clone())
+                    .map(|defining| -> Result<_, String> {
+                        let class_data_id = module
+                            .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
+                            .map_err(|e| e.to_string())?;
+                        let gv = module.declare_data_in_func(class_data_id, builder.func);
+                        let modvars_addr = builder.ins().symbol_value(types::I64, gv);
+                        let class_bits = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            modvars_addr,
+                            (defining.slot as i32) * 8,
+                        );
+                        let f = get_runtime_fn(module, builder, "wlift_aot_set_closure_class", 2)?;
+                        Ok((f, class_bits))
+                    })
+                    .transpose()?;
                 let fn_id_val = if let Some(cfg) = aot_config {
                     let gv = module.declare_data_in_func(cfg.closures_data, builder.func);
                     let base = builder.ins().symbol_value(types::I64, gv);
@@ -6082,7 +6103,14 @@ pub mod cl {
                         args.push(get(uv));
                     }
                     let result = builder.ins().call(f, &args);
-                    Ok(Some(builder.inst_results(result)[0]))
+                    let closure = builder.inst_results(result)[0];
+                    Ok(Some(match stamp_class {
+                        Some((f, class_bits)) => {
+                            let r = builder.ins().call(f, &[closure, class_bits]);
+                            builder.inst_results(r)[0]
+                        }
+                        None => closure,
+                    }))
                 } else {
                     // > 8 upvalues: spill the captured values into a
                     // stack-allocated `[u64; n]` buffer and route through
@@ -6108,7 +6136,14 @@ pub mod cl {
                     let count = builder.ins().iconst(types::I64, n as i64);
                     let f = get_runtime_fn(module, builder, "wren_make_closure_n", 3)?;
                     let result = builder.ins().call(f, &[fn_id_val, count, buf]);
-                    Ok(Some(builder.inst_results(result)[0]))
+                    let closure = builder.inst_results(result)[0];
+                    Ok(Some(match stamp_class {
+                        Some((f, class_bits)) => {
+                            let r = builder.ins().call(f, &[closure, class_bits]);
+                            builder.inst_results(r)[0]
+                        }
+                        None => closure,
+                    }))
                 }
             }
 

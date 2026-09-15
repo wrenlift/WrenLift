@@ -451,6 +451,45 @@ fn scheduler_tasks_take_turns_and_park() {
 }
 
 #[test]
+fn closure_in_a_method_reaches_the_class_static_fields() {
+    // A function or fiber made inside a compiled method names the
+    // class's static fields, at any nesting.
+    let r = compile_link_run(
+        r#"class A {
+  static go() {
+    __x = 1
+    __y = 2
+    System.print("direct %(__x) %(__y)")
+    var f = Fiber.new { System.print("in fiber x=%(__x)") }
+    f.call()
+    var g = Fn.new { System.print("in fn x=%(__x) y=%(__y)") }
+    g.call()
+    var h = Fn.new { __x = 5 }
+    h.call()
+    System.print("after h x=%(__x)")
+    var nested = Fn.new { Fn.new { System.print("nested x=%(__x)") } }
+    nested.call().call()
+    return g
+  }
+  construct new() {}
+  go2() {
+    var t = Fiber.spawn { System.print("task x=%(__x)") }
+    Fiber.tick(0)
+  }
+}
+var g = A.go()
+g.call()
+A.new().go2()
+"#,
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "direct 1 2\nin fiber x=1\nin fn x=1 y=2\nafter h x=5\nnested x=5\nin fn x=5 y=2\ntask x=5\n"
+    );
+}
+
+#[test]
 fn fiber_yield_in_loop_with_branch_and_live_loop_var() {
     // A yield inside an `if` inside a `while`, with the loop
     // variable live across it.

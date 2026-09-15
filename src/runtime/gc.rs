@@ -2096,6 +2096,7 @@ pub(super) unsafe fn for_each_child<F: FnMut(*mut ObjHeader)>(header: *mut ObjHe
             for &uv in &closure.upvalues {
                 child_ptr(uv as *mut ObjHeader, f);
             }
+            child_ptr(closure.defining_class as *mut ObjHeader, f);
         }
 
         ObjType::Upvalue => {
@@ -2367,6 +2368,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
             for uv in &mut closure.upvalues {
                 update_raw_ptr_inline(uv, nursery);
             }
+            update_raw_ptr_inline(&mut closure.defining_class, nursery);
         }
 
         ObjType::Upvalue => {

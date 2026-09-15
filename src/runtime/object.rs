@@ -996,6 +996,9 @@ pub struct ObjClosure {
     pub function: *mut ObjFn,
     /// Captured upvalues (pointers to ObjUpvalue).
     pub upvalues: Vec<*mut ObjUpvalue>,
+    /// The class whose method made this closure, or null: its
+    /// static fields are the ones the body names.
+    pub defining_class: *mut ObjClass,
 }
 
 impl ObjClosure {
@@ -1004,7 +1007,13 @@ impl ObjClosure {
             header: ObjHeader::new(ObjType::Closure),
             function,
             upvalues: vec![std::ptr::null_mut(); upvalue_count],
+            defining_class: std::ptr::null_mut(),
         }
+    }
+
+    /// The defining class as the frame slot wants it.
+    pub fn defining_class_opt(&self) -> Option<*mut ObjClass> {
+        (!self.defining_class.is_null()).then_some(self.defining_class)
     }
 }
 

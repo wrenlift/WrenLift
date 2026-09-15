@@ -5881,6 +5881,8 @@ impl VM {
     ) -> Option<Value> {
         use crate::mir::{BlockId, Instruction};
 
+        let defining_class =
+            defining_class.or_else(|| unsafe { (*closure_ptr).defining_class_opt() });
         // Root the callee and argument values before alloc_fiber(), which may
         // trigger GC while these values still live only in the native caller.
         let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
