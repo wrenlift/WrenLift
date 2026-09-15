@@ -167,7 +167,7 @@
       </table>
       <p>
         One rule connects them: <strong>a <code>Thread</code> is a <code>Fiber</code> that runs on another OS thread.</strong>
-        Every task in the pool is a real <code>Fiber</code>. <code>Thread.current</code> returns it, and <code>Thread.yield()</code> is its <code>yield</code>.
+        Every task in the pool is a real <code>Fiber</code>, and <code>Thread.yield()</code> is its <code>yield</code>.
         The difference is that a <code>Thread</code> runs at the same time as the code that made it. A plain <code>Fiber</code> never does. That is why it gets its own name.
       </p>
 
@@ -208,14 +208,15 @@ System.print(log)         // [a1, b1, b2, a2]</code></pre>
       <h2 id="threads">Threads: parallel fibers on one heap</h2>
 <pre><code class="language-wren">import "thread" for Thread, Mutex, Lock, Deque</code></pre>
       <p>
-        <code>Thread.create(fn)</code> runs <code>fn</code> as a task on a worker thread. The workers start on the first call, one per hardware thread. Each new task goes to the worker with the least work.
+        <code>Thread.create(fn)</code> runs <code>fn</code> as a task on a worker thread and returns its handle. The workers start on the first call, one per hardware thread. Each new task goes to the worker with the least work.
         The task shares the heap with the caller. The lists, maps and objects it reaches are the caller's own, not copies. This is the model for CPU-bound work that wants every core.
       </p>
       <table>
         <thead><tr><th>Method</th><th>What it does</th></tr></thead>
         <tbody>
-          <tr><td><code>Thread.create(fn)</code></td><td>Run <code>fn</code> as a task on a worker.</td></tr>
-          <tr><td><code>Thread.current</code></td><td>The fiber running this task.</td></tr>
+          <tr><td><code>Thread.create(fn)</code></td><td>Run <code>fn</code> as a task on a worker. Returns the <code>Thread</code>.</td></tr>
+          <tr><td><code>.join()</code> &middot; <code>.join(ms)</code> &middot; <code>.isDone</code> &middot; <code>.error</code></td><td>Wait for the task to end (<code>join(ms)</code> returns <code>false</code> when the time runs out); whether it has; the error it ended with, or null.</td></tr>
+          <tr><td><code>Thread.current</code></td><td>The handle of the task being run, or null outside one.</td></tr>
           <tr><td><code>Thread.yield()</code></td><td>Let the other tasks of this worker run.</td></tr>
           <tr><td><code>Thread.count</code></td><td>Worker threads started.</td></tr>
           <tr><td><code>Mutex.new()</code> &middot; <code>.acquire()</code> &middot; <code>.tryAcquire()</code> &middot; <code>.release()</code></td><td>Mutual exclusion. Not reentrant. When it is released, the task that waited longest takes it.</td></tr>
@@ -223,7 +224,7 @@ System.print(log)         // [a1, b1, b2, a2]</code></pre>
           <tr><td><code>Deque.new()</code> &middot; <code>.add(v)</code> &middot; <code>.push(v)</code> &middot; <code>.pop(block)</code> &middot; <code>.count</code></td><td>A queue that any task can share. <code>add</code> puts at the back, <code>push</code> at the front. <code>pop(true)</code> waits for an item. <code>pop(false)</code> returns <code>null</code> when empty.</td></tr>
         </tbody>
       </table>
-<pre><code class="language-wren">import "thread" for Thread, Lock, Deque
+<pre><code class="language-wren">import "thread" for Thread, Deque
 
 class Fib {
   static of(n) {
@@ -233,14 +234,11 @@ class Fib {
 }
 
 var results = Deque.new()
-var done = Lock.new()
+var workers = []
 for (i in 0...8) {
-  Thread.create {
-    results.add(Fib.of(30))
-    done.release()
-  }
+  workers.add(Thread.create { results.add(Fib.of(30)) })
 }
-for (i in 0...8) done.wait()   // eight units, one per task
+for (t in workers) t.join()
 var total = 0
 while (results.count > 0) total = total + results.pop(false)
 System.print(total)</code></pre>
@@ -273,7 +271,7 @@ System.print(results.count)           // 100</code></pre>
       <ul>
         <li><strong>Two tasks writing the same list or map at the same time is a race.</strong> The runtime does not catch it. Put a <code>Mutex</code> around shared structures, or give each task its own and merge at the end. A <code>Deque</code> is safe to share, which is what the examples do.</li>
         <li><strong>A fiber runs on the thread that made it.</strong> Calling a fiber that another task created is an error. Make fibers inside the task that will drive them.</li>
-        <li><strong>When a task aborts, it ends quietly.</strong> Nothing is printed. Catch what you care about inside the task and report it through a <code>Deque</code>.</li>
+        <li><strong>When a task aborts, it ends quietly.</strong> Nothing is printed; the handle's <code>error</code> holds it after <code>join</code>.</li>
         <li><strong>At module top level, a wait runs your own scheduler.</strong> <code>done.wait()</code> in the examples runs any <code>Fiber.spawn</code> tasks on the main thread while it waits. <code>Fiber.sleep</code> works the same way there.</li>
         <li>Module variables, static fields and object fields are single-word writes. They never tear. Between threads, you see the writes in whatever order they landed.</li>
       </ul>

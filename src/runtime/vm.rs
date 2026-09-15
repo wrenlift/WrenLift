@@ -4443,7 +4443,7 @@ impl VM {
         // 10d. Fibers the scheduler holds as tasks.
         #[cfg(feature = "host")]
         if let Some(sched) = &self.sched {
-            roots.extend(sched.fibers().map(|f| Value::object(f as *mut u8)));
+            roots.extend(sched.roots());
         }
 
         // 10e. What the other threads published when they stopped.
@@ -6718,7 +6718,7 @@ impl VM {
                 .map(|&f| Value::object(f as *mut u8)),
         );
         if let Some(sched) = &self.sched {
-            roots.extend(sched.fibers().map(|f| Value::object(f as *mut u8)));
+            roots.extend(sched.roots());
         }
         super::live_regs::collect_live_values(&mut roots);
         roots.extend(crate::codegen::runtime_fns::jit_roots_snapshot());

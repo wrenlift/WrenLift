@@ -6200,6 +6200,64 @@ for (l in lines) System.print(l)
 }
 
 #[test]
+fn e2e_thread_create_returns_a_handle_to_join() {
+    // The handle joins from the main thread and from a task, reports
+    // the abort a task ended with, and times out on one still running.
+    if !scheduler_available() {
+        return;
+    }
+    let src = r#"
+import "thread" for Thread, Lock
+class F {
+  static fib(n) {
+    if (n < 2) return n
+    return fib(n - 1) + fib(n - 2)
+  }
+}
+var out = []
+var t = Thread.create {
+  out.add(F.fib(20))
+  out.add(Thread.current != null)
+}
+System.print(Thread.current)
+System.print(t.join())
+System.print(t.isDone)
+System.print(out)
+var bad = Thread.create { Fiber.abort("boom") }
+bad.join()
+System.print(bad.error)
+var slow = Thread.create { Fiber.sleep(200) }
+System.print(slow.join(10))
+System.print(slow.isDone)
+System.print(slow.join())
+System.print(slow.join(1))
+var ts = []
+for (i in 0...4) ts.add(Thread.create { Fiber.sleep(5 * i) })
+var done = Lock.new()
+Thread.create {
+  for (x in ts) x.join()
+  System.print("all joined")
+  done.release()
+}
+done.wait()
+"#;
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    });
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", src);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(
+        output.trim(),
+        "null\ntrue\ntrue\n[6765, true]\nboom\nfalse\nfalse\ntrue\ntrue\nall joined"
+    );
+}
+
+#[test]
 fn e2e_compiled_loop_answers_a_collector_on_another_thread() {
     // A task spinning in a compiled loop that allocates nothing
     // reaches the safepoint at its loop header, so collections

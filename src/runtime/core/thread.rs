@@ -11,7 +11,7 @@
 
 use crate::runtime::core::fiber::{deadline_arg, park_on, sched_of, sched_vm};
 use crate::runtime::core::sequence::{instance_field, set_instance_field};
-use crate::runtime::object::{NativeContext, ObjInstance, ObjList};
+use crate::runtime::object::{NativeContext, ObjFiber, ObjInstance, ObjList};
 use crate::runtime::sched;
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
@@ -20,8 +20,13 @@ use crate::runtime::vm::VM;
 
 const GUARD: usize = 0;
 /// Mutex: held flag. Lock: units available. Deque: the items.
+/// Thread: 1 once the task has ended.
 const STATE: usize = 1;
 const WAITERS: usize = 2;
+/// Thread: the error the task ended with, or null.
+const ERROR: usize = 3;
+/// Thread: the task's fiber once its worker has made it.
+const FIBER: usize = 4;
 
 fn field_ptr(receiver: Value, index: usize) -> *mut u64 {
     unsafe {
@@ -101,7 +106,8 @@ fn forget_waiter(receiver: Value, token: u64) -> bool {
 
 // -- Thread -------------------------------------------------------------------
 
-/// `Thread.create(fn)`: run `fn` as a task on a worker thread.
+/// `Thread.create(fn)`: run `fn` as a task on a worker thread; the
+/// handle it returns is finished when the task ends.
 fn thread_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(vm) = sched_vm(ctx, "Thread.create") else {
         return Value::null();
@@ -114,18 +120,103 @@ fn thread_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         ctx.runtime_error("Thread.create: expected a function.".to_string());
         return Value::null();
     }
-    unsafe { (*vm).create_thread(args[1]) };
-    Value::null()
+    let handle = init(ctx, "Thread", Value::num(0.0));
+    set_instance_field(ctx, handle, ERROR, Value::null());
+    set_instance_field(ctx, handle, FIBER, Value::null());
+    unsafe { (*vm).create_thread(args[1], handle) };
+    handle
 }
 
-/// `Thread.current`: the fiber running this task.
-fn thread_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    let f = ctx.get_current_fiber();
-    if f.is_null() {
-        Value::null()
-    } else {
-        Value::object(f as *mut u8)
+/// Record the task's fiber on its handle, on the worker that made it.
+pub(crate) fn attach(ctx: &mut dyn NativeContext, handle: Value, fiber: *mut ObjFiber) {
+    if !handle.is_null() {
+        set_instance_field(ctx, handle, FIBER, Value::object(fiber as *mut u8));
     }
+}
+
+/// The task ended: mark the handle done with the fiber's error and
+/// wake everyone joined on it.
+pub(crate) fn finish(handle: Value, fiber: *mut ObjFiber) {
+    let error = unsafe { (*fiber).error };
+    guard(handle);
+    let vm = crate::runtime::vm::current_vm_ptr();
+    if vm.is_null() {
+        unsafe {
+            let inst = &mut *(handle.as_object().unwrap() as *mut ObjInstance);
+            inst.set_field(STATE, Value::num(1.0));
+            inst.set_field(ERROR, error);
+        }
+    } else {
+        let ctx: &mut dyn NativeContext = unsafe { &mut *vm };
+        set_instance_field(ctx, handle, STATE, Value::num(1.0));
+        set_instance_field(ctx, handle, ERROR, error);
+    }
+    let waiters: Vec<u64> = list_field(handle, WAITERS)
+        .as_slice()
+        .iter()
+        .filter_map(|t| t.as_num())
+        .map(|t| t as u64)
+        .collect();
+    list_field(handle, WAITERS).clear();
+    unguard(handle);
+    for token in waiters {
+        sched::wake(token);
+    }
+}
+
+/// `Thread.current`: the handle of the task being run, or null
+/// outside one.
+fn thread_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let vm = ctx.krio_vm_raw_ptr() as *mut VM;
+    if vm.is_null() {
+        return Value::null();
+    }
+    unsafe {
+        (*vm)
+            .sched
+            .as_ref()
+            .map_or_else(Value::null, |s| s.active_handle())
+    }
+}
+
+/// `join()` / `join(ms)`: wait for the task to end; false when `ms`
+/// ran out first.
+fn thread_join(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(vm) = sched_vm(ctx, "Thread.join") else {
+        return Value::null();
+    };
+    let ms = args.get(1).copied().unwrap_or_else(Value::null);
+    let Ok(deadline) = deadline_arg(ctx, "Thread.join", ms) else {
+        return Value::null();
+    };
+    let t = args[0];
+    guard(t);
+    if num_field(t, STATE) != 0.0 {
+        unguard(t);
+        return Value::bool(true);
+    }
+    let token = sched_of(vm).new_waiter();
+    push_waiter(t, token);
+    unguard(t);
+    match park_on(ctx, vm, token, deadline) {
+        None => Value::null(),
+        Some(true) => Value::bool(true),
+        Some(false) => {
+            guard(t);
+            let still_waiting = forget_waiter(t, token);
+            unguard(t);
+            // Gone from the list: the task ended as the wait ran out.
+            Value::bool(!still_waiting)
+        }
+    }
+}
+
+fn thread_is_done(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    Value::bool(num_field(args[0], STATE) != 0.0)
+}
+
+fn thread_error(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    instance_field(args[0], ERROR)
 }
 
 /// `Thread.yield()`: let the other tasks of this world run.
@@ -345,6 +436,7 @@ pub fn register(vm: &mut VM) -> [*mut crate::runtime::object::ObjClass; 4] {
     let lock = vm.make_class("Lock", vm.object_class);
     let deque = vm.make_class("Deque", vm.object_class);
     unsafe {
+        (*thread).num_fields = 5;
         (*mutex).num_fields = 3;
         (*lock).num_fields = 3;
         (*deque).num_fields = 3;
@@ -354,6 +446,10 @@ pub fn register(vm: &mut VM) -> [*mut crate::runtime::object::ObjClass; 4] {
     vm.primitive_static(thread, "current", thread_current);
     vm.primitive_static(thread, "yield()", thread_yield);
     vm.primitive_static(thread, "count", thread_count);
+    vm.primitive(thread, "join()", thread_join);
+    vm.primitive(thread, "join(_)", thread_join);
+    vm.primitive(thread, "isDone", thread_is_done);
+    vm.primitive(thread, "error", thread_error);
 
     vm.primitive_static(mutex, "new()", mutex_new);
     vm.primitive(mutex, "acquire()", mutex_acquire);

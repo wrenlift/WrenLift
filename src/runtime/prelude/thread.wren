@@ -6,26 +6,28 @@
 //! meanwhile.
 
 class Thread {
-  /// Run `body` as a task on a worker thread. The workers start on
-  /// the first call, one per hardware thread; the task lands on the
-  /// least loaded. It shares the heap with the caller: the values it
-  /// can reach are the caller's, and writes to them race the way
-  /// they do between threads anywhere — guard shared state with a
-  /// `Mutex`. An abort ends the task and prints nothing.
+  /// Run `body` as a task on a worker thread and return its handle.
+  /// The workers start on the first call, one per hardware thread;
+  /// the task lands on the least loaded. It shares the heap with the
+  /// caller: the values it can reach are the caller's, and writes to
+  /// them race the way they do between threads anywhere — guard
+  /// shared state with a `Mutex`. An abort ends the task and prints
+  /// nothing; the handle's `error` holds it.
   ///
-  /// @param {Fn} body — function to run as the task
+  /// @param   {Fn} body — function to run as the task
+  /// @returns {Thread}
   ///
   /// ```wren
-  /// import "thread" for Thread, Lock
-  /// var done = Lock.new()
-  /// for (i in 0...4) Thread.create { work(i); done.release() }
-  /// for (i in 0...4) done.wait()
+  /// import "thread" for Thread
+  /// var workers = []
+  /// for (i in 0...4) workers.add(Thread.create { work(i) })
+  /// for (t in workers) t.join()
   /// ```
   static create(body) {}
 
-  /// The fiber running this task.
+  /// The handle of the task being run, or null outside one.
   ///
-  /// @returns {Fiber}
+  /// @returns {Thread}
   static current {}
 
   /// Let the other tasks of this worker run.
@@ -35,6 +37,23 @@ class Thread {
   ///
   /// @returns {Num}
   static count {}
+
+  /// Wait for the task to end, up to `ms` milliseconds.
+  ///
+  /// @param   {Num}  ms — how long to wait; without it, until the task ends
+  /// @returns {Bool} true once the task has ended, false when the wait ran out
+  join(ms) {}
+  join() {}
+
+  /// Whether the task has ended.
+  ///
+  /// @returns {Bool}
+  isDone {}
+
+  /// The error the task ended with, or null.
+  ///
+  /// @returns {Object}
+  error {}
 }
 
 class Mutex {

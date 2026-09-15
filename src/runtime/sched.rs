@@ -54,9 +54,10 @@ struct Registration {
 /// land here, and the idle driver sleeps on the condvar.
 pub struct Endpoint {
     wakes: Mutex<VecDeque<Token>>,
-    /// Closures another thread asked this world to run as tasks;
-    /// roots of the program until the world takes them.
-    spawns: Mutex<VecDeque<Value>>,
+    /// Closures another thread asked this world to run as tasks,
+    /// each with its `Thread` handle or null; roots of the program
+    /// until the world takes them.
+    spawns: Mutex<VecDeque<(Value, Value)>>,
     /// Tasks not yet finished plus closures not yet taken, for
     /// placing new ones.
     live: AtomicUsize,
@@ -64,12 +65,13 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Ask the world to run `closure` as a task.
-    pub fn push_spawn(&self, closure: Value) {
+    /// Ask the world to run `closure` as a task, finishing `handle`
+    /// when it ends.
+    pub fn push_spawn(&self, closure: Value, handle: Value) {
         self.spawns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(closure);
+            .push_back((closure, handle));
         self.live.fetch_add(1, Ordering::Relaxed);
         // The idle wait checks the mailbox under the wakes lock, so
         // the notice is given under it too, or could fall between
@@ -78,13 +80,14 @@ impl Endpoint {
         self.changed.notify_all();
     }
 
-    /// Closures waiting to become tasks: roots for the collector.
+    /// Closures waiting to become tasks and their handles: roots for
+    /// the collector.
     pub fn pending_spawns(&self) -> Vec<Value> {
         self.spawns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .copied()
+            .flat_map(|&(c, h)| [c, h])
             .collect()
     }
 
@@ -95,6 +98,8 @@ impl Endpoint {
 
 struct Task {
     fiber: *mut ObjFiber,
+    /// The `Thread` handle to finish when the task ends, or null.
+    handle: Value,
     state: RunState,
     /// How the last park ended: a wake, or the timer.
     woken: bool,
@@ -220,9 +225,10 @@ impl Sched {
         Arc::clone(&self.endpoint)
     }
 
-    /// Closures other threads asked this world to run.
-    pub fn take_spawns(&self) -> Vec<Value> {
-        let taken: Vec<Value> = self
+    /// Closures other threads asked this world to run, with their
+    /// handles.
+    pub fn take_spawns(&self) -> Vec<(Value, Value)> {
+        let taken: Vec<(Value, Value)> = self
             .endpoint
             .spawns
             .lock()
@@ -231,7 +237,7 @@ impl Sched {
             .collect();
         // Each becomes a task at once, so the count carries over.
         self.endpoint.live.store(
-            self.tasks.len() + taken.iter().filter(|v| !v.is_null()).count(),
+            self.tasks.len() + taken.iter().filter(|(c, _)| !c.is_null()).count(),
             Ordering::Relaxed,
         );
         taken
@@ -255,18 +261,34 @@ impl Sched {
         !self.ready.is_empty()
     }
 
-    /// Fibers the world holds, for the collector's roots.
-    pub fn fibers(&self) -> impl Iterator<Item = *mut ObjFiber> + '_ {
-        self.tasks.values().map(|t| t.fiber)
+    /// What the world holds for the collector: its tasks' fibers and
+    /// handles.
+    pub fn roots(&self) -> impl Iterator<Item = Value> + '_ {
+        self.tasks
+            .values()
+            .flat_map(|t| [Value::object(t.fiber as *mut u8), t.handle])
+    }
+
+    /// The handle of the task being stepped, or null.
+    pub fn active_handle(&self) -> Value {
+        self.active
+            .and_then(|(id, _)| self.tasks.get(&id))
+            .map_or_else(Value::null, |t| t.handle)
     }
 
     pub fn spawn(&mut self, fiber: *mut ObjFiber) -> TaskId {
+        self.spawn_with(fiber, Value::null())
+    }
+
+    /// Make a task of `fiber`; `handle` is finished when it ends.
+    pub fn spawn_with(&mut self, fiber: *mut ObjFiber, handle: Value) -> TaskId {
         let id = self.next_task;
         self.next_task += 1;
         self.tasks.insert(
             id,
             Task {
                 fiber,
+                handle,
                 state: RunState::Runnable,
                 woken: false,
             },
@@ -430,10 +452,13 @@ impl Sched {
                 FiberState::Done | FiberState::Error
             );
         if done {
-            self.tasks.remove(&id);
+            let task = self.tasks.remove(&id).expect("task");
             self.endpoint
                 .live
                 .store(self.tasks.len(), Ordering::Relaxed);
+            if !task.handle.is_null() {
+                crate::runtime::core::thread::finish(task.handle, fiber);
+            }
             return;
         }
         let task = self.tasks.get_mut(&id).expect("task");

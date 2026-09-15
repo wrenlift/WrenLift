@@ -48,7 +48,7 @@ impl Pool {
     pub fn shutdown(&mut self) -> Vec<JoinHandle<()>> {
         self.shutdown.store(true, Ordering::Release);
         for w in &self.workers {
-            w.endpoint.push_spawn(Value::null());
+            w.endpoint.push_spawn(Value::null(), Value::null());
         }
         self.workers
             .drain(..)
@@ -95,8 +95,8 @@ impl VM {
             .extend(workers);
     }
 
-    /// Run `closure` as a task on a worker.
-    pub fn create_thread(&mut self, closure: Value) {
+    /// Run `closure` as a task on a worker; `handle` is its `Thread`.
+    pub fn create_thread(&mut self, closure: Value, handle: Value) {
         self.start_pool(None);
         let target = self
             .pool
@@ -104,7 +104,7 @@ impl VM {
             .unwrap_or_else(|e| e.into_inner())
             .least_loaded()
             .expect("pool started");
-        target.push_spawn(closure);
+        target.push_spawn(closure, handle);
     }
 }
 
@@ -120,14 +120,17 @@ fn worker_main(vm: &mut VM, shutdown: Arc<AtomicBool>) {
             .as_ref()
             .map(|s| s.take_spawns())
             .unwrap_or_default();
-        for closure in spawns {
+        for (closure, handle) in spawns {
             if closure.is_null() {
                 continue;
             }
             let fiber = crate::runtime::core::fiber::fiber_new_inner(vm, closure, None);
             if let Some(ptr) = fiber.as_object() {
                 let fiber = ptr as *mut crate::runtime::object::ObjFiber;
-                vm.sched.get_or_insert_with(Default::default).spawn(fiber);
+                crate::runtime::core::thread::attach(vm, handle, fiber);
+                vm.sched
+                    .get_or_insert_with(Default::default)
+                    .spawn_with(fiber, handle);
             }
         }
         if shutdown.load(Ordering::Acquire) {
