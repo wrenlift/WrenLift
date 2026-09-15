@@ -4694,18 +4694,29 @@ impl VM {
     /// no chain are suspended and live from their saved sp. krio keeps
     /// a stale `caller_sp` after a yield, so membership is decided by
     /// the chain walk, never by that field alone.
+    ///
+    /// Only a stack this collector can place is scanned: one of its own
+    /// fibers, or the thread's own stack when the chain ends on it. A
+    /// thread inside a fiber of a host's making, or whose chain resumes
+    /// from one, has that stack and everything below it left to the
+    /// host's collector.
     #[cfg(all(unix, feature = "host"))]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         let mut spill = [0usize; super::stack_scan::SPILL_WORDS];
         super::stack_scan::spill_callee_saved(&mut spill);
         let probe = (spill.as_ptr() as usize).min(super::stack_scan::approx_sp());
-        let host_top = super::stack_scan::thread_stack_top();
+        let (host_lo, host_top) = super::stack_scan::thread_stack_bounds();
         if host_top == 0 {
             return Vec::new();
         }
-        // (probe, host top, current fiber id) per thread.
-        let mut threads: Vec<(usize, usize, u64)> =
-            vec![(probe, host_top, krio_fiber::current_fiber_id().unwrap_or(0))];
+        // (probe, host stack low end, host top, current fiber id) per
+        // thread.
+        let mut threads: Vec<(usize, usize, usize, u64)> = vec![(
+            probe,
+            host_lo,
+            host_top,
+            krio_fiber::current_fiber_id().unwrap_or(0),
+        )];
         let mut extra: Vec<(usize, usize)> = Vec::new();
         for other in self.world.others(&self.thread) {
             let sp = other.sp.load(std::sync::atomic::Ordering::Relaxed);
@@ -4713,6 +4724,7 @@ impl VM {
             if sp != 0 && top != 0 {
                 threads.push((
                     sp,
+                    other.stack_lo.load(std::sync::atomic::Ordering::Relaxed),
                     top,
                     other.fiber_id.load(std::sync::atomic::Ordering::Relaxed),
                 ));
@@ -4745,7 +4757,7 @@ impl VM {
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(fibers.len() + threads.len());
         ranges.extend(extra);
         let mut on_chain = vec![false; fibers.len()];
-        for &(probe, host_top, current) in &threads {
+        for &(probe, host_lo, host_top, current) in &threads {
             // Walk the running chain from the innermost fiber outward.
             let mut start = probe;
             let mut cur = if current == 0 {
@@ -4753,6 +4765,9 @@ impl VM {
             } else {
                 fibers.iter().position(|f| f.0 == current)
             };
+            if current != 0 && cur.is_none() {
+                continue;
+            }
             while let Some(i) = cur {
                 on_chain[i] = true;
                 let (_, lo, hi, _, caller_sp) = fibers[i];
@@ -4768,9 +4783,12 @@ impl VM {
                     }
                 }
             }
-            // Whatever the chain resumed from last is the host stack.
+            // Whatever the chain resumed from last is the host stack, when
+            // it lies on it; otherwise it is a stack of the host's making.
             let host_start = if start >= host_top { probe } else { start };
-            ranges.push((host_start, host_top));
+            if host_start < host_top && (host_lo == 0 || host_start >= host_lo) {
+                ranges.push((host_start, host_top));
+            }
         }
         for (i, &(_, lo, hi, saved_sp, _)) in fibers.iter().enumerate() {
             if on_chain[i] || saved_sp == 0 {
@@ -6662,17 +6680,7 @@ pub fn park_interrupted(addr: usize, sp: usize, regs: &[usize]) {
         let lo = buf.as_ptr() as usize;
         (lo, lo + std::mem::size_of::<[usize; 32]>())
     });
-    if vm
-        .thread
-        .stack_top
-        .load(std::sync::atomic::Ordering::Relaxed)
-        == 0
-    {
-        vm.thread.stack_top.store(
-            super::stack_scan::thread_stack_top(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
+    vm.thread.note_stack();
     vm.thread
         .extra_lo
         .store(lo, std::sync::atomic::Ordering::Relaxed);
@@ -6790,17 +6798,7 @@ impl VM {
     fn safe_state(&mut self, spill: &mut Spill) -> (usize, u64, Vec<Value>) {
         super::stack_scan::spill_callee_saved(&mut spill.0);
         let sp = (spill.0.as_ptr() as usize).min(super::stack_scan::approx_sp());
-        if self
-            .thread
-            .stack_top
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
-            self.thread.stack_top.store(
-                super::stack_scan::thread_stack_top(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        self.thread.note_stack();
         let fiber_id = krio_fiber::current_fiber_id().unwrap_or(0);
         (sp, fiber_id, self.thread_roots())
     }
@@ -6813,9 +6811,23 @@ impl VM {
         self.after_safe();
     }
 
-    /// `leave_safe` after `enter_safe_here`.
+    /// `leave_safe` after `enter_safe_here`. The wait for a collection
+    /// under way is one the seam hears of, since a host's own collector
+    /// may need this thread meanwhile: safe from here, running after.
     pub fn leave_safe_here(&mut self) {
-        self.world.become_running_here(&self.thread);
+        let sp = super::stack_scan::approx_sp();
+        unsafe {
+            super::rt::thread_safe(
+                sp,
+                self.thread
+                    .extra_lo
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.thread
+                    .extra_hi
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
+        self.world.become_running(&self.thread);
         self.after_safe();
     }
 
@@ -7004,6 +7016,7 @@ impl Drop for VM {
                 let _ = w.join();
             }
             std::hint::black_box(&spill);
+            self.leave_safe();
         }
         let thread = self.thread.clone();
         self.world.leave(&thread);

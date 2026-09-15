@@ -33,7 +33,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Bumped whenever a slot is added, removed or changes signature.
-pub const RT_VERSION: u32 = 4;
+pub const RT_VERSION: u32 = 5;
 
 /// Largest size `alloc_raw` is ever asked for.
 pub const MAX_ALLOC: usize = 32 * 1024;
@@ -238,6 +238,12 @@ runtime_table! {
     /// and undoes once its collection is over. A thread reaching one
     /// passes through `thread_safe` and `thread_running`.
     host_stop(on: bool) = wren::host_stop;
+    /// wren_lift's world asked every thread of a program to stop (`on`),
+    /// or let them go. A host whose threads reach safepoints of its own
+    /// while they run its code has them come to wren_lift's there: a
+    /// thread that polls neither wren_lift's page nor its interpreter
+    /// loop is otherwise waited for.
+    host_poll(on: bool) = threads::host_poll;
     /// Run one turn of the task `task` (a context `world_spawn` was
     /// given): up to its next park or yield. False once the task is
     /// done, and the context is released with it. Called on the world
@@ -291,12 +297,12 @@ runtime_table! {
 
 pub use call::{
     alloc_plain, alloc_raw, collect_begin, collect_end, containing_allocation, for_each_allocation,
-    heap_drop, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop, object_trace,
-    run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended, task_step,
-    task_suspend, thread_running, thread_safe, thread_start, thread_stop, track_external, watch,
-    world_idle, world_live, world_park_drive, world_park_pending, world_park_request,
-    world_resume_woken, world_spawn, world_tick, world_waiter_discard, world_waiter_new,
-    world_waiter_ready, world_wake, world_workers,
+    heap_drop, host_poll, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop,
+    object_trace, run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended,
+    task_step, task_suspend, thread_running, thread_safe, thread_start, thread_stop,
+    track_external, watch, world_idle, world_live, world_park_drive, world_park_pending,
+    world_park_request, world_resume_woken, world_spawn, world_tick, world_waiter_discard,
+    world_waiter_new, world_waiter_ready, world_wake, world_workers,
 };
 
 /// Whether wren_lift's own world serves the world slots.
@@ -418,13 +424,14 @@ pub extern "C" fn wlift_rt_task_suspend() -> TaskSuspend {
 
 // ── wren_lift's own implementations, C-shaped ───────────────────────────
 
-/// The stack slots' defaults: nothing, since wren_lift's collectors walk
-/// krio's fibers when they scan.
+/// The thread slots' defaults: nothing, since wren_lift's own world
+/// keeps the same facts.
 mod threads {
     pub unsafe extern "C" fn thread_start() {}
     pub unsafe extern "C" fn thread_stop() {}
     pub unsafe extern "C" fn thread_safe(_sp: usize, _extra_lo: usize, _extra_hi: usize) {}
     pub unsafe extern "C" fn thread_running() {}
+    pub unsafe extern "C" fn host_poll(_on: bool) {}
 }
 
 /// The world slots' defaults: wren_lift's own world on the view.

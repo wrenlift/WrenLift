@@ -60,43 +60,55 @@ pub fn approx_sp() -> usize {
 }
 
 thread_local! {
-    static STACK_TOP: Cell<usize> = const { Cell::new(0) };
+    static STACK_BOUNDS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 /// Highest address of the current thread's stack, cached per thread.
 /// Zero on platforms without a query, which disables stack scanning.
 pub fn thread_stack_top() -> usize {
-    STACK_TOP.with(|c| {
+    thread_stack_bounds().1
+}
+
+/// The current thread's own stack, `(lowest, highest)`, cached per
+/// thread. Both zero on platforms without a query; the lowest alone
+/// zero where only the top is known.
+pub fn thread_stack_bounds() -> (usize, usize) {
+    STACK_BOUNDS.with(|c| {
         let v = c.get();
-        if v != 0 {
+        if v.1 != 0 {
             return v;
         }
-        let top = query_stack_top();
-        c.set(top);
-        top
+        let bounds = query_stack_bounds();
+        c.set(bounds);
+        bounds
     })
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
-fn query_stack_top() -> usize {
-    unsafe { libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize }
+fn query_stack_bounds() -> (usize, usize) {
+    unsafe {
+        let me = libc::pthread_self();
+        let top = libc::pthread_get_stackaddr_np(me) as usize;
+        let size = libc::pthread_get_stacksize_np(me);
+        (top.saturating_sub(size), top)
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "host"))]
-fn query_stack_top() -> usize {
+fn query_stack_bounds() -> (usize, usize) {
     unsafe {
         let mut attr: libc::pthread_attr_t = std::mem::zeroed();
         if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
-            return 0;
+            return (0, 0);
         }
         let mut base: *mut libc::c_void = std::ptr::null_mut();
         let mut size: libc::size_t = 0;
         let rc = libc::pthread_attr_getstack(&attr, &mut base, &mut size);
         libc::pthread_attr_destroy(&mut attr);
         if rc != 0 {
-            return 0;
+            return (0, 0);
         }
-        base as usize + size
+        (base as usize, base as usize + size)
     }
 }
 
@@ -104,8 +116,8 @@ fn query_stack_top() -> usize {
     all(target_os = "macos", feature = "host"),
     all(target_os = "linux", feature = "host")
 )))]
-fn query_stack_top() -> usize {
-    0
+fn query_stack_bounds() -> (usize, usize) {
+    (0, 0)
 }
 
 #[cfg(test)]

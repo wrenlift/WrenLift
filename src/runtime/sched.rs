@@ -291,15 +291,33 @@ fn sched_of<'a>(vm: *mut VM) -> &'a mut Sched {
 }
 
 /// Views a host's world made on this thread to step tasks of programs
-/// the thread had no view of, by program. They go with the thread, and
+/// the thread had no view of, by program, each with the tasks of that
+/// program on this thread. A view goes with its last task, so a program
+/// whose main view is gone is held by nothing once its tasks are done;
 /// the seam hears the thread stop once for each.
 #[derive(Default)]
-struct HostViews(Vec<(*const SharedCell, Box<VM>)>);
+struct HostViews(Vec<HostView>);
+
+struct HostView {
+    program: *const SharedCell,
+    vm: Box<VM>,
+    tasks: usize,
+}
+
+impl HostViews {
+    fn retire(&mut self, program: *const SharedCell) {
+        if let Some(i) = self.0.iter().position(|v| v.program == program) {
+            let view = self.0.remove(i);
+            drop(view.vm);
+            unsafe { rt::thread_stop() };
+        }
+    }
+}
 
 impl Drop for HostViews {
     fn drop(&mut self) {
-        for (_, vm) in self.0.drain(..) {
-            drop(vm);
+        while let Some(view) = self.0.pop() {
+            drop(view.vm);
             unsafe { rt::thread_stop() };
         }
     }
@@ -327,6 +345,7 @@ pub unsafe fn task_step(ctx: *mut TaskCtx) -> bool {
             return false;
         }
     };
+    let program = Arc::as_ptr(&shared);
     let vm = view_for(&shared);
     let prev = crate::runtime::vm::__set_thread_local_current_vm(vm);
     let was_safe = unsafe { (*vm).thread.is_safe() };
@@ -335,6 +354,13 @@ pub unsafe fn task_step(ctx: *mut TaskCtx) -> bool {
     }
     let id = ctx as u64;
     let sched = sched_of(vm);
+    let first = matches!(
+        sched.tasks.entry(id),
+        std::collections::hash_map::Entry::Vacant(_)
+    );
+    if first {
+        host_view_tasks(program, 1);
+    }
     if let std::collections::hash_map::Entry::Vacant(entry) = sched.tasks.entry(id) {
         let (closure, handle) = unsafe { ((*ctx).closure, (*ctx).handle) };
         let fiber = if unsafe { (*ctx).fiber.is_null() } {
@@ -377,7 +403,28 @@ pub unsafe fn task_step(ctx: *mut TaskCtx) -> bool {
         std::hint::black_box(&spill);
     }
     crate::runtime::vm::__set_thread_local_current_vm(prev);
+    if done && host_view_tasks(program, -1) == 0 {
+        // The program's last task on this thread: a view the host's
+        // world made here goes with it.
+        drop(shared);
+        HOST_VIEWS.with(|views| views.borrow_mut().retire(program));
+    }
     !done
+}
+
+/// Count a task of `program` on this thread's host-made view in or out;
+/// the tasks left, or `usize::MAX` when the view is the thread's own.
+fn host_view_tasks(program: *const SharedCell, by: isize) -> usize {
+    HOST_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        match views.0.iter_mut().find(|v| v.program == program) {
+            Some(view) => {
+                view.tasks = view.tasks.saturating_add_signed(by);
+                view.tasks
+            }
+            None => usize::MAX,
+        }
+    })
 }
 
 /// Suspend the task being stepped from inside, through wren_lift's own
@@ -395,15 +442,19 @@ fn view_for(shared: &Arc<SharedCell>) -> *mut VM {
         return current;
     }
     HOST_VIEWS.with(|views| {
-        let key = Arc::as_ptr(shared);
+        let program = Arc::as_ptr(shared);
         let mut views = views.borrow_mut();
-        if let Some((_, vm)) = views.0.iter_mut().find(|(k, _)| *k == key) {
-            return &mut **vm as *mut VM;
+        if let Some(view) = views.0.iter_mut().find(|v| v.program == program) {
+            return &mut *view.vm as *mut VM;
         }
         unsafe { rt::thread_start() };
         let mut vm = Box::new(VM::view_of(shared));
         let ptr: *mut VM = &mut *vm;
-        views.0.push((key, vm));
+        views.0.push(HostView {
+            program,
+            vm,
+            tasks: 0,
+        });
         ptr
     })
 }

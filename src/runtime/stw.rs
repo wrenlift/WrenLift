@@ -28,6 +28,8 @@ pub struct ThreadState {
     /// The high end of the thread's stack, recorded when it first
     /// becomes safe on its own thread.
     pub stack_top: AtomicUsize,
+    /// The low end, recorded with it; 0 where only the top is known.
+    pub stack_lo: AtomicUsize,
     /// The krio fiber the thread was inside when it became safe, or 0.
     pub fiber_id: AtomicU64,
     /// A second range to scan while safe: the registers saved when
@@ -46,6 +48,7 @@ impl ThreadState {
             state: AtomicU8::new(SAFE),
             sp: AtomicUsize::new(0),
             stack_top: AtomicUsize::new(0),
+            stack_lo: AtomicUsize::new(0),
             fiber_id: AtomicU64::new(0),
             extra_lo: AtomicUsize::new(0),
             extra_hi: AtomicUsize::new(0),
@@ -55,6 +58,15 @@ impl ThreadState {
 
     pub fn is_safe(&self) -> bool {
         self.state.load(Ordering::SeqCst) == SAFE
+    }
+
+    /// Record the thread's own stack, once, from the thread itself.
+    pub fn note_stack(&self) {
+        if self.stack_top.load(Ordering::Relaxed) == 0 {
+            let (lo, top) = crate::runtime::stack_scan::thread_stack_bounds();
+            self.stack_lo.store(lo, Ordering::Relaxed);
+            self.stack_top.store(top, Ordering::Relaxed);
+        }
     }
 }
 
@@ -187,10 +199,12 @@ impl World {
         let guard = self.collector.lock().unwrap_or_else(|e| e.into_inner());
         self.requested.store(true, Ordering::SeqCst);
         // The program's own page for its compiled loops, and the
-        // process's static one for an AOT binary's.
+        // process's static one for an AOT binary's; and a host's own
+        // safepoints, for a thread running the host's code.
         poll_page::install_handler();
         self.page.protect(true);
         poll_page::static_page().protect(true);
+        unsafe { crate::runtime::rt::host_poll(true) };
         t.state.store(RUNNING, Ordering::SeqCst);
         let mut g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -213,6 +227,7 @@ impl World {
         self.requested.store(false, Ordering::SeqCst);
         self.page.protect(false);
         poll_page::static_page().protect(false);
+        unsafe { crate::runtime::rt::host_poll(false) };
         {
             let _g = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             self.changed.notify_all();
