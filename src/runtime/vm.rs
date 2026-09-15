@@ -4319,7 +4319,7 @@ impl VM {
         // 3. VM-owned class pointers — may be nursery-allocated, so they can
         //    be promoted/forwarded during GC.
         let classes_start = roots.len();
-        let core_classes: [*mut ObjClass; 20] = [
+        let core_classes: [*mut ObjClass; 27] = [
             self.object_class,
             self.class_class,
             self.bool_class,
@@ -4340,6 +4340,13 @@ impl VM {
             self.string_byte_seq_class,
             self.string_code_point_seq_class,
             self.map_entry_class,
+            self.byte_array_class,
+            self.int32_array_class,
+            self.float32_array_class,
+            self.float64_array_class,
+            self.simd_class,
+            self.simd4f_class,
+            self.simd4i_class,
         ];
         for &ptr in &core_classes {
             if !ptr.is_null() {
@@ -4538,7 +4545,7 @@ impl VM {
 
         // Write back core class pointers
         let shared = self.shared_mut();
-        let class_fields: [&mut *mut ObjClass; 20] = [
+        let class_fields: [&mut *mut ObjClass; 27] = [
             &mut shared.object_class,
             &mut shared.class_class,
             &mut shared.bool_class,
@@ -4559,6 +4566,13 @@ impl VM {
             &mut shared.string_byte_seq_class,
             &mut shared.string_code_point_seq_class,
             &mut shared.map_entry_class,
+            &mut shared.byte_array_class,
+            &mut shared.int32_array_class,
+            &mut shared.float32_array_class,
+            &mut shared.float64_array_class,
+            &mut shared.simd_class,
+            &mut shared.simd4f_class,
+            &mut shared.simd4i_class,
         ];
         for (i, field) in class_fields.into_iter().enumerate() {
             let val = roots[classes_start + i];
