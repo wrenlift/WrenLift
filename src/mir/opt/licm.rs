@@ -331,10 +331,13 @@ fn find_invariants(
                 ) {
                     continue;
                 }
-                // Skip module var reads (may change between iterations).
+                // Skip module var, upvalue and static field reads
+                // (may change between iterations).
                 if matches!(
                     inst,
-                    Instruction::GetModuleVar(_) | Instruction::GetUpvalue(_)
+                    Instruction::GetModuleVar(_)
+                        | Instruction::GetUpvalue(_)
+                        | Instruction::GetStaticField(_)
                 ) {
                     continue;
                 }

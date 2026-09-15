@@ -6265,6 +6265,65 @@ A.new().go2()
 }
 
 #[test]
+fn e2e_static_field_read_in_a_loop_sees_the_write_before_it() {
+    // A static field read inside a loop is not loop-invariant: the
+    // body's own write changes it. In a method, a function and a
+    // fiber body.
+    let src = r#"
+class P {
+  static run() {
+    __c = 0
+    for (i in 1..3) {
+      __c = __c + 1
+      System.print("method %(__c)")
+    }
+    var f = Fn.new {
+      for (i in 1..3) {
+        __c = __c + 1
+        System.print("fn %(__c)")
+      }
+    }
+    f.call()
+    var g = Fiber.new {
+      for (i in 1..3) {
+        __c = __c + 1
+        Fiber.yield()
+        System.print("fiber %(__c)")
+      }
+    }
+    while (!g.isDone) g.call()
+    System.print("end %(__c)")
+  }
+}
+P.run()
+"#;
+    for (mode, threshold) in [
+        (ExecutionMode::Interpreter, 0),
+        (ExecutionMode::Tiered, 1),
+        (ExecutionMode::Tiered, 100),
+    ] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            jit_threshold: threshold,
+            opt_threshold: 4,
+            ..VMConfig::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", src);
+        let output = vm.take_output();
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{mode:?}: {output}"
+        );
+        assert_eq!(
+            output.trim(),
+            "method 1\nmethod 2\nmethod 3\nfn 4\nfn 5\nfn 6\nfiber 7\nfiber 8\nfiber 9\nend 9",
+            "{mode:?} threshold {threshold}"
+        );
+    }
+}
+
+#[test]
 fn e2e_thread_create_returns_a_handle_to_join() {
     // The handle joins from the main thread and from a task, reports
     // the abort a task ended with, and times out on one still running.
