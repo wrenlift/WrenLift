@@ -160,6 +160,12 @@ pub type ResolveModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 /// The second argument is empty for the root file.
 pub type LoadModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 
+/// Callback to load a module's compiled form, the bytes of a `.wlbc`,
+/// with the arguments of [`LoadModuleFn`]. Asked before the source
+/// loader: a host that keeps compiled modules answers here and leaves
+/// the rest to the source loader.
+pub type LoadBytecodeFn = Box<dyn Fn(&str, &str) -> Option<Vec<u8>>>;
+
 /// Callback to bind a foreign method.
 pub type BindForeignMethodFn = Box<dyn Fn(&str, &str, bool, &str) -> Option<NativeFn>>;
 
@@ -185,6 +191,7 @@ pub struct VMConfig {
     pub error_fn: Option<ErrorFn>,
     pub resolve_module_fn: Option<ResolveModuleFn>,
     pub load_module_fn: Option<LoadModuleFn>,
+    pub load_bytecode_fn: Option<LoadBytecodeFn>,
     pub bind_foreign_method_fn: Option<BindForeignMethodFn>,
     pub bind_foreign_class_fn: Option<BindForeignClassFn>,
     pub initial_heap_size: usize,
@@ -216,6 +223,7 @@ impl Default for VMConfig {
             error_fn: None,
             resolve_module_fn: None,
             load_module_fn: None,
+            load_bytecode_fn: None,
             bind_foreign_method_fn: None,
             bind_foreign_class_fn: None,
             initial_heap_size: 10 * 1024 * 1024,
@@ -1007,6 +1015,74 @@ impl VM {
     /// top-level fiber runs. Same semantics as `interpret(name, src)`
     /// modulo anything that depended on having source text (e.g. span
     /// diagnostics carry snapshot spans, not fresh source byte ranges).
+    /// Have the module `requested` imports from `importer` loaded: its
+    /// canonical name through the resolver, then a built-in, a staged
+    /// hatch module, the compiled form the bytecode loader has, or the
+    /// source the module loader has, in that order. `Err` with the
+    /// result of a load that failed, or `CompileError` when nothing has
+    /// the module.
+    fn load_import(&mut self, requested: &str, importer: &str) -> Result<(), InterpretResult> {
+        // Resolve the requested name to its canonical form. For
+        // relative paths (`./foo`, `../foo`) the loader's resolver
+        // returns the absolute on-disk path so that `./foo` and
+        // `../foo` referring to the same file dedupe to a single
+        // ModuleEntry — without this the engine registers two modules
+        // for one file and class-identity (`is`) checks fail across
+        // the boundary. Scoped names (`@hatch:foo`) and bare builtins
+        // resolve to themselves.
+        let canonical = self
+            .config
+            .resolve_module_fn
+            .as_ref()
+            .and_then(|fn_| fn_(requested, importer))
+            .unwrap_or_else(|| requested.to_string());
+        if self.engine.modules.contains_key(&canonical) {
+            return Ok(());
+        }
+        // Check for built-in optional modules first
+        if self.try_load_builtin_module(&canonical) {
+            return Ok(());
+        }
+        if let Some(result) = self.load_staged_hatch_module(&canonical) {
+            return (result == InterpretResult::Success)
+                .then_some(())
+                .ok_or(result);
+        }
+        if let Some(bytes) = self
+            .config
+            .load_bytecode_fn
+            .as_ref()
+            .and_then(|load_fn| load_fn(&canonical, importer))
+        {
+            let result = self.interpret_bytecode(&canonical, &bytes);
+            return (result == InterpretResult::Success)
+                .then_some(())
+                .ok_or(result);
+        }
+        // Resolve module source via config callback. Pass the canonical
+        // name so the loader's `dirs` registry stays keyed by canonical
+        // — subsequent imports from inside this module use the
+        // canonical name as `from`, which has to match what we recorded
+        // here.
+        let source_opt = self
+            .config
+            .load_module_fn
+            .as_ref()
+            .and_then(|load_fn| load_fn(&canonical, importer));
+        match source_opt {
+            Some(mod_source) => {
+                let result = self.interpret(&canonical, &mod_source);
+                (result == InterpretResult::Success)
+                    .then_some(())
+                    .ok_or(result)
+            }
+            None => {
+                self.report_error(&format!("Could not load module '{}'", requested));
+                Err(InterpretResult::CompileError)
+            }
+        }
+    }
+
     pub fn interpret_bytecode(&mut self, module_name: &str, bytes: &[u8]) -> InterpretResult {
         let module_key = module_name.to_string();
         if !self.loading_modules.insert(module_key.clone()) {
@@ -1025,6 +1101,20 @@ impl VM {
                 return InterpretResult::CompileError;
             }
         };
+        // What the module imports, loaded as a source module's imports
+        // are, so a compiled module loads on demand as one does.
+        let mut imports: Vec<String> = Vec::new();
+        for source in blob.var_sources.iter().flatten() {
+            if !imports.contains(source) {
+                imports.push(source.clone());
+            }
+        }
+        for import in imports {
+            if let Err(result) = self.load_import(&import, module_name) {
+                self.loading_modules.remove(&module_key);
+                return result;
+            }
+        }
         self.install_module_mir_and_run_with_sources(
             module_name,
             &blob.interner,
@@ -1595,61 +1685,10 @@ impl VM {
                 names: _,
             } = &stmt.0
             {
-                let requested = mod_path.0.clone();
-
-                // Resolve the requested name to its canonical form.
-                // For relative paths (`./foo`, `../foo`) the loader's
-                // resolver returns the absolute on-disk path so that
-                // `./foo` and `../foo` referring to the same file
-                // dedupe to a single ModuleEntry — without this the
-                // engine registers two modules for one file and
-                // class-identity (`is`) checks fail across the
-                // boundary. Scoped names (`@hatch:foo`) and bare
-                // builtins resolve to themselves.
-                let importer = module_name.to_string();
-                let canonical = self
-                    .config
-                    .resolve_module_fn
-                    .as_ref()
-                    .and_then(|fn_| fn_(&requested, &importer))
-                    .unwrap_or_else(|| requested.clone());
-
-                // Skip if already loaded
-                if !self.engine.modules.contains_key(&canonical) {
-                    // Check for built-in optional modules first
-                    if self.try_load_builtin_module(&canonical) {
-                        // Built-in module registered successfully
-                    } else if let Some(result) = self.load_staged_hatch_module(&canonical) {
-                        if result != InterpretResult::Success {
-                            self.loading_modules.remove(&module_key);
-                            return result;
-                        }
-                    } else {
-                        // Resolve module source via config callback.
-                        // Pass the canonical name so the loader's
-                        // `dirs` registry stays keyed by canonical
-                        // — subsequent imports from inside this
-                        // module use the canonical name as `from`,
-                        // which has to match what we recorded here.
-                        let source_opt = self
-                            .config
-                            .load_module_fn
-                            .as_ref()
-                            .and_then(|load_fn| load_fn(&canonical, &importer));
-                        if let Some(mod_source) = source_opt {
-                            let result = self.interpret(&canonical, &mod_source);
-                            if result != InterpretResult::Success {
-                                self.loading_modules.remove(&module_key);
-                                return result;
-                            }
-                        } else {
-                            self.report_error(&format!("Could not load module '{}'", requested));
-                            self.loading_modules.remove(&module_key);
-                            return InterpretResult::CompileError;
-                        }
-                    }
+                if let Err(result) = self.load_import(&mod_path.0, module_name) {
+                    self.loading_modules.remove(&module_key);
+                    return result;
                 }
-
                 // Imported names are resolved by name after MIR compilation
                 // when building the module var storage; here we only ensure
                 // the imported module exists.
