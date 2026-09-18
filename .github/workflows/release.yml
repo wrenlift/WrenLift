@@ -1,9 +1,9 @@
 name: Release binaries
 
 # Triggered on `v*` tag push (e.g. `v0.1.0`, `v0.2.0-rc1`). Builds
-# `wlift` + `hatch` for every supported Unix target, bundles each
-# pair into a tarball with a SHA256 checksum, and attaches
-# everything to a GitHub Release.
+# `wlift` + `hatch` + `wlift-lsp` for every supported target, bundles
+# each set into a tarball (a zip on Windows) with a SHA256 checksum,
+# and attaches everything to a GitHub Release.
 #
 # Consumers grab binaries via `install.sh` (curl | bash style) —
 # the script parses this release's asset list, so the artifact
@@ -168,6 +168,84 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------
+  # Windows: its own job rather than a matrix leg, as the packaging
+  # is a zip made in PowerShell and the binaries are checked by
+  # running them before they ship. Emits
+  # `wlift-<tag>-x86_64-pc-windows-msvc.zip` and its `.sha256`.
+  # ---------------------------------------------------------------
+  windows:
+    name: Build windows-x86_64
+    needs: resolve
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows
+
+      - name: Build wlift + hatch
+        run: cargo build --release --bin wlift --bin hatch --target x86_64-pc-windows-msvc
+
+      - name: Build wlift-lsp
+        run: cargo build --release -p wlift_lsp --target x86_64-pc-windows-msvc
+
+      # A binary that starts is what ships: run each one, and a
+      # program through the tiers.
+      - name: Smoke test the binaries
+        shell: pwsh
+        run: |
+          $bin = "target\x86_64-pc-windows-msvc\release"
+          & "$bin\wlift.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "wlift --version failed" }
+          & "$bin\hatch.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "hatch --version failed" }
+          & "$bin\wlift-lsp.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "wlift-lsp --version failed" }
+          & "$bin\wlift.exe" --mode tiered bench\fib.wren
+          if ($LASTEXITCODE -ne 0) { throw "wlift bench/fib.wren failed" }
+
+      - name: Package zip + checksum
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.resolve.outputs.tag }}"
+          $triple = "x86_64-pc-windows-msvc"
+          $stage = "wlift-$tag-$triple"
+          $bin = "target\$triple\release"
+          New-Item -ItemType Directory -Force "dist\$stage" | Out-Null
+          Copy-Item "$bin\wlift.exe", "$bin\hatch.exe", "$bin\wlift-lsp.exe" "dist\$stage\"
+          @"
+          wlift $tag     - Wren runtime (JIT + interpreter)
+          hatch $tag     - Package + build tool for Wren
+          wlift-lsp $tag - Language server (LSP) for editors
+
+          Add this dir to your PATH to use the binaries directly.
+          The binaries need the Microsoft Visual C++ Redistributable (2015+).
+          Docs: https://github.com/wrenlift/WrenLift
+          "@ | Out-File -Encoding ascii "dist\$stage\README.txt"
+          Compress-Archive -Path "dist\$stage" -DestinationPath "dist\$stage.zip"
+          $hash = (Get-FileHash "dist\$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Out-File -Encoding ascii "dist\$stage.zip.sha256"
+          Get-ChildItem dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            dist/wlift-*.zip
+            dist/wlift-*.zip.sha256
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
   # Publish: collect every matrix artifact, attach to a release.
   # Uses `softprops/action-gh-release` so re-running the workflow
   # (via workflow_dispatch) updates the existing release in place
@@ -175,7 +253,7 @@ jobs:
   # ---------------------------------------------------------------
   publish:
     name: Publish release
-    needs: [resolve, build]
+    needs: [resolve, build, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -193,7 +271,7 @@ jobs:
         run: |
           set -eu
           mkdir -p release
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
             -exec cp {} release/ \;
           ls -la release/
 

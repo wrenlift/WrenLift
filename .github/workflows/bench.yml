@@ -205,6 +205,8 @@ jobs:
         run: |
           cp install.sh site/install.sh
           chmod +x site/install.sh
+          # The Windows twin, for `irm wrenlift.com/install.ps1 | iex`.
+          cp install.ps1 site/install.ps1
 
       - name: Install wasm-pack
         # `wasm-pack` produces the `wasm/pkg/` bundle the

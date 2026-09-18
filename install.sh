@@ -20,7 +20,7 @@
 #
 # Supported platforms
 #   macOS arm64 / x86_64, Linux x86_64 / aarch64.
-#   Windows users should grab the binaries manually from Releases.
+#   Windows: `irm https://wrenlift.com/install.ps1 | iex` (install.ps1).
 
 set -euo pipefail
 

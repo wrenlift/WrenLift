@@ -2407,7 +2407,10 @@ impl ExecutionEngine {
     /// A speculative guard failed in `id`'s compiled code. The function
     /// runs its baseline until a compile without speculation replaces
     /// it; the top tier may be proposed again for the unspeculated body.
-    #[cfg(feature = "host")]
+    #[cfg(not(feature = "cranelift"))]
+    pub fn note_speculation_failed(&mut self, _id: FuncId, _interner: &crate::intern::Interner) {}
+
+    #[cfg(feature = "cranelift")]
     pub fn note_speculation_failed(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         let _guard = self.tier_guard();
         let idx = id.0 as usize;
@@ -3912,12 +3915,12 @@ impl ExecutionEngine {
     /// `compile_function_artifact_*` which is itself host-only. The
     /// wasm stub returns `false` so any caller that opportunistically
     /// asked "did this function get promoted?" sees the same shape.
-    #[cfg(not(feature = "host"))]
+    #[cfg(not(feature = "cranelift"))]
     pub fn tier_up(&mut self, _id: FuncId, _interner: &crate::intern::Interner) -> bool {
         false
     }
 
-    #[cfg(feature = "host")]
+    #[cfg(feature = "cranelift")]
     pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
         let idx = id.0 as usize;
         let Some(tier) = self.next_compile_tier(idx) else {
@@ -4067,10 +4070,10 @@ impl ExecutionEngine {
     /// Submit the next tier for background compilation.
     /// The interpreter keeps running bytecode; the compiled result is installed
     /// when `poll_compilations` is called at the next safepoint.
-    #[cfg(not(feature = "host"))]
+    #[cfg(not(feature = "cranelift"))]
     pub fn request_tier_up(&mut self, _id: FuncId, _interner: &crate::intern::Interner) {}
 
-    #[cfg(feature = "host")]
+    #[cfg(feature = "cranelift")]
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         let _guard = self.tier_guard();
         let idx = id.0 as usize;
@@ -4082,7 +4085,7 @@ impl ExecutionEngine {
 
     /// Compile `id` at `tier` in the background; the install lands
     /// through `poll_compilations`.
-    #[cfg(feature = "host")]
+    #[cfg(feature = "cranelift")]
     fn request_compile(
         &mut self,
         id: FuncId,

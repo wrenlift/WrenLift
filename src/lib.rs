@@ -15,6 +15,12 @@
     not(feature = "host"),
     allow(dead_code, unused_imports, unused_variables, unreachable_patterns)
 )]
+// The language server builds `host` without `cranelift`: the compile
+// pipeline's items exist for the JIT it does not carry.
+#![cfg_attr(
+    all(feature = "host", not(feature = "cranelift")),
+    allow(dead_code, unused_imports, unused_variables)
+)]
 
 // Global allocator override is opt-in via the `wlift_alloc`
 // feature, which the wlift / hatch binaries enable but plugins

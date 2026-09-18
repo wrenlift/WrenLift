@@ -1832,6 +1832,15 @@ fn map_severity(sev: WlSeverity) -> DiagnosticSeverity {
 
 #[tokio::main]
 async fn main() {
+    // The server speaks over stdin; `--version` is the one flag an
+    // editor or an installer asks before starting it.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!("wlift-lsp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 

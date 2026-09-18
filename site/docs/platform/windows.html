@@ -155,20 +155,22 @@
     <div class="pkg-readme">
       <h2 id="install">Install</h2>
       <p>
-        Download
-        <code>wlift-x86_64-pc-windows-msvc.zip</code> from the
-        <a href="https://github.com/wrenlift/WrenLift/releases">release page</a>,
-        unzip, and drop the three binaries
-        (<code>wlift.exe</code>, <code>hatch.exe</code>,
-        <code>wlift-lsp.exe</code>) into a directory that's on your
-        <code>PATH</code>. <code>%LOCALAPPDATA%\Programs\wlift\bin</code>
-        is a reasonable choice; add it via <em>System Properties &rarr;
-        Environment Variables</em>.
+        One line in PowerShell. It fetches the latest release, checks
+        the SHA256, puts <code>wlift.exe</code>, <code>hatch.exe</code>
+        and <code>wlift-lsp.exe</code> in
+        <code>%LOCALAPPDATA%\Programs\wlift\bin</code>, and adds that
+        directory to your user <code>PATH</code>:
       </p>
+<pre><code>irm https://wrenlift.com/install.ps1 | iex</code></pre>
       <p>
-        The <code>install.sh</code> shell installer doesn't work on
-        native Windows. WSL users can use the Linux installer and
-        get a Linux <code>wlift</code> binary inside WSL.
+        <code>WLIFT_VERSION</code> pins a tag and <code>INSTALL_DIR</code>
+        picks another directory, as with the shell installer. To do it
+        by hand, download
+        <code>wlift-&lt;tag&gt;-x86_64-pc-windows-msvc.zip</code> from the
+        <a href="https://github.com/wrenlift/WrenLift/releases">release page</a>,
+        unzip, and put the three binaries on your <code>PATH</code>.
+        WSL users can use the Linux installer and get a Linux
+        <code>wlift</code> inside WSL.
       </p>
 
       <h2 id="runtime-reqs">Runtime requirements</h2>
