@@ -35,7 +35,7 @@
 ///     next_i = AddF64(i, one)
 ///     br cond_bb [next_i, ...]
 /// ```
-use super::{replace_uses_in_func, MirPass};
+use super::{MirPass, replace_uses_in_func};
 use crate::intern::Interner;
 use crate::mir::{Instruction, MirFunction, Terminator, ValueId};
 use std::collections::HashMap;
@@ -63,10 +63,10 @@ impl<'a> MirPass for RangeLoop<'a> {
         let mut range_infos: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
         for block in &func.blocks {
             for &(vid, ref inst) in &block.instructions {
-                if let Instruction::MakeRange(from, to, inclusive) = inst {
-                    if !inclusive {
-                        range_infos.push((vid, *from, *to));
-                    }
+                if let Instruction::MakeRange(from, to, inclusive) = inst
+                    && !inclusive
+                {
+                    range_infos.push((vid, *from, *to));
                 }
             }
         }

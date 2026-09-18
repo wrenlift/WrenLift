@@ -1852,13 +1852,15 @@ mod tests {
         assert!(!Instruction::ConstNum(1.0).has_side_effects());
         assert!(!Instruction::Add(ValueId(0), ValueId(1)).has_side_effects());
         assert!(!Instruction::AddF64(ValueId(0), ValueId(1)).has_side_effects());
-        assert!(Instruction::Call {
-            receiver: ValueId(0),
-            method: SymbolId::from_raw(0),
-            args: vec![],
-            pure_call: false,
-        }
-        .has_side_effects());
+        assert!(
+            Instruction::Call {
+                receiver: ValueId(0),
+                method: SymbolId::from_raw(0),
+                args: vec![],
+                pure_call: false,
+            }
+            .has_side_effects()
+        );
         assert!(Instruction::SetField(ValueId(0), 0, ValueId(1)).has_side_effects());
         assert!(Instruction::SetModuleVar(0, ValueId(0)).has_side_effects());
     }

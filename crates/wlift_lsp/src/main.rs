@@ -471,15 +471,14 @@ impl LanguageServer for Backend {
         // class members and module-level shapes. Skips when the
         // cursor sits on a method-name (already handled by the
         // member-receiver path above).
-        if receiver_class.is_none() {
-            if let Some(a) = analysis.as_ref() {
-                if let Some(span_local) = a.local_var_decl_span_by_name(byte, ident) {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                        uri: uri.clone(),
-                        range: doc.byte_range_to_lsp(span_local),
-                    })));
-                }
-            }
+        if receiver_class.is_none()
+            && let Some(a) = analysis.as_ref()
+            && let Some(span_local) = a.local_var_decl_span_by_name(byte, ident)
+        {
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: doc.byte_range_to_lsp(span_local),
+            })));
         }
 
         // Class-name jump: cursor on a class identifier itself.
@@ -648,18 +647,19 @@ impl LanguageServer for Backend {
         // `String`, `List`, etc. directly. Only kick in for
         // lowercase-led identifiers — uppercase already gets
         // the bare-class-name shortcut below.
-        if class_name.is_none() && !recv.is_empty() {
-            if let (Some(a), Some(c)) = (
+        if class_name.is_none()
+            && !recv.is_empty()
+            && let (Some(a), Some(c)) = (
                 analysis.as_ref(),
                 recv.chars()
                     .next()
                     .filter(|c| c.is_ascii_lowercase() || *c == '_'),
-            ) {
-                let _ = c;
-                class_name = a
-                    .local_var_type_by_name(recv_start, recv)
-                    .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner));
-            }
+            )
+        {
+            let _ = c;
+            class_name = a
+                .local_var_type_by_name(recv_start, recv)
+                .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner));
         }
         if class_name.is_none()
             && !recv.is_empty()
@@ -1166,48 +1166,48 @@ fn identifier_hover(
 
     // Last-resort scan-all only when sema couldn't pin the
     // receiver type AND the text receiver isn't class-shaped.
-    if effective_receiver.is_none() {
-        if let Some(recv) = text_receiver {
-            let first = recv.chars().next().unwrap_or('_');
-            let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
-            if receiver_looks_like_value {
-                for m in &all {
-                    for class in &m.classes {
-                        for member in &class.members {
-                            if member.name == ident {
-                                let body = format!(
-                                    "```wren\n{}\n```{}{}",
-                                    wren_lift::docs::hover::format_member_sig(
-                                        &class.name,
-                                        &member.signature
-                                    ),
-                                    if member.doc.is_empty() { "" } else { "\n\n" },
-                                    member.doc,
-                                );
-                                return Some(Hover {
-                                    contents: HoverContents::Markup(MarkupContent {
-                                        kind: MarkupKind::Markdown,
-                                        value: body,
-                                    }),
-                                    range: Some(doc.byte_range_to_lsp(span)),
-                                });
-                            }
+    if effective_receiver.is_none()
+        && let Some(recv) = text_receiver
+    {
+        let first = recv.chars().next().unwrap_or('_');
+        let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
+        if receiver_looks_like_value {
+            for m in &all {
+                for class in &m.classes {
+                    for member in &class.members {
+                        if member.name == ident {
+                            let body = format!(
+                                "```wren\n{}\n```{}{}",
+                                wren_lift::docs::hover::format_member_sig(
+                                    &class.name,
+                                    &member.signature
+                                ),
+                                if member.doc.is_empty() { "" } else { "\n\n" },
+                                member.doc,
+                            );
+                            return Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: body,
+                                }),
+                                range: Some(doc.byte_range_to_lsp(span)),
+                            });
                         }
                     }
                 }
-            } else {
-                let body_md = format!(
-                    "```wren\n{}.{}\n```\n\n`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep the workspace hasn't loaded yet.",
-                    recv, ident, ident
-                );
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: body_md,
-                    }),
-                    range: Some(doc.byte_range_to_lsp(span)),
-                });
             }
+        } else {
+            let body_md = format!(
+                "```wren\n{}.{}\n```\n\n`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep the workspace hasn't loaded yet.",
+                recv, ident, ident
+            );
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: body_md,
+                }),
+                range: Some(doc.byte_range_to_lsp(span)),
+            });
         }
     }
 

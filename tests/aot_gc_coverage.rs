@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use wren_lift::codegen::aot::{
-    compile_walk_to_object_with_manifest, link_executable, locate_runtime_staticlib, walk_imports,
-    AotBundleMeta,
+    AotBundleMeta, compile_walk_to_object_with_manifest, link_executable, locate_runtime_staticlib,
+    walk_imports,
 };
 
 fn staticlib() -> PathBuf {

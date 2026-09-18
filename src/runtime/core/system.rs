@@ -183,12 +183,12 @@ fn system_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn system_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let obj = args[1];
     // Try calling toString on the object
-    if let Some(s) = ctx.call_method_on(obj, "toString", &[]) {
-        if super::is_string(s) {
-            let text = super::as_string(s);
-            ctx.write_output(text);
-            return Value::null();
-        }
+    if let Some(s) = ctx.call_method_on(obj, "toString", &[])
+        && super::is_string(s)
+    {
+        let text = super::as_string(s);
+        ctx.write_output(text);
+        return Value::null();
     }
     ctx.write_output("[invalid toString]");
     Value::null()

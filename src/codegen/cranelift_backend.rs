@@ -39,17 +39,17 @@
 pub mod cl {
     use crate::intern::Interner;
     use crate::mir::{
-        osr_external_live_values, osr_reachable_blocks, osr_rematerializable_defs, BlockId,
-        DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
+        BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
+        osr_external_live_values, osr_reachable_blocks, osr_rematerializable_defs,
     };
     use crate::runtime::object_layout::*;
+    use cranelift_codegen::Context;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::{
         AbiParam, BlockArg, Function, InstBuilder, MemFlagsData as MemFlags, Signature, Type, Value,
     };
     use cranelift_codegen::settings::{self, Configurable};
-    use cranelift_codegen::Context;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{Linkage, Module};
@@ -1947,16 +1947,16 @@ pub mod cl {
         }
 
         // 6. Compile
-        if std::env::var_os("WLIFT_CL_VERIFY").is_some() {
-            if let Err(errs) = cranelift_codegen::verify_function(&func, module.isa()) {
-                eprintln!(
-                    "cl-verify: {} (FuncId u0:{}) failed:\n{}\nIR:\n{}",
-                    safe_name,
-                    func_id.as_u32(),
-                    errs,
-                    func.display()
-                );
-            }
+        if std::env::var_os("WLIFT_CL_VERIFY").is_some()
+            && let Err(errs) = cranelift_codegen::verify_function(&func, module.isa())
+        {
+            eprintln!(
+                "cl-verify: {} (FuncId u0:{}) failed:\n{}\nIR:\n{}",
+                safe_name,
+                func_id.as_u32(),
+                errs,
+                func.display()
+            );
         }
         let mut ctx = Context::for_function(func);
         module
@@ -3232,19 +3232,19 @@ pub mod cl {
                 builder.switch_to_block(cont_block);
             }
 
-            if let Some((_, live)) = retier_polls.get(&bid) {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
-                    let missing: Vec<ValueId> = live
-                        .iter()
-                        .copied()
-                        .filter(|v| !val_map.contains_key(v))
-                        .collect();
-                    if !missing.is_empty() {
-                        eprintln!(
-                            "osr-trace: retier poll skipped at bb{} live-ins undefined: {:?}",
-                            bid.0, missing
-                        );
-                    }
+            if let Some((_, live)) = retier_polls.get(&bid)
+                && std::env::var_os("WLIFT_OSR_TRACE").is_some()
+            {
+                let missing: Vec<ValueId> = live
+                    .iter()
+                    .copied()
+                    .filter(|v| !val_map.contains_key(v))
+                    .collect();
+                if !missing.is_empty() {
+                    eprintln!(
+                        "osr-trace: retier poll skipped at bb{} live-ins undefined: {:?}",
+                        bid.0, missing
+                    );
                 }
             }
             if let Some(hook) = tier_hook
@@ -3369,16 +3369,16 @@ pub mod cl {
                                 // A promotable baseline body profiles
                                 // its arguments the way it does call
                                 // results; the receiver is never a Num.
-                                if idx > 0 {
-                                    if let Some(hook) = tier_hook.as_ref().filter(|h| {
+                                if idx > 0
+                                    && let Some(hook) = tier_hook.as_ref().filter(|h| {
                                         h.result_kinds != 0 && (vid.0 as usize) < h.result_kinds_len
-                                    }) {
-                                        emit_note_call_result(
-                                            builder,
-                                            hook.result_kinds + vid.0 as usize,
-                                            entry_params[idx],
-                                        );
-                                    }
+                                    })
+                                {
+                                    emit_note_call_result(
+                                        builder,
+                                        hook.result_kinds + vid.0 as usize,
+                                        entry_params[idx],
+                                    );
                                 }
                             }
                         }
@@ -3428,27 +3428,26 @@ pub mod cl {
             // abort-exit block, lazy-created on first need; the
             // post-loop emit fills in its body (roots-restore +
             // typed null return).
-            if let Some(cfg) = aot_config {
-                if block_idx != 0
-                    && cfg.current_jit_roots_snapshot_var.borrow().is_some()
-                    && f64_self_id.is_none()
-                {
-                    let existing = *cfg.current_abort_exit_block.borrow();
-                    let abort_exit = match existing {
-                        Some(b) => b,
-                        None => {
-                            let b = builder.create_block();
-                            *cfg.current_abort_exit_block.borrow_mut() = Some(b);
-                            b
-                        }
-                    };
-                    let f = get_runtime_fn(module, builder, "wren_aot_check_error", 0)?;
-                    let call = builder.ins().call(f, &[]);
-                    let err = builder.inst_results(call)[0];
-                    let cont = builder.create_block();
-                    builder.ins().brif(err, abort_exit, &[], cont, &[]);
-                    builder.switch_to_block(cont);
-                }
+            if let Some(cfg) = aot_config
+                && block_idx != 0
+                && cfg.current_jit_roots_snapshot_var.borrow().is_some()
+                && f64_self_id.is_none()
+            {
+                let existing = *cfg.current_abort_exit_block.borrow();
+                let abort_exit = match existing {
+                    Some(b) => b,
+                    None => {
+                        let b = builder.create_block();
+                        *cfg.current_abort_exit_block.borrow_mut() = Some(b);
+                        b
+                    }
+                };
+                let f = get_runtime_fn(module, builder, "wren_aot_check_error", 0)?;
+                let call = builder.ins().call(f, &[]);
+                let err = builder.inst_results(call)[0];
+                let cont = builder.create_block();
+                builder.ins().brif(err, abort_exit, &[], cont, &[]);
+                builder.switch_to_block(cont);
             }
 
             // Back-edge JIT-roots release. Emitted at the top of
@@ -3544,18 +3543,17 @@ pub mod cl {
                     val_map.insert(vid, val);
                     // A promotable baseline body profiles what each
                     // call returns for the top tier to speculate on.
-                    if let Some(ref hook) = tier_hook {
-                        if hook.result_kinds != 0
-                            && (vid.0 as usize) < hook.result_kinds_len
-                            && matches!(
-                                inst,
-                                Instruction::Call { .. }
-                                    | Instruction::CallKnownFunc { .. }
-                                    | Instruction::SuperCall { .. }
-                            )
-                        {
-                            emit_note_call_result(builder, hook.result_kinds + vid.0 as usize, val);
-                        }
+                    if let Some(ref hook) = tier_hook
+                        && hook.result_kinds != 0
+                        && (vid.0 as usize) < hook.result_kinds_len
+                        && matches!(
+                            inst,
+                            Instruction::Call { .. }
+                                | Instruction::CallKnownFunc { .. }
+                                | Instruction::SuperCall { .. }
+                        )
+                    {
+                        emit_note_call_result(builder, hook.result_kinds + vid.0 as usize, val);
                     }
                     if let Some(var) = osr_vars.get(&vid) {
                         builder.def_var(*var, val);
@@ -3578,14 +3576,12 @@ pub mod cl {
             if matches!(
                 block.terminator,
                 Terminator::Return(_) | Terminator::ReturnNull
-            ) {
-                if let Some(cfg) = aot_config {
-                    if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
-                        let snap = builder.use_var(snap_var);
-                        let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
-                        let _ = builder.ins().call(f, &[snap]);
-                    }
-                }
+            ) && let Some(cfg) = aot_config
+                && let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow()
+            {
+                let snap = builder.use_var(snap_var);
+                let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
+                let _ = builder.ins().call(f, &[snap]);
             }
 
             lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools)?;
@@ -3598,23 +3594,23 @@ pub mod cl {
         // error up. Returning the function's declared type avoids
         // a Cranelift verifier mismatch on f64-inner emit paths
         // (which never set this block in the first place).
-        if let Some(cfg) = aot_config {
-            if let Some(abort_exit) = *cfg.current_abort_exit_block.borrow() {
-                builder.switch_to_block(abort_exit);
-                if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
-                    let snap = builder.use_var(snap_var);
-                    let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
-                    let _ = builder.ins().call(f, &[snap]);
-                }
-                let return_ty = builder.func.signature.returns[0].value_type;
-                let null = if return_ty == types::F64 {
-                    let zero = builder.ins().iconst(types::I64, TAG_NULL as i64);
-                    builder.ins().bitcast(types::F64, MemFlags::new(), zero)
-                } else {
-                    builder.ins().iconst(return_ty, TAG_NULL as i64)
-                };
-                builder.ins().return_(&[null]);
+        if let Some(cfg) = aot_config
+            && let Some(abort_exit) = *cfg.current_abort_exit_block.borrow()
+        {
+            builder.switch_to_block(abort_exit);
+            if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
+                let snap = builder.use_var(snap_var);
+                let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
+                let _ = builder.ins().call(f, &[snap]);
             }
+            let return_ty = builder.func.signature.returns[0].value_type;
+            let null = if return_ty == types::F64 {
+                let zero = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                builder.ins().bitcast(types::F64, MemFlags::new(), zero)
+            } else {
+                builder.ins().iconst(return_ty, TAG_NULL as i64)
+            };
+            builder.ins().return_(&[null]);
         }
 
         Ok(())
@@ -4560,8 +4556,8 @@ pub mod cl {
                 )? {
                     return Ok(Some(simd_result));
                 }
-                if aot_config.is_none() {
-                    if let Some(v) = try_lower_list_protocol(
+                if aot_config.is_none()
+                    && let Some(v) = try_lower_list_protocol(
                         interner,
                         builder,
                         module,
@@ -4569,9 +4565,9 @@ pub mod cl {
                         r,
                         *method,
                         &arg_vals,
-                    )? {
-                        return Ok(Some(v));
-                    }
+                    )?
+                {
+                    return Ok(Some(v));
                 }
 
                 // ============================================================
@@ -4587,243 +4583,226 @@ pub mod cl {
                 // wired, monomorphic dispatch in AOT bodies costs `mask +
                 // load + icmp + brif + load`, not a runtime helper call.
                 // ============================================================
-                if let Some(cfg) = aot_config {
-                    if let Some(cha_ptr) = cfg.cha {
-                        let cha = unsafe { &*cha_ptr };
-                        let sig_text = interner.resolve(*method).to_string();
-                        if let Some(impls) = cha.by_sig.get(&sig_text) {
-                            if !impls.is_empty() {
-                                let merge_block = builder.create_block();
-                                builder.append_block_param(merge_block, types::I64);
+                if let Some(cfg) = aot_config
+                    && let Some(cha_ptr) = cfg.cha
+                {
+                    let cha = unsafe { &*cha_ptr };
+                    let sig_text = interner.resolve(*method).to_string();
+                    if let Some(impls) = cha.by_sig.get(&sig_text)
+                        && !impls.is_empty()
+                    {
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, types::I64);
 
-                                // Slow-path block — `wren_call_N` with
-                                // the remapped symbol. Reached either
-                                // when the receiver isn't an object at
-                                // all (Number / Null / Bool) or when no
-                                // CHA-known class matched. Created up
-                                // front so the is-object guard can
-                                // branch straight here without a class
-                                // load that would fault on non-object
-                                // receivers.
-                                let slow_block = builder.create_block();
+                        // Slow-path block — `wren_call_N` with
+                        // the remapped symbol. Reached either
+                        // when the receiver isn't an object at
+                        // all (Number / Null / Bool) or when no
+                        // CHA-known class matched. Created up
+                        // front so the is-object guard can
+                        // branch straight here without a class
+                        // load that would fault on non-object
+                        // receivers.
+                        let slow_block = builder.create_block();
 
-                                // Is-object guard: short-circuit to the
-                                // slow path before the receiver-class
-                                // load, since masking a Number Value
-                                // off the bottom 48 bits and reading
-                                // `+HEADER_CLASS` lands in unmapped
-                                // memory.
-                                let tag_obj_const =
-                                    builder.ins().iconst(types::I64, TAG_OBJ as i64);
-                                let high = builder.ins().band(r, tag_obj_const);
-                                let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj_const);
-                                let object_block = builder.create_block();
+                        // Is-object guard: short-circuit to the
+                        // slow path before the receiver-class
+                        // load, since masking a Number Value
+                        // off the bottom 48 bits and reading
+                        // `+HEADER_CLASS` lands in unmapped
+                        // memory.
+                        let tag_obj_const = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+                        let high = builder.ins().band(r, tag_obj_const);
+                        let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj_const);
+                        let object_block = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(is_obj, object_block, &[], slow_block, &[]);
+                        builder.switch_to_block(object_block);
+
+                        // Receiver's class header field.
+                        let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                        let recv_obj = builder.ins().band(r, mask);
+                        let recv_class_field = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            recv_obj,
+                            HEADER_CLASS,
+                        );
+
+                        // Chain a class-check per impl. Match
+                        // → emit body (direct call or inline
+                        // trivial-getter load), jump to merge.
+                        // Miss → fall to the next check or the
+                        // final `wren_call_N` slow block.
+                        for impl_ in impls {
+                            let next_check = builder.create_block();
+                            let fast_block = builder.create_block();
+
+                            let class_data_id = module
+                                .declare_data(
+                                    &impl_.class_modvars_symbol,
+                                    Linkage::Export,
+                                    true,
+                                    false,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            let gv = module.declare_data_in_func(class_data_id, builder.func);
+                            let modvars_addr = builder.ins().symbol_value(types::I64, gv);
+                            let boxed_cls = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                modvars_addr,
+                                (impl_.class_slot as i32) * 8,
+                            );
+                            let cls_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                            let expected_cls = builder.ins().band(boxed_cls, cls_mask);
+                            let eq =
                                 builder
                                     .ins()
-                                    .brif(is_obj, object_block, &[], slow_block, &[]);
-                                builder.switch_to_block(object_block);
+                                    .icmp(IntCC::Equal, recv_class_field, expected_cls);
+                            builder.ins().brif(eq, fast_block, &[], next_check, &[]);
 
-                                // Receiver's class header field.
-                                let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                                let recv_obj = builder.ins().band(r, mask);
-                                let recv_class_field = builder.ins().load(
+                            builder.switch_to_block(fast_block);
+                            let fast_result = if let Some(field_idx) = impl_.trivial_getter_field {
+                                // Inline trivial getter: load
+                                // recv.fields[field_idx].
+                                let fields_ptr = builder.ins().load(
                                     types::I64,
                                     MemFlags::trusted(),
                                     recv_obj,
-                                    HEADER_CLASS,
+                                    INSTANCE_FIELDS,
                                 );
-
-                                // Chain a class-check per impl. Match
-                                // → emit body (direct call or inline
-                                // trivial-getter load), jump to merge.
-                                // Miss → fall to the next check or the
-                                // final `wren_call_N` slow block.
-                                for impl_ in impls {
-                                    let next_check = builder.create_block();
-                                    let fast_block = builder.create_block();
-
-                                    let class_data_id = module
-                                        .declare_data(
-                                            &impl_.class_modvars_symbol,
-                                            Linkage::Export,
-                                            true,
-                                            false,
-                                        )
-                                        .map_err(|e| e.to_string())?;
-                                    let gv =
-                                        module.declare_data_in_func(class_data_id, builder.func);
-                                    let modvars_addr = builder.ins().symbol_value(types::I64, gv);
-                                    let boxed_cls = builder.ins().load(
-                                        types::I64,
-                                        MemFlags::trusted(),
-                                        modvars_addr,
-                                        (impl_.class_slot as i32) * 8,
-                                    );
-                                    let cls_mask =
-                                        builder.ins().iconst(types::I64, PTR_MASK as i64);
-                                    let expected_cls = builder.ins().band(boxed_cls, cls_mask);
-                                    let eq = builder.ins().icmp(
-                                        IntCC::Equal,
-                                        recv_class_field,
-                                        expected_cls,
-                                    );
-                                    builder.ins().brif(eq, fast_block, &[], next_check, &[]);
-
-                                    builder.switch_to_block(fast_block);
-                                    let fast_result = if let Some(field_idx) =
-                                        impl_.trivial_getter_field
-                                    {
-                                        // Inline trivial getter: load
-                                        // recv.fields[field_idx].
-                                        let fields_ptr = builder.ins().load(
-                                            types::I64,
-                                            MemFlags::trusted(),
-                                            recv_obj,
-                                            INSTANCE_FIELDS,
-                                        );
-                                        builder.ins().load(
-                                            types::I64,
-                                            MemFlags::trusted(),
-                                            fields_ptr,
-                                            (field_idx as i32) * 8,
-                                        )
-                                    } else {
-                                        // Direct call to the AOT'd
-                                        // method body. The body's
-                                        // MIR arity ALREADY counts
-                                        // the receiver — so the
-                                        // signature has `arity`
-                                        // params total (recv + N-1
-                                        // user args), and the call
-                                        // passes `[r, args...]` of
-                                        // matching length.
-                                        let mut sig = Signature::new(
-                                            module.target_config().default_call_conv,
-                                        );
-                                        for _ in 0..(impl_.arity as usize) {
-                                            sig.params.push(AbiParam::new(types::I64));
-                                        }
-                                        sig.returns.push(AbiParam::new(types::I64));
-                                        let body_id = module
-                                            .declare_function(
-                                                &impl_.fn_symbol,
-                                                Linkage::Import,
-                                                &sig,
-                                            )
-                                            .map_err(|e| e.to_string())?;
-                                        let fn_ref =
-                                            module.declare_func_in_func(body_id, builder.func);
-                                        let user_arity = (impl_.arity as usize).saturating_sub(1);
-                                        let mut call_args = vec![r];
-                                        for a in args.iter().take(user_arity) {
-                                            call_args.push(get(a));
-                                        }
-                                        // Pad with nulls when MIR
-                                        // site arg count is below
-                                        // the body's declared
-                                        // arity. Defensive — the
-                                        // resolver should have
-                                        // matched arities, but a
-                                        // mismatched signature
-                                        // would otherwise fault
-                                        // Cranelift's verifier.
-                                        while call_args.len() < impl_.arity as usize {
-                                            let null =
-                                                builder.ins().iconst(types::I64, TAG_NULL as i64);
-                                            call_args.push(null);
-                                        }
-                                        let call = builder.ins().call(fn_ref, &call_args);
-                                        builder.inst_results(call)[0]
-                                    };
-                                    builder
-                                        .ins()
-                                        .jump(merge_block, &[BlockArg::Value(fast_result)]);
-
-                                    builder.switch_to_block(next_check);
-                                }
-
-                                // Last next_check falls through here;
-                                // route it to the shared slow_block.
-                                builder.ins().jump(slow_block, &[]);
-                                builder.switch_to_block(slow_block);
-
-                                // Fallback: wren_call_N with the
-                                // remapped symbol — used when none of
-                                // the known impl class checks matched
-                                // (receiver was a prelude type or an
-                                // unrelated class).
-                                let slot = aot_intern_symbol(cfg, method.index(), interner);
-                                let sym_gv =
-                                    module.declare_data_in_func(cfg.symbols_data, builder.func);
-                                let sym_base = builder.ins().symbol_value(types::I64, sym_gv);
-                                let method_val = builder.ins().load(
+                                builder.ins().load(
                                     types::I64,
                                     MemFlags::trusted(),
-                                    sym_base,
-                                    (slot as i32) * 8,
-                                );
-                                // Pick the helper whose user-arg
-                                // count matches the call site. The
-                                // `wren_call_N` family ranges
-                                // 0..=8; arity > 8 routes through
-                                // `wren_call_dynamic` with a
-                                // stack-allocated args buffer so we
-                                // never silently truncate (which
-                                // surfaced as `Float32Array[_]=:
-                                // value must be a number` on the
-                                // sprite-batch path).
-                                let slow_result = if args.len() > 8 {
-                                    let f =
-                                        get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
-                                    let slot = builder.create_sized_stack_slot(
-                                        cranelift_codegen::ir::StackSlotData::new(
-                                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                                            (args.len() as u32) * 8,
-                                            3,
-                                        ),
-                                    );
-                                    let buf_ptr = builder.ins().stack_addr(types::I64, slot, 0);
-                                    for (i, a) in args.iter().enumerate() {
-                                        builder.ins().store(
-                                            MemFlags::trusted(),
-                                            get(a),
-                                            buf_ptr,
-                                            (i as i32) * 8,
-                                        );
-                                    }
-                                    let count = builder.ins().iconst(types::I64, args.len() as i64);
-                                    let call =
-                                        builder.ins().call(f, &[r, method_val, count, buf_ptr]);
-                                    builder.inst_results(call)[0]
-                                } else {
-                                    let call_name = match args.len() {
-                                        0 => "wren_call_0",
-                                        1 => "wren_call_1",
-                                        2 => "wren_call_2",
-                                        3 => "wren_call_3",
-                                        4 => "wren_call_4",
-                                        5 => "wren_call_5",
-                                        6 => "wren_call_6",
-                                        7 => "wren_call_7",
-                                        _ => "wren_call_8",
-                                    };
-                                    let f =
-                                        get_runtime_fn(module, builder, call_name, 2 + args.len())?;
-                                    let mut slow_args = vec![r, method_val];
-                                    for a in args.iter() {
-                                        slow_args.push(get(a));
-                                    }
-                                    let slow_call = builder.ins().call(f, &slow_args);
-                                    builder.inst_results(slow_call)[0]
-                                };
-                                builder
-                                    .ins()
-                                    .jump(merge_block, &[BlockArg::Value(slow_result)]);
+                                    fields_ptr,
+                                    (field_idx as i32) * 8,
+                                )
+                            } else {
+                                // Direct call to the AOT'd
+                                // method body. The body's
+                                // MIR arity ALREADY counts
+                                // the receiver — so the
+                                // signature has `arity`
+                                // params total (recv + N-1
+                                // user args), and the call
+                                // passes `[r, args...]` of
+                                // matching length.
+                                let mut sig =
+                                    Signature::new(module.target_config().default_call_conv);
+                                for _ in 0..(impl_.arity as usize) {
+                                    sig.params.push(AbiParam::new(types::I64));
+                                }
+                                sig.returns.push(AbiParam::new(types::I64));
+                                let body_id = module
+                                    .declare_function(&impl_.fn_symbol, Linkage::Import, &sig)
+                                    .map_err(|e| e.to_string())?;
+                                let fn_ref = module.declare_func_in_func(body_id, builder.func);
+                                let user_arity = (impl_.arity as usize).saturating_sub(1);
+                                let mut call_args = vec![r];
+                                for a in args.iter().take(user_arity) {
+                                    call_args.push(get(a));
+                                }
+                                // Pad with nulls when MIR
+                                // site arg count is below
+                                // the body's declared
+                                // arity. Defensive — the
+                                // resolver should have
+                                // matched arities, but a
+                                // mismatched signature
+                                // would otherwise fault
+                                // Cranelift's verifier.
+                                while call_args.len() < impl_.arity as usize {
+                                    let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                                    call_args.push(null);
+                                }
+                                let call = builder.ins().call(fn_ref, &call_args);
+                                builder.inst_results(call)[0]
+                            };
+                            builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(fast_result)]);
 
-                                builder.switch_to_block(merge_block);
-                                return Ok(Some(builder.block_params(merge_block)[0]));
-                            }
+                            builder.switch_to_block(next_check);
                         }
+
+                        // Last next_check falls through here;
+                        // route it to the shared slow_block.
+                        builder.ins().jump(slow_block, &[]);
+                        builder.switch_to_block(slow_block);
+
+                        // Fallback: wren_call_N with the
+                        // remapped symbol — used when none of
+                        // the known impl class checks matched
+                        // (receiver was a prelude type or an
+                        // unrelated class).
+                        let slot = aot_intern_symbol(cfg, method.index(), interner);
+                        let sym_gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
+                        let sym_base = builder.ins().symbol_value(types::I64, sym_gv);
+                        let method_val = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            sym_base,
+                            (slot as i32) * 8,
+                        );
+                        // Pick the helper whose user-arg
+                        // count matches the call site. The
+                        // `wren_call_N` family ranges
+                        // 0..=8; arity > 8 routes through
+                        // `wren_call_dynamic` with a
+                        // stack-allocated args buffer so we
+                        // never silently truncate (which
+                        // surfaced as `Float32Array[_]=:
+                        // value must be a number` on the
+                        // sprite-batch path).
+                        let slow_result = if args.len() > 8 {
+                            let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
+                            let slot = builder.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    (args.len() as u32) * 8,
+                                    3,
+                                ),
+                            );
+                            let buf_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                            for (i, a) in args.iter().enumerate() {
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    get(a),
+                                    buf_ptr,
+                                    (i as i32) * 8,
+                                );
+                            }
+                            let count = builder.ins().iconst(types::I64, args.len() as i64);
+                            let call = builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                            builder.inst_results(call)[0]
+                        } else {
+                            let call_name = match args.len() {
+                                0 => "wren_call_0",
+                                1 => "wren_call_1",
+                                2 => "wren_call_2",
+                                3 => "wren_call_3",
+                                4 => "wren_call_4",
+                                5 => "wren_call_5",
+                                6 => "wren_call_6",
+                                7 => "wren_call_7",
+                                _ => "wren_call_8",
+                            };
+                            let f = get_runtime_fn(module, builder, call_name, 2 + args.len())?;
+                            let mut slow_args = vec![r, method_val];
+                            for a in args.iter() {
+                                slow_args.push(get(a));
+                            }
+                            let slow_call = builder.ins().call(f, &slow_args);
+                            builder.inst_results(slow_call)[0]
+                        };
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                        builder.switch_to_block(merge_block);
+                        return Ok(Some(builder.block_params(merge_block)[0]));
                     }
                 }
 
@@ -4839,184 +4818,177 @@ pub mod cl {
                 // fast path while extending coverage to call sites
                 // that see multiple receiver classes (where the IC
                 // alone keeps thrashing).
-                if let Some(cha) = cha_by_method {
-                    if args.len() <= 4 {
-                        let impls: Vec<crate::runtime::engine::ChaImpl> =
-                            cha.get(method).cloned().unwrap_or_default();
-                        if !impls.is_empty() {
-                            let merge_block = builder.create_block();
-                            builder.append_block_param(merge_block, types::I64);
+                if let Some(cha) = cha_by_method
+                    && args.len() <= 4
+                {
+                    let impls: Vec<crate::runtime::engine::ChaImpl> =
+                        cha.get(method).cloned().unwrap_or_default();
+                    if !impls.is_empty() {
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, types::I64);
 
-                            // Non-objects (Numbers, Null, Bool, ...)
-                            // skip every class check and route to
-                            // wren_call_N; reading `recv.class` from
-                            // their NaN-box bits would dereference
-                            // garbage. The slow_block is the merge
-                            // target for both "no impl matched" and
-                            // "receiver isn't an object".
-                            let slow_block = builder.create_block();
-                            let (_obj_ptr, recv_class) =
-                                emit_class_load_guarded(builder, r, slow_block);
+                        // Non-objects (Numbers, Null, Bool, ...)
+                        // skip every class check and route to
+                        // wren_call_N; reading `recv.class` from
+                        // their NaN-box bits would dereference
+                        // garbage. The slow_block is the merge
+                        // target for both "no impl matched" and
+                        // "receiver isn't an object".
+                        let slow_block = builder.create_block();
+                        let (_obj_ptr, recv_class) =
+                            emit_class_load_guarded(builder, r, slow_block);
 
-                            for crate::runtime::engine::ChaImpl {
-                                class: class_ptr,
-                                fid,
-                                ..
-                            } in &impls
-                            {
-                                let next_check = builder.create_block();
-                                let fast_block = builder.create_block();
-                                let cached_class =
-                                    builder.ins().iconst(types::I64, *class_ptr as i64);
-                                let class_match =
-                                    builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
-                                builder
-                                    .ins()
-                                    .brif(class_match, fast_block, &[], next_check, &[]);
-
-                                builder.switch_to_block(fast_block);
-                                let inlinable_body =
-                                    inline_bodies.as_ref().and_then(|b| b.get(fid)).cloned();
-                                let mut emitted_inline = false;
-                                if let Some(callee_mir) = inlinable_body {
-                                    let mut callee_vals: HashMap<ValueId, Value> = HashMap::new();
-                                    let mut callee_args: Vec<Value> =
-                                        Vec::with_capacity(args.len() + 1);
-                                    callee_args.push(r);
-                                    for a in args.iter() {
-                                        callee_args.push(get(a));
-                                    }
-                                    let callee_block = &callee_mir.blocks[0];
-                                    let mut inline_failed = false;
-                                    let outer_class = INLINE_CLASS.replace(Some((r, *class_ptr)));
-                                    for (vid, callee_inst) in &callee_block.instructions {
-                                        match callee_inst {
-                                            Instruction::BlockParam(idx) => {
-                                                let i = *idx as usize;
-                                                if i < callee_args.len() {
-                                                    callee_vals.insert(*vid, callee_args[i]);
-                                                } else {
-                                                    inline_failed = true;
-                                                    break;
-                                                }
-                                            }
-                                            _ => {
-                                                let res = lower_instruction(
-                                                    callee_inst,
-                                                    &callee_mir,
-                                                    interner,
-                                                    builder,
-                                                    module,
-                                                    &callee_vals,
-                                                    get_runtime_fn,
-                                                    None,
-                                                    None,
-                                                    jit_code_base,
-                                                    None,
-                                                    f64_self_id,
-                                                    Some(callee_args[0]),
-                                                    aot_config,
-                                                    None,
-                                                    None,
-                                                    None,
-                                                )?;
-                                                if let Some(v) = res {
-                                                    callee_vals.insert(*vid, v);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    INLINE_CLASS.set(outer_class);
-                                    let return_val = if inline_failed {
-                                        None
-                                    } else {
-                                        match &callee_block.terminator {
-                                            Terminator::Return(v) => callee_vals.get(v).copied(),
-                                            Terminator::ReturnNull => Some(
-                                                builder.ins().iconst(types::I64, TAG_NULL as i64),
-                                            ),
-                                            _ => None,
-                                        }
-                                    };
-                                    if let Some(rv) = return_val {
-                                        builder.ins().jump(merge_block, &[BlockArg::Value(rv)]);
-                                        emitted_inline = true;
-                                    }
-                                }
-
-                                if !emitted_inline {
-                                    // Helper-based fast path for
-                                    // non-inlinable callees. Mirrors
-                                    // the kind=1 IC fast block (class
-                                    // check + nocheck helper). Args
-                                    // capped at 3 since the *_nocheck
-                                    // family only goes up to arity 3.
-                                    if args.len() <= 3 {
-                                        let packed =
-                                            (*fid as u64) | ((method.index() as u64) << 32);
-                                        let fid_val =
-                                            builder.ins().iconst(types::I64, packed as i64);
-                                        let fast_name = match args.len() {
-                                            0 => "wren_known_call_0_nocheck",
-                                            1 => "wren_known_call_1_nocheck",
-                                            2 => "wren_known_call_2_nocheck",
-                                            _ => "wren_known_call_3_nocheck",
-                                        };
-                                        let fast_arg_count = 2 + args.len();
-                                        let fast_f = get_runtime_fn(
-                                            module,
-                                            builder,
-                                            fast_name,
-                                            fast_arg_count,
-                                        )?;
-                                        let mut fast_args = vec![fid_val, r];
-                                        for a in args.iter() {
-                                            fast_args.push(get(a));
-                                        }
-                                        let fast_call = builder.ins().call(fast_f, &fast_args);
-                                        let fast_result = builder.inst_results(fast_call)[0];
-                                        builder
-                                            .ins()
-                                            .jump(merge_block, &[BlockArg::Value(fast_result)]);
-                                    } else {
-                                        // Arity 4: fall through to
-                                        // wren_call_N at the tail.
-                                        builder.ins().jump(next_check, &[]);
-                                    }
-                                }
-
-                                builder.switch_to_block(next_check);
-                            }
-
-                            // After all class checks miss, fall into
-                            // the shared slow_block (also reached by
-                            // the is-object guard for non-object
-                            // receivers).
-                            builder.ins().jump(slow_block, &[]);
-
-                            builder.switch_to_block(slow_block);
-                            // No class matched — full dispatch
-                            // through `emit_wren_call`, which picks
-                            // the right `wren_call_N` (0..=8) or
-                            // routes 9+ through `wren_call_dynamic`.
-                            let method_bits = method.index() as u64;
-                            let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                            let arg_vals: Vec<_> = args.iter().map(&get).collect();
-                            let slow_result = emit_wren_call(
-                                builder,
-                                module,
-                                get_runtime_fn,
-                                r,
-                                method_val,
-                                &arg_vals,
-                            )?;
+                        for crate::runtime::engine::ChaImpl {
+                            class: class_ptr,
+                            fid,
+                            ..
+                        } in &impls
+                        {
+                            let next_check = builder.create_block();
+                            let fast_block = builder.create_block();
+                            let cached_class = builder.ins().iconst(types::I64, *class_ptr as i64);
+                            let class_match =
+                                builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
                             builder
                                 .ins()
-                                .jump(merge_block, &[BlockArg::Value(slow_result)]);
+                                .brif(class_match, fast_block, &[], next_check, &[]);
 
-                            builder.switch_to_block(merge_block);
-                            return Ok(Some(builder.block_params(merge_block)[0]));
+                            builder.switch_to_block(fast_block);
+                            let inlinable_body =
+                                inline_bodies.as_ref().and_then(|b| b.get(fid)).cloned();
+                            let mut emitted_inline = false;
+                            if let Some(callee_mir) = inlinable_body {
+                                let mut callee_vals: HashMap<ValueId, Value> = HashMap::new();
+                                let mut callee_args: Vec<Value> =
+                                    Vec::with_capacity(args.len() + 1);
+                                callee_args.push(r);
+                                for a in args.iter() {
+                                    callee_args.push(get(a));
+                                }
+                                let callee_block = &callee_mir.blocks[0];
+                                let mut inline_failed = false;
+                                let outer_class = INLINE_CLASS.replace(Some((r, *class_ptr)));
+                                for (vid, callee_inst) in &callee_block.instructions {
+                                    match callee_inst {
+                                        Instruction::BlockParam(idx) => {
+                                            let i = *idx as usize;
+                                            if i < callee_args.len() {
+                                                callee_vals.insert(*vid, callee_args[i]);
+                                            } else {
+                                                inline_failed = true;
+                                                break;
+                                            }
+                                        }
+                                        _ => {
+                                            let res = lower_instruction(
+                                                callee_inst,
+                                                &callee_mir,
+                                                interner,
+                                                builder,
+                                                module,
+                                                &callee_vals,
+                                                get_runtime_fn,
+                                                None,
+                                                None,
+                                                jit_code_base,
+                                                None,
+                                                f64_self_id,
+                                                Some(callee_args[0]),
+                                                aot_config,
+                                                None,
+                                                None,
+                                                None,
+                                            )?;
+                                            if let Some(v) = res {
+                                                callee_vals.insert(*vid, v);
+                                            }
+                                        }
+                                    }
+                                }
+                                INLINE_CLASS.set(outer_class);
+                                let return_val = if inline_failed {
+                                    None
+                                } else {
+                                    match &callee_block.terminator {
+                                        Terminator::Return(v) => callee_vals.get(v).copied(),
+                                        Terminator::ReturnNull => {
+                                            Some(builder.ins().iconst(types::I64, TAG_NULL as i64))
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                if let Some(rv) = return_val {
+                                    builder.ins().jump(merge_block, &[BlockArg::Value(rv)]);
+                                    emitted_inline = true;
+                                }
+                            }
+
+                            if !emitted_inline {
+                                // Helper-based fast path for
+                                // non-inlinable callees. Mirrors
+                                // the kind=1 IC fast block (class
+                                // check + nocheck helper). Args
+                                // capped at 3 since the *_nocheck
+                                // family only goes up to arity 3.
+                                if args.len() <= 3 {
+                                    let packed = (*fid as u64) | ((method.index() as u64) << 32);
+                                    let fid_val = builder.ins().iconst(types::I64, packed as i64);
+                                    let fast_name = match args.len() {
+                                        0 => "wren_known_call_0_nocheck",
+                                        1 => "wren_known_call_1_nocheck",
+                                        2 => "wren_known_call_2_nocheck",
+                                        _ => "wren_known_call_3_nocheck",
+                                    };
+                                    let fast_arg_count = 2 + args.len();
+                                    let fast_f =
+                                        get_runtime_fn(module, builder, fast_name, fast_arg_count)?;
+                                    let mut fast_args = vec![fid_val, r];
+                                    for a in args.iter() {
+                                        fast_args.push(get(a));
+                                    }
+                                    let fast_call = builder.ins().call(fast_f, &fast_args);
+                                    let fast_result = builder.inst_results(fast_call)[0];
+                                    builder
+                                        .ins()
+                                        .jump(merge_block, &[BlockArg::Value(fast_result)]);
+                                } else {
+                                    // Arity 4: fall through to
+                                    // wren_call_N at the tail.
+                                    builder.ins().jump(next_check, &[]);
+                                }
+                            }
+
+                            builder.switch_to_block(next_check);
                         }
+
+                        // After all class checks miss, fall into
+                        // the shared slow_block (also reached by
+                        // the is-object guard for non-object
+                        // receivers).
+                        builder.ins().jump(slow_block, &[]);
+
+                        builder.switch_to_block(slow_block);
+                        // No class matched — full dispatch
+                        // through `emit_wren_call`, which picks
+                        // the right `wren_call_N` (0..=8) or
+                        // routes 9+ through `wren_call_dynamic`.
+                        let method_bits = method.index() as u64;
+                        let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                        let arg_vals: Vec<_> = args.iter().map(&get).collect();
+                        let slow_result = emit_wren_call(
+                            builder,
+                            module,
+                            get_runtime_fn,
+                            r,
+                            method_val,
+                            &arg_vals,
+                        )?;
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                        builder.switch_to_block(merge_block);
+                        return Ok(Some(builder.block_params(merge_block)[0]));
                     }
                 }
 
@@ -5340,124 +5312,115 @@ pub mod cl {
                 // helper hop, no jit_ctx swap, no jit_roots push, no
                 // depth tracking — i.e. the AOT-shape direct call,
                 // but with a per-callsite speculation guard.
-                if let Some(bodies) = inline_bodies {
-                    if *expected_class != 0 && args.len() <= 4 {
-                        if let Some(callee_mir) = bodies.get(func_id).cloned() {
-                            let fast_block = builder.create_block();
-                            let slow_block = builder.create_block();
-                            let merge_block = builder.create_block();
-                            builder.append_block_param(merge_block, types::I64);
+                if let Some(bodies) = inline_bodies
+                    && *expected_class != 0
+                    && args.len() <= 4
+                    && let Some(callee_mir) = bodies.get(func_id).cloned()
+                {
+                    let fast_block = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, types::I64);
 
-                            // is-object guard + class load. Non-objects
-                            // skip the inlined body and route to the
-                            // slow path.
-                            let (_obj_ptr, recv_class) =
-                                emit_class_load_guarded(builder, r, slow_block);
-                            let cached_class =
-                                builder.ins().iconst(types::I64, *expected_class as i64);
-                            let class_match =
-                                builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
-                            builder
-                                .ins()
-                                .brif(class_match, fast_block, &[], slow_block, &[]);
+                    // is-object guard + class load. Non-objects
+                    // skip the inlined body and route to the
+                    // slow path.
+                    let (_obj_ptr, recv_class) = emit_class_load_guarded(builder, r, slow_block);
+                    let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
+                    let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                    builder
+                        .ins()
+                        .brif(class_match, fast_block, &[], slow_block, &[]);
 
-                            // Fast block: walk the callee's single
-                            // block, lowering each instruction into the
-                            // caller's function with a fresh local
-                            // val_map. BlockParam(i) maps to the
-                            // caller-supplied receiver/arg values.
-                            builder.switch_to_block(fast_block);
-                            let mut callee_vals: HashMap<ValueId, Value> = HashMap::new();
-                            // arg slot 0 = receiver, 1.. = user args.
-                            let mut callee_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
-                            callee_args.push(r);
-                            for a in args.iter() {
-                                callee_args.push(get(a));
-                            }
-                            let callee_block = &callee_mir.blocks[0];
-                            let mut inline_failed = false;
-                            let outer_class = INLINE_CLASS.replace(Some((r, *expected_class)));
-                            for (vid, callee_inst) in &callee_block.instructions {
-                                match callee_inst {
-                                    Instruction::BlockParam(idx) => {
-                                        let i = *idx as usize;
-                                        if i < callee_args.len() {
-                                            callee_vals.insert(*vid, callee_args[i]);
-                                        } else {
-                                            // Eligibility check should have
-                                            // matched arity, but stay defensive.
-                                            inline_failed = true;
-                                            break;
-                                        }
-                                    }
-                                    _ => {
-                                        let res = lower_instruction(
-                                            callee_inst,
-                                            &callee_mir,
-                                            interner,
-                                            builder,
-                                            module,
-                                            &callee_vals,
-                                            get_runtime_fn,
-                                            None,
-                                            None,
-                                            jit_code_base,
-                                            None,
-                                            f64_self_id,
-                                            Some(callee_args[0]),
-                                            aot_config,
-                                            None,
-                                            None,
-                                            None,
-                                        )?;
-                                        if let Some(v) = res {
-                                            callee_vals.insert(*vid, v);
-                                        }
-                                    }
+                    // Fast block: walk the callee's single
+                    // block, lowering each instruction into the
+                    // caller's function with a fresh local
+                    // val_map. BlockParam(i) maps to the
+                    // caller-supplied receiver/arg values.
+                    builder.switch_to_block(fast_block);
+                    let mut callee_vals: HashMap<ValueId, Value> = HashMap::new();
+                    // arg slot 0 = receiver, 1.. = user args.
+                    let mut callee_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                    callee_args.push(r);
+                    for a in args.iter() {
+                        callee_args.push(get(a));
+                    }
+                    let callee_block = &callee_mir.blocks[0];
+                    let mut inline_failed = false;
+                    let outer_class = INLINE_CLASS.replace(Some((r, *expected_class)));
+                    for (vid, callee_inst) in &callee_block.instructions {
+                        match callee_inst {
+                            Instruction::BlockParam(idx) => {
+                                let i = *idx as usize;
+                                if i < callee_args.len() {
+                                    callee_vals.insert(*vid, callee_args[i]);
+                                } else {
+                                    // Eligibility check should have
+                                    // matched arity, but stay defensive.
+                                    inline_failed = true;
+                                    break;
                                 }
                             }
-                            INLINE_CLASS.set(outer_class);
-                            let return_val = if inline_failed {
-                                None
-                            } else {
-                                match &callee_block.terminator {
-                                    Terminator::Return(v) => callee_vals.get(v).copied(),
-                                    Terminator::ReturnNull => {
-                                        Some(builder.ins().iconst(types::I64, TAG_NULL as i64))
-                                    }
-                                    _ => None,
+                            _ => {
+                                let res = lower_instruction(
+                                    callee_inst,
+                                    &callee_mir,
+                                    interner,
+                                    builder,
+                                    module,
+                                    &callee_vals,
+                                    get_runtime_fn,
+                                    None,
+                                    None,
+                                    jit_code_base,
+                                    None,
+                                    f64_self_id,
+                                    Some(callee_args[0]),
+                                    aot_config,
+                                    None,
+                                    None,
+                                    None,
+                                )?;
+                                if let Some(v) = res {
+                                    callee_vals.insert(*vid, v);
                                 }
-                            };
-                            if let Some(rv) = return_val {
-                                builder.ins().jump(merge_block, &[BlockArg::Value(rv)]);
-                            } else {
-                                // Inline fell through (unsupported terminator
-                                // or missing param) — collapse the fast block
-                                // into the slow path so emit stays sound.
-                                builder.ins().jump(slow_block, &[]);
                             }
-
-                            // Slow path: full dispatch via emit_wren_call.
-                            builder.switch_to_block(slow_block);
-                            let method_bits = method.index() as u64;
-                            let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                            let arg_vals: Vec<_> = args.iter().map(&get).collect();
-                            let slow_result = emit_wren_call(
-                                builder,
-                                module,
-                                get_runtime_fn,
-                                r,
-                                method_val,
-                                &arg_vals,
-                            )?;
-                            builder
-                                .ins()
-                                .jump(merge_block, &[BlockArg::Value(slow_result)]);
-
-                            builder.switch_to_block(merge_block);
-                            return Ok(Some(builder.block_params(merge_block)[0]));
                         }
                     }
+                    INLINE_CLASS.set(outer_class);
+                    let return_val = if inline_failed {
+                        None
+                    } else {
+                        match &callee_block.terminator {
+                            Terminator::Return(v) => callee_vals.get(v).copied(),
+                            Terminator::ReturnNull => {
+                                Some(builder.ins().iconst(types::I64, TAG_NULL as i64))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(rv) = return_val {
+                        builder.ins().jump(merge_block, &[BlockArg::Value(rv)]);
+                    } else {
+                        // Inline fell through (unsupported terminator
+                        // or missing param) — collapse the fast block
+                        // into the slow path so emit stays sound.
+                        builder.ins().jump(slow_block, &[]);
+                    }
+
+                    // Slow path: full dispatch via emit_wren_call.
+                    builder.switch_to_block(slow_block);
+                    let method_bits = method.index() as u64;
+                    let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
+                    let slow_result =
+                        emit_wren_call(builder, module, get_runtime_fn, r, method_val, &arg_vals)?;
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                    builder.switch_to_block(merge_block);
+                    return Ok(Some(builder.block_params(merge_block)[0]));
                 }
 
                 // === Pure-leaf direct call (ZERO FFI) ===
@@ -5482,107 +5445,95 @@ pub mod cl {
                     && *direct
                     && *expected_class != 0
                     && args.len() <= 4
+                    && let Some(jit_base_ptr) = jit_code_base
                 {
-                    if let Some(jit_base_ptr) = jit_code_base {
-                        let fast_block = builder.create_block();
-                        let slow_block = builder.create_block();
-                        let merge_block = builder.create_block();
-                        builder.append_block_param(merge_block, types::I64);
+                    let fast_block = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, types::I64);
 
-                        // is-object guard + class load.
-                        let (_obj_ptr, recv_class) =
-                            emit_class_load_guarded(builder, r, slow_block);
-                        let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
-                        let class_match =
-                            builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
-                        builder
-                            .ins()
-                            .brif(class_match, fast_block, &[], slow_block, &[]);
+                    // is-object guard + class load.
+                    let (_obj_ptr, recv_class) = emit_class_load_guarded(builder, r, slow_block);
+                    let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
+                    let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                    builder
+                        .ins()
+                        .brif(class_match, fast_block, &[], slow_block, &[]);
 
-                        // Fast path: load the callee's JIT slot and call_indirect.
-                        // slot_addr = jit_code_base + func_id * 8
-                        builder.switch_to_block(fast_block);
-                        let slot_addr = unsafe { jit_base_ptr.add(*func_id as usize) as i64 };
-                        let slot_addr_val = builder.ins().iconst(types::I64, slot_addr);
-                        let jit_ptr =
-                            builder
-                                .ins()
-                                .load(types::I64, MemFlags::new(), slot_addr_val, 0);
-                        // Guard: if slot is null (callee not yet compiled),
-                        // fall to slow path.
-                        let zero = builder.ins().iconst(types::I64, 0);
-                        let has_jit = builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
-                        let depth_block = builder.create_block();
-                        let pure_call_block = builder.create_block();
-                        builder
-                            .ins()
-                            .brif(has_jit, depth_block, &[], slow_block, &[]);
-                        builder.switch_to_block(depth_block);
-                        let depth_addr = builder.ins().iconst(
-                            types::I64,
-                            &crate::codegen::runtime_fns::JIT_DIRECT_DEPTH
-                                as *const std::sync::atomic::AtomicU32
-                                as i64,
-                        );
-                        let depth =
-                            builder
-                                .ins()
-                                .load(types::I32, MemFlags::trusted(), depth_addr, 0);
-                        let room = builder.ins().icmp_imm_u(
-                            IntCC::UnsignedLessThan,
-                            depth,
-                            crate::codegen::runtime_fns::MAX_JIT_DEPTH as i64,
-                        );
-                        builder
-                            .ins()
-                            .brif(room, pure_call_block, &[], slow_block, &[]);
+                    // Fast path: load the callee's JIT slot and call_indirect.
+                    // slot_addr = jit_code_base + func_id * 8
+                    builder.switch_to_block(fast_block);
+                    let slot_addr = unsafe { jit_base_ptr.add(*func_id as usize) as i64 };
+                    let slot_addr_val = builder.ins().iconst(types::I64, slot_addr);
+                    let jit_ptr = builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), slot_addr_val, 0);
+                    // Guard: if slot is null (callee not yet compiled),
+                    // fall to slow path.
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let has_jit = builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
+                    let depth_block = builder.create_block();
+                    let pure_call_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(has_jit, depth_block, &[], slow_block, &[]);
+                    builder.switch_to_block(depth_block);
+                    let depth_addr = builder.ins().iconst(
+                        types::I64,
+                        &crate::codegen::runtime_fns::JIT_DIRECT_DEPTH
+                            as *const std::sync::atomic::AtomicU32 as i64,
+                    );
+                    let depth = builder
+                        .ins()
+                        .load(types::I32, MemFlags::trusted(), depth_addr, 0);
+                    let room = builder.ins().icmp_imm_u(
+                        IntCC::UnsignedLessThan,
+                        depth,
+                        crate::codegen::runtime_fns::MAX_JIT_DEPTH as i64,
+                    );
+                    builder
+                        .ins()
+                        .brif(room, pure_call_block, &[], slow_block, &[]);
 
-                        builder.switch_to_block(pure_call_block);
-                        let deeper = builder.ins().iadd_imm_u(depth, 1);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), deeper, depth_addr, 0);
-                        // Direct call signature: (recv, args...) -> i64
-                        let mut sig = module.make_signature();
-                        sig.params.push(AbiParam::new(types::I64)); // recv
-                        for _ in args.iter() {
-                            sig.params.push(AbiParam::new(types::I64));
-                        }
-                        sig.returns.push(AbiParam::new(types::I64));
-                        let sig_ref = builder.import_signature(sig);
-                        let mut call_args = vec![r];
-                        for a in args {
-                            call_args.push(get(a));
-                        }
-                        let call = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
-                        let fast_result = builder.inst_results(call)[0];
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), depth, depth_addr, 0);
-                        builder
-                            .ins()
-                            .jump(merge_block, &[BlockArg::Value(fast_result)]);
-
-                        // Slow path: full dispatch via emit_wren_call.
-                        builder.switch_to_block(slow_block);
-                        let method_bits = method.index() as u64;
-                        let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                        let arg_vals: Vec<_> = args.iter().map(&get).collect();
-                        let slow_result = emit_wren_call(
-                            builder,
-                            module,
-                            get_runtime_fn,
-                            r,
-                            method_val,
-                            &arg_vals,
-                        )?;
-                        builder
-                            .ins()
-                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
-
-                        builder.switch_to_block(merge_block);
-                        return Ok(Some(builder.block_params(merge_block)[0]));
+                    builder.switch_to_block(pure_call_block);
+                    let deeper = builder.ins().iadd_imm_u(depth, 1);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), deeper, depth_addr, 0);
+                    // Direct call signature: (recv, args...) -> i64
+                    let mut sig = module.make_signature();
+                    sig.params.push(AbiParam::new(types::I64)); // recv
+                    for _ in args.iter() {
+                        sig.params.push(AbiParam::new(types::I64));
                     }
+                    sig.returns.push(AbiParam::new(types::I64));
+                    let sig_ref = builder.import_signature(sig);
+                    let mut call_args = vec![r];
+                    for a in args {
+                        call_args.push(get(a));
+                    }
+                    let call = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
+                    let fast_result = builder.inst_results(call)[0];
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), depth, depth_addr, 0);
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(fast_result)]);
+
+                    // Slow path: full dispatch via emit_wren_call.
+                    builder.switch_to_block(slow_block);
+                    let method_bits = method.index() as u64;
+                    let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
+                    let slow_result =
+                        emit_wren_call(builder, module, get_runtime_fn, r, method_val, &arg_vals)?;
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                    builder.switch_to_block(merge_block);
+                    return Ok(Some(builder.block_params(merge_block)[0]));
                 }
 
                 // === Trivial-getter inline path ===
@@ -5908,33 +5859,33 @@ pub mod cl {
             // already populates `ctx.closure` and the helper
             // amortises away under tier-up perf budgets).
             Instruction::GetUpvalue(idx) => {
-                if let Some(cfg) = aot_config {
-                    if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
-                        let closure_ptr = builder.use_var(var);
-                        let upvalues_data = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            closure_ptr,
-                            CLOSURE_UPVALUES_DATA,
-                        );
-                        let upvalue_ptr = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            upvalues_data,
-                            (*idx as i32) * 8,
-                        );
-                        let location_ptr = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            upvalue_ptr,
-                            UPVALUE_LOCATION,
-                        );
-                        let value =
-                            builder
-                                .ins()
-                                .load(types::I64, MemFlags::trusted(), location_ptr, 0);
-                        return Ok(Some(value));
-                    }
+                if let Some(cfg) = aot_config
+                    && let Some(var) = *cfg.current_closure_ptr_var.borrow()
+                {
+                    let closure_ptr = builder.use_var(var);
+                    let upvalues_data = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        closure_ptr,
+                        CLOSURE_UPVALUES_DATA,
+                    );
+                    let upvalue_ptr = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        upvalues_data,
+                        (*idx as i32) * 8,
+                    );
+                    let location_ptr = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        upvalue_ptr,
+                        UPVALUE_LOCATION,
+                    );
+                    let value =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), location_ptr, 0);
+                    return Ok(Some(value));
                 }
                 let f = get_runtime_fn(module, builder, "wren_get_upvalue", 1)?;
                 let idx_val = builder.ins().iconst(types::I64, *idx as i64);
@@ -5942,37 +5893,37 @@ pub mod cl {
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::SetUpvalue(idx, val) => {
-                if let Some(cfg) = aot_config {
-                    if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
-                        let closure_ptr = builder.use_var(var);
-                        let upvalues_data = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            closure_ptr,
-                            CLOSURE_UPVALUES_DATA,
-                        );
-                        let upvalue_ptr = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            upvalues_data,
-                            (*idx as i32) * 8,
-                        );
-                        let location_ptr = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            upvalue_ptr,
-                            UPVALUE_LOCATION,
-                        );
-                        let v = get(val);
-                        builder.ins().store(MemFlags::trusted(), v, location_ptr, 0);
-                        // Generational write barrier: the upvalue
-                        // header is the slot's owner; a young value
-                        // stored into an old upvalue must surface to
-                        // the major GC's remembered set.
-                        let barrier = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
-                        builder.ins().call(barrier, &[upvalue_ptr, v]);
-                        return Ok(Some(v));
-                    }
+                if let Some(cfg) = aot_config
+                    && let Some(var) = *cfg.current_closure_ptr_var.borrow()
+                {
+                    let closure_ptr = builder.use_var(var);
+                    let upvalues_data = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        closure_ptr,
+                        CLOSURE_UPVALUES_DATA,
+                    );
+                    let upvalue_ptr = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        upvalues_data,
+                        (*idx as i32) * 8,
+                    );
+                    let location_ptr = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        upvalue_ptr,
+                        UPVALUE_LOCATION,
+                    );
+                    let v = get(val);
+                    builder.ins().store(MemFlags::trusted(), v, location_ptr, 0);
+                    // Generational write barrier: the upvalue
+                    // header is the slot's owner; a young value
+                    // stored into an old upvalue must surface to
+                    // the major GC's remembered set.
+                    let barrier = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
+                    builder.ins().call(barrier, &[upvalue_ptr, v]);
+                    return Ok(Some(v));
                 }
                 let f = get_runtime_fn(module, builder, "wren_set_upvalue", 2)?;
                 let idx_val = builder.ins().iconst(types::I64, *idx as i64);
@@ -5993,24 +5944,24 @@ pub mod cl {
             // defining class is in scope) keeps the legacy
             // `wren_get/set_static_field` call.
             Instruction::GetStaticField(sym) => {
-                if let Some(cfg) = aot_config {
-                    if let Some(defining) = cfg.current_defining_class.borrow().as_ref() {
-                        let class_data_id = module
-                            .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
-                            .map_err(|e| e.to_string())?;
-                        let gv = module.declare_data_in_func(class_data_id, builder.func);
-                        let modvars_addr = builder.ins().symbol_value(types::I64, gv);
-                        let class_bits = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            modvars_addr,
-                            (defining.slot as i32) * 8,
-                        );
-                        let f = get_runtime_fn(module, builder, "wlift_aot_get_static_field", 2)?;
-                        let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
-                        let result = builder.ins().call(f, &[class_bits, sym_val]);
-                        return Ok(Some(builder.inst_results(result)[0]));
-                    }
+                if let Some(cfg) = aot_config
+                    && let Some(defining) = cfg.current_defining_class.borrow().as_ref()
+                {
+                    let class_data_id = module
+                        .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
+                        .map_err(|e| e.to_string())?;
+                    let gv = module.declare_data_in_func(class_data_id, builder.func);
+                    let modvars_addr = builder.ins().symbol_value(types::I64, gv);
+                    let class_bits = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        modvars_addr,
+                        (defining.slot as i32) * 8,
+                    );
+                    let f = get_runtime_fn(module, builder, "wlift_aot_get_static_field", 2)?;
+                    let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
+                    let result = builder.ins().call(f, &[class_bits, sym_val]);
+                    return Ok(Some(builder.inst_results(result)[0]));
                 }
                 let f = get_runtime_fn(module, builder, "wren_get_static_field", 1)?;
                 let idx_val = builder.ins().iconst(types::I64, sym.index() as i64);
@@ -6018,24 +5969,24 @@ pub mod cl {
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::SetStaticField(sym, val) => {
-                if let Some(cfg) = aot_config {
-                    if let Some(defining) = cfg.current_defining_class.borrow().as_ref() {
-                        let class_data_id = module
-                            .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
-                            .map_err(|e| e.to_string())?;
-                        let gv = module.declare_data_in_func(class_data_id, builder.func);
-                        let modvars_addr = builder.ins().symbol_value(types::I64, gv);
-                        let class_bits = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            modvars_addr,
-                            (defining.slot as i32) * 8,
-                        );
-                        let f = get_runtime_fn(module, builder, "wlift_aot_set_static_field", 3)?;
-                        let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
-                        let result = builder.ins().call(f, &[class_bits, sym_val, get(val)]);
-                        return Ok(Some(builder.inst_results(result)[0]));
-                    }
+                if let Some(cfg) = aot_config
+                    && let Some(defining) = cfg.current_defining_class.borrow().as_ref()
+                {
+                    let class_data_id = module
+                        .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
+                        .map_err(|e| e.to_string())?;
+                    let gv = module.declare_data_in_func(class_data_id, builder.func);
+                    let modvars_addr = builder.ins().symbol_value(types::I64, gv);
+                    let class_bits = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        modvars_addr,
+                        (defining.slot as i32) * 8,
+                    );
+                    let f = get_runtime_fn(module, builder, "wlift_aot_set_static_field", 3)?;
+                    let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
+                    let result = builder.ins().call(f, &[class_bits, sym_val, get(val)]);
+                    return Ok(Some(builder.inst_results(result)[0]));
                 }
                 let f = get_runtime_fn(module, builder, "wren_set_static_field", 2)?;
                 let idx_val = builder.ins().iconst(types::I64, sym.index() as i64);
@@ -7036,10 +6987,10 @@ pub mod cl {
                 // Prepend receiver (param #0) for self-calls to match arity.
                 // f64 inner functions don't need the receiver (they use
                 // a reduced signature).
-                if f64_self_id.is_none() {
-                    if let Some(recv) = receiver_val {
-                        call_args.push(recv);
-                    }
+                if f64_self_id.is_none()
+                    && let Some(recv) = receiver_val
+                {
+                    call_args.push(recv);
                 }
                 for a in args {
                     call_args.push(get(a));

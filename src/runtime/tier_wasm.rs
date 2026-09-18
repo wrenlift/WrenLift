@@ -402,11 +402,11 @@ pub unsafe fn module_vars_ptr_for_closure(
             return cached.1;
         }
     }
-    let fn_ptr = (*closure).function;
+    let fn_ptr = unsafe { (*closure).function };
     if fn_ptr.is_null() {
         return std::ptr::null_mut();
     }
-    let func_id = FuncId((*fn_ptr).fn_id);
+    let func_id = FuncId(unsafe { (*fn_ptr).fn_id });
     let module_name = match vm.engine.func_module(func_id) {
         Some(name) => name.clone(),
         None => return std::ptr::null_mut(),

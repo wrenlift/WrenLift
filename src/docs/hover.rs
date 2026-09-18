@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use crate::ast::{Expr, Module, Spanned, Stmt};
 use crate::intern::{Interner, SymbolId};
-use crate::sema::types::{infer_types_with_classes, InferredType, TypeEnv};
+use crate::sema::types::{InferredType, TypeEnv, infer_types_with_classes};
 
 use super::{ModuleDoc, ParamTypeInfo};
 
@@ -579,10 +579,10 @@ fn walk_stmt_for_call<'a>(
             if out.is_none() {
                 walk_stmt_for_call(then_branch, byte, out);
             }
-            if out.is_none() {
-                if let Some(eb) = else_branch {
-                    walk_stmt_for_call(eb, byte, out);
-                }
+            if out.is_none()
+                && let Some(eb) = else_branch
+            {
+                walk_stmt_for_call(eb, byte, out);
             }
         }
         Stmt::While { condition, body } => {
@@ -637,10 +637,10 @@ fn walk_expr_for_call<'a>(
                     return;
                 }
             }
-            if span_contains(&method.1, byte) {
-                if let Some(recv) = receiver {
-                    *out = Some(recv);
-                }
+            if span_contains(&method.1, byte)
+                && let Some(recv) = receiver
+            {
+                *out = Some(recv);
             }
         }
         Expr::UnaryOp { operand, .. } => walk_expr_for_call(operand, byte, out),
@@ -918,7 +918,10 @@ pub fn identifier_kind_hint(
                 "Imported from `{}`. Docs may still be loading — they appear once the workspace finishes resolving the dep graph.",
                 pkg
             ),
-            None => "No matching class in the local module, loaded `@hatch:*` packages, or the prelude.".into(),
+            None => {
+                "No matching class in the local module, loaded `@hatch:*` packages, or the prelude."
+                    .into()
+            }
         };
         return Some((format!("class {}", ident), body));
     }
@@ -1065,11 +1068,7 @@ pub fn infer_rhs_type(rhs: &str, prelude: &[ModuleDoc]) -> Option<String> {
             }
             b')' => {
                 depth -= 1;
-                if depth == 0 {
-                    Some(i)
-                } else {
-                    None
-                }
+                if depth == 0 { Some(i) } else { None }
             }
             _ => None,
         });
@@ -1106,11 +1105,7 @@ pub fn infer_rhs_type(rhs: &str, prelude: &[ModuleDoc]) -> Option<String> {
                 }
                 b')' => {
                     depth -= 1;
-                    if depth == 0 {
-                        Some(i)
-                    } else {
-                        None
-                    }
+                    if depth == 0 { Some(i) } else { None }
                 }
                 _ => None,
             });
@@ -1277,11 +1272,11 @@ fn find_for_binding(source: &str, ident: &str, scope_start: usize) -> Option<(us
     }
     let after_for = trimmed["for".len()..].trim_start();
     let after_paren = after_for.strip_prefix('(')?.trim_start();
-    if let Some(tail) = after_paren.strip_prefix(ident) {
-        if tail.starts_with(' ') || tail.starts_with('\t') || tail.starts_with("in") {
-            let line_no = source[..line_start].matches('\n').count() + 1;
-            return Some((line_no, line.to_string()));
-        }
+    if let Some(tail) = after_paren.strip_prefix(ident)
+        && (tail.starts_with(' ') || tail.starts_with('\t') || tail.starts_with("in"))
+    {
+        let line_no = source[..line_start].matches('\n').count() + 1;
+        return Some((line_no, line.to_string()));
     }
     None
 }
@@ -1377,7 +1372,7 @@ mod tests {
         assert!(!is_keyword(""));
     }
 
-    use super::{inferred_to_class_name, Analysis};
+    use super::{Analysis, inferred_to_class_name};
 
     #[test]
     fn field_type_resolves_via_sema_list_literal() {

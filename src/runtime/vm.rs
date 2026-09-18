@@ -6,8 +6,8 @@ use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Hot reload — SIGUSR1-driven reload-pending flag.
@@ -105,12 +105,14 @@ use crate::intern::{Interner, SymbolId};
 /// `addr` must be a valid pointer into the process address space.
 #[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
 unsafe fn dladdr_symbol(addr: *const ()) -> Option<String> {
-    let mut info: libc::Dl_info = std::mem::zeroed();
-    if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
-        return None;
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
+        cstr.to_str().ok().map(|s| s.to_string())
     }
-    let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
-    cstr.to_str().ok().map(|s| s.to_string())
 }
 
 #[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
@@ -910,8 +912,8 @@ impl VM {
     pub fn compile_source_to_blob(&mut self, source: &str) -> Result<Vec<u8>, InterpretResult> {
         use crate::diagnostics::Severity;
         use crate::mir::opt::{
-            self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
-            sra::Sra, MirPass,
+            self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
+            licm::Licm, sra::Sra,
         };
         use crate::parse::parser;
         use crate::sema;
@@ -1297,11 +1299,7 @@ impl VM {
     ) {
         let resolve = |raw: &str| -> std::path::PathBuf {
             let p = std::path::PathBuf::from(raw);
-            if p.is_absolute() {
-                p
-            } else {
-                root.join(p)
-            }
+            if p.is_absolute() { p } else { root.join(p) }
         };
         for raw in &manifest.native_search_paths {
             let path = resolve(raw);
@@ -1490,11 +1488,11 @@ impl VM {
         // error raised inside this module renders through ariadne's
         // labelled-span path rather than the bare-prose fallback.
         for section in &hatch.sections {
-            if matches!(section.kind, crate::hatch::SectionKind::Source) {
-                if let Ok(text) = std::str::from_utf8(&section.data) {
-                    self.module_sources
-                        .insert(section.name.clone(), text.to_string());
-                }
+            if matches!(section.kind, crate::hatch::SectionKind::Source)
+                && let Ok(text) = std::str::from_utf8(&section.data)
+            {
+                self.module_sources
+                    .insert(section.name.clone(), text.to_string());
             }
         }
 
@@ -1652,8 +1650,8 @@ impl VM {
     fn interpret_inner(&mut self, module_name: &str, source: &str) -> InterpretResult {
         use crate::diagnostics::Severity;
         use crate::mir::opt::{
-            self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
-            sra::Sra, MirPass,
+            self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
+            licm::Licm, sra::Sra,
         };
         use crate::parse::parser;
         use crate::sema;
@@ -1715,15 +1713,14 @@ impl VM {
                 module: mod_path,
                 names: _,
             } = &stmt.0
+                && let Err(result) = self.load_import(&mod_path.0, module_name)
             {
-                if let Err(result) = self.load_import(&mod_path.0, module_name) {
-                    self.loading_modules.remove(&module_key);
-                    return result;
-                }
-                // Imported names are resolved by name after MIR compilation
-                // when building the module var storage; here we only ensure
-                // the imported module exists.
+                self.loading_modules.remove(&module_key);
+                return result;
             }
+            // Imported names are resolved by name after MIR compilation
+            // when building the module var storage; here we only ensure
+            // the imported module exists.
         }
 
         // 4. Lower to MIR. Thread `field_layouts` through so subclasses
@@ -2226,10 +2223,10 @@ impl VM {
             ("Hatch", "hatch"),
         ];
         for name in &var_names {
-            if let Some(&(_, module_id)) = builtin_for_var.iter().find(|(cls, _)| *cls == name) {
-                if !self.engine.modules.contains_key(module_id) {
-                    let _ = self.try_load_builtin_module(module_id);
-                }
+            if let Some(&(_, module_id)) = builtin_for_var.iter().find(|(cls, _)| *cls == name)
+                && !self.engine.modules.contains_key(module_id)
+            {
+                let _ = self.try_load_builtin_module(module_id);
             }
         }
         let mut module_vars = Vec::with_capacity(var_names.len());
@@ -2310,10 +2307,10 @@ impl VM {
         );
         // Baseline mtime for the SIGUSR1 watcher. Only meaningful for
         // user modules whose canonical name is an absolute path.
-        if std::path::Path::new(module_name).is_absolute() {
-            if let Some(mt) = file_mtime_secs(module_name) {
-                self.module_mtimes.insert(module_name.to_string(), mt);
-            }
+        if std::path::Path::new(module_name).is_absolute()
+            && let Some(mt) = file_mtime_secs(module_name)
+        {
+            self.module_mtimes.insert(module_name.to_string(), mt);
         }
 
         // 8b. Create user-defined classes and bind their methods.
@@ -2847,12 +2844,12 @@ impl VM {
 
         // Append spawn trace if present
         let spawn_trace = unsafe { &(*fiber).spawn_trace };
-        if let Some(frames) = spawn_trace {
-            if !frames.is_empty() {
-                trace.push("  --- spawned at ---".to_string());
-                for frame in frames {
-                    trace.push(frame.to_string());
-                }
+        if let Some(frames) = spawn_trace
+            && !frames.is_empty()
+        {
+            trace.push("  --- spawned at ---".to_string());
+            for frame in frames {
+                trace.push(frame.to_string());
             }
         }
 
@@ -2897,32 +2894,32 @@ impl VM {
         loc: Option<&super::vm_interp::SourceLoc>,
         fiber: *mut ObjFiber,
     ) {
-        if let Some(loc) = loc {
-            if let Some(source) = self.module_sources.get(loc.module.as_str()) {
-                let mut diag = crate::diagnostics::Diagnostic::error(error.to_string())
-                    .with_label(loc.span.clone(), "error occurred here");
+        if let Some(loc) = loc
+            && let Some(source) = self.module_sources.get(loc.module.as_str())
+        {
+            let mut diag = crate::diagnostics::Diagnostic::error(error.to_string())
+                .with_label(loc.span.clone(), "error occurred here");
 
-                // Add contextual help note
-                if let Some(help) = Self::error_help(error) {
-                    diag = diag.with_note(help);
-                }
-
-                // Add stack trace as a note (uses full cross-fiber trace when enabled)
-                let trace = self.build_full_fiber_trace(fiber);
-                if trace.len() > 1 {
-                    let trace_str = format!("stack trace:\n{}", trace.join("\n"));
-                    diag = diag.with_note(trace_str);
-                }
-
-                if self.output_buffer.is_some() {
-                    // In test mode, render to string via error_fn
-                    let rendered = diag.render_to_string(source);
-                    self.report_error(&rendered);
-                } else {
-                    diag.eprint(source);
-                }
-                return;
+            // Add contextual help note
+            if let Some(help) = Self::error_help(error) {
+                diag = diag.with_note(help);
             }
+
+            // Add stack trace as a note (uses full cross-fiber trace when enabled)
+            let trace = self.build_full_fiber_trace(fiber);
+            if trace.len() > 1 {
+                let trace_str = format!("stack trace:\n{}", trace.join("\n"));
+                diag = diag.with_note(trace_str);
+            }
+
+            if self.output_buffer.is_some() {
+                // In test mode, render to string via error_fn
+                let rendered = diag.render_to_string(source);
+                self.report_error(&rendered);
+            } else {
+                diag.eprint(source);
+            }
+            return;
         }
         // Fallback: no source location available (e.g. error
         // raised inside a hatch-bundled module that didn't ship
@@ -2996,17 +2993,17 @@ impl VM {
             // borrow of the fiber exists. The region (if present)
             // lives inside the ObjFiber and stays valid for the
             // fiber's lifetime.
-            if let Some(region) = unsafe { (*self.fiber).region.as_deref_mut() } {
-                if let Some(ptr) = region.try_alloc(ObjString::new(s.clone())) {
-                    unsafe {
-                        (*ptr).header.class = self.string_class;
-                        (*ptr).header.flags |= crate::runtime::object::FLAG_ARENA_ALLOCATED;
-                    }
-                    return Value::object(ptr as *mut u8);
+            if let Some(region) = unsafe { (*self.fiber).region.as_deref_mut() }
+                && let Some(ptr) = region.try_alloc(ObjString::new(s.clone()))
+            {
+                unsafe {
+                    (*ptr).header.class = self.string_class;
+                    (*ptr).header.flags |= crate::runtime::object::FLAG_ARENA_ALLOCATED;
                 }
-                // Region cap exceeded — fall through to the GC heap.
-                // `s` was cloned above so it's still usable.
+                return Value::object(ptr as *mut u8);
             }
+            // Region cap exceeded — fall through to the GC heap.
+            // `s` was cloned above so it's still usable.
         }
         let obj = if s.len() <= INTERN_THRESHOLD {
             self.gc.intern_string(s)
@@ -3141,10 +3138,10 @@ impl VM {
     /// first use and kept alive by the VM.
     pub fn closure_fn(&mut self, fn_id: u32, upvalue_count: u16) -> *mut ObjFn {
         let idx = fn_id as usize;
-        if let Some(&ptr) = self.closure_fns.get(idx) {
-            if !ptr.is_null() {
-                return ptr;
-            }
+        if let Some(&ptr) = self.closure_fns.get(idx)
+            && !ptr.is_null()
+        {
+            return ptr;
         }
         let arity = self
             .engine
@@ -3383,14 +3380,14 @@ impl VM {
         let target_sym = self.interner.lookup(name)?;
         for entry in self.engine.modules.values() {
             for &var_val in &entry.vars {
-                if var_val.is_object() {
-                    if let Some(ptr) = var_val.as_object() {
-                        let header = ptr as *const ObjHeader;
-                        if unsafe { (*header).obj_type } == ObjType::Class {
-                            let cls = ptr as *mut ObjClass;
-                            if unsafe { (*cls).name } == target_sym {
-                                return Some(var_val);
-                            }
+                if var_val.is_object()
+                    && let Some(ptr) = var_val.as_object()
+                {
+                    let header = ptr as *const ObjHeader;
+                    if unsafe { (*header).obj_type } == ObjType::Class {
+                        let cls = ptr as *mut ObjClass;
+                        if unsafe { (*cls).name } == target_sym {
+                            return Some(var_val);
                         }
                     }
                 }
@@ -3980,7 +3977,11 @@ impl VM {
                                 let next = sps_dump.iter().copied().find(|o| *o > offset);
                                 eprintln!(
                                     "    [gc] unmatched offset={}, nearest≤={:?} next>={:?} (first={:?} last={:?})",
-                                    offset, nearest, next, sps_dump.first(), sps_dump.last()
+                                    offset,
+                                    nearest,
+                                    next,
+                                    sps_dump.first(),
+                                    sps_dump.last()
                                 );
                             }
                         }
@@ -4898,10 +4899,10 @@ impl VM {
                 cur = fibers
                     .iter()
                     .position(|&(_, lo, hi, _, _)| caller_sp >= lo && caller_sp < hi);
-                if let Some(j) = cur {
-                    if on_chain[j] {
-                        break;
-                    }
+                if let Some(j) = cur
+                    && on_chain[j]
+                {
+                    break;
                 }
             }
             // Whatever the chain resumed from last is the host stack, when
@@ -5543,11 +5544,7 @@ impl NativeContext for VM {
             "Map" => self.map_class,
             _ => return None,
         };
-        if cls.is_null() {
-            None
-        } else {
-            Some(cls)
-        }
+        if cls.is_null() { None } else { Some(cls) }
     }
 
     fn trigger_gc(&mut self) {
@@ -5643,8 +5640,8 @@ impl VM {
     fn eval_source_in_module(&mut self, module_name: &str, source: &str) -> bool {
         use crate::diagnostics::Severity;
         use crate::mir::opt::{
-            constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
-            run_to_fixpoint, sra::Sra, MirPass,
+            MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+            run_to_fixpoint, sra::Sra,
         };
         use crate::parse::parser;
 
@@ -5821,10 +5818,10 @@ impl VM {
             let eval_vals = eval_entry.vars.clone();
             if let Some(calling_entry) = self.engine.modules.get_mut(module_name) {
                 for (i, name) in eval_names.iter().enumerate() {
-                    if let Some(j) = calling_entry.var_names.iter().position(|n| n == name) {
-                        if i < eval_vals.len() {
-                            calling_entry.vars[j] = eval_vals[i];
-                        }
+                    if let Some(j) = calling_entry.var_names.iter().position(|n| n == name)
+                        && i < eval_vals.len()
+                    {
+                        calling_entry.vars[j] = eval_vals[i];
                     }
                 }
             }
@@ -5843,8 +5840,8 @@ impl VM {
     fn compile_to_closure(&mut self, source: &str, is_expression: bool) -> Option<Value> {
         use crate::diagnostics::Severity;
         use crate::mir::opt::{
-            constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
-            run_to_fixpoint, sra::Sra, MirPass,
+            MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+            run_to_fixpoint, sra::Sra,
         };
         use crate::parse::parser;
 
@@ -7352,10 +7349,10 @@ fn extract_archive_imports(src: &str) -> Vec<String> {
 fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32]) {
     for block in &mut func.blocks {
         for (_, inst) in &mut block.instructions {
-            if let crate::mir::Instruction::MakeClosure { fn_id, .. } = inst {
-                if let Some(&actual_id) = closure_func_ids.get(*fn_id as usize) {
-                    *fn_id = actual_id;
-                }
+            if let crate::mir::Instruction::MakeClosure { fn_id, .. } = inst
+                && let Some(&actual_id) = closure_func_ids.get(*fn_id as usize)
+            {
+                *fn_id = actual_id;
             }
         }
     }
@@ -8882,14 +8879,18 @@ System.print(f.stackTrace)
         let cls = vm.string_class;
 
         let empty = vm.new_string("".to_string());
-        assert!(call_primitive(&mut vm, cls, "isEmpty", &[empty])
-            .as_bool()
-            .unwrap());
+        assert!(
+            call_primitive(&mut vm, cls, "isEmpty", &[empty])
+                .as_bool()
+                .unwrap()
+        );
 
         let nonempty = vm.new_string("a".to_string());
-        assert!(!call_primitive(&mut vm, cls, "isEmpty", &[nonempty])
-            .as_bool()
-            .unwrap());
+        assert!(
+            !call_primitive(&mut vm, cls, "isEmpty", &[nonempty])
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[test]

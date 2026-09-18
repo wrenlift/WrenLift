@@ -24,8 +24,8 @@ use crate::portable_time::Instant;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -295,8 +295,10 @@ impl ImmixGc {
 
 /// `Visit` over a `&mut dyn FnMut(*mut u8)` passed as the context.
 unsafe extern "C" fn visit_dyn(start: *mut u8, ctx: *mut c_void) {
-    let f = &mut *(ctx as *mut &mut dyn FnMut(*mut u8));
-    f(start);
+    unsafe {
+        let f = &mut *(ctx as *mut &mut dyn FnMut(*mut u8));
+        f(start);
+    }
 }
 
 /// The objects claimed for the open cycle and not yet traced.
@@ -341,7 +343,9 @@ impl Gray {
 /// # Safety
 /// `obj` must be a live `ObjHeader`-led object.
 pub(super) unsafe fn object_trace<F: FnMut(*mut u8)>(obj: *mut u8, mut mark: F) {
-    gc::for_each_child(obj as *mut ObjHeader, &mut |child| mark(child as *mut u8));
+    unsafe {
+        gc::for_each_child(obj as *mut ObjHeader, &mut |child| mark(child as *mut u8));
+    }
 }
 
 fn lookup_interned(
@@ -363,20 +367,22 @@ fn lookup_interned(
 /// `obj` must be a dead `ObjHeader`-led object that no live object
 /// refers to; it is not touched again.
 pub(super) unsafe fn object_drop(obj: *mut u8) {
-    let header = obj as *mut ObjHeader;
-    let closing = CLOSING.get();
-    if !closing.is_null() {
-        let gc = &mut *closing;
-        match (*header).obj_type {
-            ObjType::Class | ObjType::Closure | ObjType::Fn | ObjType::Module => {
-                gc.freed_code_objects = true;
+    unsafe {
+        let header = obj as *mut ObjHeader;
+        let closing = CLOSING.get();
+        if !closing.is_null() {
+            let gc = &mut *closing;
+            match (*header).obj_type {
+                ObjType::Class | ObjType::Closure | ObjType::Fn | ObjType::Module => {
+                    gc.freed_code_objects = true;
+                }
+                ObjType::Fiber => lock(&gc.fibers).retain(|&f| f as *mut ObjHeader != header),
+                ObjType::String => gc.unlink_intern(header),
+                _ => {}
             }
-            ObjType::Fiber => lock(&gc.fibers).retain(|&f| f as *mut ObjHeader != header),
-            ObjType::String => gc.unlink_intern(header),
-            _ => {}
         }
+        gc::drop_in_place_by_type(header);
     }
-    gc::drop_in_place_by_type(header);
 }
 
 impl Drop for ImmixGc {

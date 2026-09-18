@@ -101,10 +101,10 @@ fn seq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             return Value::bool(true);
         }
         // Also check via == for objects
-        if let Some(result) = ctx.call_method_on(element, "==(_)", &[value]) {
-            if !result.is_falsy() {
-                return Value::bool(true);
-            }
+        if let Some(result) = ctx.call_method_on(element, "==(_)", &[value])
+            && !result.is_falsy()
+        {
+            return Value::bool(true);
         }
     }
 }
@@ -144,10 +144,10 @@ fn seq_count_where(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             Some(v) => v,
             None => return Value::num(count),
         };
-        if let Some(result) = ctx.call_method_on(func, "call(_)", &[value]) {
-            if !result.is_falsy() {
-                count += 1.0;
-            }
+        if let Some(result) = ctx.call_method_on(func, "call(_)", &[value])
+            && !result.is_falsy()
+        {
+            count += 1.0;
         }
     }
 }
@@ -316,10 +316,10 @@ pub(crate) fn value_to_string(ctx: &mut dyn NativeContext, value: Value) -> Stri
     }
 
     // Try calling toString on the object
-    if let Some(s) = ctx.call_method_on(value, "toString", &[]) {
-        if super::is_string(s) {
-            return super::as_string(s).to_string();
-        }
+    if let Some(s) = ctx.call_method_on(value, "toString", &[])
+        && super::is_string(s)
+    {
+        return super::as_string(s).to_string();
     }
     "<object>".to_string()
 }

@@ -252,10 +252,10 @@ impl<'a> Resolver<'a> {
     }
 
     fn pop_scope(&mut self) {
-        if let Some(scope) = self.scopes.pop() {
-            if !scope.upvalues.is_empty() {
-                self.upvalue_map.insert(scope.scope_id, scope.upvalues);
-            }
+        if let Some(scope) = self.scopes.pop()
+            && !scope.upvalues.is_empty()
+        {
+            self.upvalue_map.insert(scope.scope_id, scope.upvalues);
         }
     }
 

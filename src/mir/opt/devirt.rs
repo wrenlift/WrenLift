@@ -107,25 +107,25 @@ impl<'a> MirPass for Devirt<'a> {
 
                         if let Some(known) = known_types.get(receiver) {
                             // Num arithmetic devirtualization
-                            if *known == KnownType::Num && args.len() == 1 {
-                                if let Some(replacement) =
+                            if *known == KnownType::Num
+                                && args.len() == 1
+                                && let Some(replacement) =
                                     self.devirt_num_method(method_name, *receiver, args[0])
-                                {
-                                    replacements.push((inst_idx, *vid, replacement));
-                                    changed = true;
-                                    continue;
-                                }
+                            {
+                                replacements.push((inst_idx, *vid, replacement));
+                                changed = true;
+                                continue;
                             }
 
                             // Num comparison devirtualization
-                            if *known == KnownType::Num && args.len() == 1 {
-                                if let Some(replacement) =
+                            if *known == KnownType::Num
+                                && args.len() == 1
+                                && let Some(replacement) =
                                     self.devirt_num_compare(method_name, *receiver, args[0])
-                                {
-                                    replacements.push((inst_idx, *vid, replacement));
-                                    changed = true;
-                                    continue;
-                                }
+                            {
+                                replacements.push((inst_idx, *vid, replacement));
+                                changed = true;
+                                continue;
                             }
 
                             // String/List/Map count devirtualization

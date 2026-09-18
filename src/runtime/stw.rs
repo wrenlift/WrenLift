@@ -11,7 +11,7 @@
 //! scheduler, or back in the embedder) is scanned where it stands
 //! and waits at its next transition to running.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::runtime::value::Value;
@@ -480,11 +480,7 @@ pub mod poll_page {
                 0,
             )
         };
-        if p == libc::MAP_FAILED {
-            0
-        } else {
-            p as usize
-        }
+        if p == libc::MAP_FAILED { 0 } else { p as usize }
     }
 
     #[cfg(not(all(unix, feature = "host")))]

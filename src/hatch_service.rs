@@ -639,10 +639,10 @@ pub(crate) fn extract_code_from_request(req: &str) -> Option<String> {
     let path = first.split_whitespace().nth(1)?;
     let (_, query) = path.split_once('?')?;
     for kv in query.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            if k == "code" {
-                return Some(urldecode(v));
-            }
+        if let Some((k, v)) = kv.split_once('=')
+            && k == "code"
+        {
+            return Some(urldecode(v));
         }
     }
     None
@@ -653,12 +653,13 @@ fn urldecode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
         }
         if bytes[i] == b'+' {
             out.push(b' ');

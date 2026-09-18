@@ -8,8 +8,8 @@
 /// 4. When no register is free, spill the interval ending latest
 /// 5. Rewrite all VRegs to assigned PhysRegs, inserting spill/reload as needed
 use super::{
-    MachFunc, MachInst, Mem, PhysReg, RegClass, VReg, ABI_RET_SENTINEL, CALL_SCRATCH_SENTINEL,
-    COPY_SCRATCH_SENTINEL, CTX_PTR_SENTINEL, FRAME_PTR_SENTINEL, SPILL_SCRATCH_SENTINEL,
+    ABI_RET_SENTINEL, CALL_SCRATCH_SENTINEL, COPY_SCRATCH_SENTINEL, CTX_PTR_SENTINEL,
+    FRAME_PTR_SENTINEL, MachFunc, MachInst, Mem, PhysReg, RegClass, SPILL_SCRATCH_SENTINEL, VReg,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -1499,7 +1499,7 @@ mod tests {
         let target = x86_64_target_regs();
         assert_eq!(target.gp_allocatable.len(), 12); // 16 - RSP(4) - RBP(5) - R10(10) - R11(11)
         assert_eq!(target.fp_allocatable.len(), 15); // XMM0-XMM14
-                                                     // Verify excluded registers.
+        // Verify excluded registers.
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 4)); // no RSP
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 5)); // no RBP
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 11)); // no R11
@@ -1572,10 +1572,10 @@ mod tests {
 
         // FP vregs should all be allocated to FP physical registers.
         for (vreg, loc) in &result.assignments {
-            if vreg.is_fp() {
-                if let Location::Reg(p) = loc {
-                    assert_eq!(p.class, RegClass::Fp);
-                }
+            if vreg.is_fp()
+                && let Location::Reg(p) = loc
+            {
+                assert_eq!(p.class, RegClass::Fp);
             }
         }
     }

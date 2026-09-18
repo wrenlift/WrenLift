@@ -2020,13 +2020,13 @@ impl ExecutableFunction {
     pub unsafe fn as_fn<F: Copy>(&self) -> F {
         match self {
             #[cfg(feature = "host")]
-            ExecutableFunction::X86_64(code) => code.as_fn(),
+            ExecutableFunction::X86_64(code) => unsafe { code.as_fn() },
             #[cfg(all(target_arch = "aarch64", feature = "host"))]
-            ExecutableFunction::Aarch64(code) => code.as_fn(),
+            ExecutableFunction::Aarch64(code) => unsafe { code.as_fn() },
             #[cfg(feature = "cranelift")]
-            ExecutableFunction::Cranelift(cl) => std::mem::transmute_copy(&cl.fn_ptr),
+            ExecutableFunction::Cranelift(cl) => unsafe { std::mem::transmute_copy(&cl.fn_ptr) },
             #[cfg(feature = "llvm")]
-            ExecutableFunction::Llvm(l) => std::mem::transmute_copy(&l.fn_ptr),
+            ExecutableFunction::Llvm(l) => unsafe { std::mem::transmute_copy(&l.fn_ptr) },
             #[allow(unreachable_patterns)]
             _ => panic!("ExecutableFunction::as_fn called on a wasm-only build"),
         }
@@ -2361,13 +2361,13 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 // WLIFT_ENABLE_POSTDEVIRT_CSE; default off pending
                 // root-cause of an intermittent Linux x86_64 SIGSEGV
                 // on delta_blue.
-                if std::env::var_os("WLIFT_ENABLE_POSTDEVIRT_CSE").is_some() {
-                    if let Some(purity) = callee_purity.clone() {
-                        use crate::mir::opt::cse::Cse;
-                        use crate::mir::opt::MirPass;
-                        let cse = Cse::with_callee_purity(purity);
-                        cse.run(&mut devirt_mir);
-                    }
+                if std::env::var_os("WLIFT_ENABLE_POSTDEVIRT_CSE").is_some()
+                    && let Some(purity) = callee_purity.clone()
+                {
+                    use crate::mir::opt::MirPass;
+                    use crate::mir::opt::cse::Cse;
+                    let cse = Cse::with_callee_purity(purity);
+                    cse.run(&mut devirt_mir);
                 }
                 &devirt_mir
             } else {
@@ -2539,7 +2539,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 }
                 #[cfg(not(target_arch = "aarch64"))]
                 Target::Aarch64 => {
-                    return Err("aarch64 codegen is only available on aarch64 hosts".into())
+                    return Err("aarch64 codegen is only available on aarch64 hosts".into());
                 }
                 Target::Wasm => unreachable!(),
             };
@@ -5995,25 +5995,31 @@ mod tests {
 
     #[test]
     fn test_inst_side_effects() {
-        assert!(!MachInst::IAdd {
-            dst: VReg::gp(0),
-            lhs: VReg::gp(1),
-            rhs: VReg::gp(2),
-        }
-        .has_side_effects());
+        assert!(
+            !MachInst::IAdd {
+                dst: VReg::gp(0),
+                lhs: VReg::gp(1),
+                rhs: VReg::gp(2),
+            }
+            .has_side_effects()
+        );
 
-        assert!(MachInst::Str {
-            src: VReg::gp(0),
-            mem: Mem::new(VReg::gp(1), 0),
-        }
-        .has_side_effects());
+        assert!(
+            MachInst::Str {
+                src: VReg::gp(0),
+                mem: Mem::new(VReg::gp(1), 0),
+            }
+            .has_side_effects()
+        );
 
-        assert!(MachInst::CallRuntime {
-            name: "foo",
-            args: vec![],
-            ret: None,
-        }
-        .has_side_effects());
+        assert!(
+            MachInst::CallRuntime {
+                name: "foo",
+                args: vec![],
+                ret: None,
+            }
+            .has_side_effects()
+        );
 
         assert!(MachInst::Ret.has_side_effects());
         assert!(MachInst::Trap.has_side_effects());
@@ -7264,7 +7270,7 @@ mod tests {
 
     #[test]
     fn test_return_spilled_value_reloads_into_abi_return_reg() {
-        use crate::codegen::regalloc::{apply_allocation, Location, RegAllocResult};
+        use crate::codegen::regalloc::{Location, RegAllocResult, apply_allocation};
 
         let mut mf = MachFunc::new("test".to_string());
         mf.emit(MachInst::Mov {

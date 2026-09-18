@@ -477,8 +477,8 @@ pub fn dispatch(_slot: u32, _fn_export_name: &str, _args: &[u64]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     fn fake_code_ptr() -> *mut () {

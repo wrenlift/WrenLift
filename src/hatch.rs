@@ -1130,10 +1130,10 @@ fn harvest_version_dep_layouts(
         harvest_vm.field_layouts.insert(cls.clone(), layout.clone());
     }
     for s in &dep_hatch.sections {
-        if matches!(s.kind, SectionKind::Source) {
-            if let Ok(src) = std::str::from_utf8(&s.data) {
-                let _ = harvest_vm.compile_source_to_blob(src);
-            }
+        if matches!(s.kind, SectionKind::Source)
+            && let Ok(src) = std::str::from_utf8(&s.data)
+        {
+            let _ = harvest_vm.compile_source_to_blob(src);
         }
     }
     for (cls, layout) in harvest_vm.field_layouts.drain() {
@@ -1219,56 +1219,53 @@ fn build_recursive_inner(
     // `Source` sections through a throwaway VM whose populated
     // `field_layouts` get drained back into `state` — same end state
     // as a path-dep recursion, no `.hatch` wire-format change.
-    if let Ok(text) = std::fs::read_to_string(root.join(HATCHFILE)) {
-        if let Ok(early_manifest) = toml::from_str::<Manifest>(&text) {
-            for (dep_name, dep) in &early_manifest.dependencies {
-                match dep {
-                    Dependency::Path { path, version } => {
-                        let dep_root = root.join(path);
-                        if dep_root.exists() {
-                            // Ignore failures here — `merge_path_dependencies`
-                            // will surface a clean error when it tries the
-                            // same path again. We only need the layout
-                            // harvest to flow into `state` on the happy
-                            // path so the upcoming compile sees parents.
-                            let _ = build_recursive(&dep_root, state, cache_dir, target);
-                        } else if let Some(v) = version {
-                            // Local-override miss: path doesn't exist
-                            // (typical when a consumer clones a publish
-                            // bundle without the workspace checkout).
-                            // Harvest the version-pinned cached bundle's
-                            // layouts instead.
-                            harvest_version_dep_layouts(dep_name, v, state, cache_dir, target);
-                        }
+    if let Ok(text) = std::fs::read_to_string(root.join(HATCHFILE))
+        && let Ok(early_manifest) = toml::from_str::<Manifest>(&text)
+    {
+        for (dep_name, dep) in &early_manifest.dependencies {
+            match dep {
+                Dependency::Path { path, version } => {
+                    let dep_root = root.join(path);
+                    if dep_root.exists() {
+                        // Ignore failures here — `merge_path_dependencies`
+                        // will surface a clean error when it tries the
+                        // same path again. We only need the layout
+                        // harvest to flow into `state` on the happy
+                        // path so the upcoming compile sees parents.
+                        let _ = build_recursive(&dep_root, state, cache_dir, target);
+                    } else if let Some(v) = version {
+                        // Local-override miss: path doesn't exist
+                        // (typical when a consumer clones a publish
+                        // bundle without the workspace checkout).
+                        // Harvest the version-pinned cached bundle's
+                        // layouts instead.
+                        harvest_version_dep_layouts(dep_name, v, state, cache_dir, target);
                     }
-                    Dependency::Git { git, .. } => {
-                        let Some(git_ref) = dep.git_ref() else {
-                            continue;
-                        };
-                        let cache_base = match cache_dir {
-                            Some(p) => p.to_path_buf(),
-                            None => match crate::hatch_registry::cache_root() {
-                                Ok(p) => p,
-                                Err(_) => continue,
-                            },
-                        };
-                        let checkout = crate::hatch_registry::cached_git_checkout_path(
-                            &cache_base,
-                            git,
-                            git_ref,
-                        );
-                        if checkout.exists() {
-                            let _ = build_recursive(&checkout, state, cache_dir, target);
-                        }
+                }
+                Dependency::Git { git, .. } => {
+                    let Some(git_ref) = dep.git_ref() else {
+                        continue;
+                    };
+                    let cache_base = match cache_dir {
+                        Some(p) => p.to_path_buf(),
+                        None => match crate::hatch_registry::cache_root() {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        },
+                    };
+                    let checkout =
+                        crate::hatch_registry::cached_git_checkout_path(&cache_base, git, git_ref);
+                    if checkout.exists() {
+                        let _ = build_recursive(&checkout, state, cache_dir, target);
                     }
-                    Dependency::Version(version) => {
-                        harvest_version_dep_layouts(dep_name, version, state, cache_dir, target);
-                    }
-                    Dependency::Url { .. } => {
-                        // URL deps are wasm-runtime only;
-                        // `merge_path_dependencies` errors loudly on
-                        // the host build path. No layouts to harvest.
-                    }
+                }
+                Dependency::Version(version) => {
+                    harvest_version_dep_layouts(dep_name, version, state, cache_dir, target);
+                }
+                Dependency::Url { .. } => {
+                    // URL deps are wasm-runtime only;
+                    // `merge_path_dependencies` errors loudly on
+                    // the host build path. No layouts to harvest.
                 }
             }
         }
@@ -2274,11 +2271,11 @@ fn topo_sort_wren_files_by_imports(files: &mut Vec<(String, std::path::PathBuf)>
             if normalized.is_empty() {
                 continue;
             }
-            if let Some(&j) = name_to_idx.get(&normalized) {
-                if j != i {
-                    adj[j].push(i);
-                    in_degree[i] += 1;
-                }
+            if let Some(&j) = name_to_idx.get(&normalized)
+                && j != i
+            {
+                adj[j].push(i);
+                in_degree[i] += 1;
             }
         }
     }
@@ -3326,10 +3323,11 @@ hello = { macos = "libs/hello.dylib", wasm = "libs/hello.wasm" }
         let h = load(&bytes).expect("load uncompressed");
         assert_eq!(h.manifest.name, "u");
         assert_eq!(h.manifest.target.as_deref(), Some("wasm32-unknown-unknown"));
-        assert!(h
-            .sections
-            .iter()
-            .any(|s| matches!(s.kind, SectionKind::Wlbc)));
+        assert!(
+            h.sections
+                .iter()
+                .any(|s| matches!(s.kind, SectionKind::Wlbc))
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use super::licm::{compute_dominators, compute_rpo, detect_loops, merge_loops_by_header};
 use super::{remap_inst, remap_term};
 use crate::mir::{
-    live_in_sets, BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
+    BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId, live_in_sets,
 };
 
 /// What the receiver is checked against before the inlined body runs.
@@ -164,12 +164,12 @@ pub fn inline_known_calls(func: &mut MirFunction, sites: &HashMap<ValueId, Known
     let mut pending: Vec<Site> = Vec::new();
     for block in &func.blocks {
         for (dst, inst) in &block.instructions {
-            if let Instruction::Call { args, .. } = inst {
-                if let Some(callee) = sites.get(dst) {
-                    let expected = args.len() + usize::from(callee.takes_receiver());
-                    if callee.body.arity as usize == expected && inlinable_body(&callee.body) {
-                        pending.push(Site { dst: *dst });
-                    }
+            if let Instruction::Call { args, .. } = inst
+                && let Some(callee) = sites.get(dst)
+            {
+                let expected = args.len() + usize::from(callee.takes_receiver());
+                if callee.body.arity as usize == expected && inlinable_body(&callee.body) {
+                    pending.push(Site { dst: *dst });
                 }
             }
         }

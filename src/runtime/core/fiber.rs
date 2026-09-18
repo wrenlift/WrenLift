@@ -9,23 +9,27 @@ use crate::runtime::vm::VM;
 
 /// Extract an ObjFiber pointer from a Value (args[0] for instance methods).
 unsafe fn as_fiber(val: Value) -> Option<*mut ObjFiber> {
-    let ptr = val.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if (*header).obj_type == ObjType::Fiber {
-        Some(ptr as *mut ObjFiber)
-    } else {
-        None
+    unsafe {
+        let ptr = val.as_object()?;
+        let header = ptr as *const ObjHeader;
+        if (*header).obj_type == ObjType::Fiber {
+            Some(ptr as *mut ObjFiber)
+        } else {
+            None
+        }
     }
 }
 
 /// Extract an ObjClosure pointer from a Value.
 unsafe fn as_closure(val: Value) -> Option<*mut ObjClosure> {
-    let ptr = val.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if (*header).obj_type == ObjType::Closure {
-        Some(ptr as *mut ObjClosure)
-    } else {
-        None
+    unsafe {
+        let ptr = val.as_object()?;
+        let header = ptr as *const ObjHeader;
+        if (*header).obj_type == ObjType::Closure {
+            Some(ptr as *mut ObjClosure)
+        } else {
+            None
+        }
     }
 }
 
@@ -37,39 +41,43 @@ unsafe fn setup_fiber_from_closure(
     closure: *mut ObjClosure,
     module_name: std::sync::Arc<String>,
 ) {
-    let fn_ptr = (*closure).function;
-    let func_id = FuncId((*fn_ptr).fn_id);
+    unsafe {
+        let fn_ptr = (*closure).function;
+        let func_id = FuncId((*fn_ptr).fn_id);
 
-    // The register file starts empty; it will be sized correctly when the
-    // fiber's first frame is loaded in run_fiber.
-    (*fiber).mir_frames.push(MirCallFrame {
-        func_id,
-        current_block: crate::mir::BlockId(0),
-        ip: 0,
-        pc: 0,
-        values: Vec::new(),
-        module_name,
-        return_dst: None,
-        closure: Some(closure),
-        defining_class: (*closure).defining_class_opt(),
-        bc_ptr: std::ptr::null(),
-    });
-    (*fiber).state = FiberState::New;
+        // The register file starts empty; it will be sized correctly when the
+        // fiber's first frame is loaded in run_fiber.
+        (*fiber).mir_frames.push(MirCallFrame {
+            func_id,
+            current_block: crate::mir::BlockId(0),
+            ip: 0,
+            pc: 0,
+            values: Vec::new(),
+            module_name,
+            return_dst: None,
+            closure: Some(closure),
+            defining_class: (*closure).defining_class_opt(),
+            bc_ptr: std::ptr::null(),
+        });
+        (*fiber).state = FiberState::New;
+    }
 }
 
 /// Pull the module name from the caller's topmost frame so a
 /// newly-spawned fiber resolves `Greet` (etc.) against the module
 /// where it was defined, not a hardcoded "main".
 unsafe fn current_module_name(ctx: &mut dyn NativeContext) -> std::sync::Arc<String> {
-    let caller = ctx.get_current_fiber();
-    if caller.is_null() {
-        return std::sync::Arc::new(String::from("main"));
+    unsafe {
+        let caller = ctx.get_current_fiber();
+        if caller.is_null() {
+            return std::sync::Arc::new(String::from("main"));
+        }
+        (*caller)
+            .mir_frames
+            .last()
+            .map(|f| f.module_name.clone())
+            .unwrap_or_else(|| std::sync::Arc::new(String::from("main")))
     }
-    (*caller)
-        .mir_frames
-        .last()
-        .map(|f| f.module_name.clone())
-        .unwrap_or_else(|| std::sync::Arc::new(String::from("main")))
 }
 
 // --- Static methods ---
@@ -266,39 +274,43 @@ pub(crate) fn fiber_new_inner(
 /// can pass them to a later `alloc_map` without worrying about GC
 /// moving the source map mid-copy.
 unsafe fn snapshot_context_entries(fiber: *mut ObjFiber) -> Vec<(Value, Value)> {
-    if fiber.is_null() || (*fiber).context_map.is_null() {
-        return Vec::new();
+    unsafe {
+        if fiber.is_null() || (*fiber).context_map.is_null() {
+            return Vec::new();
+        }
+        let ptr = match (*fiber).context_map.as_object() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let header = ptr as *const ObjHeader;
+        if (*header).obj_type != ObjType::Map {
+            return Vec::new();
+        }
+        let map = ptr as *const ObjMap;
+        (*map)
+            .entries
+            .iter()
+            .map(|(k, &v)| (k.value(), v))
+            .collect()
     }
-    let ptr = match (*fiber).context_map.as_object() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
-    let header = ptr as *const ObjHeader;
-    if (*header).obj_type != ObjType::Map {
-        return Vec::new();
-    }
-    let map = ptr as *const ObjMap;
-    (*map)
-        .entries
-        .iter()
-        .map(|(k, &v)| (k.value(), v))
-        .collect()
 }
 
 /// Return (or lazily create + cache) a fiber's context map.
 unsafe fn get_or_init_context_map(ctx: &mut dyn NativeContext, fiber: *mut ObjFiber) -> Value {
-    if !(*fiber).context_map.is_null() {
-        return (*fiber).context_map;
+    unsafe {
+        if !(*fiber).context_map.is_null() {
+            return (*fiber).context_map;
+        }
+        let map = ctx.alloc_map();
+        (*fiber).context_map = map;
+        // Old(fiber)->young(map) edge if the fiber has already been
+        // promoted. Without a barrier, the next minor GC misses the
+        // map and a subsequent access faults at 0x4 (same channel as
+        // the prior fiber set_reg / list subscript-set barrier fixes).
+        let fiber_val = Value::object(fiber as *mut u8);
+        ctx.write_barrier(fiber_val, map);
+        map
     }
-    let map = ctx.alloc_map();
-    (*fiber).context_map = map;
-    // Old(fiber)->young(map) edge if the fiber has already been
-    // promoted. Without a barrier, the next minor GC misses the
-    // map and a subsequent access faults at 0x4 (same channel as
-    // the prior fiber set_reg / list subscript-set barrier fixes).
-    let fiber_val = Value::object(fiber as *mut u8);
-    ctx.write_barrier(fiber_val, map);
-    map
 }
 
 // --- Context / cancellation / deadline ---

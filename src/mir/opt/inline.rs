@@ -335,10 +335,9 @@ fn infer_loop_carried_nums(func: &MirFunction) -> HashSet<ValueId> {
                     }
                     if let Instruction::GuardNum(src) | Instruction::GuardNumAt { value: src, .. } =
                         inst
+                        && known.insert(*src)
                     {
-                        if known.insert(*src) {
-                            grew = true;
-                        }
+                        grew = true;
                     }
                 }
             }
@@ -349,11 +348,12 @@ fn infer_loop_carried_nums(func: &MirFunction) -> HashSet<ValueId> {
             let mut check = |target: BlockId, args: &[ValueId]| {
                 let params = &func.blocks[target.0 as usize].params;
                 for (i, arg) in args.iter().enumerate() {
-                    if let Some(&(param, _)) = params.get(i) {
-                        if candidates.contains(&param) && !known.contains(arg) {
-                            candidates.remove(&param);
-                            dropped = true;
-                        }
+                    if let Some(&(param, _)) = params.get(i)
+                        && candidates.contains(&param)
+                        && !known.contains(arg)
+                    {
+                        candidates.remove(&param);
+                        dropped = true;
                     }
                 }
             };
@@ -437,7 +437,7 @@ fn expand_cmp(
 mod tests {
     use super::*;
     use crate::intern::Interner;
-    use crate::mir::interp::{eval, InterpValue};
+    use crate::mir::interp::{InterpValue, eval};
     use crate::mir::{Instruction, Terminator};
     use crate::runtime::value::Value;
 

@@ -259,20 +259,19 @@ fn try_fold_terminator(
         false_target,
         false_args,
     } = term
+        && let Some(cv) = constants.get(condition)
     {
-        if let Some(cv) = constants.get(condition) {
-            return if cv.is_truthy() {
-                Some(Terminator::Branch {
-                    target: *true_target,
-                    args: true_args.clone(),
-                })
-            } else {
-                Some(Terminator::Branch {
-                    target: *false_target,
-                    args: false_args.clone(),
-                })
-            };
-        }
+        return if cv.is_truthy() {
+            Some(Terminator::Branch {
+                target: *true_target,
+                args: true_args.clone(),
+            })
+        } else {
+            Some(Terminator::Branch {
+                target: *false_target,
+                args: false_args.clone(),
+            })
+        };
     }
     None
 }
@@ -352,8 +351,8 @@ fn int_binop(
 mod tests {
     use super::*;
     use crate::intern::Interner;
-    use crate::mir::interp::{eval, InterpValue};
     use crate::mir::Terminator;
+    use crate::mir::interp::{InterpValue, eval};
     use crate::runtime::value::Value;
 
     fn make_func(interner: &mut Interner) -> MirFunction {

@@ -76,11 +76,7 @@ impl Value {
 
     #[inline(always)]
     pub fn bool(b: bool) -> Self {
-        if b {
-            Value::TRUE
-        } else {
-            Value::FALSE
-        }
+        if b { Value::TRUE } else { Value::FALSE }
     }
 
     #[inline(always)]

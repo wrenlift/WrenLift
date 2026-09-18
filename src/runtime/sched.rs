@@ -778,12 +778,12 @@ impl Sched {
     }
 
     fn make_runnable(&mut self, id: TaskId, woken: bool) {
-        if let Some(task) = self.tasks.get_mut(&id) {
-            if matches!(task.state, RunState::Waiting(_)) {
-                task.state = RunState::Runnable;
-                task.woken = woken;
-                self.ready.push_back(id);
-            }
+        if let Some(task) = self.tasks.get_mut(&id)
+            && matches!(task.state, RunState::Waiting(_))
+        {
+            task.state = RunState::Runnable;
+            task.woken = woken;
+            self.ready.push_back(id);
         }
     }
 

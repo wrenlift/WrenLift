@@ -11,9 +11,9 @@
 
 use std::io::{Cursor, Read, Write};
 
+use zip::CompressionMethod;
 use zip::read::ZipArchive;
 use zip::write::{SimpleFileOptions, ZipWriter};
-use zip::CompressionMethod;
 
 use super::bytes_from_byte_list as bytes_from_list;
 use super::bytes_from_value;

@@ -311,14 +311,14 @@ fn try_dispatch_call_noframe_fast(
     let (method_sym, _) = decode_method_and_ic(method_packed);
     let class = vm.class_of(recv);
 
-    if class == vm.list_class {
-        if let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args) {
-            vm.engine.note_runtime_call_stats(|s| {
-                s.wren_call_noframe_fastpath += 1;
-                s.dispatch_call_entries += 1;
-            });
-            return Frameless::Done(result);
-        }
+    if class == vm.list_class
+        && let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args)
+    {
+        vm.engine.note_runtime_call_stats(|s| {
+            s.wren_call_noframe_fastpath += 1;
+            s.dispatch_call_entries += 1;
+        });
+        return Frameless::Done(result);
     }
 
     let cache_key_class = cache_key_class(vm, recv, class);
@@ -449,328 +449,331 @@ pub unsafe fn call_jit_at(j: *mut JitThread, fn_ptr: *const u8, args: &[Value]) 
 
 #[inline(always)]
 unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = ctx;
-    // Ensure x20 holds the JitContext pointer for the JIT code.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let ctx_ptr = ctx as u64;
-        core::arch::asm!(
-            "mov x20, {ctx}",
-            ctx = in(reg) ctx_ptr,
-            lateout("x20") _,
-            options(nostack, nomem),
-        );
-    }
-    match args.len() {
-        0 => {
-            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
-            f()
+    unsafe {
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = ctx;
+        // Ensure x20 holds the JitContext pointer for the JIT code.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ctx_ptr = ctx as u64;
+            core::arch::asm!(
+                "mov x20, {ctx}",
+                ctx = in(reg) ctx_ptr,
+                lateout("x20") _,
+                options(nostack, nomem),
+            );
         }
-        1 => {
-            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits())
-        }
-        2 => {
-            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits())
-        }
-        3 => {
-            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
-        }
-        4 => {
-            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-            )
-        }
-        5 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-            )
-        }
-        6 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-            )
-        }
-        7 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-            )
-        }
-        // 8+ args. AOT-emitted method bodies declare their
-        // physical arity to match the call site. Each explicit
-        // arm below transmutes to an extern "C" fn with the
-        // matching signature so cranelift's calling-convention
-        // register-passing lines up — a `_` arm that drops to a
-        // smaller signature silently truncates higher arg slots
-        // and leaves them reading garbage in the JIT'd frame
-        // (the previous version capped at 8, so Renderer2D's
-        // `drawSprite_(texture, x, y, w, h, u0, v0, u1, v1, r, g,
-        // b, a)` saw garbage for `v1` through `a`, surfacing as
-        // `Float32Array[_]=: value must be a number` across
-        // every sprite-batch flush).
-        8 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-            )
-        }
-        9 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-            )
-        }
-        10 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-            )
-        }
-        11 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-                args[10].to_bits(),
-            )
-        }
-        12 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-                args[10].to_bits(),
-                args[11].to_bits(),
-            )
-        }
-        13 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-                args[10].to_bits(),
-                args[11].to_bits(),
-                args[12].to_bits(),
-            )
-        }
-        14 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-                args[10].to_bits(),
-                args[11].to_bits(),
-                args[12].to_bits(),
-                args[13].to_bits(),
-            )
-        }
-        15 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-                args[10].to_bits(),
-                args[11].to_bits(),
-                args[12].to_bits(),
-                args[13].to_bits(),
-                args[14].to_bits(),
-            )
-        }
-        16 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-                args[8].to_bits(),
-                args[9].to_bits(),
-                args[10].to_bits(),
-                args[11].to_bits(),
-                args[12].to_bits(),
-                args[13].to_bits(),
-                args[14].to_bits(),
-                args[15].to_bits(),
-            )
-        }
-        n => panic!(
-            "call_jit_cached: arity {} not in explicit table; extend the match arms up to {} \
+        match args.len() {
+            0 => {
+                let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                f()
+            }
+            1 => {
+                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(args[0].to_bits())
+            }
+            2 => {
+                let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(args[0].to_bits(), args[1].to_bits())
+            }
+            3 => {
+                let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+            }
+            4 => {
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                )
+            }
+            5 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                )
+            }
+            6 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                )
+            }
+            7 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                )
+            }
+            // 8+ args. AOT-emitted method bodies declare their
+            // physical arity to match the call site. Each explicit
+            // arm below transmutes to an extern "C" fn with the
+            // matching signature so cranelift's calling-convention
+            // register-passing lines up — a `_` arm that drops to a
+            // smaller signature silently truncates higher arg slots
+            // and leaves them reading garbage in the JIT'd frame
+            // (the previous version capped at 8, so Renderer2D's
+            // `drawSprite_(texture, x, y, w, h, u0, v0, u1, v1, r, g,
+            // b, a)` saw garbage for `v1` through `a`, surfacing as
+            // `Float32Array[_]=: value must be a number` across
+            // every sprite-batch flush).
+            8 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                )
+            }
+            9 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                )
+            }
+            10 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                )
+            }
+            11 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                    args[10].to_bits(),
+                )
+            }
+            12 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                    args[10].to_bits(),
+                    args[11].to_bits(),
+                )
+            }
+            13 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                    args[10].to_bits(),
+                    args[11].to_bits(),
+                    args[12].to_bits(),
+                )
+            }
+            14 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                    args[10].to_bits(),
+                    args[11].to_bits(),
+                    args[12].to_bits(),
+                    args[13].to_bits(),
+                )
+            }
+            15 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                    args[10].to_bits(),
+                    args[11].to_bits(),
+                    args[12].to_bits(),
+                    args[13].to_bits(),
+                    args[14].to_bits(),
+                )
+            }
+            16 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                    args[8].to_bits(),
+                    args[9].to_bits(),
+                    args[10].to_bits(),
+                    args[11].to_bits(),
+                    args[12].to_bits(),
+                    args[13].to_bits(),
+                    args[14].to_bits(),
+                    args[15].to_bits(),
+                )
+            }
+            n => panic!(
+                "call_jit_cached: arity {} not in explicit table; extend the match arms up to {} \
              (truncating to a smaller signature silently drops higher args)",
-            n, n
-        ),
+                n, n
+            ),
+        }
     }
 }
 
@@ -1643,10 +1646,12 @@ fn collect_suppressed() -> bool {
 /// `vm` must be the current thread's running VM.
 #[inline]
 pub unsafe fn finish_alloc_native(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
-    if vm.gc.is_immix() {
-        return val.to_bits();
+    unsafe {
+        if vm.gc.is_immix() {
+            return val.to_bits();
+        }
+        finish_alloc(vm, val)
     }
-    finish_alloc(vm, val)
 }
 
 #[inline(always)]
@@ -2528,18 +2533,20 @@ unsafe fn find_method_with_class(
     cls: *mut ObjClass,
     method: crate::intern::SymbolId,
 ) -> Option<(Method, *mut ObjClass)> {
-    let idx = method.index() as usize;
-    let mut c = cls;
-    while !c.is_null() {
-        let cls_ref = &*c;
-        if idx < cls_ref.methods.len() {
-            if let Some(m) = &cls_ref.methods[idx] {
+    unsafe {
+        let idx = method.index() as usize;
+        let mut c = cls;
+        while !c.is_null() {
+            let cls_ref = &*c;
+            if idx < cls_ref.methods.len()
+                && let Some(m) = &cls_ref.methods[idx]
+            {
                 return Some((*m, c));
             }
+            c = (*c).superclass;
         }
-        c = (*c).superclass;
+        None
     }
-    None
 }
 
 /// Internal: dispatch a method call with a pre-built args slice.
@@ -2577,24 +2584,25 @@ fn dispatch_call_rooted(
 
     // Match the interpreter's closure call fast path. Fn.call(...) is a stub
     // on the Fn class; actual closure invocation must pass only the user args.
-    if vm.is_call_sym(method_sym) && recv.is_object() {
-        if let Some(ptr) = recv.as_object() {
-            let header = ptr as *const ObjHeader;
-            if unsafe { (*header).obj_type } == ObjType::Closure {
-                let closure_ptr = ptr as *mut ObjClosure;
-                vm.engine
-                    .note_runtime_call_stats(|s| s.dispatch_call_fn_fastpath += 1);
-                return call_closure_jit_or_sync(vm, closure_ptr, &args[1..], None);
-            }
+    if vm.is_call_sym(method_sym)
+        && recv.is_object()
+        && let Some(ptr) = recv.as_object()
+    {
+        let header = ptr as *const ObjHeader;
+        if unsafe { (*header).obj_type } == ObjType::Closure {
+            let closure_ptr = ptr as *mut ObjClosure;
+            vm.engine
+                .note_runtime_call_stats(|s| s.dispatch_call_fn_fastpath += 1);
+            return call_closure_jit_or_sync(vm, closure_ptr, &args[1..], None);
         }
     }
 
     let class = vm.class_of(recv);
     let cache_key_class = cache_key_class(vm, recv, class);
-    if class == vm.list_class {
-        if let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args) {
-            return result;
-        }
+    if class == vm.list_class
+        && let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args)
+    {
+        return result;
     }
     let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, j, idx));
 
@@ -2719,12 +2727,11 @@ fn handle_jit_fiber_action(
                 if is_call
                     && unsafe { (*target).krio_fiber.is_some() }
                     && crate::runtime::core::fiber::current_vm_krio_active(vm)
+                    && let Some(v) = crate::runtime::core::fiber::try_krio_call_pub(target, value)
                 {
-                    if let Some(v) = crate::runtime::core::fiber::try_krio_call_pub(target, value) {
-                        set_jit_context(saved_jit_ctx);
-                        set_jit_depth(saved_jit_depth);
-                        return v.to_bits();
-                    }
+                    set_jit_context(saved_jit_ctx);
+                    set_jit_depth(saved_jit_depth);
+                    return v.to_bits();
                 }
             }
             // A krio-backed target returned to the caller through its own
@@ -2741,15 +2748,15 @@ fn handle_jit_fiber_action(
             if target_state == FiberState::Suspended {
                 // Resuming a suspended fiber: deliver the value.
                 unsafe {
-                    if let Some(dst) = (*target).resume_value_dst.take() {
-                        if let Some(frame) = (*target).mir_frames.last_mut() {
-                            let i = dst.0 as usize;
-                            if i < frame.values.len() {
-                                frame.values[i] = value;
-                            } else {
-                                frame.values.resize(i + 1, Value::null());
-                                frame.values[i] = value;
-                            }
+                    if let Some(dst) = (*target).resume_value_dst.take()
+                        && let Some(frame) = (*target).mir_frames.last_mut()
+                    {
+                        let i = dst.0 as usize;
+                        if i < frame.values.len() {
+                            frame.values[i] = value;
+                        } else {
+                            frame.values.resize(i + 1, Value::null());
+                            frame.values[i] = value;
                         }
                     }
                 }
@@ -3958,10 +3965,10 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
             // or abort the fiber with a clear message rather than
             // letting the caller crash on a null receiver downstream.
             let closure = ic.closure as *mut ObjClosure;
-            if !closure.is_null() {
-                if let Some(vm) = unsafe { vm_ref() } {
-                    return call_closure_jit_or_sync(vm, closure, &collect_args(), None);
-                }
+            if !closure.is_null()
+                && let Some(vm) = unsafe { vm_ref() }
+            {
+                return call_closure_jit_or_sync(vm, closure, &collect_args(), None);
             }
             // No usable dispatch info — surface to stderr so the
             // failure is at least visible. (`runtime_error` lives on
@@ -4093,79 +4100,82 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
 /// Raw call into JIT code without VM reference (for IC dispatch).
 #[inline(always)]
 unsafe fn call_jit_with_shadow_raw(fn_ptr: *const u8, args: &[Value]) -> u64 {
-    match args.len() {
-        0 => {
-            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
-            f()
-        }
-        1 => {
-            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits())
-        }
-        2 => {
-            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits())
-        }
-        3 => {
-            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
-        }
-        4 => {
-            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-            )
-        }
-        5 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-            )
-        }
-        6 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-            )
-        }
-        7 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-            )
-        }
-        _ => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
-            )
+    unsafe {
+        match args.len() {
+            0 => {
+                let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                f()
+            }
+            1 => {
+                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(args[0].to_bits())
+            }
+            2 => {
+                let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(args[0].to_bits(), args[1].to_bits())
+            }
+            3 => {
+                let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+            }
+            4 => {
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                )
+            }
+            5 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                )
+            }
+            6 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                )
+            }
+            7 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                )
+            }
+            _ => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    args[0].to_bits(),
+                    args[1].to_bits(),
+                    args[2].to_bits(),
+                    args[3].to_bits(),
+                    args[4].to_bits(),
+                    args[5].to_bits(),
+                    args[6].to_bits(),
+                    args[7].to_bits(),
+                )
+            }
         }
     }
 }
@@ -4790,12 +4800,14 @@ pub extern "C" fn wren_is_type(val: u64, class_sym: u64) -> u64 {
 
 #[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
 unsafe fn dladdr_symbol_runtime(addr: *const ()) -> Option<String> {
-    let mut info: libc::Dl_info = std::mem::zeroed();
-    if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
-        return None;
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
+        cstr.to_str().ok().map(|s| s.to_string())
     }
-    let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
-    cstr.to_str().ok().map(|s| s.to_string())
 }
 #[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
 unsafe fn dladdr_symbol_runtime(_addr: *const ()) -> Option<String> {
@@ -4868,46 +4880,45 @@ fn dump_stale_subscript_frames(obj_ptr: *const u8, recv: Value, idx: Value) {
             // the receiver slot was tracked by the stack map.
             if walked == 1 {
                 let vm = unsafe { vm_ref() };
-                if let Some(vm) = vm {
-                    if let Some(meta) = vm
+                if let Some(vm) = vm
+                    && let Some(meta) = vm
                         .engine
                         .jit_metadata
                         .get(func_id as usize)
                         .and_then(|m| m.as_ref())
-                    {
-                        let sp = meta
-                            .safepoints
-                            .iter()
-                            .find(|sp| sp.code_offset == offset as u32);
-                        if let Some(sp) = sp {
-                            eprintln!(
-                                "    safepoint at +{offset} has {} live root(s):",
-                                sp.live_roots.len()
-                            );
-                            for (i, root) in sp.live_roots.iter().enumerate() {
-                                use crate::codegen::native_meta::RootLocation;
-                                let slot_str = match root.location {
-                                    RootLocation::Spill(off) => {
-                                        let addr = (saved_fp as isize + off as isize) as *const u64;
-                                        let bits = unsafe { *addr };
-                                        format!(
-                                            "fp+{} = {:#018x}{}",
-                                            off,
-                                            bits,
-                                            if bits == recv.to_bits() {
-                                                " *** matches recv ***"
-                                            } else {
-                                                ""
-                                            }
-                                        )
-                                    }
-                                    _ => format!("{:?}", root.location),
-                                };
-                                eprintln!("      [{i}] {slot_str}");
-                            }
-                        } else {
-                            eprintln!("    no safepoint at +{offset} (GAP)");
+                {
+                    let sp = meta
+                        .safepoints
+                        .iter()
+                        .find(|sp| sp.code_offset == offset as u32);
+                    if let Some(sp) = sp {
+                        eprintln!(
+                            "    safepoint at +{offset} has {} live root(s):",
+                            sp.live_roots.len()
+                        );
+                        for (i, root) in sp.live_roots.iter().enumerate() {
+                            use crate::codegen::native_meta::RootLocation;
+                            let slot_str = match root.location {
+                                RootLocation::Spill(off) => {
+                                    let addr = (saved_fp as isize + off as isize) as *const u64;
+                                    let bits = unsafe { *addr };
+                                    format!(
+                                        "fp+{} = {:#018x}{}",
+                                        off,
+                                        bits,
+                                        if bits == recv.to_bits() {
+                                            " *** matches recv ***"
+                                        } else {
+                                            ""
+                                        }
+                                    )
+                                }
+                                _ => format!("{:?}", root.location),
+                            };
+                            eprintln!("      [{i}] {slot_str}");
                         }
+                    } else {
+                        eprintln!("    no safepoint at +{offset} (GAP)");
                     }
                 }
             }
@@ -4947,10 +4958,10 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                 if let Some(n) = idx.as_num() {
                     let i = n as usize;
                     let count = unsafe { (*list).count as usize };
-                    if i < count {
-                        if let Some(val) = unsafe { (*list).get(i) } {
-                            return val.to_bits();
-                        }
+                    if i < count
+                        && let Some(val) = unsafe { (*list).get(i) }
+                    {
+                        return val.to_bits();
                     }
                 }
             }
@@ -4975,12 +4986,13 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                     if i < 0 {
                         i += char_count;
                     }
-                    if i >= 0 && i < char_count {
-                        if let Some(ch) = s.chars().nth(i as usize) {
-                            let vm = unsafe { vm_ref() };
-                            if let Some(vm) = vm {
-                                return vm.new_string(ch.to_string()).to_bits();
-                            }
+                    if i >= 0
+                        && i < char_count
+                        && let Some(ch) = s.chars().nth(i as usize)
+                    {
+                        let vm = unsafe { vm_ref() };
+                        if let Some(vm) = vm {
+                            return vm.new_string(ch.to_string()).to_bits();
                         }
                     }
                 }
@@ -5078,10 +5090,10 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
     // JIT'd code, which broke `c.bytes[0]`-style patterns and any
     // user class overloading `[_]`.
     let vm = unsafe { vm_ref() };
-    if let Some(vm) = vm {
-        if let Some(v) = vm.call_method_on(recv, "[_]", &[idx]) {
-            return v.to_bits();
-        }
+    if let Some(vm) = vm
+        && let Some(v) = vm.call_method_on(recv, "[_]", &[idx])
+    {
+        return v.to_bits();
     }
     Value::null().to_bits()
 }
@@ -5169,10 +5181,10 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
     // receiver and returns null-but-"arity 1" runtime errors at the
     // next use site.
     let vm = unsafe { vm_ref() };
-    if let Some(vm) = vm {
-        if let Some(v) = vm.call_method_on(recv, "[_]=(_)", &[idx, value]) {
-            return v.to_bits();
-        }
+    if let Some(vm) = vm
+        && let Some(v) = vm.call_method_on(recv, "[_]=(_)", &[idx, value])
+    {
+        return v.to_bits();
     }
     value.to_bits()
 }
@@ -5796,11 +5808,10 @@ pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
         && !rhs.is_null()
         && !rhs.is_bool()
         && !rhs.is_num()
+        && let Some(vm) = unsafe { vm_ref() }
     {
-        if let Some(vm) = unsafe { vm_ref() } {
-            let sym = vm.interner.intern("==(_)");
-            return dispatch_call(lhs, sym.index() as u64, &[lhs, rhs]);
-        }
+        let sym = vm.interner.intern("==(_)");
+        return dispatch_call(lhs, sym.index() as u64, &[lhs, rhs]);
     }
     Value::bool(lhs.equals(rhs)).to_bits()
 }
@@ -5815,11 +5826,10 @@ pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
         && !rhs.is_null()
         && !rhs.is_bool()
         && !rhs.is_num()
+        && let Some(vm) = unsafe { vm_ref() }
     {
-        if let Some(vm) = unsafe { vm_ref() } {
-            let sym = vm.interner.intern("!=(_)");
-            return dispatch_call(lhs, sym.index() as u64, &[lhs, rhs]);
-        }
+        let sym = vm.interner.intern("!=(_)");
+        return dispatch_call(lhs, sym.index() as u64, &[lhs, rhs]);
     }
     Value::bool(!lhs.equals(rhs)).to_bits()
 }
@@ -5839,11 +5849,7 @@ pub extern "C" fn wren_not(a: u64) -> u64 {
 pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
     let v = Value::from_bits(value);
     // Return raw 0/1 (not NaN-boxed) so JmpZero can branch correctly.
-    if v.is_falsy() {
-        0u64
-    } else {
-        1u64
-    }
+    if v.is_falsy() { 0u64 } else { 1u64 }
 }
 
 // ---------------------------------------------------------------------------
@@ -6610,10 +6616,10 @@ fn compute_live_out(insts: &[MachInst]) -> Vec<std::collections::HashSet<u32>> {
         inst_uses.push(uses);
 
         let mut defs = HashSet::new();
-        if let Some(d) = inst.def() {
-            if d.class == super::RegClass::Gp {
-                defs.insert(d.index);
-            }
+        if let Some(d) = inst.def()
+            && d.class == super::RegClass::Gp
+        {
+            defs.insert(d.index);
         }
         inst_defs.push(defs);
     }

@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::licm::{compute_dominators, compute_rpo};
 use super::MirPass;
+use super::licm::{compute_dominators, compute_rpo};
 use crate::mir::{BlockId, Instruction, MirFunction, MirType, Terminator, ValueId};
 
 /// Every value this pass carries as an integer stays within this bound,
@@ -251,11 +251,12 @@ impl MirPass for IntSpecialize {
                 for (target, args) in edges(&block.terminator) {
                     let params = &func.blocks[target.0 as usize].params;
                     for (i, a) in args.iter().enumerate() {
-                        if let Some((p, _)) = params.get(i) {
-                            if int_vals.contains(p) && !int_vals.contains(a) {
-                                int_vals.remove(p);
-                                dropped = true;
-                            }
+                        if let Some((p, _)) = params.get(i)
+                            && int_vals.contains(p)
+                            && !int_vals.contains(a)
+                        {
+                            int_vals.remove(p);
+                            dropped = true;
                         }
                     }
                 }
@@ -447,10 +448,10 @@ fn remap_edges_into_f64(
 ) {
     let fix = |args: &mut Vec<ValueId>, int_params: &[bool]| {
         for (i, a) in args.iter_mut().enumerate() {
-            if !int_params.get(i).copied().unwrap_or(false) {
-                if let Some(c) = map.get(a) {
-                    *a = *c;
-                }
+            if !int_params.get(i).copied().unwrap_or(false)
+                && let Some(c) = map.get(a)
+            {
+                *a = *c;
             }
         }
     };

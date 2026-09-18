@@ -28,10 +28,10 @@ impl MirPass for Sra {
 
         for block in &func.blocks {
             for (val_id, inst) in &block.instructions {
-                if let Instruction::MakeList(elems) = inst {
-                    if non_escaping.contains(val_id) {
-                        list_elements.insert(*val_id, elems.clone());
-                    }
+                if let Instruction::MakeList(elems) = inst
+                    && non_escaping.contains(val_id)
+                {
+                    list_elements.insert(*val_id, elems.clone());
                 }
                 match inst {
                     Instruction::ConstNum(n) => {
@@ -80,18 +80,16 @@ impl MirPass for Sra {
         for block_idx in 0..func.blocks.len() {
             for inst_idx in 0..func.blocks[block_idx].instructions.len() {
                 let (val_id, ref inst) = func.blocks[block_idx].instructions[inst_idx];
-                if let Instruction::SubscriptGet { receiver, args } = inst {
-                    if let Some(elems) = current_elements.get(receiver) {
-                        if !args.is_empty() {
-                            if let Some(&idx_f) = const_nums.get(&args[0]) {
-                                let idx = idx_f as usize;
-                                if idx < elems.len() {
-                                    func.blocks[block_idx].instructions[inst_idx] =
-                                        (val_id, Instruction::Move(elems[idx]));
-                                    changed = true;
-                                }
-                            }
-                        }
+                if let Instruction::SubscriptGet { receiver, args } = inst
+                    && let Some(elems) = current_elements.get(receiver)
+                    && !args.is_empty()
+                    && let Some(&idx_f) = const_nums.get(&args[0])
+                {
+                    let idx = idx_f as usize;
+                    if idx < elems.len() {
+                        func.blocks[block_idx].instructions[inst_idx] =
+                            (val_id, Instruction::Move(elems[idx]));
+                        changed = true;
                     }
                 }
             }

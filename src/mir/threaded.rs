@@ -715,10 +715,10 @@ pub fn can_use_threaded(mir: &MirFunction, interner: Option<&crate::intern::Inte
                 | Instruction::GuardNum(_)
                 | Instruction::GuardBool(_) => {}
                 Instruction::Call { method, .. } => {
-                    if let Some(intr) = interner {
-                        if is_fiber_action_method(intr.resolve(*method)) {
-                            return false;
-                        }
+                    if let Some(intr) = interner
+                        && is_fiber_action_method(intr.resolve(*method))
+                    {
+                        return false;
                     }
                 }
                 _ => return false,
@@ -771,10 +771,10 @@ pub fn lower_mir_to_threaded(
         block_offsets.insert(BlockId(block_idx as u32), offset);
         for (_, inst) in &block.instructions {
             offset += 1;
-            if let Instruction::StringConcat(parts) = inst {
-                if parts.len() > 2 {
-                    offset += parts.len() - 2;
-                }
+            if let Instruction::StringConcat(parts) = inst
+                && parts.len() > 2
+            {
+                offset += parts.len() - 2;
             }
         }
         // Count extra moves for branch args
@@ -798,28 +798,28 @@ pub fn lower_mir_to_threaded(
             // fell through to op_noop and left `dst` uninitialised
             // (= null) — silently miscompiling any closure that
             // touched such a string under the threaded path.
-            if let Instruction::StringConcat(parts) = inst {
-                if parts.len() >= 2 {
+            if let Instruction::StringConcat(parts) = inst
+                && parts.len() >= 2
+            {
+                ops.push(ThreadedOp {
+                    handler: op_string_concat,
+                    dst,
+                    a: parts[0].0 as u16,
+                    b: parts[1].0 as u16,
+                    c: 0,
+                    extra: 0,
+                });
+                for part in &parts[2..] {
                     ops.push(ThreadedOp {
                         handler: op_string_concat,
                         dst,
-                        a: parts[0].0 as u16,
-                        b: parts[1].0 as u16,
+                        a: dst,
+                        b: part.0 as u16,
                         c: 0,
                         extra: 0,
                     });
-                    for part in &parts[2..] {
-                        ops.push(ThreadedOp {
-                            handler: op_string_concat,
-                            dst,
-                            a: dst,
-                            b: part.0 as u16,
-                            c: 0,
-                            extra: 0,
-                        });
-                    }
-                    continue;
                 }
+                continue;
             }
             let threaded_op = match inst {
                 Instruction::ConstNull => ThreadedOp {

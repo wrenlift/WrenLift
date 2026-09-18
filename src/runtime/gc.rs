@@ -73,94 +73,96 @@ fn trace_str_buf_event(
 
 #[cfg(target_os = "macos")]
 unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
-    if !trace_alias_enabled() {
-        return;
-    }
-    let ty = (*header).obj_type;
-    eprintln!("PRE-DROP [{where_}] obj={:p} type={:?}", header, ty);
-    match ty {
-        ObjType::String => {
-            let s = &*(header as *mut ObjString);
-            check_buf_allocated(
-                header,
-                s.value.as_ptr() as *const std::ffi::c_void,
-                s.value.len(),
-                s.value.capacity(),
-                "ObjString.value",
-                where_,
-            );
+    unsafe {
+        if !trace_alias_enabled() {
+            return;
         }
-        ObjType::List => {
-            let l = &*(header as *mut ObjList);
-            check_buf_allocated(
-                header,
-                l.elements as *const std::ffi::c_void,
-                l.count as usize * std::mem::size_of::<Value>(),
-                l.capacity as usize * std::mem::size_of::<Value>(),
-                "ObjList.elements",
-                where_,
-            );
-        }
-        ObjType::TypedArray => {
-            let a = &*(header as *mut ObjTypedArray);
-            let elem_size = a.kind_tag().element_size();
-            check_buf_allocated(
-                header,
-                a.data as *const std::ffi::c_void,
-                a.count as usize * elem_size,
-                a.count as usize * elem_size,
-                "ObjTypedArray.data",
-                where_,
-            );
-        }
-        ObjType::Instance => {
-            let i = &*(header as *mut ObjInstance);
-            if i.fields_owned {
+        let ty = (*header).obj_type;
+        eprintln!("PRE-DROP [{where_}] obj={:p} type={:?}", header, ty);
+        match ty {
+            ObjType::String => {
+                let s = &*(header as *mut ObjString);
                 check_buf_allocated(
                     header,
-                    i.fields as *const std::ffi::c_void,
-                    i.num_fields as usize * std::mem::size_of::<Value>(),
-                    i.num_fields as usize * std::mem::size_of::<Value>(),
-                    "ObjInstance.fields",
+                    s.value.as_ptr() as *const std::ffi::c_void,
+                    s.value.len(),
+                    s.value.capacity(),
+                    "ObjString.value",
                     where_,
                 );
             }
-        }
-        ObjType::Fiber => {
-            let f = &*(header as *mut ObjFiber);
-            check_vec_buf(
-                header,
-                f.stack.as_ptr() as _,
-                f.stack.capacity(),
-                "ObjFiber.stack",
-                where_,
-            );
-            check_vec_buf(
-                header,
-                f.frames.as_ptr() as _,
-                f.frames.capacity(),
-                "ObjFiber.frames",
-                where_,
-            );
-            check_vec_buf(
-                header,
-                f.mir_frames.as_ptr() as _,
-                f.mir_frames.capacity(),
-                "ObjFiber.mir_frames",
-                where_,
-            );
-            for (i, mf) in f.mir_frames.iter().enumerate() {
+            ObjType::List => {
+                let l = &*(header as *mut ObjList);
+                check_buf_allocated(
+                    header,
+                    l.elements as *const std::ffi::c_void,
+                    l.count as usize * std::mem::size_of::<Value>(),
+                    l.capacity as usize * std::mem::size_of::<Value>(),
+                    "ObjList.elements",
+                    where_,
+                );
+            }
+            ObjType::TypedArray => {
+                let a = &*(header as *mut ObjTypedArray);
+                let elem_size = a.kind_tag().element_size();
+                check_buf_allocated(
+                    header,
+                    a.data as *const std::ffi::c_void,
+                    a.count as usize * elem_size,
+                    a.count as usize * elem_size,
+                    "ObjTypedArray.data",
+                    where_,
+                );
+            }
+            ObjType::Instance => {
+                let i = &*(header as *mut ObjInstance);
+                if i.fields_owned {
+                    check_buf_allocated(
+                        header,
+                        i.fields as *const std::ffi::c_void,
+                        i.num_fields as usize * std::mem::size_of::<Value>(),
+                        i.num_fields as usize * std::mem::size_of::<Value>(),
+                        "ObjInstance.fields",
+                        where_,
+                    );
+                }
+            }
+            ObjType::Fiber => {
+                let f = &*(header as *mut ObjFiber);
                 check_vec_buf(
                     header,
-                    mf.values.as_ptr() as _,
-                    mf.values.capacity(),
-                    "ObjFiber.mir_frames[].values",
+                    f.stack.as_ptr() as _,
+                    f.stack.capacity(),
+                    "ObjFiber.stack",
                     where_,
                 );
-                let _ = i;
+                check_vec_buf(
+                    header,
+                    f.frames.as_ptr() as _,
+                    f.frames.capacity(),
+                    "ObjFiber.frames",
+                    where_,
+                );
+                check_vec_buf(
+                    header,
+                    f.mir_frames.as_ptr() as _,
+                    f.mir_frames.capacity(),
+                    "ObjFiber.mir_frames",
+                    where_,
+                );
+                for (i, mf) in f.mir_frames.iter().enumerate() {
+                    check_vec_buf(
+                        header,
+                        mf.values.as_ptr() as _,
+                        mf.values.capacity(),
+                        "ObjFiber.mir_frames[].values",
+                        where_,
+                    );
+                    let _ = i;
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -172,19 +174,21 @@ unsafe fn check_vec_buf(
     field: &'static str,
     where_: &'static str,
 ) {
-    if cap == 0 || buf.is_null() {
-        return;
-    }
-    let sz = malloc_size(buf as *const std::ffi::c_void);
-    if sz == 0 {
-        eprintln!(
-            "ALIAS-DETECT [{where_}] {field}@{:p} buf=0x{:x} cap={} malloc_size=0",
-            header, buf as usize, cap
-        );
-        panic!(
-            "{field} buffer 0x{:x} already free at {} — buffer-aliasing bug",
-            buf as usize, where_
-        );
+    unsafe {
+        if cap == 0 || buf.is_null() {
+            return;
+        }
+        let sz = malloc_size(buf as *const std::ffi::c_void);
+        if sz == 0 {
+            eprintln!(
+                "ALIAS-DETECT [{where_}] {field}@{:p} buf=0x{:x} cap={} malloc_size=0",
+                header, buf as usize, cap
+            );
+            panic!(
+                "{field} buffer 0x{:x} already free at {} — buffer-aliasing bug",
+                buf as usize, where_
+            );
+        }
     }
 }
 
@@ -197,32 +201,34 @@ unsafe fn check_buf_allocated(
     field: &'static str,
     where_: &'static str,
 ) {
-    if cap == 0 || buf.is_null() {
-        return;
-    }
-    let sz = malloc_size(buf);
-    if sz == 0 {
-        // Buffer already free. Snapshot first 24 bytes so we can
-        // tell whether the contents look like NaN-boxed Values
-        // (Vec<Value>/list buffer poisoning) or text (String reuse).
-        let mut snap = [0u8; 24];
-        let to_copy = len.min(24);
-        if to_copy > 0 {
-            std::ptr::copy_nonoverlapping(buf as *const u8, snap.as_mut_ptr(), to_copy);
+    unsafe {
+        if cap == 0 || buf.is_null() {
+            return;
         }
-        eprintln!(
-            "ALIAS-DETECT [{where_}] {field}@{:p} buf=0x{:x} len={} cap={} malloc_size=0 \
+        let sz = malloc_size(buf);
+        if sz == 0 {
+            // Buffer already free. Snapshot first 24 bytes so we can
+            // tell whether the contents look like NaN-boxed Values
+            // (Vec<Value>/list buffer poisoning) or text (String reuse).
+            let mut snap = [0u8; 24];
+            let to_copy = len.min(24);
+            if to_copy > 0 {
+                std::ptr::copy_nonoverlapping(buf as *const u8, snap.as_mut_ptr(), to_copy);
+            }
+            eprintln!(
+                "ALIAS-DETECT [{where_}] {field}@{:p} buf=0x{:x} len={} cap={} malloc_size=0 \
              first24={:02x?}",
-            header,
-            buf as usize,
-            len,
-            cap,
-            &snap[..to_copy]
-        );
-        panic!(
-            "{field} buffer 0x{:x} already free at {} — buffer-aliasing bug",
-            buf as usize, where_
-        );
+                header,
+                buf as usize,
+                len,
+                cap,
+                &snap[..to_copy]
+            );
+            panic!(
+                "{field} buffer 0x{:x} already free at {} — buffer-aliasing bug",
+                buf as usize, where_
+            );
+        }
     }
 }
 
@@ -297,7 +303,7 @@ impl OldArena {
         // Current chunk full — add a new one.
         let needed = (size + align).max(self.chunk_size);
         self.chunk_size = (self.chunk_size * 2).min(4 * 1024 * 1024); // grow up to 4 MB
-                                                                      // Allocate as Vec<u64> to guarantee 8-byte alignment, then transmute to Vec<u8>.
+        // Allocate as Vec<u64> to guarantee 8-byte alignment, then transmute to Vec<u8>.
         let u64_count = needed.div_ceil(8);
         let aligned_vec: Vec<u64> = vec![0u64; u64_count];
         let byte_len = u64_count * 8;
@@ -818,131 +824,140 @@ impl Gc {
         header: *mut ObjHeader,
         remembered: &std::collections::HashSet<usize>,
     ) {
-        let check_val = |val: Value, desc: &str| {
-            if let Some(ptr) = val.as_object() {
-                let target = ptr as *mut ObjHeader;
-                if !target.is_null()
-                    && (*target).generation == GEN_YOUNG
-                    && !remembered.contains(&(header as usize))
-                {
-                    panic!(
-                        "WRITE BARRIER BUG: old {:?} ({:?}) → young {:?}, not in remembered set. desc: {}",
-                        header, (*header).obj_type, target, desc
-                    );
-                }
-            }
-        };
-        let check_raw = |ptr: *const u8, desc: &str| {
-            if !ptr.is_null() && self.nursery.contains(ptr) {
-                let target = ptr as *mut ObjHeader;
-                if (*target).generation == GEN_YOUNG && !remembered.contains(&(header as usize)) {
-                    panic!(
-                        "WRITE BARRIER BUG: old {:?} ({:?}) → young raw {:?}, not in remembered set. desc: {}",
-                        header, (*header).obj_type, ptr, desc
-                    );
-                }
-            }
-        };
-
-        check_raw((*header).class as *const u8, "header.class");
-
-        match (*header).obj_type {
-            ObjType::String
-            | ObjType::Fn
-            | ObjType::Range
-            | ObjType::Foreign
-            | ObjType::TypedArray
-            | ObjType::Simd
-            | ObjType::Buffer => {}
-            ObjType::List => {
-                let list = &*(header as *mut ObjList);
-                for (i, &val) in list.as_slice().iter().enumerate() {
-                    check_val(val, &format!("list[{}]", i));
-                }
-            }
-            ObjType::Map => {
-                let map = &*(header as *mut ObjMap);
-                for (key, &val) in &map.entries {
-                    check_val(key.value(), "map key");
-                    check_val(val, "map val");
-                }
-            }
-            ObjType::Closure => {
-                let closure = &*(header as *mut ObjClosure);
-                check_raw(closure.function as *const u8, "closure.function");
-                for (i, &uv) in closure.upvalues.iter().enumerate() {
-                    check_raw(uv as *const u8, &format!("closure.upvalue[{}]", i));
-                }
-            }
-            ObjType::Upvalue => {
-                let uv = &*(header as *mut ObjUpvalue);
-                check_val(uv.closed, "upvalue.closed");
-            }
-            ObjType::Fiber => {
-                let fiber = &*(header as *mut ObjFiber);
-                for (i, &val) in fiber.stack.iter().enumerate() {
-                    check_val(val, &format!("fiber.stack[{}]", i));
-                }
-                for (fi, frame) in fiber.mir_frames.iter().enumerate() {
-                    for (vi, &val) in frame.values.iter().enumerate() {
-                        check_val(val, &format!("fiber.frame[{}].values[{}]", fi, vi));
-                    }
-                    if let Some(c) = frame.closure {
-                        check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
-                    }
-                    if let Some(c) = frame.defining_class {
-                        check_raw(
-                            c as *const u8,
-                            &format!("fiber.frame[{}].defining_class", fi),
+        unsafe {
+            let check_val = |val: Value, desc: &str| {
+                if let Some(ptr) = val.as_object() {
+                    let target = ptr as *mut ObjHeader;
+                    if !target.is_null()
+                        && (*target).generation == GEN_YOUNG
+                        && !remembered.contains(&(header as usize))
+                    {
+                        panic!(
+                            "WRITE BARRIER BUG: old {:?} ({:?}) → young {:?}, not in remembered set. desc: {}",
+                            header,
+                            (*header).obj_type,
+                            target,
+                            desc
                         );
                     }
                 }
-                check_raw(fiber.caller as *const u8, "fiber.caller");
-                check_val(fiber.error, "fiber.error");
-                check_val(fiber.context_map, "fiber.context_map");
-                if let Some(v) = fiber.jit_resume_value {
-                    check_val(v, "fiber.jit_resume_value");
-                }
-                #[cfg(feature = "host")]
-                {
-                    check_val(fiber.krio_return_value, "fiber.krio_return_value");
-                    for (i, &v) in fiber.krio_jit_roots.iter().enumerate() {
-                        check_val(v, &format!("fiber.krio_jit_roots[{}]", i));
+            };
+            let check_raw = |ptr: *const u8, desc: &str| {
+                if !ptr.is_null() && self.nursery.contains(ptr) {
+                    let target = ptr as *mut ObjHeader;
+                    if (*target).generation == GEN_YOUNG && !remembered.contains(&(header as usize))
+                    {
+                        panic!(
+                            "WRITE BARRIER BUG: old {:?} ({:?}) → young raw {:?}, not in remembered set. desc: {}",
+                            header,
+                            (*header).obj_type,
+                            ptr,
+                            desc
+                        );
                     }
                 }
-            }
-            ObjType::Class => {
-                let class = &*(header as *mut ObjClass);
-                check_raw(class.superclass as *const u8, "class.superclass");
-                for (i, method) in class.methods.iter().enumerate() {
-                    if let Some(m) = method {
-                        match m {
-                            Method::Closure(ptr) | Method::Constructor(ptr) => {
-                                check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
-                            }
-                            Method::Native(_)
-                            | Method::Host(..)
-                            | Method::ForeignC(_)
-                            | Method::ForeignCDynamic(_) => {}
+            };
+
+            check_raw((*header).class as *const u8, "header.class");
+
+            match (*header).obj_type {
+                ObjType::String
+                | ObjType::Fn
+                | ObjType::Range
+                | ObjType::Foreign
+                | ObjType::TypedArray
+                | ObjType::Simd
+                | ObjType::Buffer => {}
+                ObjType::List => {
+                    let list = &*(header as *mut ObjList);
+                    for (i, &val) in list.as_slice().iter().enumerate() {
+                        check_val(val, &format!("list[{}]", i));
+                    }
+                }
+                ObjType::Map => {
+                    let map = &*(header as *mut ObjMap);
+                    for (key, &val) in &map.entries {
+                        check_val(key.value(), "map key");
+                        check_val(val, "map val");
+                    }
+                }
+                ObjType::Closure => {
+                    let closure = &*(header as *mut ObjClosure);
+                    check_raw(closure.function as *const u8, "closure.function");
+                    for (i, &uv) in closure.upvalues.iter().enumerate() {
+                        check_raw(uv as *const u8, &format!("closure.upvalue[{}]", i));
+                    }
+                }
+                ObjType::Upvalue => {
+                    let uv = &*(header as *mut ObjUpvalue);
+                    check_val(uv.closed, "upvalue.closed");
+                }
+                ObjType::Fiber => {
+                    let fiber = &*(header as *mut ObjFiber);
+                    for (i, &val) in fiber.stack.iter().enumerate() {
+                        check_val(val, &format!("fiber.stack[{}]", i));
+                    }
+                    for (fi, frame) in fiber.mir_frames.iter().enumerate() {
+                        for (vi, &val) in frame.values.iter().enumerate() {
+                            check_val(val, &format!("fiber.frame[{}].values[{}]", fi, vi));
+                        }
+                        if let Some(c) = frame.closure {
+                            check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
+                        }
+                        if let Some(c) = frame.defining_class {
+                            check_raw(
+                                c as *const u8,
+                                &format!("fiber.frame[{}].defining_class", fi),
+                            );
+                        }
+                    }
+                    check_raw(fiber.caller as *const u8, "fiber.caller");
+                    check_val(fiber.error, "fiber.error");
+                    check_val(fiber.context_map, "fiber.context_map");
+                    if let Some(v) = fiber.jit_resume_value {
+                        check_val(v, "fiber.jit_resume_value");
+                    }
+                    #[cfg(feature = "host")]
+                    {
+                        check_val(fiber.krio_return_value, "fiber.krio_return_value");
+                        for (i, &v) in fiber.krio_jit_roots.iter().enumerate() {
+                            check_val(v, &format!("fiber.krio_jit_roots[{}]", i));
                         }
                     }
                 }
-                for &val in class.static_fields.values() {
-                    check_val(val, "class.static_field");
-                }
-            }
-            ObjType::Instance => {
-                let inst = &*(header as *mut ObjInstance);
-                if !inst.fields.is_null() {
-                    for i in 0..inst.num_fields as usize {
-                        check_val(*inst.fields.add(i), &format!("instance.field[{}]", i));
+                ObjType::Class => {
+                    let class = &*(header as *mut ObjClass);
+                    check_raw(class.superclass as *const u8, "class.superclass");
+                    for (i, method) in class.methods.iter().enumerate() {
+                        if let Some(m) = method {
+                            match m {
+                                Method::Closure(ptr) | Method::Constructor(ptr) => {
+                                    check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
+                                }
+                                Method::Native(_)
+                                | Method::Host(..)
+                                | Method::ForeignC(_)
+                                | Method::ForeignCDynamic(_) => {}
+                            }
+                        }
+                    }
+                    for &val in class.static_fields.values() {
+                        check_val(val, "class.static_field");
                     }
                 }
-            }
-            ObjType::Module => {
-                let module = &*(header as *mut ObjModule);
-                for (i, &val) in module.variables.iter().enumerate() {
-                    check_val(val, &format!("module.var[{}]", i));
+                ObjType::Instance => {
+                    let inst = &*(header as *mut ObjInstance);
+                    if !inst.fields.is_null() {
+                        for i in 0..inst.num_fields as usize {
+                            check_val(*inst.fields.add(i), &format!("instance.field[{}]", i));
+                        }
+                    }
+                }
+                ObjType::Module => {
+                    let module = &*(header as *mut ObjModule);
+                    for (i, &val) in module.variables.iter().enumerate() {
+                        check_val(val, &format!("module.var[{}]", i));
+                    }
                 }
             }
         }
@@ -1593,50 +1608,52 @@ impl Gc {
 
     /// Promote a nursery object to old gen: ptr::read from arena → Box on heap.
     unsafe fn promote_object(&mut self, old_header: *mut ObjHeader) -> *mut ObjHeader {
-        let new_header = match (*old_header).obj_type {
-            ObjType::String => self.promote_typed::<ObjString>(old_header),
-            ObjType::List => self.promote_typed::<ObjList>(old_header),
-            ObjType::Map => self.promote_typed::<ObjMap>(old_header),
-            ObjType::Range => self.promote_typed::<ObjRange>(old_header),
-            ObjType::Fn => self.promote_typed::<ObjFn>(old_header),
-            ObjType::Closure => self.promote_typed::<ObjClosure>(old_header),
-            ObjType::Upvalue => self.promote_typed::<ObjUpvalue>(old_header),
-            ObjType::Fiber => self.promote_typed::<ObjFiber>(old_header),
-            ObjType::Class => self.promote_typed::<ObjClass>(old_header),
-            ObjType::Instance => self.promote_typed::<ObjInstance>(old_header),
-            ObjType::Foreign => self.promote_typed::<ObjForeign>(old_header),
-            ObjType::Module => self.promote_typed::<ObjModule>(old_header),
-            ObjType::TypedArray => self.promote_typed::<ObjTypedArray>(old_header),
-            ObjType::Simd => self.promote_typed::<ObjSimd>(old_header),
-            ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
-        };
+        unsafe {
+            let new_header = match (*old_header).obj_type {
+                ObjType::String => self.promote_typed::<ObjString>(old_header),
+                ObjType::List => self.promote_typed::<ObjList>(old_header),
+                ObjType::Map => self.promote_typed::<ObjMap>(old_header),
+                ObjType::Range => self.promote_typed::<ObjRange>(old_header),
+                ObjType::Fn => self.promote_typed::<ObjFn>(old_header),
+                ObjType::Closure => self.promote_typed::<ObjClosure>(old_header),
+                ObjType::Upvalue => self.promote_typed::<ObjUpvalue>(old_header),
+                ObjType::Fiber => self.promote_typed::<ObjFiber>(old_header),
+                ObjType::Class => self.promote_typed::<ObjClass>(old_header),
+                ObjType::Instance => self.promote_typed::<ObjInstance>(old_header),
+                ObjType::Foreign => self.promote_typed::<ObjForeign>(old_header),
+                ObjType::Module => self.promote_typed::<ObjModule>(old_header),
+                ObjType::TypedArray => self.promote_typed::<ObjTypedArray>(old_header),
+                ObjType::Simd => self.promote_typed::<ObjSimd>(old_header),
+                ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
+            };
 
-        // Fix ObjUpvalue self-referential location pointer.
-        if (*old_header).obj_type == ObjType::Upvalue {
-            let new_uv = new_header as *mut ObjUpvalue;
-            if self.nursery.contains((*new_uv).location as *const u8) {
-                (*new_uv).location = &mut (*new_uv).closed;
+            // Fix ObjUpvalue self-referential location pointer.
+            if (*old_header).obj_type == ObjType::Upvalue {
+                let new_uv = new_header as *mut ObjUpvalue;
+                if self.nursery.contains((*new_uv).location as *const u8) {
+                    (*new_uv).location = &mut (*new_uv).closed;
+                }
             }
-        }
 
-        // Fix ObjInstance: if fields were nursery-allocated, copy to arena.
-        if (*old_header).obj_type == ObjType::Instance {
-            let new_inst = new_header as *mut ObjInstance;
-            let nf = (*new_inst).num_fields as usize;
-            if nf > 0 && !(*new_inst).fields_owned {
-                let old_fields = (*new_inst).fields;
-                let new_fields = self.old_arena.alloc_bytes(
-                    nf * std::mem::size_of::<Value>(),
-                    std::mem::align_of::<Value>(),
-                ) as *mut Value;
-                std::ptr::copy_nonoverlapping(old_fields, new_fields, nf);
-                (*new_inst).fields = new_fields;
-                // Don't set fields_owned = true — arena handles the memory.
-                // The fields ptr is valid as long as the arena lives.
+            // Fix ObjInstance: if fields were nursery-allocated, copy to arena.
+            if (*old_header).obj_type == ObjType::Instance {
+                let new_inst = new_header as *mut ObjInstance;
+                let nf = (*new_inst).num_fields as usize;
+                if nf > 0 && !(*new_inst).fields_owned {
+                    let old_fields = (*new_inst).fields;
+                    let new_fields = self.old_arena.alloc_bytes(
+                        nf * std::mem::size_of::<Value>(),
+                        std::mem::align_of::<Value>(),
+                    ) as *mut Value;
+                    std::ptr::copy_nonoverlapping(old_fields, new_fields, nf);
+                    (*new_inst).fields = new_fields;
+                    // Don't set fields_owned = true — arena handles the memory.
+                    // The fields ptr is valid as long as the arena lives.
+                }
             }
-        }
 
-        new_header
+            new_header
+        }
     }
 
     /// Read an object out of the nursery arena and Box it in old gen.
@@ -1666,27 +1683,29 @@ impl Gc {
     /// and zero the count so the custom Drop's bounds check
     /// short-circuits.
     unsafe fn promote_typed<T>(&mut self, old_header: *mut ObjHeader) -> *mut ObjHeader {
-        let obj: T = std::ptr::read(old_header as *const T);
-        let new_ptr = self.old_arena.alloc(obj);
-        let header = new_ptr as *mut ObjHeader;
-        (*header).generation = GEN_OLD;
-        (*header).gc_mark = BLACK; // survive subsequent sweep_old
-        (*header).next = self.old_objects;
-        self.old_objects = header;
-        self.old_count += 1;
-        forget_heap_on_source(old_header);
-        if (*header).obj_type == ObjType::String {
-            let s = &*(header as *const ObjString);
-            trace_str_buf_event("PROMOTE", header, s.value.as_ptr(), s.value.len());
-            #[cfg(target_os = "macos")]
-            if trace_alias_enabled() {
-                eprintln!(
-                    "STR-PROMOTE-FROM old_hdr={:p} -> new_hdr={:p}",
-                    old_header, header
-                );
+        unsafe {
+            let obj: T = std::ptr::read(old_header as *const T);
+            let new_ptr = self.old_arena.alloc(obj);
+            let header = new_ptr as *mut ObjHeader;
+            (*header).generation = GEN_OLD;
+            (*header).gc_mark = BLACK; // survive subsequent sweep_old
+            (*header).next = self.old_objects;
+            self.old_objects = header;
+            self.old_count += 1;
+            forget_heap_on_source(old_header);
+            if (*header).obj_type == ObjType::String {
+                let s = &*(header as *const ObjString);
+                trace_str_buf_event("PROMOTE", header, s.value.as_ptr(), s.value.len());
+                #[cfg(target_os = "macos")]
+                if trace_alias_enabled() {
+                    eprintln!(
+                        "STR-PROMOTE-FROM old_hdr={:p} -> new_hdr={:p}",
+                        old_header, header
+                    );
+                }
             }
+            header
         }
-        header
     }
 
     // -- Sweep old gen (mark-sweep) -----------------------------------------
@@ -1732,25 +1751,29 @@ impl Gc {
     /// Debug: validate no old-gen object or root references a nursery address.
     #[cfg(debug_assertions)]
     unsafe fn validate_no_nursery_ptrs_inline(&self, roots: &[Value]) {
-        for (i, val) in roots.iter().enumerate() {
-            if let Some(ptr) = val.as_object() {
-                if self.nursery.contains(ptr) {
+        unsafe {
+            for (i, val) in roots.iter().enumerate() {
+                if let Some(ptr) = val.as_object()
+                    && self.nursery.contains(ptr)
+                {
                     panic!("GC BUG: root[{}] contains stale nursery ptr {:?}", i, ptr);
                 }
             }
-        }
-        let mut current = self.old_objects;
-        while !current.is_null() {
-            self.validate_object_no_nursery_inline(current);
-            current = (*current).next;
+            let mut current = self.old_objects;
+            while !current.is_null() {
+                self.validate_object_no_nursery_inline(current);
+                current = (*current).next;
+            }
         }
     }
 
     #[cfg(debug_assertions)]
     unsafe fn validate_object_no_nursery_inline(&self, header: *mut ObjHeader) {
-        let check_val = |val: Value, desc: &str| {
-            if let Some(ptr) = val.as_object() {
-                if self.nursery.contains(ptr) {
+        unsafe {
+            let check_val = |val: Value, desc: &str| {
+                if let Some(ptr) = val.as_object()
+                    && self.nursery.contains(ptr)
+                {
                     panic!(
                         "GC BUG: {:?} ({:?}) contains stale nursery ptr {:?}, desc: {}",
                         header,
@@ -1759,119 +1782,119 @@ impl Gc {
                         desc
                     );
                 }
-            }
-        };
-        let check_raw = |ptr: *const u8, desc: &str| {
-            if !ptr.is_null() && self.nursery.contains(ptr) {
-                panic!(
-                    "GC BUG: {:?} ({:?}) contains stale nursery raw ptr {:?}, desc: {}",
-                    header,
-                    (*header).obj_type,
-                    ptr,
-                    desc
-                );
-            }
-        };
+            };
+            let check_raw = |ptr: *const u8, desc: &str| {
+                if !ptr.is_null() && self.nursery.contains(ptr) {
+                    panic!(
+                        "GC BUG: {:?} ({:?}) contains stale nursery raw ptr {:?}, desc: {}",
+                        header,
+                        (*header).obj_type,
+                        ptr,
+                        desc
+                    );
+                }
+            };
 
-        check_raw((*header).class as *const u8, "header.class");
+            check_raw((*header).class as *const u8, "header.class");
 
-        match (*header).obj_type {
-            ObjType::String
-            | ObjType::Fn
-            | ObjType::Range
-            | ObjType::Foreign
-            | ObjType::TypedArray
-            | ObjType::Simd
-            | ObjType::Buffer => {}
-            ObjType::List => {
-                let list = &*(header as *mut ObjList);
-                for (i, &val) in list.as_slice().iter().enumerate() {
-                    check_val(val, &format!("list[{}]", i));
-                }
-            }
-            ObjType::Map => {
-                let map = &*(header as *mut ObjMap);
-                for (key, &val) in &map.entries {
-                    check_val(key.value(), "map key");
-                    check_val(val, "map val");
-                }
-            }
-            ObjType::Closure => {
-                let closure = &*(header as *mut ObjClosure);
-                check_raw(closure.function as *const u8, "closure.function");
-                for (i, &uv) in closure.upvalues.iter().enumerate() {
-                    check_raw(uv as *const u8, &format!("closure.upvalue[{}]", i));
-                }
-            }
-            ObjType::Upvalue => {
-                let uv = &*(header as *mut ObjUpvalue);
-                check_val(uv.closed, "upvalue.closed");
-            }
-            ObjType::Fiber => {
-                let fiber = &*(header as *mut ObjFiber);
-                for (i, &val) in fiber.stack.iter().enumerate() {
-                    check_val(val, &format!("fiber.stack[{}]", i));
-                }
-                for (fi, frame) in fiber.mir_frames.iter().enumerate() {
-                    for (vi, &val) in frame.values.iter().enumerate() {
-                        check_val(val, &format!("fiber.frame[{}].values[{}]", fi, vi));
-                    }
-                    if let Some(c) = frame.closure {
-                        check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
-                    }
-                    if let Some(c) = frame.defining_class {
-                        check_raw(
-                            c as *const u8,
-                            &format!("fiber.frame[{}].defining_class", fi),
-                        );
+            match (*header).obj_type {
+                ObjType::String
+                | ObjType::Fn
+                | ObjType::Range
+                | ObjType::Foreign
+                | ObjType::TypedArray
+                | ObjType::Simd
+                | ObjType::Buffer => {}
+                ObjType::List => {
+                    let list = &*(header as *mut ObjList);
+                    for (i, &val) in list.as_slice().iter().enumerate() {
+                        check_val(val, &format!("list[{}]", i));
                     }
                 }
-                check_raw(fiber.caller as *const u8, "fiber.caller");
-                check_val(fiber.error, "fiber.error");
-                check_val(fiber.context_map, "fiber.context_map");
-                if let Some(v) = fiber.jit_resume_value {
-                    check_val(v, "fiber.jit_resume_value");
-                }
-                #[cfg(feature = "host")]
-                {
-                    check_val(fiber.krio_return_value, "fiber.krio_return_value");
-                    for (i, &v) in fiber.krio_jit_roots.iter().enumerate() {
-                        check_val(v, &format!("fiber.krio_jit_roots[{}]", i));
+                ObjType::Map => {
+                    let map = &*(header as *mut ObjMap);
+                    for (key, &val) in &map.entries {
+                        check_val(key.value(), "map key");
+                        check_val(val, "map val");
                     }
                 }
-            }
-            ObjType::Class => {
-                let class = &*(header as *mut ObjClass);
-                check_raw(class.superclass as *const u8, "class.superclass");
-                for (i, method) in class.methods.iter().enumerate() {
-                    if let Some(m) = method {
-                        match m {
-                            Method::Closure(ptr) | Method::Constructor(ptr) => {
-                                check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
-                            }
-                            Method::Native(_)
-                            | Method::Host(..)
-                            | Method::ForeignC(_)
-                            | Method::ForeignCDynamic(_) => {}
+                ObjType::Closure => {
+                    let closure = &*(header as *mut ObjClosure);
+                    check_raw(closure.function as *const u8, "closure.function");
+                    for (i, &uv) in closure.upvalues.iter().enumerate() {
+                        check_raw(uv as *const u8, &format!("closure.upvalue[{}]", i));
+                    }
+                }
+                ObjType::Upvalue => {
+                    let uv = &*(header as *mut ObjUpvalue);
+                    check_val(uv.closed, "upvalue.closed");
+                }
+                ObjType::Fiber => {
+                    let fiber = &*(header as *mut ObjFiber);
+                    for (i, &val) in fiber.stack.iter().enumerate() {
+                        check_val(val, &format!("fiber.stack[{}]", i));
+                    }
+                    for (fi, frame) in fiber.mir_frames.iter().enumerate() {
+                        for (vi, &val) in frame.values.iter().enumerate() {
+                            check_val(val, &format!("fiber.frame[{}].values[{}]", fi, vi));
+                        }
+                        if let Some(c) = frame.closure {
+                            check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
+                        }
+                        if let Some(c) = frame.defining_class {
+                            check_raw(
+                                c as *const u8,
+                                &format!("fiber.frame[{}].defining_class", fi),
+                            );
+                        }
+                    }
+                    check_raw(fiber.caller as *const u8, "fiber.caller");
+                    check_val(fiber.error, "fiber.error");
+                    check_val(fiber.context_map, "fiber.context_map");
+                    if let Some(v) = fiber.jit_resume_value {
+                        check_val(v, "fiber.jit_resume_value");
+                    }
+                    #[cfg(feature = "host")]
+                    {
+                        check_val(fiber.krio_return_value, "fiber.krio_return_value");
+                        for (i, &v) in fiber.krio_jit_roots.iter().enumerate() {
+                            check_val(v, &format!("fiber.krio_jit_roots[{}]", i));
                         }
                     }
                 }
-                for &val in class.static_fields.values() {
-                    check_val(val, "class.static_field");
-                }
-            }
-            ObjType::Instance => {
-                let inst = &*(header as *mut ObjInstance);
-                if !inst.fields.is_null() {
-                    for i in 0..inst.num_fields as usize {
-                        check_val(*inst.fields.add(i), &format!("instance.field[{}]", i));
+                ObjType::Class => {
+                    let class = &*(header as *mut ObjClass);
+                    check_raw(class.superclass as *const u8, "class.superclass");
+                    for (i, method) in class.methods.iter().enumerate() {
+                        if let Some(m) = method {
+                            match m {
+                                Method::Closure(ptr) | Method::Constructor(ptr) => {
+                                    check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
+                                }
+                                Method::Native(_)
+                                | Method::Host(..)
+                                | Method::ForeignC(_)
+                                | Method::ForeignCDynamic(_) => {}
+                            }
+                        }
+                    }
+                    for &val in class.static_fields.values() {
+                        check_val(val, "class.static_field");
                     }
                 }
-            }
-            ObjType::Module => {
-                let module = &*(header as *mut ObjModule);
-                for (i, &val) in module.variables.iter().enumerate() {
-                    check_val(val, &format!("module.var[{}]", i));
+                ObjType::Instance => {
+                    let inst = &*(header as *mut ObjInstance);
+                    if !inst.fields.is_null() {
+                        for i in 0..inst.num_fields as usize {
+                            check_val(*inst.fields.add(i), &format!("instance.field[{}]", i));
+                        }
+                    }
+                }
+                ObjType::Module => {
+                    let module = &*(header as *mut ObjModule);
+                    for (i, &val) in module.variables.iter().enumerate() {
+                        check_val(val, &format!("module.var[{}]", i));
+                    }
                 }
             }
         }
@@ -1879,20 +1902,24 @@ impl Gc {
 
     /// Reset marks on all old objects (after minor GC where no old sweep runs).
     unsafe fn reset_old_marks(&self) {
-        let mut current = self.old_objects;
-        while !current.is_null() {
-            (*current).gc_mark = WHITE;
-            current = (*current).next;
+        unsafe {
+            let mut current = self.old_objects;
+            while !current.is_null() {
+                (*current).gc_mark = WHITE;
+                current = (*current).next;
+            }
         }
     }
 
     // -- Inline forwarding (no HashMap) -------------------------------------
 
     unsafe fn update_old_gen_pointers_inline(&self) {
-        let mut current = self.old_objects;
-        while !current.is_null() {
-            update_pointers_in_object_inline(current, &self.nursery);
-            current = (*current).next;
+        unsafe {
+            let mut current = self.old_objects;
+            while !current.is_null() {
+                update_pointers_in_object_inline(current, &self.nursery);
+                current = (*current).next;
+            }
         }
     }
 
@@ -2037,7 +2064,9 @@ pub(super) fn process_gray_stack(gray_stack: &mut Vec<*mut ObjHeader>) {
 
 /// Trace all object references from a single object.
 unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
-    for_each_child(header, &mut |child| mark_gray(child, gray_stack));
+    unsafe {
+        for_each_child(header, &mut |child| mark_gray(child, gray_stack));
+    }
 }
 
 #[inline(always)]
@@ -2058,118 +2087,120 @@ fn child_value<F: FnMut(*mut ObjHeader)>(val: Value, f: &mut F) {
 /// fields' objects. Null and implausible pointers are skipped, so a
 /// corrupt slot costs a leaked reference rather than a fault.
 pub(super) unsafe fn for_each_child<F: FnMut(*mut ObjHeader)>(header: *mut ObjHeader, f: &mut F) {
-    if !is_valid_obj_ptr(header) {
-        return;
-    }
-    child_ptr((*header).class as *mut ObjHeader, f);
-
-    match (*header).obj_type {
-        ObjType::String
-        | ObjType::Fn
-        | ObjType::Range
-        | ObjType::Foreign
-        | ObjType::TypedArray
-        | ObjType::Simd
-        | ObjType::Buffer => {}
-
-        ObjType::List => {
-            let list = &*(header as *mut ObjList);
-            if let Some(buffer) = list.buffer_object() {
-                child_ptr(buffer, f);
-            }
-            for &val in list.as_slice() {
-                child_value(val, f);
-            }
+    unsafe {
+        if !is_valid_obj_ptr(header) {
+            return;
         }
+        child_ptr((*header).class as *mut ObjHeader, f);
 
-        ObjType::Map => {
-            let map = &*(header as *mut ObjMap);
-            for (key, &val) in &map.entries {
-                child_value(key.value(), f);
-                child_value(val, f);
-            }
-        }
+        match (*header).obj_type {
+            ObjType::String
+            | ObjType::Fn
+            | ObjType::Range
+            | ObjType::Foreign
+            | ObjType::TypedArray
+            | ObjType::Simd
+            | ObjType::Buffer => {}
 
-        ObjType::Closure => {
-            let closure = &*(header as *mut ObjClosure);
-            child_ptr(closure.function as *mut ObjHeader, f);
-            for &uv in &closure.upvalues {
-                child_ptr(uv as *mut ObjHeader, f);
-            }
-            child_ptr(closure.defining_class as *mut ObjHeader, f);
-        }
-
-        ObjType::Upvalue => {
-            let uv = &*(header as *mut ObjUpvalue);
-            child_value(uv.closed, f);
-        }
-
-        ObjType::Fiber => {
-            let fiber = &*(header as *mut ObjFiber);
-            for &val in &fiber.stack {
-                child_value(val, f);
-            }
-            for frame in &fiber.frames {
-                child_ptr(frame.closure as *mut ObjHeader, f);
-            }
-            for frame in &fiber.mir_frames {
-                for &val in &frame.values {
-                    child_value(val, f);
+            ObjType::List => {
+                let list = &*(header as *mut ObjList);
+                if let Some(buffer) = list.buffer_object() {
+                    child_ptr(buffer, f);
                 }
-                if let Some(closure) = frame.closure {
-                    child_ptr(closure as *mut ObjHeader, f);
-                }
-                if let Some(class) = frame.defining_class {
-                    child_ptr(class as *mut ObjHeader, f);
-                }
-            }
-            child_ptr(fiber.caller as *mut ObjHeader, f);
-            child_value(fiber.error, f);
-            child_value(fiber.context_map, f);
-            if let Some(v) = fiber.jit_resume_value {
-                child_value(v, f);
-            }
-            #[cfg(feature = "host")]
-            {
-                child_value(fiber.krio_return_value, f);
-                for &val in &fiber.krio_jit_roots {
+                for &val in list.as_slice() {
                     child_value(val, f);
                 }
             }
-        }
 
-        ObjType::Class => {
-            let class = &*(header as *mut ObjClass);
-            child_ptr(class.superclass as *mut ObjHeader, f);
-            for method in class.methods.iter().flatten() {
-                match method {
-                    Method::Closure(ptr) | Method::Constructor(ptr) => {
-                        child_ptr(*ptr as *mut ObjHeader, f);
+            ObjType::Map => {
+                let map = &*(header as *mut ObjMap);
+                for (key, &val) in &map.entries {
+                    child_value(key.value(), f);
+                    child_value(val, f);
+                }
+            }
+
+            ObjType::Closure => {
+                let closure = &*(header as *mut ObjClosure);
+                child_ptr(closure.function as *mut ObjHeader, f);
+                for &uv in &closure.upvalues {
+                    child_ptr(uv as *mut ObjHeader, f);
+                }
+                child_ptr(closure.defining_class as *mut ObjHeader, f);
+            }
+
+            ObjType::Upvalue => {
+                let uv = &*(header as *mut ObjUpvalue);
+                child_value(uv.closed, f);
+            }
+
+            ObjType::Fiber => {
+                let fiber = &*(header as *mut ObjFiber);
+                for &val in &fiber.stack {
+                    child_value(val, f);
+                }
+                for frame in &fiber.frames {
+                    child_ptr(frame.closure as *mut ObjHeader, f);
+                }
+                for frame in &fiber.mir_frames {
+                    for &val in &frame.values {
+                        child_value(val, f);
                     }
-                    Method::Native(_)
-                    | Method::Host(..)
-                    | Method::ForeignC(_)
-                    | Method::ForeignCDynamic(_) => {}
+                    if let Some(closure) = frame.closure {
+                        child_ptr(closure as *mut ObjHeader, f);
+                    }
+                    if let Some(class) = frame.defining_class {
+                        child_ptr(class as *mut ObjHeader, f);
+                    }
+                }
+                child_ptr(fiber.caller as *mut ObjHeader, f);
+                child_value(fiber.error, f);
+                child_value(fiber.context_map, f);
+                if let Some(v) = fiber.jit_resume_value {
+                    child_value(v, f);
+                }
+                #[cfg(feature = "host")]
+                {
+                    child_value(fiber.krio_return_value, f);
+                    for &val in &fiber.krio_jit_roots {
+                        child_value(val, f);
+                    }
                 }
             }
-            for &val in class.static_fields.values() {
-                child_value(val, f);
-            }
-        }
 
-        ObjType::Instance => {
-            let inst = &*(header as *mut ObjInstance);
-            if !inst.fields.is_null() {
-                for i in 0..inst.num_fields as usize {
-                    child_value(*inst.fields.add(i), f);
+            ObjType::Class => {
+                let class = &*(header as *mut ObjClass);
+                child_ptr(class.superclass as *mut ObjHeader, f);
+                for method in class.methods.iter().flatten() {
+                    match method {
+                        Method::Closure(ptr) | Method::Constructor(ptr) => {
+                            child_ptr(*ptr as *mut ObjHeader, f);
+                        }
+                        Method::Native(_)
+                        | Method::Host(..)
+                        | Method::ForeignC(_)
+                        | Method::ForeignCDynamic(_) => {}
+                    }
+                }
+                for &val in class.static_fields.values() {
+                    child_value(val, f);
                 }
             }
-        }
 
-        ObjType::Module => {
-            let module = &*(header as *mut ObjModule);
-            for &val in &module.variables {
-                child_value(val, f);
+            ObjType::Instance => {
+                let inst = &*(header as *mut ObjInstance);
+                if !inst.fields.is_null() {
+                    for i in 0..inst.num_fields as usize {
+                        child_value(*inst.fields.add(i), f);
+                    }
+                }
+            }
+
+            ObjType::Module => {
+                let module = &*(header as *mut ObjModule);
+                for &val in &module.variables {
+                    child_value(val, f);
+                }
             }
         }
     }
@@ -2206,94 +2237,95 @@ fn update_roots_inline(roots: &mut [Value], nursery: &Nursery) {
 /// the pointer + zero the count so the Drop's bounds check
 /// short-circuits before it calls `dealloc`.
 unsafe fn forget_heap_on_source(header: *mut ObjHeader) {
-    match (*header).obj_type {
-        ObjType::String => {
-            let s = &mut *(header as *mut ObjString);
-            std::mem::forget(std::mem::take(&mut s.value));
-            // c_str's lazy CString cache is also heap-allocated;
-            // drop the source's reference without freeing so
-            // the destination keeps the populated cache (if any).
-            std::mem::forget(std::mem::take(&mut *s.c_str.borrow_mut()));
-        }
-        ObjType::List => {
-            let l = &mut *(header as *mut ObjList);
-            l.elements = std::ptr::null_mut();
-            l.count = 0;
-            l.capacity = 0;
-        }
-        ObjType::Map => {
-            let m = &mut *(header as *mut ObjMap);
-            std::mem::forget(std::mem::take(&mut m.entries));
-        }
-        ObjType::Closure => {
-            let c = &mut *(header as *mut ObjClosure);
-            std::mem::forget(std::mem::take(&mut c.upvalues));
-        }
-        ObjType::Instance => {
-            let i = &mut *(header as *mut ObjInstance);
-            if i.fields_owned {
-                i.fields = std::ptr::null_mut();
-                i.num_fields = 0;
-                i.fields_owned = false;
+    unsafe {
+        match (*header).obj_type {
+            ObjType::String => {
+                let s = &mut *(header as *mut ObjString);
+                std::mem::forget(std::mem::take(&mut s.value));
+                // c_str's lazy CString cache is also heap-allocated;
+                // drop the source's reference without freeing so
+                // the destination keeps the populated cache (if any).
+                std::mem::forget(std::mem::take(&mut *s.c_str.borrow_mut()));
             }
-        }
-        ObjType::Foreign => {
-            let f = &mut *(header as *mut ObjForeign);
-            std::mem::forget(std::mem::take(&mut f.data));
-        }
-        ObjType::Module => {
-            let m = &mut *(header as *mut ObjModule);
-            std::mem::forget(std::mem::take(&mut m.variables));
-            std::mem::forget(std::mem::take(&mut m.variable_names));
-        }
-        ObjType::TypedArray => {
-            let a = &mut *(header as *mut ObjTypedArray);
-            a.data = std::ptr::null_mut();
-            a.count = 0;
-        }
-        ObjType::Fiber | ObjType::Class => {
-            // Allocated straight to old gen via alloc_old; never
-            // promoted via this path. Falling through is fine.
-        }
-        ObjType::Range | ObjType::Fn | ObjType::Upvalue | ObjType::Simd | ObjType::Buffer => {
-            // No heap-owned fields: Range/Fn/Upvalue carry only
-            // primitives + raw pointers we don't own here, Simd
-            // is inline lane data.
+            ObjType::List => {
+                let l = &mut *(header as *mut ObjList);
+                l.elements = std::ptr::null_mut();
+                l.count = 0;
+                l.capacity = 0;
+            }
+            ObjType::Map => {
+                let m = &mut *(header as *mut ObjMap);
+                std::mem::forget(std::mem::take(&mut m.entries));
+            }
+            ObjType::Closure => {
+                let c = &mut *(header as *mut ObjClosure);
+                std::mem::forget(std::mem::take(&mut c.upvalues));
+            }
+            ObjType::Instance => {
+                let i = &mut *(header as *mut ObjInstance);
+                if i.fields_owned {
+                    i.fields = std::ptr::null_mut();
+                    i.num_fields = 0;
+                    i.fields_owned = false;
+                }
+            }
+            ObjType::Foreign => {
+                let f = &mut *(header as *mut ObjForeign);
+                std::mem::forget(std::mem::take(&mut f.data));
+            }
+            ObjType::Module => {
+                let m = &mut *(header as *mut ObjModule);
+                std::mem::forget(std::mem::take(&mut m.variables));
+                std::mem::forget(std::mem::take(&mut m.variable_names));
+            }
+            ObjType::TypedArray => {
+                let a = &mut *(header as *mut ObjTypedArray);
+                a.data = std::ptr::null_mut();
+                a.count = 0;
+            }
+            ObjType::Fiber | ObjType::Class => {
+                // Allocated straight to old gen via alloc_old; never
+                // promoted via this path. Falling through is fine.
+            }
+            ObjType::Range | ObjType::Fn | ObjType::Upvalue | ObjType::Simd | ObjType::Buffer => {
+                // No heap-owned fields: Range/Fn/Upvalue carry only
+                // primitives + raw pointers we don't own here, Simd
+                // is inline lane data.
+            }
         }
     }
 }
 
 fn update_value_inline(val: &mut Value, nursery: &Nursery) {
-    if val.is_object() {
-        if let Some(ptr) = val.as_object() {
-            if nursery.contains(ptr) {
-                let header = ptr as *mut ObjHeader;
-                unsafe {
-                    if (*header).gc_mark == FORWARDED {
-                        let next_raw = (*header).next as u64;
-                        // Detect the gpu/api corruption: a forwarded header's
-                        // `next` should be a raw old-gen pointer (typically
-                        // ~0xb0_0000_0000 range on macOS arm64). If it has
-                        // the NaN-box TAG_OBJ bits set (0xFFFC...), the
-                        // bytes have been overwritten by something storing a
-                        // Wren Value. Marker `0xDEAD` distinguishes from
-                        // normal PromoteEnd events.
-                        if (next_raw & 0xFFFC_0000_0000_0000) == 0xFFFC_0000_0000_0000 {
-                            crate::runtime::gc_ringbuf::record(
-                                crate::runtime::gc_ringbuf::Ev::PromoteEnd,
-                                [
-                                    header as u64,
-                                    next_raw,
-                                    (*header).obj_type as u64,
-                                    0xDEAD,
-                                    0,
-                                    0,
-                                ],
-                            );
-                        }
-                        *val = Value::object((*header).next as *mut u8);
-                    }
+    if val.is_object()
+        && let Some(ptr) = val.as_object()
+        && nursery.contains(ptr)
+    {
+        let header = ptr as *mut ObjHeader;
+        unsafe {
+            if (*header).gc_mark == FORWARDED {
+                let next_raw = (*header).next as u64;
+                // Detect the gpu/api corruption: a forwarded header's
+                // `next` should be a raw old-gen pointer (typically
+                // ~0xb0_0000_0000 range on macOS arm64). If it has
+                // the NaN-box TAG_OBJ bits set (0xFFFC...), the
+                // bytes have been overwritten by something storing a
+                // Wren Value. Marker `0xDEAD` distinguishes from
+                // normal PromoteEnd events.
+                if (next_raw & 0xFFFC_0000_0000_0000) == 0xFFFC_0000_0000_0000 {
+                    crate::runtime::gc_ringbuf::record(
+                        crate::runtime::gc_ringbuf::Ev::PromoteEnd,
+                        [
+                            header as u64,
+                            next_raw,
+                            (*header).obj_type as u64,
+                            0xDEAD,
+                            0,
+                            0,
+                        ],
+                    );
                 }
+                *val = Value::object((*header).next as *mut u8);
             }
         }
     }
@@ -2312,137 +2344,139 @@ fn update_raw_ptr_inline<T>(ptr: &mut *mut T, nursery: &Nursery) {
 
 /// Update all object-reference fields inside a single object using inline forwarding.
 unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nursery) {
-    // Update class pointer.
-    if !(*header).class.is_null() {
-        update_raw_ptr_inline(&mut (*header).class, nursery);
-    }
-
-    match (*header).obj_type {
-        ObjType::String
-        | ObjType::Fn
-        | ObjType::Range
-        | ObjType::Foreign
-        | ObjType::TypedArray
-        | ObjType::Simd
-        | ObjType::Buffer => {}
-
-        ObjType::List => {
-            let list = &mut *(header as *mut ObjList);
-            for val in list.as_mut_slice() {
-                update_value_inline(val, nursery);
-            }
+    unsafe {
+        // Update class pointer.
+        if !(*header).class.is_null() {
+            update_raw_ptr_inline(&mut (*header).class, nursery);
         }
 
-        ObjType::Map => {
-            let map = &mut *(header as *mut ObjMap);
-            crate::runtime::gc_ringbuf::record(
-                crate::runtime::gc_ringbuf::Ev::MapDrainBegin,
-                [header as u64, map.entries.len() as u64, 0, 0, 0, 0],
-            );
-            let entries: Vec<(MapKey, Value)> = map.entries.drain(..).collect();
-            for (key, val) in entries {
-                let mut k = key.value();
-                let mut v = val;
-                let k_before = k.to_bits();
-                update_value_inline(&mut k, nursery);
-                update_value_inline(&mut v, nursery);
-                crate::runtime::gc_ringbuf::record(
-                    crate::runtime::gc_ringbuf::Ev::MapKeyForward,
-                    [header as u64, k_before, k.to_bits(), v.to_bits(), 0, 0],
-                );
-                map.entries.insert(MapKey::new(k), v);
-                crate::runtime::gc_ringbuf::record(
-                    crate::runtime::gc_ringbuf::Ev::MapKeyInsert,
-                    [header as u64, k.to_bits(), 0, 0, 0, 0],
-                );
-            }
-            crate::runtime::gc_ringbuf::record(
-                crate::runtime::gc_ringbuf::Ev::MapDrainEnd,
-                [header as u64, 0, 0, 0, 0, 0],
-            );
-        }
+        match (*header).obj_type {
+            ObjType::String
+            | ObjType::Fn
+            | ObjType::Range
+            | ObjType::Foreign
+            | ObjType::TypedArray
+            | ObjType::Simd
+            | ObjType::Buffer => {}
 
-        ObjType::Closure => {
-            let closure = &mut *(header as *mut ObjClosure);
-            update_raw_ptr_inline(&mut closure.function, nursery);
-            for uv in &mut closure.upvalues {
-                update_raw_ptr_inline(uv, nursery);
-            }
-            update_raw_ptr_inline(&mut closure.defining_class, nursery);
-        }
-
-        ObjType::Upvalue => {
-            let uv = &mut *(header as *mut ObjUpvalue);
-            update_value_inline(&mut uv.closed, nursery);
-        }
-
-        ObjType::Fiber => {
-            let fiber = &mut *(header as *mut ObjFiber);
-            for val in &mut fiber.stack {
-                update_value_inline(val, nursery);
-            }
-            for frame in &mut fiber.frames {
-                update_raw_ptr_inline(&mut frame.closure, nursery);
-            }
-            for frame in &mut fiber.mir_frames {
-                for val in frame.values.iter_mut() {
-                    update_value_inline(val, nursery);
-                }
-                if let Some(ref mut closure) = frame.closure {
-                    update_raw_ptr_inline(closure, nursery);
-                }
-                if let Some(ref mut class) = frame.defining_class {
-                    update_raw_ptr_inline(class, nursery);
-                }
-            }
-            update_raw_ptr_inline(&mut fiber.caller, nursery);
-            update_value_inline(&mut fiber.error, nursery);
-            update_value_inline(&mut fiber.context_map, nursery);
-            if let Some(ref mut v) = fiber.jit_resume_value {
-                update_value_inline(v, nursery);
-            }
-            #[cfg(feature = "host")]
-            {
-                update_value_inline(&mut fiber.krio_return_value, nursery);
-                for val in fiber.krio_jit_roots.iter_mut() {
+            ObjType::List => {
+                let list = &mut *(header as *mut ObjList);
+                for val in list.as_mut_slice() {
                     update_value_inline(val, nursery);
                 }
             }
-        }
 
-        ObjType::Class => {
-            let class = &mut *(header as *mut ObjClass);
-            update_raw_ptr_inline(&mut class.superclass, nursery);
-            for method in class.methods.iter_mut().flatten() {
-                match method {
-                    Method::Closure(ptr) | Method::Constructor(ptr) => {
-                        update_raw_ptr_inline(ptr, nursery);
+            ObjType::Map => {
+                let map = &mut *(header as *mut ObjMap);
+                crate::runtime::gc_ringbuf::record(
+                    crate::runtime::gc_ringbuf::Ev::MapDrainBegin,
+                    [header as u64, map.entries.len() as u64, 0, 0, 0, 0],
+                );
+                let entries: Vec<(MapKey, Value)> = map.entries.drain(..).collect();
+                for (key, val) in entries {
+                    let mut k = key.value();
+                    let mut v = val;
+                    let k_before = k.to_bits();
+                    update_value_inline(&mut k, nursery);
+                    update_value_inline(&mut v, nursery);
+                    crate::runtime::gc_ringbuf::record(
+                        crate::runtime::gc_ringbuf::Ev::MapKeyForward,
+                        [header as u64, k_before, k.to_bits(), v.to_bits(), 0, 0],
+                    );
+                    map.entries.insert(MapKey::new(k), v);
+                    crate::runtime::gc_ringbuf::record(
+                        crate::runtime::gc_ringbuf::Ev::MapKeyInsert,
+                        [header as u64, k.to_bits(), 0, 0, 0, 0],
+                    );
+                }
+                crate::runtime::gc_ringbuf::record(
+                    crate::runtime::gc_ringbuf::Ev::MapDrainEnd,
+                    [header as u64, 0, 0, 0, 0, 0],
+                );
+            }
+
+            ObjType::Closure => {
+                let closure = &mut *(header as *mut ObjClosure);
+                update_raw_ptr_inline(&mut closure.function, nursery);
+                for uv in &mut closure.upvalues {
+                    update_raw_ptr_inline(uv, nursery);
+                }
+                update_raw_ptr_inline(&mut closure.defining_class, nursery);
+            }
+
+            ObjType::Upvalue => {
+                let uv = &mut *(header as *mut ObjUpvalue);
+                update_value_inline(&mut uv.closed, nursery);
+            }
+
+            ObjType::Fiber => {
+                let fiber = &mut *(header as *mut ObjFiber);
+                for val in &mut fiber.stack {
+                    update_value_inline(val, nursery);
+                }
+                for frame in &mut fiber.frames {
+                    update_raw_ptr_inline(&mut frame.closure, nursery);
+                }
+                for frame in &mut fiber.mir_frames {
+                    for val in frame.values.iter_mut() {
+                        update_value_inline(val, nursery);
                     }
-                    Method::Native(_)
-                    | Method::Host(..)
-                    | Method::ForeignC(_)
-                    | Method::ForeignCDynamic(_) => {}
+                    if let Some(ref mut closure) = frame.closure {
+                        update_raw_ptr_inline(closure, nursery);
+                    }
+                    if let Some(ref mut class) = frame.defining_class {
+                        update_raw_ptr_inline(class, nursery);
+                    }
+                }
+                update_raw_ptr_inline(&mut fiber.caller, nursery);
+                update_value_inline(&mut fiber.error, nursery);
+                update_value_inline(&mut fiber.context_map, nursery);
+                if let Some(ref mut v) = fiber.jit_resume_value {
+                    update_value_inline(v, nursery);
+                }
+                #[cfg(feature = "host")]
+                {
+                    update_value_inline(&mut fiber.krio_return_value, nursery);
+                    for val in fiber.krio_jit_roots.iter_mut() {
+                        update_value_inline(val, nursery);
+                    }
                 }
             }
-            for val in class.static_fields.values_mut() {
-                update_value_inline(val, nursery);
-            }
-        }
 
-        ObjType::Instance => {
-            let inst = &mut *(header as *mut ObjInstance);
-            if !inst.fields.is_null() {
-                for i in 0..inst.num_fields as usize {
-                    let val_ptr = inst.fields.add(i);
-                    update_value_inline(&mut *val_ptr, nursery);
+            ObjType::Class => {
+                let class = &mut *(header as *mut ObjClass);
+                update_raw_ptr_inline(&mut class.superclass, nursery);
+                for method in class.methods.iter_mut().flatten() {
+                    match method {
+                        Method::Closure(ptr) | Method::Constructor(ptr) => {
+                            update_raw_ptr_inline(ptr, nursery);
+                        }
+                        Method::Native(_)
+                        | Method::Host(..)
+                        | Method::ForeignC(_)
+                        | Method::ForeignCDynamic(_) => {}
+                    }
+                }
+                for val in class.static_fields.values_mut() {
+                    update_value_inline(val, nursery);
                 }
             }
-        }
 
-        ObjType::Module => {
-            let module = &mut *(header as *mut ObjModule);
-            for val in &mut module.variables {
-                update_value_inline(val, nursery);
+            ObjType::Instance => {
+                let inst = &mut *(header as *mut ObjInstance);
+                if !inst.fields.is_null() {
+                    for i in 0..inst.num_fields as usize {
+                        let val_ptr = inst.fields.add(i);
+                        update_value_inline(&mut *val_ptr, nursery);
+                    }
+                }
+            }
+
+            ObjType::Module => {
+                let module = &mut *(header as *mut ObjModule);
+                for val in &mut module.variables {
+                    update_value_inline(val, nursery);
+                }
             }
         }
     }
@@ -2476,83 +2510,87 @@ fn object_size(header: *mut ObjHeader) -> usize {
 
 /// Drop owned Rust types in-place (for nursery objects — arena memory freed separately).
 pub(super) unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
-    if (*header).obj_type == ObjType::String {
-        let s = &*(header as *const ObjString);
-        trace_str_buf_event("DROP-N", header, s.value.as_ptr(), s.value.len());
-    }
-    match (*header).obj_type {
-        ObjType::String => std::ptr::drop_in_place(header as *mut ObjString),
-        ObjType::List => std::ptr::drop_in_place(header as *mut ObjList),
-        ObjType::Map => std::ptr::drop_in_place(header as *mut ObjMap),
-        ObjType::Range => std::ptr::drop_in_place(header as *mut ObjRange),
-        ObjType::Fn => std::ptr::drop_in_place(header as *mut ObjFn),
-        ObjType::Closure => std::ptr::drop_in_place(header as *mut ObjClosure),
-        ObjType::Upvalue => std::ptr::drop_in_place(header as *mut ObjUpvalue),
-        ObjType::Fiber => std::ptr::drop_in_place(header as *mut ObjFiber),
-        ObjType::Class => std::ptr::drop_in_place(header as *mut ObjClass),
-        ObjType::Instance => std::ptr::drop_in_place(header as *mut ObjInstance),
-        ObjType::Foreign => std::ptr::drop_in_place(header as *mut ObjForeign),
-        ObjType::Module => std::ptr::drop_in_place(header as *mut ObjModule),
-        ObjType::TypedArray => std::ptr::drop_in_place(header as *mut ObjTypedArray),
-        ObjType::Simd => std::ptr::drop_in_place(header as *mut ObjSimd),
-        ObjType::Buffer => {}
+    unsafe {
+        if (*header).obj_type == ObjType::String {
+            let s = &*(header as *const ObjString);
+            trace_str_buf_event("DROP-N", header, s.value.as_ptr(), s.value.len());
+        }
+        match (*header).obj_type {
+            ObjType::String => std::ptr::drop_in_place(header as *mut ObjString),
+            ObjType::List => std::ptr::drop_in_place(header as *mut ObjList),
+            ObjType::Map => std::ptr::drop_in_place(header as *mut ObjMap),
+            ObjType::Range => std::ptr::drop_in_place(header as *mut ObjRange),
+            ObjType::Fn => std::ptr::drop_in_place(header as *mut ObjFn),
+            ObjType::Closure => std::ptr::drop_in_place(header as *mut ObjClosure),
+            ObjType::Upvalue => std::ptr::drop_in_place(header as *mut ObjUpvalue),
+            ObjType::Fiber => std::ptr::drop_in_place(header as *mut ObjFiber),
+            ObjType::Class => std::ptr::drop_in_place(header as *mut ObjClass),
+            ObjType::Instance => std::ptr::drop_in_place(header as *mut ObjInstance),
+            ObjType::Foreign => std::ptr::drop_in_place(header as *mut ObjForeign),
+            ObjType::Module => std::ptr::drop_in_place(header as *mut ObjModule),
+            ObjType::TypedArray => std::ptr::drop_in_place(header as *mut ObjTypedArray),
+            ObjType::Simd => std::ptr::drop_in_place(header as *mut ObjSimd),
+            ObjType::Buffer => {}
+        }
     }
 }
 
 /// Reconstruct Box and drop (for old-gen objects only).
 unsafe fn drop_object(header: *mut ObjHeader) {
-    // Use drop_in_place instead of Box::from_raw — old-gen objects may be
-    // arena-allocated (not individually heap-allocated). drop_in_place
-    // calls the destructor (freeing internal Vecs, Strings, etc.) without
-    // trying to free the object's memory itself.
-    if (*header).obj_type == ObjType::String {
-        let s = &*(header as *const ObjString);
-        trace_str_buf_event("DROP-O", header, s.value.as_ptr(), s.value.len());
-    }
-    match (*header).obj_type {
-        ObjType::String => {
-            std::ptr::drop_in_place(header as *mut ObjString);
+    unsafe {
+        // Use drop_in_place instead of Box::from_raw — old-gen objects may be
+        // arena-allocated (not individually heap-allocated). drop_in_place
+        // calls the destructor (freeing internal Vecs, Strings, etc.) without
+        // trying to free the object's memory itself.
+        if (*header).obj_type == ObjType::String {
+            let s = &*(header as *const ObjString);
+            trace_str_buf_event("DROP-O", header, s.value.as_ptr(), s.value.len());
         }
-        ObjType::List => {
-            std::ptr::drop_in_place(header as *mut ObjList);
+        match (*header).obj_type {
+            ObjType::String => {
+                std::ptr::drop_in_place(header as *mut ObjString);
+            }
+            ObjType::List => {
+                std::ptr::drop_in_place(header as *mut ObjList);
+            }
+            ObjType::Map => {
+                std::ptr::drop_in_place(header as *mut ObjMap);
+            }
+            ObjType::Range => {
+                std::ptr::drop_in_place(header as *mut ObjRange);
+            }
+            ObjType::Fn => {
+                std::ptr::drop_in_place(header as *mut ObjFn);
+            }
+            ObjType::Closure => {
+                std::ptr::drop_in_place(header as *mut ObjClosure);
+            }
+            ObjType::Upvalue => {
+                std::ptr::drop_in_place(header as *mut ObjUpvalue);
+            }
+            ObjType::Fiber => {
+                std::ptr::drop_in_place(header as *mut ObjFiber);
+            }
+            ObjType::Class => {
+                std::ptr::drop_in_place(header as *mut ObjClass);
+            }
+            ObjType::Instance => {
+                std::ptr::drop_in_place(header as *mut ObjInstance);
+            }
+            ObjType::Foreign => {
+                std::ptr::drop_in_place(header as *mut ObjForeign);
+            }
+            ObjType::Module => {
+                let _ = Box::from_raw(header as *mut ObjModule);
+            }
+            ObjType::TypedArray => {
+                std::ptr::drop_in_place(header as *mut ObjTypedArray);
+            }
+            ObjType::Simd => {
+                std::ptr::drop_in_place(header as *mut ObjSimd);
+            }
+            ObjType::Buffer => {}
         }
-        ObjType::Map => {
-            std::ptr::drop_in_place(header as *mut ObjMap);
-        }
-        ObjType::Range => {
-            std::ptr::drop_in_place(header as *mut ObjRange);
-        }
-        ObjType::Fn => {
-            std::ptr::drop_in_place(header as *mut ObjFn);
-        }
-        ObjType::Closure => {
-            std::ptr::drop_in_place(header as *mut ObjClosure);
-        }
-        ObjType::Upvalue => {
-            std::ptr::drop_in_place(header as *mut ObjUpvalue);
-        }
-        ObjType::Fiber => {
-            std::ptr::drop_in_place(header as *mut ObjFiber);
-        }
-        ObjType::Class => {
-            std::ptr::drop_in_place(header as *mut ObjClass);
-        }
-        ObjType::Instance => {
-            std::ptr::drop_in_place(header as *mut ObjInstance);
-        }
-        ObjType::Foreign => {
-            std::ptr::drop_in_place(header as *mut ObjForeign);
-        }
-        ObjType::Module => {
-            let _ = Box::from_raw(header as *mut ObjModule);
-        }
-        ObjType::TypedArray => {
-            std::ptr::drop_in_place(header as *mut ObjTypedArray);
-        }
-        ObjType::Simd => {
-            std::ptr::drop_in_place(header as *mut ObjSimd);
-        }
-        ObjType::Buffer => {}
     }
 }
 

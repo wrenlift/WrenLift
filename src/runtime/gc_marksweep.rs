@@ -101,12 +101,12 @@ impl MarkSweepGc {
 // ---------------------------------------------------------------------------
 
 fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
-    if val.is_object() {
-        if let Some(ptr) = val.as_object() {
-            let header = ptr as *mut ObjHeader;
-            if !header.is_null() {
-                mark_gray(header, gray_stack);
-            }
+    if val.is_object()
+        && let Some(ptr) = val.as_object()
+    {
+        let header = ptr as *mut ObjHeader;
+        if !header.is_null() {
+            mark_gray(header, gray_stack);
         }
     }
 }
@@ -122,119 +122,121 @@ fn mark_gray(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
 }
 
 unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
-    if !(*header).class.is_null() {
-        mark_gray((*header).class as *mut ObjHeader, gray_stack);
-    }
-
-    match (*header).obj_type {
-        ObjType::String
-        | ObjType::Fn
-        | ObjType::Range
-        | ObjType::Foreign
-        | ObjType::TypedArray
-        | ObjType::Simd
-        | ObjType::Buffer => {}
-
-        ObjType::List => {
-            let list = &*(header as *mut ObjList);
-            for &val in list.as_slice() {
-                mark_value(val, gray_stack);
-            }
+    unsafe {
+        if !(*header).class.is_null() {
+            mark_gray((*header).class as *mut ObjHeader, gray_stack);
         }
 
-        ObjType::Map => {
-            let map = &*(header as *mut ObjMap);
-            for (key, &val) in &map.entries {
-                mark_value(key.value(), gray_stack);
-                mark_value(val, gray_stack);
-            }
-        }
+        match (*header).obj_type {
+            ObjType::String
+            | ObjType::Fn
+            | ObjType::Range
+            | ObjType::Foreign
+            | ObjType::TypedArray
+            | ObjType::Simd
+            | ObjType::Buffer => {}
 
-        ObjType::Closure => {
-            let closure = &*(header as *mut ObjClosure);
-            if !closure.function.is_null() {
-                mark_gray(closure.function as *mut ObjHeader, gray_stack);
-            }
-            for &uv in &closure.upvalues {
-                if !uv.is_null() {
-                    mark_gray(uv as *mut ObjHeader, gray_stack);
+            ObjType::List => {
+                let list = &*(header as *mut ObjList);
+                for &val in list.as_slice() {
+                    mark_value(val, gray_stack);
                 }
             }
-        }
 
-        ObjType::Upvalue => {
-            let uv = &*(header as *mut ObjUpvalue);
-            mark_value(uv.closed, gray_stack);
-        }
-
-        ObjType::Fiber => {
-            let fiber = &*(header as *mut ObjFiber);
-            for &val in &fiber.stack {
-                mark_value(val, gray_stack);
-            }
-            for frame in &fiber.frames {
-                if !frame.closure.is_null() {
-                    mark_gray(frame.closure as *mut ObjHeader, gray_stack);
+            ObjType::Map => {
+                let map = &*(header as *mut ObjMap);
+                for (key, &val) in &map.entries {
+                    mark_value(key.value(), gray_stack);
+                    mark_value(val, gray_stack);
                 }
             }
-            for frame in &fiber.mir_frames {
-                for val in &frame.values {
-                    mark_value(*val, gray_stack);
+
+            ObjType::Closure => {
+                let closure = &*(header as *mut ObjClosure);
+                if !closure.function.is_null() {
+                    mark_gray(closure.function as *mut ObjHeader, gray_stack);
                 }
-                if let Some(closure) = frame.closure {
-                    if !closure.is_null() {
-                        mark_gray(closure as *mut ObjHeader, gray_stack);
+                for &uv in &closure.upvalues {
+                    if !uv.is_null() {
+                        mark_gray(uv as *mut ObjHeader, gray_stack);
                     }
                 }
-                if let Some(class) = frame.defining_class {
-                    if !class.is_null() {
+            }
+
+            ObjType::Upvalue => {
+                let uv = &*(header as *mut ObjUpvalue);
+                mark_value(uv.closed, gray_stack);
+            }
+
+            ObjType::Fiber => {
+                let fiber = &*(header as *mut ObjFiber);
+                for &val in &fiber.stack {
+                    mark_value(val, gray_stack);
+                }
+                for frame in &fiber.frames {
+                    if !frame.closure.is_null() {
+                        mark_gray(frame.closure as *mut ObjHeader, gray_stack);
+                    }
+                }
+                for frame in &fiber.mir_frames {
+                    for val in &frame.values {
+                        mark_value(*val, gray_stack);
+                    }
+                    if let Some(closure) = frame.closure
+                        && !closure.is_null()
+                    {
+                        mark_gray(closure as *mut ObjHeader, gray_stack);
+                    }
+                    if let Some(class) = frame.defining_class
+                        && !class.is_null()
+                    {
                         mark_gray(class as *mut ObjHeader, gray_stack);
                     }
                 }
+                if !fiber.caller.is_null() {
+                    mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
+                }
+                mark_value(fiber.error, gray_stack);
+                mark_value(fiber.context_map, gray_stack);
             }
-            if !fiber.caller.is_null() {
-                mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
-            }
-            mark_value(fiber.error, gray_stack);
-            mark_value(fiber.context_map, gray_stack);
-        }
 
-        ObjType::Class => {
-            let class = &*(header as *mut ObjClass);
-            if !class.superclass.is_null() {
-                mark_gray(class.superclass as *mut ObjHeader, gray_stack);
-            }
-            for method in class.methods.iter().flatten() {
-                match method {
-                    Method::Closure(ptr) | Method::Constructor(ptr) => {
-                        if !ptr.is_null() {
-                            mark_gray(*ptr as *mut ObjHeader, gray_stack);
+            ObjType::Class => {
+                let class = &*(header as *mut ObjClass);
+                if !class.superclass.is_null() {
+                    mark_gray(class.superclass as *mut ObjHeader, gray_stack);
+                }
+                for method in class.methods.iter().flatten() {
+                    match method {
+                        Method::Closure(ptr) | Method::Constructor(ptr) => {
+                            if !ptr.is_null() {
+                                mark_gray(*ptr as *mut ObjHeader, gray_stack);
+                            }
                         }
+                        Method::Native(_)
+                        | Method::Host(..)
+                        | Method::ForeignC(_)
+                        | Method::ForeignCDynamic(_) => {}
                     }
-                    Method::Native(_)
-                    | Method::Host(..)
-                    | Method::ForeignC(_)
-                    | Method::ForeignCDynamic(_) => {}
+                }
+                for &val in class.static_fields.values() {
+                    mark_value(val, gray_stack);
                 }
             }
-            for &val in class.static_fields.values() {
-                mark_value(val, gray_stack);
-            }
-        }
 
-        ObjType::Instance => {
-            let inst = &*(header as *mut ObjInstance);
-            if !inst.fields.is_null() {
-                for i in 0..inst.num_fields as usize {
-                    mark_value(*inst.fields.add(i), gray_stack);
+            ObjType::Instance => {
+                let inst = &*(header as *mut ObjInstance);
+                if !inst.fields.is_null() {
+                    for i in 0..inst.num_fields as usize {
+                        mark_value(*inst.fields.add(i), gray_stack);
+                    }
                 }
             }
-        }
 
-        ObjType::Module => {
-            let module = &*(header as *mut ObjModule);
-            for &val in &module.variables {
-                mark_value(val, gray_stack);
+            ObjType::Module => {
+                let module = &*(header as *mut ObjModule);
+                for &val in &module.variables {
+                    mark_value(val, gray_stack);
+                }
             }
         }
     }
@@ -245,71 +247,75 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
 // ---------------------------------------------------------------------------
 
 unsafe fn object_size(header: *mut ObjHeader) -> usize {
-    match (*header).obj_type {
-        ObjType::String => std::mem::size_of::<ObjString>(),
-        ObjType::List => std::mem::size_of::<ObjList>(),
-        ObjType::Map => std::mem::size_of::<ObjMap>(),
-        ObjType::Range => std::mem::size_of::<ObjRange>(),
-        ObjType::Fn => std::mem::size_of::<ObjFn>(),
-        ObjType::Closure => std::mem::size_of::<ObjClosure>(),
-        ObjType::Upvalue => std::mem::size_of::<ObjUpvalue>(),
-        ObjType::Fiber => std::mem::size_of::<ObjFiber>(),
-        ObjType::Class => std::mem::size_of::<ObjClass>(),
-        ObjType::Instance => std::mem::size_of::<ObjInstance>(),
-        ObjType::Foreign => std::mem::size_of::<ObjForeign>(),
-        ObjType::Module => std::mem::size_of::<ObjModule>(),
-        ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
-        ObjType::Simd => std::mem::size_of::<ObjSimd>(),
-        ObjType::Buffer => std::mem::size_of::<ObjHeader>(),
+    unsafe {
+        match (*header).obj_type {
+            ObjType::String => std::mem::size_of::<ObjString>(),
+            ObjType::List => std::mem::size_of::<ObjList>(),
+            ObjType::Map => std::mem::size_of::<ObjMap>(),
+            ObjType::Range => std::mem::size_of::<ObjRange>(),
+            ObjType::Fn => std::mem::size_of::<ObjFn>(),
+            ObjType::Closure => std::mem::size_of::<ObjClosure>(),
+            ObjType::Upvalue => std::mem::size_of::<ObjUpvalue>(),
+            ObjType::Fiber => std::mem::size_of::<ObjFiber>(),
+            ObjType::Class => std::mem::size_of::<ObjClass>(),
+            ObjType::Instance => std::mem::size_of::<ObjInstance>(),
+            ObjType::Foreign => std::mem::size_of::<ObjForeign>(),
+            ObjType::Module => std::mem::size_of::<ObjModule>(),
+            ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
+            ObjType::Simd => std::mem::size_of::<ObjSimd>(),
+            ObjType::Buffer => std::mem::size_of::<ObjHeader>(),
+        }
     }
 }
 
 unsafe fn drop_object(header: *mut ObjHeader) {
-    match (*header).obj_type {
-        ObjType::String => {
-            let _ = Box::from_raw(header as *mut ObjString);
+    unsafe {
+        match (*header).obj_type {
+            ObjType::String => {
+                let _ = Box::from_raw(header as *mut ObjString);
+            }
+            ObjType::List => {
+                let _ = Box::from_raw(header as *mut ObjList);
+            }
+            ObjType::Map => {
+                let _ = Box::from_raw(header as *mut ObjMap);
+            }
+            ObjType::Range => {
+                let _ = Box::from_raw(header as *mut ObjRange);
+            }
+            ObjType::Fn => {
+                let _ = Box::from_raw(header as *mut ObjFn);
+            }
+            ObjType::Closure => {
+                let _ = Box::from_raw(header as *mut ObjClosure);
+            }
+            ObjType::Upvalue => {
+                let _ = Box::from_raw(header as *mut ObjUpvalue);
+            }
+            ObjType::Fiber => {
+                let _ = Box::from_raw(header as *mut ObjFiber);
+            }
+            ObjType::Class => {
+                let _ = Box::from_raw(header as *mut ObjClass);
+            }
+            ObjType::Instance => {
+                let _ = Box::from_raw(header as *mut ObjInstance);
+            }
+            ObjType::Foreign => {
+                let _ = Box::from_raw(header as *mut ObjForeign);
+            }
+            ObjType::Module => {
+                let _ = Box::from_raw(header as *mut ObjModule);
+            }
+            ObjType::TypedArray => {
+                let _ = Box::from_raw(header as *mut ObjTypedArray);
+            }
+            ObjType::Simd => {
+                let _ = Box::from_raw(header as *mut ObjSimd);
+            }
+            // Only the built-in heap allocates buffers; it never boxes.
+            ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
         }
-        ObjType::List => {
-            let _ = Box::from_raw(header as *mut ObjList);
-        }
-        ObjType::Map => {
-            let _ = Box::from_raw(header as *mut ObjMap);
-        }
-        ObjType::Range => {
-            let _ = Box::from_raw(header as *mut ObjRange);
-        }
-        ObjType::Fn => {
-            let _ = Box::from_raw(header as *mut ObjFn);
-        }
-        ObjType::Closure => {
-            let _ = Box::from_raw(header as *mut ObjClosure);
-        }
-        ObjType::Upvalue => {
-            let _ = Box::from_raw(header as *mut ObjUpvalue);
-        }
-        ObjType::Fiber => {
-            let _ = Box::from_raw(header as *mut ObjFiber);
-        }
-        ObjType::Class => {
-            let _ = Box::from_raw(header as *mut ObjClass);
-        }
-        ObjType::Instance => {
-            let _ = Box::from_raw(header as *mut ObjInstance);
-        }
-        ObjType::Foreign => {
-            let _ = Box::from_raw(header as *mut ObjForeign);
-        }
-        ObjType::Module => {
-            let _ = Box::from_raw(header as *mut ObjModule);
-        }
-        ObjType::TypedArray => {
-            let _ = Box::from_raw(header as *mut ObjTypedArray);
-        }
-        ObjType::Simd => {
-            let _ = Box::from_raw(header as *mut ObjSimd);
-        }
-        // Only the built-in heap allocates buffers; it never boxes.
-        ObjType::Buffer => unreachable!("a buffer is only allocated in the built-in heap"),
     }
 }
 

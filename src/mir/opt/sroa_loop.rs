@@ -119,11 +119,7 @@ pub fn trivial_getter_field(mir: &MirFunction) -> Option<usize> {
             while let Some(&s) = aliases.get(&r) {
                 r = s;
             }
-            if r == lv {
-                Some(field)
-            } else {
-                None
-            }
+            if r == lv { Some(field) } else { None }
         }
         _ => None,
     }
@@ -386,10 +382,11 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
             .collect();
         for block in func.blocks.iter() {
             for &(p, _) in block.params.iter() {
-                if param_candidates.contains(&p) && !dropped_params.contains(&p) {
-                    if let Some(Some(c)) = param_class.get(&p) {
-                        round.insert(p, Scalar::Param { class: c.clone() });
-                    }
+                if param_candidates.contains(&p)
+                    && !dropped_params.contains(&p)
+                    && let Some(Some(c)) = param_class.get(&p)
+                {
+                    round.insert(p, Scalar::Param { class: c.clone() });
                 }
             }
         }

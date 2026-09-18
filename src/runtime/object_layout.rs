@@ -12,7 +12,7 @@ use {super::object::*, super::value::Value, crate::codegen::runtime_fns::JitCont
 pub const HEADER_OBJ_TYPE: i32 = 0; // u8
 pub const HEADER_GC_MARK: i32 = 1; // u8
 pub const HEADER_GENERATION: i32 = 2; // u8
-                                      // 5 bytes padding
+// 5 bytes padding
 pub const HEADER_NEXT: i32 = 8; // *mut ObjHeader
 pub const HEADER_CLASS: i32 = 16; // *mut ObjClass
 pub const HEADER_SIZE: i32 = 24;
@@ -34,7 +34,7 @@ pub const CLASS_FLAG_EQ: u8 = 1;
 // -- ObjInstance (40 bytes) --------------------------------------------------
 
 pub const INSTANCE_NUM_FIELDS: i32 = 24; // u32
-                                         // 4 bytes padding
+// 4 bytes padding
 pub const INSTANCE_FIELDS: i32 = 32; // *mut Value
 pub const INSTANCE_SIZE: i32 = 40;
 

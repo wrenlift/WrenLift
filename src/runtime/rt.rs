@@ -127,11 +127,11 @@ macro_rules! runtime_table {
                 /// # Safety
                 /// The slot's contract on [`RuntimeVTable`].
                 #[inline(always)]
-                pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? { unsafe {
                     let f: unsafe extern "C" fn($($ty),*) $(-> $ret)? =
                         std::mem::transmute(slot::$name.load(Ordering::Relaxed));
                     f($($arg),*)
-                }
+                }}
             )*
         }
 
@@ -329,7 +329,7 @@ pub fn heap_is_builtin() -> bool {
 /// # Safety
 /// `heap` must be a handle `heap_new` returned while `heap_is_builtin`.
 pub unsafe fn bump_region(heap: *mut c_void) -> *const ImmixHeapBump {
-    (*(heap as *const super::gc_immix_heap::ImmixHeap)).bump_region()
+    unsafe { (*(heap as *const super::gc_immix_heap::ImmixHeap)).bump_region() }
 }
 
 pub use super::gc_immix_heap::BumpRegion as ImmixHeapBump;
@@ -348,9 +348,11 @@ pub fn heap_new() -> *mut c_void {
 /// released.
 #[inline(always)]
 pub unsafe fn stats(heap: *mut c_void) -> RtStats {
-    let mut out = RtStats::default();
-    call::stats(heap, &mut out);
-    out
+    unsafe {
+        let mut out = RtStats::default();
+        call::stats(heap, &mut out);
+        out
+    }
 }
 
 // ── Installation ────────────────────────────────────────────────────────
@@ -371,19 +373,23 @@ static SEALED: AtomicBool = AtomicBool::new(false);
 /// `Some` entry must have the slot's signature and contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_rt_install(table: *const RuntimeVTable) -> bool {
-    if table.is_null() {
-        return false;
+    unsafe {
+        if table.is_null() {
+            return false;
+        }
+        let table = &*table;
+        if table.version != RT_VERSION
+            || table.size as usize != std::mem::size_of::<RuntimeVTable>()
+        {
+            return false;
+        }
+        if SEALED.load(Ordering::Acquire) || INSTALLED.load(Ordering::Acquire) {
+            return false;
+        }
+        install_entries(table);
+        INSTALLED.store(true, Ordering::Release);
+        true
     }
-    let table = &*table;
-    if table.version != RT_VERSION || table.size as usize != std::mem::size_of::<RuntimeVTable>() {
-        return false;
-    }
-    if SEALED.load(Ordering::Acquire) || INSTALLED.load(Ordering::Acquire) {
-        return false;
-    }
-    install_entries(table);
-    INSTALLED.store(true, Ordering::Release);
-    true
 }
 
 /// Whether a host table has been installed.
@@ -448,47 +454,49 @@ mod world {
     use crate::runtime::vm::VM;
 
     pub unsafe extern "C" fn waiter_new(vm: *mut c_void) -> u64 {
-        local::waiter_new(vm as *mut VM)
+        unsafe { local::waiter_new(vm as *mut VM) }
     }
     pub unsafe extern "C" fn waiter_discard(vm: *mut c_void, token: u64) {
-        local::waiter_discard(vm as *mut VM, token)
+        unsafe { local::waiter_discard(vm as *mut VM, token) }
     }
     pub unsafe extern "C" fn wake(token: u64) -> bool {
         local::wake(token)
     }
     pub unsafe extern "C" fn waiter_ready(vm: *mut c_void, token: u64) -> i32 {
-        local::waiter_ready(vm as *mut VM, token)
+        unsafe { local::waiter_ready(vm as *mut VM, token) }
     }
     pub unsafe extern "C" fn park_request(vm: *mut c_void, token: u64, deadline_ns: u64) {
-        local::park_request(vm as *mut VM, token, deadline_ns)
+        unsafe { local::park_request(vm as *mut VM, token, deadline_ns) }
     }
     pub unsafe extern "C" fn park_pending(vm: *mut c_void) -> bool {
-        local::park_pending(vm as *mut VM)
+        unsafe { local::park_pending(vm as *mut VM) }
     }
     pub unsafe extern "C" fn resume_woken(vm: *mut c_void) -> bool {
-        local::resume_woken(vm as *mut VM)
+        unsafe { local::resume_woken(vm as *mut VM) }
     }
     pub unsafe extern "C" fn park_drive(vm: *mut c_void, token: u64, deadline_ns: u64) -> bool {
-        local::park_drive(vm as *mut VM, token, deadline_ns)
+        unsafe { local::park_drive(vm as *mut VM, token, deadline_ns) }
     }
     pub unsafe extern "C" fn spawn(vm: *mut c_void, task: *mut c_void, on_pool: bool) {
-        local::spawn(
-            vm as *mut VM,
-            task as *mut crate::runtime::sched::TaskCtx,
-            on_pool,
-        )
+        unsafe {
+            local::spawn(
+                vm as *mut VM,
+                task as *mut crate::runtime::sched::TaskCtx,
+                on_pool,
+            )
+        }
     }
     pub unsafe extern "C" fn tick(vm: *mut c_void, deadline_ns: u64) -> bool {
-        local::tick(vm as *mut VM, deadline_ns)
+        unsafe { local::tick(vm as *mut VM, deadline_ns) }
     }
     pub unsafe extern "C" fn idle(vm: *mut c_void, deadline_ns: u64) {
-        local::idle(vm as *mut VM, deadline_ns)
+        unsafe { local::idle(vm as *mut VM, deadline_ns) }
     }
     pub unsafe extern "C" fn live(vm: *mut c_void) -> usize {
-        local::live(vm as *mut VM)
+        unsafe { local::live(vm as *mut VM) }
     }
     pub unsafe extern "C" fn workers(vm: *mut c_void) -> usize {
-        local::workers(vm as *mut VM)
+        unsafe { local::workers(vm as *mut VM) }
     }
 }
 
@@ -544,8 +552,10 @@ mod stacks {
         body: unsafe extern "C" fn(*mut c_void),
         ctx: *mut c_void,
     ) -> bool {
-        body(ctx);
-        true
+        unsafe {
+            body(ctx);
+            true
+        }
     }
 }
 
@@ -556,7 +566,7 @@ mod immix {
 
     #[inline(always)]
     unsafe fn heap<'a>(heap: *mut c_void) -> &'a mut ImmixHeap {
-        &mut *(heap as *mut ImmixHeap)
+        unsafe { &mut *(heap as *mut ImmixHeap) }
     }
 
     pub unsafe extern "C" fn heap_new() -> *mut c_void {
@@ -564,31 +574,33 @@ mod immix {
     }
 
     pub unsafe extern "C" fn heap_drop(heap: *mut c_void) {
-        drop(Box::from_raw(heap as *mut ImmixHeap));
+        unsafe {
+            drop(Box::from_raw(heap as *mut ImmixHeap));
+        }
     }
 
     pub unsafe extern "C" fn alloc_raw(heap: *mut c_void, size: usize) -> *mut u8 {
-        self::heap(heap).alloc_raw(size)
+        unsafe { self::heap(heap).alloc_raw(size) }
     }
 
     pub unsafe extern "C" fn alloc_plain(heap: *mut c_void, size: usize) -> *mut u8 {
-        self::heap(heap).alloc_plain(size)
+        unsafe { self::heap(heap).alloc_plain(size) }
     }
 
     pub unsafe extern "C" fn containing_allocation(heap: *mut c_void, addr: usize) -> *mut u8 {
-        self::heap(heap).containing_allocation(addr)
+        unsafe { self::heap(heap).containing_allocation(addr) }
     }
 
     pub unsafe extern "C" fn is_heap_ptr(heap: *mut c_void, addr: usize) -> bool {
-        self::heap(heap).is_heap_ptr(addr)
+        unsafe { self::heap(heap).is_heap_ptr(addr) }
     }
 
     pub unsafe extern "C" fn mark_allocation(heap: *mut c_void, ptr: *mut u8) -> bool {
-        self::heap(heap).mark(ptr)
+        unsafe { self::heap(heap).mark(ptr) }
     }
 
     pub unsafe extern "C" fn is_marked(heap: *mut c_void, ptr: *mut u8) -> bool {
-        self::heap(heap).is_marked(ptr)
+        unsafe { self::heap(heap).is_marked(ptr) }
     }
 
     pub unsafe extern "C" fn scan_range(
@@ -598,27 +610,31 @@ mod immix {
         visit: Visit,
         ctx: *mut c_void,
     ) {
-        self::heap(heap).scan_range(lo, hi, |start| visit(start, ctx));
+        unsafe {
+            self::heap(heap).scan_range(lo, hi, |start| visit(start, ctx));
+        }
     }
 
     pub unsafe extern "C" fn track_external(heap: *mut c_void, bytes: usize) {
-        self::heap(heap).track_external(bytes);
+        unsafe {
+            self::heap(heap).track_external(bytes);
+        }
     }
 
     pub unsafe extern "C" fn watch(heap: *mut c_void, ptr: *mut u8) -> bool {
-        self::heap(heap).watch(ptr)
+        unsafe { self::heap(heap).watch(ptr) }
     }
 
     pub unsafe extern "C" fn should_collect(heap: *mut c_void) -> bool {
-        self::heap(heap).should_collect()
+        unsafe { self::heap(heap).should_collect() }
     }
 
     pub unsafe extern "C" fn collect_begin(heap: *mut c_void) {
-        self::heap(heap).collect_begin()
+        unsafe { self::heap(heap).collect_begin() }
     }
 
     pub unsafe extern "C" fn collect_end(heap: *mut c_void) -> usize {
-        self::heap(heap).collect_end(|dead| call::object_drop(dead))
+        unsafe { self::heap(heap).collect_end(|dead| call::object_drop(dead)) }
     }
 
     pub unsafe extern "C" fn for_each_allocation(
@@ -626,11 +642,15 @@ mod immix {
         visit: Visit,
         ctx: *mut c_void,
     ) {
-        self::heap(heap).for_each_allocation(|start| visit(start, ctx));
+        unsafe {
+            self::heap(heap).for_each_allocation(|start| visit(start, ctx));
+        }
     }
 
     pub unsafe extern "C" fn stats(heap: *mut c_void, out: *mut RtStats) {
-        *out = self::heap(heap).stats();
+        unsafe {
+            *out = self::heap(heap).stats();
+        }
     }
 }
 
@@ -639,11 +659,15 @@ mod wren {
     use super::*;
 
     pub unsafe extern "C" fn object_trace(obj: *mut u8, mark: Visit, ctx: *mut c_void) {
-        crate::runtime::gc_immix::object_trace(obj, |child| mark(child, ctx));
+        unsafe {
+            crate::runtime::gc_immix::object_trace(obj, |child| mark(child, ctx));
+        }
     }
 
     pub unsafe extern "C" fn object_drop(obj: *mut u8) {
-        crate::runtime::gc_immix::object_drop(obj);
+        unsafe {
+            crate::runtime::gc_immix::object_drop(obj);
+        }
     }
 
     #[cfg(feature = "host")]
@@ -656,7 +680,7 @@ mod wren {
 
     #[cfg(feature = "host")]
     pub unsafe extern "C" fn task_step(task: *mut c_void) -> bool {
-        crate::runtime::sched::task_step(task as *mut crate::runtime::sched::TaskCtx)
+        unsafe { crate::runtime::sched::task_step(task as *mut crate::runtime::sched::TaskCtx) }
     }
 
     #[cfg(not(feature = "host"))]
@@ -680,7 +704,7 @@ mod tests {
     use super::*;
     use crate::runtime::engine::InterpretResult;
     use crate::runtime::gc_trait::GcStrategy;
-    use crate::runtime::vm::{VMConfig, VM};
+    use crate::runtime::vm::{VM, VMConfig};
     use std::sync::atomic::AtomicUsize;
 
     fn immix_vm() -> VM {
@@ -694,8 +718,10 @@ mod tests {
 
     /// Counts, then forwards to wren_lift's.
     unsafe extern "C" fn counting_alloc_raw(heap: *mut c_void, size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::SeqCst);
-        immix::alloc_raw(heap, size)
+        unsafe {
+            ALLOCS.fetch_add(1, Ordering::SeqCst);
+            immix::alloc_raw(heap, size)
+        }
     }
 
     const CHILD_ENV: &str = "WLIFT_RT_SEAM_CHILD";

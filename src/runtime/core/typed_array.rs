@@ -588,11 +588,7 @@ fn byte_array_copy_to_float32_array(ctx: &mut dyn NativeContext, args: &[Value])
     let stride = match args[5].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
             let s = n as usize;
-            if s == 0 {
-                4
-            } else {
-                s
-            }
+            if s == 0 { 4 } else { s }
         }
         _ => 4,
     };
@@ -685,11 +681,7 @@ fn byte_array_copy_to_int32_array_u16(ctx: &mut dyn NativeContext, args: &[Value
     let stride = match args[5].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
             let s = n as usize;
-            if s == 0 {
-                2
-            } else {
-                s
-            }
+            if s == 0 { 2 } else { s }
         }
         _ => 2,
     };
@@ -775,11 +767,7 @@ fn byte_array_copy_to_int32_array_u8(ctx: &mut dyn NativeContext, args: &[Value]
     let stride = match args[5].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
             let s = n as usize;
-            if s == 0 {
-                1
-            } else {
-                s
-            }
+            if s == 0 { 1 } else { s }
         }
         _ => 1,
     };

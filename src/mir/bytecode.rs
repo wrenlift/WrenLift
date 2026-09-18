@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use crate::ast::Span;
 use crate::mir::{
-    osr_external_live_values, BasicBlock, BlockId, Instruction, MathBinaryOp, MathUnaryOp,
-    MirFunction, Terminator, ValueId,
+    BasicBlock, BlockId, Instruction, MathBinaryOp, MathUnaryOp, MirFunction, Terminator, ValueId,
+    osr_external_live_values,
 };
 
 // ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ impl Op {
     /// The caller must ensure `v` is a valid Op discriminant produced by our encoder.
     #[inline(always)]
     pub unsafe fn from_u8_unchecked(v: u8) -> Op {
-        std::mem::transmute(v)
+        unsafe { std::mem::transmute(v) }
     }
 }
 
@@ -202,7 +202,7 @@ impl CallSiteIC {
     /// together. The copy's `kind` is the kind alone.
     #[inline(always)]
     pub fn snapshot(&self) -> Option<CallSiteIC> {
-        use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
         let kind_cell = unsafe { AtomicU64::from_ptr(&self.kind as *const u64 as *mut u64) };
         let k1 = kind_cell.load(Ordering::Acquire);
         if k1 & KIND_MASK == 0 {
@@ -243,7 +243,7 @@ impl CallSiteIC {
     /// old entry, nothing, or the new entry, never a mix.
     #[inline]
     pub fn store(&self, new: CallSiteIC) {
-        use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
         let kind_cell = unsafe { AtomicU64::from_ptr(&self.kind as *const u64 as *mut u64) };
         let count = kind_cell.load(Ordering::Relaxed) & !KIND_MASK;
         kind_cell.store(0, Ordering::Relaxed);

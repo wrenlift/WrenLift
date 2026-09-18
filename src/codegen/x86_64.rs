@@ -63,8 +63,10 @@ impl ExecutableCode {
     /// # Safety
     /// The caller must ensure the type `F` matches the compiled function's ABI.
     pub unsafe fn as_fn<F: Copy>(&self) -> F {
-        let ptr = self.buf.ptr(dynasmrt::AssemblyOffset(0));
-        std::mem::transmute_copy(&ptr)
+        unsafe {
+            let ptr = self.buf.ptr(dynasmrt::AssemblyOffset(0));
+            std::mem::transmute_copy(&ptr)
+        }
     }
 
     /// Size of the native code in bytes.
@@ -1884,7 +1886,7 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_add_num() {
         use crate::intern::Interner;
-        use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::interp::{InterpValue, eval};
         use crate::mir::{Instruction, MirFunction, Terminator};
         use crate::runtime::value::Value;
 
@@ -1956,7 +1958,7 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_mul_sub() {
         use crate::intern::Interner;
-        use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::interp::{InterpValue, eval};
         use crate::mir::{Instruction, MirFunction, Terminator};
 
         // MIR: (10 * 3) - 5 = 25
@@ -2034,7 +2036,7 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_comparison() {
         use crate::intern::Interner;
-        use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::interp::{InterpValue, eval};
         use crate::mir::{Instruction, MirFunction, Terminator};
 
         // MIR: 10 < 20 → true
@@ -2090,7 +2092,7 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_unboxed_f64() {
         use crate::intern::Interner;
-        use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::interp::{InterpValue, eval};
         use crate::mir::{Instruction, MirFunction, Terminator};
 
         // MIR: ConstF64(2.0) + ConstF64(3.0) = 5.0
@@ -2142,7 +2144,7 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_loop_sum() {
         use crate::intern::Interner;
-        use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::interp::{InterpValue, eval};
         use crate::mir::{Instruction, MirFunction, MirType, Terminator};
 
         // MIR: sum 1..5 via loop with block params = 15

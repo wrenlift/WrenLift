@@ -555,11 +555,11 @@ fn http_stream_read_impl(ctx: &mut dyn NativeContext, args: &[Value], nonblockin
             // chunk-ending-on-EOF one) so repeat reads after the
             // last bytes still find the entry and see null.
             let mut reg = stream_registry().lock().unwrap();
-            if let Some(mut entry) = reg.remove(&id) {
-                if let Some(th) = entry.drain.take() {
-                    drop(reg);
-                    let _ = th.join();
-                }
+            if let Some(mut entry) = reg.remove(&id)
+                && let Some(th) = entry.drain.take()
+            {
+                drop(reg);
+                let _ = th.join();
             }
             Value::null()
         }

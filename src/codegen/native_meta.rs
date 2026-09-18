@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{regalloc::Location, MachFunc, MachInst, VReg};
+use super::{MachFunc, MachInst, VReg, regalloc::Location};
 
 /// Where a GC-visible boxed value lives at a native safepoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

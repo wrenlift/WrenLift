@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 /// VM-specific instructions (calls, collections, module vars, string
 /// allocation, fields, closures) have full VM access.
 use crate::intern::SymbolId;
-use crate::mir::bytecode::{read_u16, read_u32, read_u8, BcConst, BytecodeFunction, Op};
+use crate::mir::bytecode::{BcConst, BytecodeFunction, Op, read_u8, read_u16, read_u32};
 use crate::mir::interp::InterpError;
 use crate::mir::{BlockId, ValueId};
 use crate::runtime::engine::ExecutionMode;
@@ -138,10 +138,11 @@ impl MethodCache {
         method: SymbolId,
     ) -> Option<(Method, *mut ObjClass)> {
         let idx = Self::hash(class, method);
-        if let Some(entry) = unsafe { self.entries.get_unchecked(idx) } {
-            if entry.class == class && entry.method_raw == method.index() {
-                return Some((entry.result, entry.defining_class));
-            }
+        if let Some(entry) = unsafe { self.entries.get_unchecked(idx) }
+            && entry.class == class
+            && entry.method_raw == method.index()
+        {
+            return Some((entry.result, entry.defining_class));
         }
         None
     }
@@ -725,43 +726,44 @@ fn try_enter_loop_osr(
     // A cold-loop exit: the body stopped at a loop header it was compiled
     // for without inline-cache data. Put the header's live-ins back into
     // the frame's registers and interpret from that header.
-    if result_bits == Value::UNDEFINED.to_bits() && !vm.has_error {
-        if let Some((header, live)) = crate::codegen::runtime_fns::take_osr_exit() {
-            let header = crate::mir::BlockId(header);
-            let Some(offset) = bc
-                .osr_points
-                .iter()
-                .find(|p| p.target_block == header)
-                .map(|p| p.target_offset)
-            else {
-                return Err(RuntimeError::Error(format!(
-                    "OSR exit at bb{} has no bytecode loop header",
-                    header.0
-                )));
-            };
-            unsafe {
-                if let Some(frame) = (*live_fiber).mir_frames.last_mut() {
-                    *values = std::mem::take(&mut frame.values);
-                }
+    if result_bits == Value::UNDEFINED.to_bits()
+        && !vm.has_error
+        && let Some((header, live)) = crate::codegen::runtime_fns::take_osr_exit()
+    {
+        let header = crate::mir::BlockId(header);
+        let Some(offset) = bc
+            .osr_points
+            .iter()
+            .find(|p| p.target_block == header)
+            .map(|p| p.target_offset)
+        else {
+            return Err(RuntimeError::Error(format!(
+                "OSR exit at bb{} has no bytecode loop header",
+                header.0
+            )));
+        };
+        unsafe {
+            if let Some(frame) = (*live_fiber).mir_frames.last_mut() {
+                *values = std::mem::take(&mut frame.values);
             }
-            for (reg, v) in &live {
-                let i = *reg as usize;
-                if i >= values.len() {
-                    values.resize(i + 1, UNDEF);
-                }
-                values[i] = *v;
-            }
-            if env_osr_trace() {
-                eprintln!(
-                    "osr-trace: [{:.2}ms] exit FuncId({}) bb{} live={}",
-                    crate::runtime::engine::trace_clock_ms(),
-                    func_id.0,
-                    header.0,
-                    live.len()
-                );
-            }
-            return Ok(OsrTransfer::ContinueAt(offset));
         }
+        for (reg, v) in &live {
+            let i = *reg as usize;
+            if i >= values.len() {
+                values.resize(i + 1, UNDEF);
+            }
+            values[i] = *v;
+        }
+        if env_osr_trace() {
+            eprintln!(
+                "osr-trace: [{:.2}ms] exit FuncId({}) bb{} live={}",
+                crate::runtime::engine::trace_clock_ms(),
+                func_id.0,
+                header.0,
+                live.len()
+            );
+        }
+        return Ok(OsrTransfer::ContinueAt(offset));
     }
 
     if vm.has_error {
@@ -1224,13 +1226,13 @@ fn run_fiber_with_stop_depth(
     // An unwinding error leaves the frames it was raised in on the
     // fiber; the bridge that pushed the entry frame reports the error
     // to its own caller, whose frame must be on top again.
-    if let (Err(_), Some(depth)) = (&result, stop_depth) {
-        if !entry.is_null() {
-            unsafe {
-                let frames = &mut (*entry).mir_frames;
-                if frames.len() > depth {
-                    frames.truncate(depth);
-                }
+    if let (Err(_), Some(depth)) = (&result, stop_depth)
+        && !entry.is_null()
+    {
+        unsafe {
+            let frames = &mut (*entry).mir_frames;
+            if frames.len() > depth {
+                frames.truncate(depth);
             }
         }
     }
@@ -1429,15 +1431,13 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let bytes = mn.as_bytes();
                     let same = bytes.as_ptr() == cur.module_name
                         && bytes.len() as u32 == cur.module_name_len;
-                    if !same {
-                        if let Some(m) = vm.engine.modules.get(mn.as_str()) {
-                            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
-                                ctx.module_vars = m.vars.as_ptr() as *mut u64;
-                                ctx.module_var_count = m.vars.len() as u32;
-                                ctx.module_name = bytes.as_ptr();
-                                ctx.module_name_len = bytes.len() as u32;
-                            });
-                        }
+                    if !same && let Some(m) = vm.engine.modules.get(mn.as_str()) {
+                        crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                            ctx.module_vars = m.vars.as_ptr() as *mut u64;
+                            ctx.module_var_count = m.vars.len() as u32;
+                            ctx.module_name = bytes.as_ptr();
+                            ctx.module_name_len = bytes.len() as u32;
+                        });
                     }
                 }
                 let return_val = unsafe {
@@ -2560,151 +2560,140 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     } else {
                         None
                     };
-                    if let Some(ic) = ic_snap.as_ref() {
-                        if ic.kind == 1 && recv_val.is_object() {
-                            let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
-                            let recv_class =
-                                unsafe { (*(obj_ptr as *const ObjHeader)).class as usize };
-                            let fn_idx_ic = ic.func_id as usize;
-                            let is_leaf =
-                                vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
-                            // The IC kind=1 inline JIT-leaf dispatch
-                            // passes recv + args in registers, which the
-                            // GC root scanner can't see (no JIT-frame
-                            // stack maps). To stay sound we restrict the
-                            // fast path to callees that transitively
-                            // can't fire a GC: no allocations in the
-                            // body, and no calls that allocate either.
-                            // `func_is_alloc_free` is computed by the
-                            // module-level purity / alloc-free pass and
-                            // lives as a Vec<bool> indexed by FuncId for
-                            // O(1) lookup on this hot path.
-                            //
-                            // Setting `WLIFT_ENABLE_IC_JIT=1` overrides
-                            // the alloc-free gate for benchmarks /
-                            // diagnosis. `WLIFT_DISABLE_IC_JIT=1` turns
-                            // the fast path off entirely.
-                            // BISECT: temporarily revert the alloc-free
-                            // gate to the previous behavior (env-var
-                            // opt-in only). The Linux x86_64 CI bench
-                            // is dumping core on delta_blue and the
-                            // alloc-free auto-enable is the most
-                            // likely culprit — the analysis runs over
-                            // engine MIR concurrently with JIT
-                            // submissions, and a stale read could
-                            // route a not-actually-alloc-free callee
-                            // into the IC fast path.
-                            if recv_class == ic.class && is_leaf {
-                                if env_trace_ic_jit() {
-                                    let fn_idx_ic = ic.func_id as usize;
-                                    let name = vm
-                                        .engine
-                                        .get_mir(FuncId(fn_idx_ic as u32))
-                                        .map(|m| vm.interner.resolve(m.name).to_string())
-                                        .unwrap_or_else(|| "<unknown>".into());
-                                    eprintln!(
-                                        "ic-jit: dispatch fn_idx={} name='{}' argc={}",
-                                        fn_idx_ic, name, argc
-                                    );
-                                }
-                                let jit_ptr = ic.jit_ptr;
-                                ensure_ctx_reg();
-                                // Read recv + arg values, then push them
-                                // as JIT roots so a GC inside the callee
-                                // updates these pointers before the JIT'd
-                                // body dereferences them. Without this,
-                                // a generational promote during the
-                                // callee leaves the u64 args pointing at
-                                // freed memory; the JIT callee reads
-                                // garbage and the caller's `values`
-                                // entries (now updated via frame.values
-                                // tracing) disagree with the args the
-                                // callee was invoked with.
-                                let arg_count = argc;
-                                let mut arg_regs: SmallVec<[u16; 4]> = SmallVec::new();
-                                for i in 0..arg_count {
-                                    arg_regs.push(read_u16_at(code, arg_regs_pc + (i as u32) * 2));
-                                }
-                                let root_base =
-                                    crate::codegen::runtime_fns::jit_roots_snapshot_len();
-                                crate::codegen::runtime_fns::push_jit_root(recv_val);
-                                for &reg in &arg_regs {
-                                    crate::codegen::runtime_fns::push_jit_root(get_reg(
-                                        &values, reg,
-                                    ));
-                                }
-                                // Publish caller's register file before
-                                // the JIT call so its remaining live
-                                // pointers also get traced through
-                                // mir_frames.
-                                unsafe {
-                                    let frame = (*fiber).mir_frames.last_mut().unwrap();
-                                    frame.pc = pc;
-                                    frame.values = std::mem::take(&mut values);
-                                }
-                                let result_bits = unsafe {
-                                    let recv_bits =
-                                        crate::codegen::runtime_fns::jit_root_at(root_base)
-                                            .to_bits();
-                                    match argc {
-                                        0 => {
-                                            let f: extern "C" fn(u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(recv_bits)
-                                        }
-                                        1 => {
-                                            let a1 = crate::codegen::runtime_fns::jit_root_at(
-                                                root_base + 1,
-                                            )
-                                            .to_bits();
-                                            let f: extern "C" fn(u64, u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(recv_bits, a1)
-                                        }
-                                        2 => {
-                                            let a1 = crate::codegen::runtime_fns::jit_root_at(
-                                                root_base + 1,
-                                            )
-                                            .to_bits();
-                                            let a2 = crate::codegen::runtime_fns::jit_root_at(
-                                                root_base + 2,
-                                            )
-                                            .to_bits();
-                                            let f: extern "C" fn(u64, u64, u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(recv_bits, a1, a2)
-                                        }
-                                        _ => {
-                                            let a1 = crate::codegen::runtime_fns::jit_root_at(
-                                                root_base + 1,
-                                            )
-                                            .to_bits();
-                                            let a2 = crate::codegen::runtime_fns::jit_root_at(
-                                                root_base + 2,
-                                            )
-                                            .to_bits();
-                                            let a3 = crate::codegen::runtime_fns::jit_root_at(
-                                                root_base + 3,
-                                            )
-                                            .to_bits();
-                                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(recv_bits, a1, a2, a3)
-                                        }
-                                    }
-                                };
-                                crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
-                                // Reload the (possibly GC-updated)
-                                // register file from the frame.
-                                unsafe {
-                                    values = std::mem::take(
-                                        &mut (*fiber).mir_frames.last_mut().unwrap().values,
-                                    );
-                                }
-                                set_reg(&mut values, dst, Value::from_bits(result_bits));
-                                steps += 1;
-                                continue;
+                    if let Some(ic) = ic_snap.as_ref()
+                        && ic.kind == 1
+                        && recv_val.is_object()
+                    {
+                        let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
+                        let recv_class = unsafe { (*(obj_ptr as *const ObjHeader)).class as usize };
+                        let fn_idx_ic = ic.func_id as usize;
+                        let is_leaf = vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
+                        // The IC kind=1 inline JIT-leaf dispatch
+                        // passes recv + args in registers, which the
+                        // GC root scanner can't see (no JIT-frame
+                        // stack maps). To stay sound we restrict the
+                        // fast path to callees that transitively
+                        // can't fire a GC: no allocations in the
+                        // body, and no calls that allocate either.
+                        // `func_is_alloc_free` is computed by the
+                        // module-level purity / alloc-free pass and
+                        // lives as a Vec<bool> indexed by FuncId for
+                        // O(1) lookup on this hot path.
+                        //
+                        // Setting `WLIFT_ENABLE_IC_JIT=1` overrides
+                        // the alloc-free gate for benchmarks /
+                        // diagnosis. `WLIFT_DISABLE_IC_JIT=1` turns
+                        // the fast path off entirely.
+                        // BISECT: temporarily revert the alloc-free
+                        // gate to the previous behavior (env-var
+                        // opt-in only). The Linux x86_64 CI bench
+                        // is dumping core on delta_blue and the
+                        // alloc-free auto-enable is the most
+                        // likely culprit — the analysis runs over
+                        // engine MIR concurrently with JIT
+                        // submissions, and a stale read could
+                        // route a not-actually-alloc-free callee
+                        // into the IC fast path.
+                        if recv_class == ic.class && is_leaf {
+                            if env_trace_ic_jit() {
+                                let fn_idx_ic = ic.func_id as usize;
+                                let name = vm
+                                    .engine
+                                    .get_mir(FuncId(fn_idx_ic as u32))
+                                    .map(|m| vm.interner.resolve(m.name).to_string())
+                                    .unwrap_or_else(|| "<unknown>".into());
+                                eprintln!(
+                                    "ic-jit: dispatch fn_idx={} name='{}' argc={}",
+                                    fn_idx_ic, name, argc
+                                );
                             }
+                            let jit_ptr = ic.jit_ptr;
+                            ensure_ctx_reg();
+                            // Read recv + arg values, then push them
+                            // as JIT roots so a GC inside the callee
+                            // updates these pointers before the JIT'd
+                            // body dereferences them. Without this,
+                            // a generational promote during the
+                            // callee leaves the u64 args pointing at
+                            // freed memory; the JIT callee reads
+                            // garbage and the caller's `values`
+                            // entries (now updated via frame.values
+                            // tracing) disagree with the args the
+                            // callee was invoked with.
+                            let arg_count = argc;
+                            let mut arg_regs: SmallVec<[u16; 4]> = SmallVec::new();
+                            for i in 0..arg_count {
+                                arg_regs.push(read_u16_at(code, arg_regs_pc + (i as u32) * 2));
+                            }
+                            let root_base = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                            crate::codegen::runtime_fns::push_jit_root(recv_val);
+                            for &reg in &arg_regs {
+                                crate::codegen::runtime_fns::push_jit_root(get_reg(&values, reg));
+                            }
+                            // Publish caller's register file before
+                            // the JIT call so its remaining live
+                            // pointers also get traced through
+                            // mir_frames.
+                            unsafe {
+                                let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                frame.pc = pc;
+                                frame.values = std::mem::take(&mut values);
+                            }
+                            let result_bits = unsafe {
+                                let recv_bits =
+                                    crate::codegen::runtime_fns::jit_root_at(root_base).to_bits();
+                                match argc {
+                                    0 => {
+                                        let f: extern "C" fn(u64) -> u64 =
+                                            std::mem::transmute(jit_ptr);
+                                        f(recv_bits)
+                                    }
+                                    1 => {
+                                        let a1 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base + 1)
+                                                .to_bits();
+                                        let f: extern "C" fn(u64, u64) -> u64 =
+                                            std::mem::transmute(jit_ptr);
+                                        f(recv_bits, a1)
+                                    }
+                                    2 => {
+                                        let a1 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base + 1)
+                                                .to_bits();
+                                        let a2 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base + 2)
+                                                .to_bits();
+                                        let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                            std::mem::transmute(jit_ptr);
+                                        f(recv_bits, a1, a2)
+                                    }
+                                    _ => {
+                                        let a1 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base + 1)
+                                                .to_bits();
+                                        let a2 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base + 2)
+                                                .to_bits();
+                                        let a3 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base + 3)
+                                                .to_bits();
+                                        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                            std::mem::transmute(jit_ptr);
+                                        f(recv_bits, a1, a2, a3)
+                                    }
+                                }
+                            };
+                            crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
+                            // Reload the (possibly GC-updated)
+                            // register file from the frame.
+                            unsafe {
+                                values = std::mem::take(
+                                    &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                                );
+                            }
+                            set_reg(&mut values, dst, Value::from_bits(result_bits));
+                            steps += 1;
+                            continue;
                         }
                     }
 
@@ -2991,14 +2980,14 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                         ctx.defining_class = defining_class
                                             .map(|p| p as *mut u8)
                                             .unwrap_or(std::ptr::null_mut());
-                                        if let Some(mod_name) = callee_module {
-                                            if !mv_ptr.is_null() {
-                                                ctx.module_vars = mv_ptr;
-                                                ctx.module_var_count = mv_count;
-                                                let bytes = mod_name.as_bytes();
-                                                ctx.module_name = bytes.as_ptr();
-                                                ctx.module_name_len = bytes.len() as u32;
-                                            }
+                                        if let Some(mod_name) = callee_module
+                                            && !mv_ptr.is_null()
+                                        {
+                                            ctx.module_vars = mv_ptr;
+                                            ctx.module_var_count = mv_count;
+                                            let bytes = mod_name.as_bytes();
+                                            ctx.module_name = bytes.as_ptr();
+                                            ctx.module_name_len = bytes.len() as u32;
                                         }
                                     });
                                     ensure_ctx_reg();
@@ -3589,11 +3578,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let defining = unsafe { (*fiber).mir_frames.last().unwrap().defining_class };
                     let superclass = defining.and_then(|cls| {
                         let sup = unsafe { (*cls).superclass };
-                        if sup.is_null() {
-                            None
-                        } else {
-                            Some(sup)
-                        }
+                        if sup.is_null() { None } else { Some(sup) }
                     });
 
                     if let Some(super_cls) = superclass {
@@ -4631,17 +4616,16 @@ fn dispatch_closure_bc_inner(
         // (count == THRESHOLD) so a function that fails to
         // compile doesn't retry-spam every subsequent call.
         let count = vm.engine.bump_wasm_call_count(target_func_id);
-        if count == crate::runtime::engine::WASM_JIT_THRESHOLD {
-            if let Some(mir_arc) = vm.engine.get_mir(target_func_id) {
-                if let Some(slot) = crate::runtime::tier::try_compile(&mir_arc) {
-                    vm.engine.install_wasm_jit_slot(target_func_id, slot);
-                    // Don't dispatch this call through the JIT —
-                    // the BC interpreter has already set up
-                    // partial state. Fall through to the BC path
-                    // and let the *next* invocation of this
-                    // function take the JIT path.
-                }
-            }
+        if count == crate::runtime::engine::WASM_JIT_THRESHOLD
+            && let Some(mir_arc) = vm.engine.get_mir(target_func_id)
+            && let Some(slot) = crate::runtime::tier::try_compile(&mir_arc)
+        {
+            vm.engine.install_wasm_jit_slot(target_func_id, slot);
+            // Don't dispatch this call through the JIT —
+            // the BC interpreter has already set up
+            // partial state. Fall through to the BC path
+            // and let the *next* invocation of this
+            // function take the JIT path.
         }
     }
 
@@ -5071,274 +5055,279 @@ fn ensure_ctx_reg() {}
 /// the number of arguments provided in `args`. The JIT code must be safe to
 /// execute from the current thread context.
 pub unsafe fn call_jit_fn_pub(fn_ptr: *const u8, args: &[Value]) -> u64 {
-    call_jit_fn(fn_ptr, args)
+    unsafe { call_jit_fn(fn_ptr, args) }
 }
 
 /// Enter an OSR entry: live-ins travel through one pointer to a Value
 /// array, so a loop with any number of them can be entered.
 #[inline(always)]
 unsafe fn call_osr_entry(fn_ptr: *const u8, args: &[Value]) -> u64 {
-    ensure_ctx_reg();
-    let f: extern "C" fn(*const u64) -> u64 = std::mem::transmute(fn_ptr);
-    f(args.as_ptr() as *const u64)
+    unsafe {
+        ensure_ctx_reg();
+        let f: extern "C" fn(*const u64) -> u64 = std::mem::transmute(fn_ptr);
+        f(args.as_ptr() as *const u64)
+    }
 }
 
 /// Sets x20 = JitContext pointer before the call (preserved by callee-saved ABI).
 #[inline(always)]
 unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
-    ensure_ctx_reg();
-    let b = |i: usize| args[i].to_bits();
-    match args.len() {
-        0 => {
-            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
-            f()
-        }
-        1 => {
-            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(b(0))
-        }
-        2 => {
-            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(b(0), b(1))
-        }
-        3 => {
-            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2))
-        }
-        4 => {
-            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3))
-        }
-        5 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3), b(4))
-        }
-        6 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3), b(4), b(5))
-        }
-        7 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6))
-        }
-        8 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7))
-        }
-        9 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8))
-        }
-        10 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9))
-        }
-        11 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
-            f(
-                b(0),
-                b(1),
-                b(2),
-                b(3),
-                b(4),
-                b(5),
-                b(6),
-                b(7),
-                b(8),
-                b(9),
-                b(10),
-            )
-        }
-        12 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                b(0),
-                b(1),
-                b(2),
-                b(3),
-                b(4),
-                b(5),
-                b(6),
-                b(7),
-                b(8),
-                b(9),
-                b(10),
-                b(11),
-            )
-        }
-        13 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                b(0),
-                b(1),
-                b(2),
-                b(3),
-                b(4),
-                b(5),
-                b(6),
-                b(7),
-                b(8),
-                b(9),
-                b(10),
-                b(11),
-                b(12),
-            )
-        }
-        14 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                b(0),
-                b(1),
-                b(2),
-                b(3),
-                b(4),
-                b(5),
-                b(6),
-                b(7),
-                b(8),
-                b(9),
-                b(10),
-                b(11),
-                b(12),
-                b(13),
-            )
-        }
-        15 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                b(0),
-                b(1),
-                b(2),
-                b(3),
-                b(4),
-                b(5),
-                b(6),
-                b(7),
-                b(8),
-                b(9),
-                b(10),
-                b(11),
-                b(12),
-                b(13),
-                b(14),
-            )
-        }
-        16 => {
-            let f: extern "C" fn(
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                b(0),
-                b(1),
-                b(2),
-                b(3),
-                b(4),
-                b(5),
-                b(6),
-                b(7),
-                b(8),
-                b(9),
-                b(10),
-                b(11),
-                b(12),
-                b(13),
-                b(14),
-                b(15),
-            )
-        }
-        n => {
-            // Beyond the explicit arity table is a real bug shape:
-            // every prior `_` arm silently truncated to 9 args,
-            // leaving param slots 10..n uninitialised inside the
-            // JIT'd function's frame. The classic symptom was
-            // `Float32Array[_]=: value must be a number` from
-            // Renderer2D's sprite-batch writes where the dropped
-            // u/v/colour args read as garbage. Abort here loudly
-            // so a new high-arity Wren method surfaces this gap at
-            // first JIT call instead of producing NaN downstream.
-            panic!(
-                "call_jit_fn: arity {} not in explicit table; extend the match arms up to {} \
+    unsafe {
+        ensure_ctx_reg();
+        let b = |i: usize| args[i].to_bits();
+        match args.len() {
+            0 => {
+                let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                f()
+            }
+            1 => {
+                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(b(0))
+            }
+            2 => {
+                let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(b(0), b(1))
+            }
+            3 => {
+                let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2))
+            }
+            4 => {
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3))
+            }
+            5 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3), b(4))
+            }
+            6 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3), b(4), b(5))
+            }
+            7 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3), b(4), b(5), b(6))
+            }
+            8 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7))
+            }
+            9 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8))
+            }
+            10 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9))
+            }
+            11 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    std::mem::transmute(fn_ptr);
+                f(
+                    b(0),
+                    b(1),
+                    b(2),
+                    b(3),
+                    b(4),
+                    b(5),
+                    b(6),
+                    b(7),
+                    b(8),
+                    b(9),
+                    b(10),
+                )
+            }
+            12 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    b(0),
+                    b(1),
+                    b(2),
+                    b(3),
+                    b(4),
+                    b(5),
+                    b(6),
+                    b(7),
+                    b(8),
+                    b(9),
+                    b(10),
+                    b(11),
+                )
+            }
+            13 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    b(0),
+                    b(1),
+                    b(2),
+                    b(3),
+                    b(4),
+                    b(5),
+                    b(6),
+                    b(7),
+                    b(8),
+                    b(9),
+                    b(10),
+                    b(11),
+                    b(12),
+                )
+            }
+            14 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    b(0),
+                    b(1),
+                    b(2),
+                    b(3),
+                    b(4),
+                    b(5),
+                    b(6),
+                    b(7),
+                    b(8),
+                    b(9),
+                    b(10),
+                    b(11),
+                    b(12),
+                    b(13),
+                )
+            }
+            15 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    b(0),
+                    b(1),
+                    b(2),
+                    b(3),
+                    b(4),
+                    b(5),
+                    b(6),
+                    b(7),
+                    b(8),
+                    b(9),
+                    b(10),
+                    b(11),
+                    b(12),
+                    b(13),
+                    b(14),
+                )
+            }
+            16 => {
+                let f: extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                ) -> u64 = std::mem::transmute(fn_ptr);
+                f(
+                    b(0),
+                    b(1),
+                    b(2),
+                    b(3),
+                    b(4),
+                    b(5),
+                    b(6),
+                    b(7),
+                    b(8),
+                    b(9),
+                    b(10),
+                    b(11),
+                    b(12),
+                    b(13),
+                    b(14),
+                    b(15),
+                )
+            }
+            n => {
+                // Beyond the explicit arity table is a real bug shape:
+                // every prior `_` arm silently truncated to 9 args,
+                // leaving param slots 10..n uninitialised inside the
+                // JIT'd function's frame. The classic symptom was
+                // `Float32Array[_]=: value must be a number` from
+                // Renderer2D's sprite-batch writes where the dropped
+                // u/v/colour args read as garbage. Abort here loudly
+                // so a new high-arity Wren method surfaces this gap at
+                // first JIT call instead of producing NaN downstream.
+                panic!(
+                    "call_jit_fn: arity {} not in explicit table; extend the match arms up to {} \
                  (truncating to the first 9 args was the original bug — silent argument drop)",
-                n, n
-            );
+                    n, n
+                );
+            }
         }
     }
 }
@@ -5468,10 +5457,10 @@ fn handle_fiber_action_bc(
             let target_state = unsafe { (*target).state };
             if target_state == FiberState::Suspended {
                 unsafe {
-                    if let Some(dst) = (*target).resume_value_dst.take() {
-                        if let Some(frame) = (*target).mir_frames.last_mut() {
-                            set_reg(&mut frame.values, dst.0 as u16, value);
-                        }
+                    if let Some(dst) = (*target).resume_value_dst.take()
+                        && let Some(frame) = (*target).mir_frames.last_mut()
+                    {
+                        set_reg(&mut frame.values, dst.0 as u16, value);
                     }
                 }
             }
@@ -5516,10 +5505,10 @@ fn handle_fiber_action_bc(
             let target_state = unsafe { (*target).state };
             if target_state == FiberState::Suspended {
                 unsafe {
-                    if let Some(dst) = (*target).resume_value_dst.take() {
-                        if let Some(frame) = (*target).mir_frames.last_mut() {
-                            set_reg(&mut frame.values, dst.0 as u16, value);
-                        }
+                    if let Some(dst) = (*target).resume_value_dst.take()
+                        && let Some(frame) = (*target).mir_frames.last_mut()
+                    {
+                        set_reg(&mut frame.values, dst.0 as u16, value);
                     }
                 }
             }
@@ -5652,18 +5641,20 @@ unsafe fn find_method_with_class(
     cls: *mut ObjClass,
     method: SymbolId,
 ) -> Option<(Method, *mut ObjClass)> {
-    let idx = method.index() as usize;
-    let mut c = cls;
-    while !c.is_null() {
-        let cls = &*c;
-        if idx < cls.methods.len() {
-            if let Some(m) = &cls.methods[idx] {
+    unsafe {
+        let idx = method.index() as usize;
+        let mut c = cls;
+        while !c.is_null() {
+            let cls = &*c;
+            if idx < cls.methods.len()
+                && let Some(m) = &cls.methods[idx]
+            {
                 return Some((*m, c));
             }
+            c = (*c).superclass;
         }
-        c = (*c).superclass;
+        None
     }
-    None
 }
 
 /// Return the interned SymbolId for a subscript-get signature.
@@ -5813,7 +5804,7 @@ mod tests {
     #[cfg(feature = "cranelift")]
     use crate::mir::MirType;
     use crate::mir::{Instruction, MirFunction, Terminator};
-    use crate::runtime::vm::{VMConfig, VM};
+    use crate::runtime::vm::{VM, VMConfig};
 
     fn make_vm() -> VM {
         VM::new(VMConfig::default())

@@ -575,12 +575,12 @@ fn proc_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         match child.try_wait() {
             Ok(Some(status)) => break (status.code(), false),
             Ok(None) => {
-                if let Some(limit) = timeout {
-                    if start.elapsed() >= limit {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break (None, true);
-                    }
+                if let Some(limit) = timeout
+                    && start.elapsed() >= limit
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (None, true);
                 }
             }
             Err(e) => {

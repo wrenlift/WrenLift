@@ -1850,10 +1850,9 @@ impl Parser {
             if !self.is_at_end()
                 && !self.check(&Token::InterpolationEnd)
                 && !self.check(&Token::InterpolationMid)
+                && let Some(expr) = self.expression()
             {
-                if let Some(expr) = self.expression() {
-                    parts.push(expr);
-                }
+                parts.push(expr);
             }
 
             if self.check(&Token::InterpolationMid) {
@@ -2683,9 +2682,9 @@ mod tests {
                 match &a.body {
                     AttributeBody::Group(pairs) => {
                         assert_eq!(pairs.len(), 2);
-                        assert_eq!(result.interner.resolve(pairs[0].0 .0), "brief");
+                        assert_eq!(result.interner.resolve(pairs[0].0.0), "brief");
                         assert!(matches!(&pairs[0].1 .0, AttributeLiteral::Str(s) if s == "sum"));
-                        assert_eq!(result.interner.resolve(pairs[1].0 .0), "example");
+                        assert_eq!(result.interner.resolve(pairs[1].0.0), "example");
                         assert!(matches!(pairs[1].1 .0, AttributeLiteral::Num(n) if n == 42.0));
                     }
                     other => panic!("expected Group, got {:?}", other),

@@ -10,8 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::inline_calls::split_after;
 use super::MirPass;
+use super::inline_calls::split_after;
 use crate::intern::{Interner, SymbolId};
 use crate::mir::{Instruction, MathBinaryOp, MathUnaryOp, MirFunction, MirType, Terminator};
 

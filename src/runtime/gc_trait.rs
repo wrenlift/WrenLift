@@ -34,7 +34,7 @@ pub trait GcAllocator {
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray;
     fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd;
     fn alloc_fn(&mut self, name: SymbolId, arity: u8, upvalue_count: u16, fn_id: u32)
-        -> *mut ObjFn;
+    -> *mut ObjFn;
     fn alloc_closure(&mut self, function: *mut ObjFn) -> *mut ObjClosure;
     fn alloc_upvalue(&mut self, location: *mut Value) -> *mut ObjUpvalue;
     fn alloc_fiber(&mut self) -> *mut ObjFiber;

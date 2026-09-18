@@ -12,15 +12,15 @@
 /// thread. The interpreter continues using bytecode until compilation
 /// finishes, then swaps to native code on the next dispatch.
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::mpsc;
 
 use crate::codegen::native_meta::NativeFrameMetadata;
 use crate::codegen::{CompileTier, ExecutableFunction, NativeOsrEntry};
 use crate::intern::SymbolId;
-use crate::mir::bytecode::{BytecodeFunction, CallSiteIC};
 use crate::mir::MirFunction;
+use crate::mir::bytecode::{BytecodeFunction, CallSiteIC};
 
 /// Class-hierarchy-analysis index: for each method symbol, the
 /// list of `(class_ptr, func_id, closure_ptr)` triples implementing
@@ -108,19 +108,21 @@ impl Promoter {
                 let rx = Arc::clone(&rx);
                 std::thread::Builder::new()
                     .name("wlift-promoter".into())
-                    .spawn(move || loop {
-                        let job = match rx.lock() {
-                            Ok(rx) => rx.recv(),
-                            Err(_) => return,
-                        };
-                        let Ok(job) = job else {
-                            return;
-                        };
-                        if stopped.load(std::sync::atomic::Ordering::Acquire) {
-                            drop(job);
-                            continue;
+                    .spawn(move || {
+                        loop {
+                            let job = match rx.lock() {
+                                Ok(rx) => rx.recv(),
+                                Err(_) => return,
+                            };
+                            let Ok(job) = job else {
+                                return;
+                            };
+                            if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                                drop(job);
+                                continue;
+                            }
+                            job();
                         }
-                        job();
                     })
                     .expect("spawn promoter thread")
             })
@@ -198,8 +200,8 @@ pub enum TopTierCeiling {
 /// setter, a resolved initialiser, a small resolved body it splices
 /// in, or the iteration protocol.
 pub fn top_tier_ceiling(mir: &MirFunction, inline_site: &dyn Fn(usize) -> bool) -> TopTierCeiling {
-    use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
     use crate::mir::Instruction;
+    use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
     let instrs: usize = mir.blocks.iter().map(|b| b.instructions.len()).sum();
     let sites = mir.ic_site_numbering();
     let mut calls = 0usize;
@@ -515,14 +517,15 @@ impl DeoptSources {
 
     fn source_of(&self, v: crate::mir::ValueId) -> Option<crate::mir::DeoptSource> {
         use crate::mir::DeoptSource;
-        if let Some(&(from, to, inclusive)) = self.ranges.get(&v) {
-            if self.defined.contains(&from) && self.defined.contains(&to) {
-                return Some(DeoptSource::Range {
-                    from,
-                    to,
-                    inclusive,
-                });
-            }
+        if let Some(&(from, to, inclusive)) = self.ranges.get(&v)
+            && self.defined.contains(&from)
+            && self.defined.contains(&to)
+        {
+            return Some(DeoptSource::Range {
+                from,
+                to,
+                inclusive,
+            });
         }
         self.defined.contains(&v).then_some(DeoptSource::Value(v))
     }
@@ -542,8 +545,8 @@ impl DeoptSources {
 /// Same passes as the AOT pipeline: ConstFold, DCE, CSE, TypeSpecialize, LICM, SRA.
 fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interner) {
     use crate::mir::opt::{
-        self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
-        range_loop::RangeLoop, sra::Sra, MirPass,
+        self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
+        licm::Licm, range_loop::RangeLoop, sra::Sra,
     };
     let range_loop = RangeLoop { interner };
     // WLIFT_DISABLE_MATH_GUARD=1 leaves math methods on unknown
@@ -740,10 +743,10 @@ fn mir_calls_method_named(
     use crate::mir::Instruction;
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
-            if let Instruction::Call { method, .. } = inst {
-                if interner.resolve(*method) == name {
-                    return true;
-                }
+            if let Instruction::Call { method, .. } = inst
+                && interner.resolve(*method) == name
+            {
+                return true;
             }
         }
     }
@@ -774,10 +777,10 @@ fn mir_calls_any_tainted_method(
     use crate::mir::Instruction;
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
-            if let Instruction::Call { method, .. } = inst {
-                if tainted.contains(method) {
-                    return true;
-                }
+            if let Instruction::Call { method, .. } = inst
+                && tainted.contains(method)
+            {
+                return true;
             }
         }
     }
@@ -1402,11 +1405,7 @@ impl ExecutionEngine {
     /// returns `None` on host builds.
     pub fn wasm_jit_slot(&self, id: FuncId) -> Option<u32> {
         let raw = *self.wasm_jit_slots.get(id.0 as usize)?;
-        if raw == 0 {
-            None
-        } else {
-            Some(raw - 1)
-        }
+        if raw == 0 { None } else { Some(raw - 1) }
     }
 
     /// Bump the wasm-tier-up call count for `id` and return the
@@ -1476,11 +1475,7 @@ impl ExecutionEngine {
             return None;
         }
         let range = &self.code_ranges[idx - 1];
-        if addr < range.end {
-            Some(range)
-        } else {
-            None
-        }
+        if addr < range.end { Some(range) } else { None }
     }
 
     /// Get the MIR for a function by ID.
@@ -1586,10 +1581,10 @@ impl ExecutionEngine {
         // theirs and drop the other's under its reader.
         #[cfg(feature = "host")]
         let _guard = self.tier_guard();
-        if let Some(&cached) = self.bc_cache.get(idx) {
-            if !cached.is_null() {
-                return Some(cached);
-            }
+        if let Some(&cached) = self.bc_cache.get(idx)
+            && !cached.is_null()
+        {
+            return Some(cached);
         }
         // Slow path: compile bytecode if needed
         let ptr = match self.functions.get_mut(idx)? {
@@ -1936,24 +1931,23 @@ impl ExecutionEngine {
                 let Some(slot) = ic_snapshot.get_mut(ic_idx) else {
                     continue;
                 };
-                if slot.kind == 0 {
-                    if let Some(impls) = cha.get(method) {
-                        if impls.len() == 1 {
-                            let one = impls[0];
-                            slot.class = one.class;
-                            slot.func_id = one.fid as u64;
-                            slot.closure = one.closure as *const u8;
-                            slot.kind = 1;
-                        }
-                    }
+                if slot.kind == 0
+                    && let Some(impls) = cha.get(method)
+                    && impls.len() == 1
+                {
+                    let one = impls[0];
+                    slot.class = one.class;
+                    slot.func_id = one.fid as u64;
+                    slot.closure = one.closure as *const u8;
+                    slot.kind = 1;
                 }
-                if slot.kind == 0 {
-                    if let Some((class_ptr, fid, closure)) = constructor_of(receiver, method) {
-                        slot.class = class_ptr;
-                        slot.func_id = fid as u64;
-                        slot.closure = closure as *const u8;
-                        slot.kind = 3;
-                    }
+                if slot.kind == 0
+                    && let Some((class_ptr, fid, closure)) = constructor_of(receiver, method)
+                {
+                    slot.class = class_ptr;
+                    slot.func_id = fid as u64;
+                    slot.closure = closure as *const u8;
+                    slot.kind = 3;
                 }
             }
         }
@@ -2295,8 +2289,11 @@ impl ExecutionEngine {
             let Some(ptr) = self.tier.osr_entry(id, site) else {
                 if tier_trace_enabled() {
                     eprintln!(
-                        "tier-trace: [{:.2}ms] osr site bb{} params={} not in bead table for FuncId({})", trace_clock_ms(),
-                        target_block.0, entry.param_count, id.0
+                        "tier-trace: [{:.2}ms] osr site bb{} params={} not in bead table for FuncId({})",
+                        trace_clock_ms(),
+                        target_block.0,
+                        entry.param_count,
+                        id.0
                     );
                 }
                 continue;
@@ -2429,10 +2426,9 @@ impl ExecutionEngine {
             optimized_executable,
             ..
         }) = self.functions.get_mut(idx)
+            && let Some(old) = optimized_executable.take()
         {
-            if let Some(old) = optimized_executable.take() {
-                self.retired_code.push(old);
-            }
+            self.retired_code.push(old);
         }
         self.optimized_code[idx] = std::ptr::null();
         self.optimized_osr_entries[idx].clear();
@@ -2526,7 +2522,10 @@ impl ExecutionEngine {
             let name = interner.resolve(body.mir().name);
             eprintln!(
                 "FuncId({idx}) {name} tier={:?} interp={} baseline={} opt={} compiles={}/{} ic={}/{} native2native={} osr={} deopts={} fallbacks={}",
-                self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted),
+                self.tier_states
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(TierState::Interpreted),
                 stats.interpreted_entries,
                 stats.baseline_entries,
                 stats.optimized_entries,
@@ -2607,10 +2606,10 @@ impl ExecutionEngine {
         module: &str,
         idx: u32,
     ) -> Option<Arc<crate::mir::opt::sroa_loop::ScalarClass>> {
-        use crate::mir::opt::sroa_loop::{
-            trivial_ctor_field_map, trivial_getter_field, ScalarClass,
-        };
         use crate::mir::Instruction;
+        use crate::mir::opt::sroa_loop::{
+            ScalarClass, trivial_ctor_field_map, trivial_getter_field,
+        };
         use crate::runtime::object::{Method, ObjClass, ObjHeader, ObjType};
         // A class slot is written once by the VM at install; any
         // SetModuleVar on it in the module's own code makes the baked
@@ -2625,10 +2624,10 @@ impl ExecutionEngine {
             };
             for block in &body.mir().blocks {
                 for (_, inst) in &block.instructions {
-                    if let Instruction::SetModuleVar(slot, _) = inst {
-                        if *slot as u32 == idx {
-                            return None;
-                        }
+                    if let Instruction::SetModuleVar(slot, _) = inst
+                        && *slot as u32 == idx
+                    {
+                        return None;
                     }
                 }
             }
@@ -2696,10 +2695,10 @@ impl ExecutionEngine {
                     let Some(mir) = self.get_mir(FuncId(fn_id)) else {
                         continue;
                     };
-                    if let Some(field) = trivial_getter_field(&mir) {
-                        if field < num_fields {
-                            getters.insert(sym, field);
-                        }
+                    if let Some(field) = trivial_getter_field(&mir)
+                        && field < num_fields
+                    {
+                        getters.insert(sym, field);
                     }
                 }
                 _ => {}
@@ -2762,8 +2761,8 @@ impl ExecutionEngine {
         interner: &crate::intern::Interner,
         exits: Option<&HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>>,
     ) -> HashMap<crate::mir::ValueId, crate::mir::opt::inline_calls::KnownCallee> {
-        use crate::mir::opt::inline_calls::{CalleeGuard, KnownCallee};
         use crate::mir::Instruction;
+        use crate::mir::opt::inline_calls::{CalleeGuard, KnownCallee};
         let mut sites = HashMap::new();
         let tainted = self.compute_may_yield_methods(interner);
         let caller_module = self.func_modules.get(caller.0 as usize).cloned().flatten();
@@ -2908,10 +2907,10 @@ impl ExecutionEngine {
         mir: &MirFunction,
         ics: &[CallSiteIC],
     ) -> HashMap<crate::mir::BlockId, Vec<crate::mir::ValueId>> {
+        use crate::mir::Instruction;
         use crate::mir::opt::licm::{
             compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
         };
-        use crate::mir::Instruction;
         let mut cold = HashMap::new();
         // WLIFT_COLD_LOOP_RECOMPILE=1 turns on cold-loop exits and the
         // recompile they request; safe to run with, but the recompile
@@ -3027,7 +3026,7 @@ impl ExecutionEngine {
         authoritative: &MirFunction,
         clone: &MirFunction,
     ) -> Option<HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>> {
-        use crate::mir::{live_in_sets, Instruction};
+        use crate::mir::{Instruction, live_in_sets};
         let bc = self.ensure_bytecode(id)?;
         let call_offsets = unsafe { &(*bc).call_offsets };
         let live_in = live_in_sets(authoritative);
@@ -3130,7 +3129,7 @@ impl ExecutionEngine {
         interner: &crate::intern::Interner,
     ) -> Arc<MirFunction> {
         use crate::mir::bytecode::RESULT_NUM;
-        use crate::mir::{live_in_sets, DeoptReg, Instruction, ValueId};
+        use crate::mir::{DeoptReg, Instruction, ValueId, live_in_sets};
         use std::collections::HashSet;
         let idx = id.0 as usize;
         if self
@@ -3287,15 +3286,14 @@ impl ExecutionEngine {
             .collect();
         let mut entry_guards: Vec<Instruction> = Vec::new();
         for (vid, inst) in &out.blocks[0].instructions {
-            if let Instruction::BlockParam(idx) = inst {
-                if *idx > 0
-                    && !already_guarded.contains(vid)
-                    && result_kinds.get(vid.0 as usize).copied() == Some(RESULT_NUM)
-                {
-                    entry_guards.push(Instruction::GuardNum(*vid));
-                    if !out.speculated_num_params.contains(vid) {
-                        out.speculated_num_params.push(*vid);
-                    }
+            if let Instruction::BlockParam(idx) = inst
+                && *idx > 0
+                && !already_guarded.contains(vid)
+                && result_kinds.get(vid.0 as usize).copied() == Some(RESULT_NUM)
+            {
+                entry_guards.push(Instruction::GuardNum(*vid));
+                if !out.speculated_num_params.contains(vid) {
+                    out.speculated_num_params.push(*vid);
                 }
             }
         }
@@ -3308,10 +3306,10 @@ impl ExecutionEngine {
         for (bi, pos, guard, dst) in placed {
             let g = out.new_value();
             out.blocks[bi].instructions.insert(pos + 1, (g, guard));
-            if let Some(dst) = dst {
-                if !out.speculated_num_params.contains(&dst) {
-                    out.speculated_num_params.push(dst);
-                }
+            if let Some(dst) = dst
+                && !out.speculated_num_params.contains(&dst)
+            {
+                out.speculated_num_params.push(dst);
             }
         }
         let insert_at = out.blocks[0]
@@ -3349,10 +3347,10 @@ impl ExecutionEngine {
             return clone;
         }
         // Comma-separated caller ids to leave alone; a bisection aid.
-        if let Ok(skip) = std::env::var("WLIFT_MIR_INLINE_SKIP") {
-            if skip.split(',').any(|s| s.trim() == caller.0.to_string()) {
-                return clone;
-            }
+        if let Ok(skip) = std::env::var("WLIFT_MIR_INLINE_SKIP")
+            && skip.split(',').any(|s| s.trim() == caller.0.to_string())
+        {
+            return clone;
         }
         let Some(ics) = ics else {
             return clone;
@@ -3417,7 +3415,8 @@ impl ExecutionEngine {
             .unwrap_or_else(|| "Unregistered".to_string());
         let invocations = self.tier.invocations(id);
         eprintln!(
-            "tier-trace: [{:.2}ms] {event} {tier:?} FuncId({}) engine={engine_tier:?} bead={bead_state} invocations={invocations}", trace_clock_ms(),
+            "tier-trace: [{:.2}ms] {event} {tier:?} FuncId({}) engine={engine_tier:?} bead={bead_state} invocations={invocations}",
+            trace_clock_ms(),
             idx
         );
     }
@@ -3569,58 +3568,58 @@ impl ExecutionEngine {
             }
         }
         // Register code range for GC stack walking.
-        if !native_ptr.is_null() {
-            if let Some(meta) = self.jit_metadata.get(idx).and_then(|m| m.clone()) {
-                let func_id = FuncId(idx as u32);
-                let start = native_ptr as usize;
-                // Get code size from the executable stored in functions.
-                let code_size = match self.functions.get(idx) {
-                    Some(FuncBody::Native {
-                        baseline_executable,
-                        optimized_executable,
-                        ..
-                    }) => {
-                        if let Some(opt) = optimized_executable {
-                            opt.code_size()
-                        } else {
-                            baseline_executable.code_size()
-                        }
+        if !native_ptr.is_null()
+            && let Some(meta) = self.jit_metadata.get(idx).and_then(|m| m.clone())
+        {
+            let func_id = FuncId(idx as u32);
+            let start = native_ptr as usize;
+            // Get code size from the executable stored in functions.
+            let code_size = match self.functions.get(idx) {
+                Some(FuncBody::Native {
+                    baseline_executable,
+                    optimized_executable,
+                    ..
+                }) => {
+                    if let Some(opt) = optimized_executable {
+                        opt.code_size()
+                    } else {
+                        baseline_executable.code_size()
                     }
-                    _ => 0,
-                };
-                if code_size > 0 {
-                    self.code_ranges.retain(|r| r.func_id != func_id);
-                    if std::env::var_os("WLIFT_TRACE_CODE_RANGE").is_some() {
-                        eprintln!(
-                            "code-range: register f{} {:#x}-{:#x} size={}",
-                            func_id.0,
-                            start,
-                            start + code_size,
-                            code_size
-                        );
-                    }
-                    // Dump raw machine code hex for offline disassembly.
-                    if std::env::var_os("WLIFT_DUMP_HEX").is_some() {
-                        eprint!("HEX:f{}:{}:", func_id.0, code_size);
-                        let code_bytes =
-                            unsafe { std::slice::from_raw_parts(start as *const u8, code_size) };
-                        for b in code_bytes {
-                            eprint!("{:02x}", b);
-                        }
-                        eprintln!();
-                    }
-                    self.register_code_range(func_id, start, start + code_size, meta);
                 }
+                _ => 0,
+            };
+            if code_size > 0 {
+                self.code_ranges.retain(|r| r.func_id != func_id);
+                if std::env::var_os("WLIFT_TRACE_CODE_RANGE").is_some() {
+                    eprintln!(
+                        "code-range: register f{} {:#x}-{:#x} size={}",
+                        func_id.0,
+                        start,
+                        start + code_size,
+                        code_size
+                    );
+                }
+                // Dump raw machine code hex for offline disassembly.
+                if std::env::var_os("WLIFT_DUMP_HEX").is_some() {
+                    eprint!("HEX:f{}:{}:", func_id.0, code_size);
+                    let code_bytes =
+                        unsafe { std::slice::from_raw_parts(start as *const u8, code_size) };
+                    for b in code_bytes {
+                        eprint!("{:02x}", b);
+                    }
+                    eprintln!();
+                }
+                self.register_code_range(func_id, start, start + code_size, meta);
             }
         }
         // Selective IC invalidation: only clear IC entries that reference
         // the recompiled function. This allows other functions' ICs (including
         // recursive constructor call sites) to remain populated.
         self.invalidate_ic_entries_for(FuncId(idx as u32));
-        if self.collect_tier_stats {
-            if let Some(stats) = self.tier_stats.get_mut(idx) {
-                stats.compile_successes += 1;
-            }
+        if self.collect_tier_stats
+            && let Some(stats) = self.tier_stats.get_mut(idx)
+        {
+            stats.compile_successes += 1;
         }
     }
 
@@ -3974,10 +3973,10 @@ impl ExecutionEngine {
         }
         let mir = Arc::clone(body.mir());
         let profile = self.get_type_profile(id).cloned();
-        if self.collect_tier_stats {
-            if let Some(stats) = self.tier_stats.get_mut(idx) {
-                stats.compile_attempts += 1;
-            }
+        if self.collect_tier_stats
+            && let Some(stats) = self.tier_stats.get_mut(idx)
+        {
+            stats.compile_attempts += 1;
         }
         let mut sroa_mir = self.scalar_replaced(id, &mir, interner);
         Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
@@ -4114,27 +4113,27 @@ impl ExecutionEngine {
             return;
         }
         let tainted = self.compute_may_yield_methods(interner);
-        if let Some(body) = self.functions.get(idx) {
-            if mir_calls_any_tainted_method(body.mir(), &tainted) {
+        if let Some(body) = self.functions.get(idx)
+            && mir_calls_any_tainted_method(body.mir(), &tainted)
+        {
+            return;
+        }
+        // Skip JIT for functions named in WLIFT_SKIP_JIT env var
+        if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT")
+            && let Some(body) = self.functions.get(idx)
+        {
+            let name = interner.resolve(body.mir().name);
+            if skip.split(',').any(|s| name == s || name.contains(s)) {
                 return;
             }
         }
-        // Skip JIT for functions named in WLIFT_SKIP_JIT env var
-        if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
-            if let Some(body) = self.functions.get(idx) {
-                let name = interner.resolve(body.mir().name);
-                if skip.split(',').any(|s| name == s || name.contains(s)) {
-                    return;
-                }
-            }
-        }
         // Only JIT functions named in WLIFT_ONLY_JIT env var
-        if let Ok(only) = std::env::var("WLIFT_ONLY_JIT") {
-            if let Some(body) = self.functions.get(idx) {
-                let name = interner.resolve(body.mir().name);
-                if !only.split(',').any(|s| name == s || name.contains(s)) {
-                    return;
-                }
+        if let Ok(only) = std::env::var("WLIFT_ONLY_JIT")
+            && let Some(body) = self.functions.get(idx)
+        {
+            let name = interner.resolve(body.mir().name);
+            if !only.split(',').any(|s| name == s || name.contains(s)) {
+                return;
             }
         }
         if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
@@ -4197,10 +4196,10 @@ impl ExecutionEngine {
             .get(idx)
             .map(|body| interner.resolve(body.mir().name).to_string())
             .unwrap_or_else(|| format!("FuncId({})", id.0));
-        if self.collect_tier_stats {
-            if let Some(stats) = self.tier_stats.get_mut(idx) {
-                stats.compile_attempts += 1;
-            }
+        if self.collect_tier_stats
+            && let Some(stats) = self.tier_stats.get_mut(idx)
+        {
+            stats.compile_attempts += 1;
         }
 
         self.compiling_tier[idx] = Some(tier);
@@ -4712,9 +4711,11 @@ mod tests {
         assert!(engine.get_function(id).is_some());
         assert!(engine.baseline_osr_entries[id.0 as usize].is_empty());
         assert!(engine.optimized_osr_entries[id.0 as usize].is_empty());
-        assert!(engine
-            .active_osr_entry(id, crate::mir::BlockId(0))
-            .is_none());
+        assert!(
+            engine
+                .active_osr_entry(id, crate::mir::BlockId(0))
+                .is_none()
+        );
     }
 
     #[test]

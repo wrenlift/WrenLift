@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{replace_uses_in_func, MirPass};
+use super::{MirPass, replace_uses_in_func};
 use crate::mir::{Instruction, MirFunction, ValueId};
 
 /// CSE pass.
@@ -314,7 +314,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
 mod tests {
     use super::*;
     use crate::intern::Interner;
-    use crate::mir::interp::{eval, InterpValue};
+    use crate::mir::interp::{InterpValue, eval};
     use crate::mir::{Instruction, Terminator};
     use crate::runtime::value::Value;
 

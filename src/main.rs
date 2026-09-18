@@ -7,13 +7,13 @@ use clap::{Parser, ValueEnum};
 
 use wren_lift::diagnostics::Severity;
 use wren_lift::mir::opt::{
-    self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm, sra::Sra,
-    MirPass,
+    self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+    sra::Sra,
 };
 use wren_lift::parse::{lexer, parser};
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::gc_trait::GcStrategy;
-use wren_lift::runtime::vm::{VMConfig, VM};
+use wren_lift::runtime::vm::{VM, VMConfig};
 use wren_lift::sema;
 
 // ---------------------------------------------------------------------------
@@ -1067,13 +1067,12 @@ fn generate_docs(root: &str, out_dir: &str) {
     // .hatch bundle input: extract source sections, run the
     // collector per module. Lets the publish pipeline emit docs
     // for any registry artefact without a source checkout.
-    if root_path.is_file() {
-        if let Ok(bytes) = fs::read(&root_path) {
-            if wren_lift::hatch::looks_like_hatch(&bytes) {
-                generate_docs_from_hatch(&bytes, &out_path);
-                return;
-            }
-        }
+    if root_path.is_file()
+        && let Ok(bytes) = fs::read(&root_path)
+        && wren_lift::hatch::looks_like_hatch(&bytes)
+    {
+        generate_docs_from_hatch(&bytes, &out_path);
+        return;
     }
 
     // Collect every .wren file under the root. Single-file inputs

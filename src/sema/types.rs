@@ -449,10 +449,10 @@ impl TypeInferrer {
             Expr::Assign { target, value } => {
                 let val_ty = self.infer_expr(value);
                 // Track field types when assigning to _field inside a class.
-                if let Expr::Field(field_name) = &target.0 {
-                    if let Some(class) = self.current_class {
-                        self.env.record_field_type(class, *field_name, &val_ty);
-                    }
+                if let Expr::Field(field_name) = &target.0
+                    && let Some(class) = self.current_class
+                {
+                    self.env.record_field_type(class, *field_name, &val_ty);
                 }
                 self.infer_expr(target);
                 val_ty
@@ -463,10 +463,10 @@ impl TypeInferrer {
                 let val_ty = self.infer_expr(value);
                 let result_ty = self.infer_binary_op(*op, &target_ty, &val_ty);
                 // Track compound assignment to fields.
-                if let Expr::Field(field_name) = &target.0 {
-                    if let Some(class) = self.current_class {
-                        self.env.record_field_type(class, *field_name, &result_ty);
-                    }
+                if let Expr::Field(field_name) = &target.0
+                    && let Some(class) = self.current_class
+                {
+                    self.env.record_field_type(class, *field_name, &result_ty);
                 }
                 result_ty
             }

@@ -9,7 +9,7 @@ use std::{
 };
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::gc_trait::GcStrategy;
-use wren_lift::runtime::vm::{VMConfig, VM};
+use wren_lift::runtime::vm::{VM, VMConfig};
 
 // ---------------------------------------------------------------------------
 // Harness with timing
@@ -996,7 +996,7 @@ System.print(sum)
 /// reference) — performance is the side-effect, not the contract.
 #[test]
 fn e2e_pure_user_method_cse_through_call() {
-    use crate::{ExecutionMode, InterpretResult, VMConfig, VM};
+    use crate::{ExecutionMode, InterpretResult, VM, VMConfig};
     let source = r#"
 class Helper {
     static add(a, b) { a + b }
@@ -3760,7 +3760,7 @@ fn e2e_bytecode_cache_rejects_garbage() {
 #[test]
 fn e2e_hatch_package_round_trip_matches_source() {
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+    use wren_lift::hatch::{Hatch, Manifest, Section, SectionKind, emit};
 
     // Build a hatch containing one compiled module.
     let source = r#"
@@ -3834,7 +3834,7 @@ System.print("main says %(c.count)")
 #[test]
 fn e2e_hatch_rejects_missing_entry_module() {
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest};
+    use wren_lift::hatch::{Hatch, Manifest, emit};
 
     // Manifest claims `entry = "ghost"` but no such section exists.
     let hatch = Hatch {
@@ -3874,7 +3874,7 @@ fn e2e_hatch_cross_module_import_within_one_hatch() {
     // order (util before main) so util's top-level runs first and its
     // class is visible via `find_imported_var` when main installs.
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+    use wren_lift::hatch::{Hatch, Manifest, Section, SectionKind, emit};
 
     let util_src = r#"
 class Greeter {
@@ -3951,7 +3951,7 @@ fn e2e_hatch_cross_hatch_import_via_install_then_run() {
     // imports from it. Classes registered by the library hatch must
     // be visible to the application hatch at install time.
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+    use wren_lift::hatch::{Hatch, Manifest, Section, SectionKind, emit};
 
     let lib_src = r#"
 class Counter {
@@ -4069,7 +4069,7 @@ fn e2e_hatch_dispatcher_entry_resolves_after_siblings() {
     // The install loop must hoist non-entry modules first so the
     // dispatcher's slot fills correctly on its own first install.
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+    use wren_lift::hatch::{Hatch, Manifest, Section, SectionKind, emit};
 
     let backend_src = "class Foo { static greet() { \"from backend\" } }";
     let dispatcher_src = "import \"backend\" for Foo";
@@ -4168,7 +4168,7 @@ fn e2e_hatch_dispatcher_entry_resolves_after_siblings() {
 #[test]
 fn e2e_hatch_extracts_native_lib_sections_to_disk() {
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+    use wren_lift::hatch::{Hatch, Manifest, Section, SectionKind, emit};
 
     // A hatch carrying a `NativeLib` section must write that section
     // to a temp directory at load time, register a `<name> → path`
@@ -4375,7 +4375,7 @@ fn e2e_hatch_manifest_applies_native_search_paths_and_overrides() {
     // folded into the VM's foreign-loader state. This verifies the
     // manifest plumbing without needing a real shared library to load.
     use std::collections::BTreeMap;
-    use wren_lift::hatch::{emit, Hatch, Manifest, NativeLibEntry, Section, SectionKind};
+    use wren_lift::hatch::{Hatch, Manifest, NativeLibEntry, Section, SectionKind, emit};
 
     // Build a tiny self-contained hatch so we exercise the real
     // install path end-to-end.
@@ -4421,10 +4421,11 @@ fn e2e_hatch_manifest_applies_native_search_paths_and_overrides() {
     assert!(matches!(result, InterpretResult::Success));
 
     // The manifest's declarations must have seeded the loader state.
-    assert!(vm
-        .native_search_paths
-        .iter()
-        .any(|p| p == std::path::Path::new("/opt/homebrew/lib")));
+    assert!(
+        vm.native_search_paths
+            .iter()
+            .any(|p| p == std::path::Path::new("/opt/homebrew/lib"))
+    );
     assert_eq!(
         vm.native_lib_paths.get("custom_db"),
         Some(&std::path::PathBuf::from("/opt/custom/libdb.dylib"))

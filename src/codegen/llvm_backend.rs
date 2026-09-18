@@ -31,17 +31,17 @@ pub mod llvm {
     };
     use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
+    use crate::codegen::NativeOsrEntry;
     use crate::codegen::cranelift_backend::cl::{
+        OsrEntryLayout, PTR_MASK, QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
         collect_osr_targets, const_f64_of, direct_calls_enabled, env_jit_callsite_ic,
         infer_osr_value_types, is_positive_power_of_two, jit_func_id, jit_modvar_in_range,
-        jit_modvars_cell, osr_entry_layout, should_compile_osr_entries, OsrEntryLayout, PTR_MASK,
-        QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
+        jit_modvars_cell, osr_entry_layout, should_compile_osr_entries,
     };
-    use crate::codegen::NativeOsrEntry;
     use crate::intern::Interner;
     use crate::mir::{
-        osr_reachable_blocks, osr_rematerializable_defs, BlockId, DeoptReg, Instruction,
-        MirFunction, MirType, Terminator, ValueId,
+        BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
+        osr_reachable_blocks, osr_rematerializable_defs,
     };
     use crate::runtime::object_layout::*;
 
@@ -1273,10 +1273,10 @@ pub mod llvm {
                     .collect();
                 self.receiver = params.first().copied();
                 for &(vid, ref inst) in &entry.instructions {
-                    if let Instruction::BlockParam(idx) = inst {
-                        if let Some(p) = params.get(*idx as usize) {
-                            self.vals.insert(vid, (*p).into());
-                        }
+                    if let Instruction::BlockParam(idx) = inst
+                        && let Some(p) = params.get(*idx as usize)
+                    {
+                        self.vals.insert(vid, (*p).into());
                     }
                 }
                 self.br(self.blocks[0])?;
@@ -1311,12 +1311,11 @@ pub mod llvm {
                 }
                 self.receiver = params.first().copied();
                 for &(vid, ref inst) in &entry.instructions {
-                    if let Instruction::BlockParam(idx) = inst {
-                        if let Some(p) = params.get(*idx as usize) {
-                            if let Some((slot, _)) = self.slots.get(&vid).copied() {
-                                self.b.build_store(slot, *p).map_err(|e| e.to_string())?;
-                            }
-                        }
+                    if let Instruction::BlockParam(idx) = inst
+                        && let Some(p) = params.get(*idx as usize)
+                        && let Some((slot, _)) = self.slots.get(&vid).copied()
+                    {
+                        self.b.build_store(slot, *p).map_err(|e| e.to_string())?;
                     }
                 }
                 self.param_regs = params;
@@ -2704,7 +2703,7 @@ pub mod llvm {
         /// after the header; a literal too long for a line, or no bump
         /// region, takes the helper.
         fn alloc_list(&mut self, elems: &[IntValue<'ctx>]) -> Result<IntValue<'ctx>, String> {
-            use crate::runtime::object::{ObjType, FLAG_HEAP_BUFFER};
+            use crate::runtime::object::{FLAG_HEAP_BUFFER, ObjType};
             let bump = crate::codegen::jit_bump_region();
             let list_class = crate::codegen::jit_list_class();
             let n = elems.len();
@@ -3352,77 +3351,68 @@ pub mod llvm {
 
             // Class-hierarchy devirtualisation: one guarded direct call
             // per known implementation.
-            if let Some(cha) = self.sh.cha_by_method {
-                if args.len() <= 4 {
-                    let impls: Vec<crate::runtime::engine::ChaImpl> =
-                        cha.get(&method).cloned().unwrap_or_default();
-                    if !impls.is_empty() {
-                        let merge = self.new_block("cham");
-                        let slow = self.new_block("chas");
-                        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
-                            Vec::new();
-                        let (is_obj, _, recv_class) = self.class_of(r)?;
-                        for imp in &impls {
-                            let (class_ptr, fid) = (&imp.class, &imp.fid);
-                            let next = self.new_block("chan");
-                            let fast = self.new_block("chaf");
-                            let same = self.icmp(
-                                IntPredicate::EQ,
-                                recv_class,
-                                self.c64(*class_ptr as u64),
-                            )?;
-                            let hit = self
-                                .b
-                                .build_and(is_obj, same, "hit")
-                                .map_err(|e| e.to_string())?;
-                            self.cbr(hit, fast, next)?;
-                            self.b.position_at_end(fast);
-                            let body = self.sh.inline_bodies.and_then(|b| b.get(fid)).cloned();
-                            let mut done = false;
-                            if let Some(callee) = body {
-                                if let Some(v) =
-                                    self.inline_body(&callee, r, *class_ptr, &arg_vals)?
-                                {
-                                    incoming.push((v.into(), self.b.get_insert_block().unwrap()));
-                                    self.br(merge)?;
-                                    done = true;
-                                }
-                            }
-                            if !done
-                                && imp.direct
-                                && args.len() <= 4
-                                && self.sh.jit_code_base.is_some()
-                            {
-                                // Straight through the slot when the callee
-                                // is compiled; the helper otherwise.
-                                let helper = self.new_block("chah");
-                                let (v, end) = self
-                                    .slot_call(*fid, r, &arg_vals, helper)?
-                                    .expect("a slot table");
-                                incoming.push((v.into(), end));
-                                self.br(merge)?;
-                                self.b.position_at_end(helper);
-                            }
-                            if !done {
-                                if args.len() <= 3 {
-                                    let v = self.known_call_nocheck(*fid, method, r, &arg_vals)?;
-                                    incoming.push((v.into(), self.b.get_insert_block().unwrap()));
-                                    self.br(merge)?;
-                                } else {
-                                    self.br(next)?;
-                                }
-                            }
-                            self.b.position_at_end(next);
+            if let Some(cha) = self.sh.cha_by_method
+                && args.len() <= 4
+            {
+                let impls: Vec<crate::runtime::engine::ChaImpl> =
+                    cha.get(&method).cloned().unwrap_or_default();
+                if !impls.is_empty() {
+                    let merge = self.new_block("cham");
+                    let slow = self.new_block("chas");
+                    let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+                    let (is_obj, _, recv_class) = self.class_of(r)?;
+                    for imp in &impls {
+                        let (class_ptr, fid) = (&imp.class, &imp.fid);
+                        let next = self.new_block("chan");
+                        let fast = self.new_block("chaf");
+                        let same =
+                            self.icmp(IntPredicate::EQ, recv_class, self.c64(*class_ptr as u64))?;
+                        let hit = self
+                            .b
+                            .build_and(is_obj, same, "hit")
+                            .map_err(|e| e.to_string())?;
+                        self.cbr(hit, fast, next)?;
+                        self.b.position_at_end(fast);
+                        let body = self.sh.inline_bodies.and_then(|b| b.get(fid)).cloned();
+                        let mut done = false;
+                        if let Some(callee) = body
+                            && let Some(v) = self.inline_body(&callee, r, *class_ptr, &arg_vals)?
+                        {
+                            incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                            self.br(merge)?;
+                            done = true;
                         }
-                        self.br(slow)?;
-                        self.b.position_at_end(slow);
-                        let m = self.c64(method.index() as u64);
-                        let sv = self.wren_call(r, m, &arg_vals)?;
-                        incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
-                        self.br(merge)?;
-                        self.b.position_at_end(merge);
-                        return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
+                        if !done && imp.direct && args.len() <= 4 && self.sh.jit_code_base.is_some()
+                        {
+                            // Straight through the slot when the callee
+                            // is compiled; the helper otherwise.
+                            let helper = self.new_block("chah");
+                            let (v, end) = self
+                                .slot_call(*fid, r, &arg_vals, helper)?
+                                .expect("a slot table");
+                            incoming.push((v.into(), end));
+                            self.br(merge)?;
+                            self.b.position_at_end(helper);
+                        }
+                        if !done {
+                            if args.len() <= 3 {
+                                let v = self.known_call_nocheck(*fid, method, r, &arg_vals)?;
+                                incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                                self.br(merge)?;
+                            } else {
+                                self.br(next)?;
+                            }
+                        }
+                        self.b.position_at_end(next);
                     }
+                    self.br(slow)?;
+                    self.b.position_at_end(slow);
+                    let m = self.c64(method.index() as u64);
+                    let sv = self.wren_call(r, m, &arg_vals)?;
+                    incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
                 }
             }
 
@@ -3801,53 +3791,52 @@ pub mod llvm {
             }
             let m = self.c64(method.index() as u64);
 
-            if let Some(bodies) = self.sh.inline_bodies {
-                if expected_class != 0 && args.len() <= 4 {
-                    if let Some(callee) = bodies.get(&func_id).cloned() {
-                        let fast = self.new_block("kif");
-                        let (hit, _) = self.instance_check(r, expected_class as u64)?;
-                        if let Some(miss) = self.miss_exit_block()? {
-                            // A class miss leaves the function, so the
-                            // inlined body needs no merge.
-                            self.cbr(hit, fast, miss)?;
-                            self.b.position_at_end(fast);
-                            return match self.inline_body(&callee, r, expected_class, &arg_vals)? {
-                                Some(v) => {
-                                    if let Some(field) = inline_getter_field {
-                                        let dst = self.cur_vid;
-                                        self.note_field_invariant(expected_class, field, dst);
-                                    }
-                                    Ok(v)
-                                }
-                                None => {
-                                    let slow = self.new_block("kis");
-                                    self.br(slow)?;
-                                    self.b.position_at_end(slow);
-                                    self.wren_call(r, m, &arg_vals)
-                                }
-                            };
-                        }
-                        let slow = self.new_block("kis");
-                        let merge = self.new_block("kim");
-                        self.cbr(hit, fast, slow)?;
-                        self.b.position_at_end(fast);
-                        let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> =
-                            Vec::new();
-                        match self.inline_body(&callee, r, expected_class, &arg_vals)? {
-                            Some(v) => {
-                                incoming.push((v.into(), self.b.get_insert_block().unwrap()));
-                                self.br(merge)?;
+            if let Some(bodies) = self.sh.inline_bodies
+                && expected_class != 0
+                && args.len() <= 4
+                && let Some(callee) = bodies.get(&func_id).cloned()
+            {
+                let fast = self.new_block("kif");
+                let (hit, _) = self.instance_check(r, expected_class as u64)?;
+                if let Some(miss) = self.miss_exit_block()? {
+                    // A class miss leaves the function, so the
+                    // inlined body needs no merge.
+                    self.cbr(hit, fast, miss)?;
+                    self.b.position_at_end(fast);
+                    return match self.inline_body(&callee, r, expected_class, &arg_vals)? {
+                        Some(v) => {
+                            if let Some(field) = inline_getter_field {
+                                let dst = self.cur_vid;
+                                self.note_field_invariant(expected_class, field, dst);
                             }
-                            None => self.br(slow)?,
+                            Ok(v)
                         }
-                        self.b.position_at_end(slow);
-                        let sv = self.wren_call(r, m, &arg_vals)?;
-                        incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
-                        self.br(merge)?;
-                        self.b.position_at_end(merge);
-                        return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
-                    }
+                        None => {
+                            let slow = self.new_block("kis");
+                            self.br(slow)?;
+                            self.b.position_at_end(slow);
+                            self.wren_call(r, m, &arg_vals)
+                        }
+                    };
                 }
+                let slow = self.new_block("kis");
+                let merge = self.new_block("kim");
+                self.cbr(hit, fast, slow)?;
+                self.b.position_at_end(fast);
+                let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+                match self.inline_body(&callee, r, expected_class, &arg_vals)? {
+                    Some(v) => {
+                        incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                        self.br(merge)?;
+                    }
+                    None => self.br(slow)?,
+                }
+                self.b.position_at_end(slow);
+                let sv = self.wren_call(r, m, &arg_vals)?;
+                incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+                self.b.position_at_end(merge);
+                return Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value());
             }
 
             if direct_calls_enabled()

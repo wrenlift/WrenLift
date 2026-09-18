@@ -635,11 +635,11 @@ app.listen("127.0.0.1:3000")
     }
 
     let public_dir = dir.join("public");
-    if !public_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&public_dir) {
-            eprintln!("error: cannot create '{}': {}", public_dir.display(), e);
-            process::exit(1);
-        }
+    if !public_dir.exists()
+        && let Err(e) = std::fs::create_dir_all(&public_dir)
+    {
+        eprintln!("error: cannot create '{}': {}", public_dir.display(), e);
+        process::exit(1);
     }
     let gitkeep = public_dir.join(".gitkeep");
     if !gitkeep.exists() {
@@ -906,15 +906,14 @@ fn cmd_install(dir: &Path, package: Option<&str>) {
                 .get("dependencies")
                 .and_then(toml_edit::Item::as_table_like)
                 .and_then(|t| t.get(name))
+                && let Some(spec) = extract_git_spec(entry)
             {
-                if let Some(spec) = extract_git_spec(entry) {
-                    // Git-hosted dep: ignore any `@version` the user
-                    // typed and use the declared ref. Downgrading
-                    // pinned commits via CLI would be surprising.
-                    install_git(&cache_dir, name, &spec);
-                    println!("installed {} from {}", name, spec.git);
-                    return;
-                }
+                // Git-hosted dep: ignore any `@version` the user
+                // typed and use the declared ref. Downgrading
+                // pinned commits via CLI would be surprising.
+                install_git(&cache_dir, name, &spec);
+                println!("installed {} from {}", name, spec.git);
+                return;
             }
 
             let resolved_version = match version {
@@ -1061,10 +1060,10 @@ fn extract_version(item: &toml_edit::Item) -> Option<String> {
         return Some(v.to_string());
     }
     // `name = { version = "1.0.0", path = "..." }` — inline table.
-    if let Some(tbl) = item.as_table_like() {
-        if let Some(v) = tbl.get("version").and_then(|i| i.as_str()) {
-            return Some(v.to_string());
-        }
+    if let Some(tbl) = item.as_table_like()
+        && let Some(v) = tbl.get("version").and_then(|i| i.as_str())
+    {
+        return Some(v.to_string());
     }
     None
 }
@@ -1181,10 +1180,10 @@ fn cmd_find(name: &str) {
 
     let latest = &rows[0];
     println!("{}@{} — {}", latest.name, latest.version, latest.git);
-    if let Some(desc) = latest.description.as_deref() {
-        if !desc.is_empty() {
-            println!("  {}", desc);
-        }
+    if let Some(desc) = latest.description.as_deref()
+        && !desc.is_empty()
+    {
+        println!("  {}", desc);
     }
     if let Some(owner) = latest.owner.as_deref() {
         println!("  owner: {}", owner);
@@ -1474,13 +1473,12 @@ fn upload_workspace_docs(
     // no modules, no changelog, no readme. Parsing here is cheap
     // and avoids a brittle string compare against `[]` (the old
     // legacy sentinel that no longer matches the new shape).
-    if let Ok(bundle) = wren_lift::docs::parse_docs_bundle(docs_json.as_bytes()) {
-        if bundle.modules.is_empty()
-            && bundle.changelog.as_deref().unwrap_or("").trim().is_empty()
-            && bundle.readme.as_deref().unwrap_or("").trim().is_empty()
-        {
-            return Ok(None);
-        }
+    if let Ok(bundle) = wren_lift::docs::parse_docs_bundle(docs_json.as_bytes())
+        && bundle.modules.is_empty()
+        && bundle.changelog.as_deref().unwrap_or("").trim().is_empty()
+        && bundle.readme.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Ok(None);
     }
     // Body: {name, version, docs} where docs is the parsed JSON
     // from `collect_workspace_docs`. Splice in literally rather
@@ -1647,11 +1645,7 @@ fn detect_origin_remote(dir: &Path) -> Option<String> {
         return None;
     }
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url)
-    }
+    if url.is_empty() { None } else { Some(url) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,11 +1757,11 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
     // paths (`"assets/foo.png"`) regardless of where the user
     // launched `hatch run` from. Single-file `.hatch` targets keep
     // the launcher's cwd unchanged.
-    if target.is_dir() {
-        if let Err(e) = std::env::set_current_dir(target) {
-            eprintln!("error: cannot chdir into '{}': {}", target.display(), e);
-            process::exit(1);
-        }
+    if target.is_dir()
+        && let Err(e) = std::env::set_current_dir(target)
+    {
+        eprintln!("error: cannot chdir into '{}': {}", target.display(), e);
+        process::exit(1);
     }
 
     match vm.interpret_hatch(main_bytes) {
@@ -1897,10 +1891,10 @@ fn walk_wren(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, std::time
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.') || name == "target" || name == "node_modules")
+        {
+            continue;
         }
         let ft = match entry.file_type() {
             Ok(t) => t,
@@ -1910,12 +1904,11 @@ fn walk_wren(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, std::time
             walk_wren(&path, out);
         } else if ft.is_file() {
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if WATCH_EXTENSIONS.contains(&ext) {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mt) = meta.modified() {
-                        out.insert(path, mt);
-                    }
-                }
+            if WATCH_EXTENSIONS.contains(&ext)
+                && let Ok(meta) = entry.metadata()
+                && let Ok(mt) = meta.modified()
+            {
+                out.insert(path, mt);
             }
         }
     }
@@ -1958,12 +1951,12 @@ fn locate_wlift() -> Option<PathBuf> {
     // Prefer a `wlift` next to the hatch binary (the cargo install
     // / release-build layout puts both in the same dir), else walk
     // PATH for the executable. Avoids pulling in the `which` crate.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("wlift");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let candidate = parent.join("wlift");
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     let path = std::env::var_os("PATH")?;
@@ -1989,9 +1982,9 @@ fn strip_ansi(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
             chars.next(); // consume `[`
-                          // Drain parameter bytes until we hit a letter (the
-                          // CSI final byte). Cap the inner loop so a malformed
-                          // sequence can't run away.
+            // Drain parameter bytes until we hit a letter (the
+            // CSI final byte). Cap the inner loop so a malformed
+            // sequence can't run away.
             for _ in 0..32 {
                 match chars.next() {
                     Some(c) if c.is_ascii_alphabetic() => break,
@@ -2261,10 +2254,10 @@ fn walk_specs(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.starts_with('.') || name == "target" || name == "node_modules")
+        {
+            continue;
         }
         let ft = match entry.file_type() {
             Ok(t) => t,
@@ -2272,12 +2265,11 @@ fn walk_specs(dir: &Path, out: &mut Vec<PathBuf>) {
         };
         if ft.is_dir() {
             walk_specs(&path, out);
-        } else if ft.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".spec.wren") {
-                    out.push(path);
-                }
-            }
+        } else if ft.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.ends_with(".spec.wren")
+        {
+            out.push(path);
         }
     }
 }

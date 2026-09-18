@@ -126,7 +126,7 @@ fn compute_used_values(func: &MirFunction) -> HashSet<ValueId> {
 mod tests {
     use super::*;
     use crate::intern::Interner;
-    use crate::mir::interp::{eval, InterpValue};
+    use crate::mir::interp::{InterpValue, eval};
     use crate::mir::{Instruction, Terminator};
     use crate::runtime::value::Value;
 

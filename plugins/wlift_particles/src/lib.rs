@@ -12,7 +12,7 @@
 //! - `wlift_particles_pack` — packs the per-instance billboard data
 //!   the GPU draw expects (16 f32 per slot — position + size + uv-rect
 //!   + tint + rotation + lod) for each live slot, with optional
-//!   distance-scaled width and atmospheric alpha falloff.
+//!     distance-scaled width and atmospheric alpha falloff.
 //!
 //! The hot work happens in tight `for off in 0..count*8 step 8` loops
 //! against the raw `&mut [f32]` view of the host Float32Array. The
@@ -258,12 +258,7 @@ pub unsafe extern "C" fn wlift_particles_integrate(vm: *mut WrenVm) {
             if span > 1e-5 {
                 u = (py - kp_y) / span;
             }
-            if u < 0.0 {
-                u = 0.0;
-            }
-            if u > 1.0 {
-                u = 1.0;
-            }
+            u = u.clamp(0.0, 1.0);
             let hx = px + (nx - px) * u;
             let hz = pz + (nz - pz) * u;
             if death_count < deaths_cap {
@@ -402,12 +397,7 @@ pub unsafe extern "C" fn wlift_particles_pack(vm: *mut WrenVm) {
         // spawned slot in the same frame may briefly have t very near
         // 0 with floating noise.
         let mut t = age * inv_life;
-        if t < 0.0 {
-            t = 0.0;
-        }
-        if t > 1.0 {
-            t = 1.0;
-        }
+        t = t.clamp(0.0, 1.0);
 
         let r = cs0 + cd0 * t;
         let g = cs1 + cd1 * t;
@@ -438,7 +428,7 @@ pub unsafe extern "C" fn wlift_particles_pack(vm: *mut WrenVm) {
             sx = sx_base * scale;
             // Atmospheric alpha fade: closer streaks at 65% of base,
             // reference-distance streaks at full alpha.
-            a = a * (0.65 + 0.35 * lin);
+            a *= 0.65 + 0.35 * lin;
         }
 
         inst[off] = px;

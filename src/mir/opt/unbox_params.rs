@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{replace_uses_in_func, MirPass};
+use super::{MirPass, replace_uses_in_func};
 use crate::mir::{BlockId, Instruction, MirFunction, MirType, Terminator, ValueId};
 
 pub struct UnboxParams;
@@ -299,10 +299,10 @@ fn rewrite_term_boxed(
 ) {
     let fix = |args: &mut Vec<ValueId>, chosen: &[bool]| {
         for (i, a) in args.iter_mut().enumerate() {
-            if !chosen.get(i).copied().unwrap_or(false) {
-                if let Some(b) = boxed.get(a) {
-                    *a = *b;
-                }
+            if !chosen.get(i).copied().unwrap_or(false)
+                && let Some(b) = boxed.get(a)
+            {
+                *a = *b;
             }
         }
     };

@@ -34,7 +34,7 @@
 
 #![cfg(feature = "host")]
 
-use krio_fiber::{yield_now, Fiber};
+use krio_fiber::{Fiber, yield_now};
 
 /// Count the frames in a suspended fiber's saved_fp chain. Real GC
 /// walker does this exact loop, but stops at each frame to scan

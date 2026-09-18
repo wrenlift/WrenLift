@@ -55,11 +55,7 @@ impl Value {
     /// Box a boolean.
     #[inline(always)]
     pub fn bool(b: bool) -> Self {
-        if b {
-            Value(TAG_TRUE)
-        } else {
-            Value(TAG_FALSE)
-        }
+        if b { Value(TAG_TRUE) } else { Value(TAG_FALSE) }
     }
 
     /// The internal undefined sentinel (never exposed to user code).

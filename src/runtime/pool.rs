@@ -5,8 +5,8 @@
 //! starts on first use, one worker per hardware thread, and stops
 //! when the main view goes.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use crate::runtime::sched::Endpoint;

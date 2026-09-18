@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use super::licm::{compute_dominators, compute_rpo, dominates};
 use super::{remap_inst, remap_term, replace_uses_in_func};
 use crate::mir::{
-    live_in_sets, BlockId, DeoptSource, Instruction, MirFunction, MirType, Terminator, ValueId,
+    BlockId, DeoptSource, Instruction, MirFunction, MirType, Terminator, ValueId, live_in_sets,
 };
 
 /// A call that is a field access on the class its cache recorded.
@@ -184,10 +184,11 @@ pub fn promote_fields(func: &mut MirFunction, classes: &Classes) -> bool {
                             if dead.insert(p) || had {
                                 changed = true;
                             }
-                        } else if let Some(s) = shape {
-                            if !pending && params.insert(p, s) != Some(s) {
-                                changed = true;
-                            }
+                        } else if let Some(s) = shape
+                            && !pending
+                            && params.insert(p, s) != Some(s)
+                        {
+                            changed = true;
                         }
                     }
                 }
@@ -247,15 +248,15 @@ pub fn promote_fields(func: &mut MirFunction, classes: &Classes) -> bool {
                     needs.push((n, format!("{:?}", inst)));
                 }
             }
-            if let Terminator::Return(v) = &block.terminator {
-                if tracked(*v).is_some() {
-                    needs.push((root(*v), "return".to_string()));
-                }
+            if let Terminator::Return(v) = &block.terminator
+                && tracked(*v).is_some()
+            {
+                needs.push((root(*v), "return".to_string()));
             }
-            if let Terminator::CondBranch { condition, .. } = &block.terminator {
-                if tracked(*condition).is_some() {
-                    escaped.insert(root(*condition));
-                }
+            if let Terminator::CondBranch { condition, .. } = &block.terminator
+                && tracked(*condition).is_some()
+            {
+                escaped.insert(root(*condition));
             }
             for (n, what) in needs {
                 if live_out.contains(&n) {
@@ -764,13 +765,13 @@ fn rebuild(
     cur: &HashMap<ValueId, Vec<ValueId>>,
     shapes: &HashMap<ValueId, Shape>,
 ) {
-    if let DeoptSource::Value(v) = r.source {
-        if let Some(fields) = cur.get(&v) {
-            r.source = DeoptSource::Object {
-                class: shapes[&v].class,
-                id: v.0,
-                fields: fields.clone(),
-            };
-        }
+    if let DeoptSource::Value(v) = r.source
+        && let Some(fields) = cur.get(&v)
+    {
+        r.source = DeoptSource::Object {
+            class: shapes[&v].class,
+            id: v.0,
+            fields: fields.clone(),
+        };
     }
 }

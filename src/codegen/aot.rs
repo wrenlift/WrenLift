@@ -31,7 +31,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use cranelift_codegen::ir::{types, AbiParam, Function, Signature, UserFuncName};
+use cranelift_codegen::ir::{AbiParam, Function, Signature, UserFuncName, types};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, Linkage, Module};
@@ -39,11 +39,11 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::ast::Stmt;
 use crate::codegen::cranelift_backend::cl::{
-    lower_mir_to_module, AotCha, AotDefiningClass, AotLoweringConfig, AotMethodImpl,
+    AotCha, AotDefiningClass, AotLoweringConfig, AotMethodImpl, lower_mir_to_module,
 };
 use crate::intern::Interner;
-use crate::mir::builder::lower_module_with_known_classes;
 use crate::mir::ModuleMir;
+use crate::mir::builder::lower_module_with_known_classes;
 use crate::parse::parser::parse;
 use crate::sema::resolve::resolve_with_prelude;
 

@@ -21,12 +21,12 @@
 //! Marking and sweeping run with every other thread stopped.
 
 use super::object::ObjHeader;
-use super::rt::{RtStats, MAX_ALLOC};
+use super::rt::{MAX_ALLOC, RtStats};
 use super::value::Value;
 use crate::portable_time::Instant;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{
-    AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed,
+    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed,
 };
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -986,44 +986,46 @@ impl ImmixHeap {
     /// `ptr` must be the start of an `ObjHeader`-led object.
     #[inline(always)]
     pub unsafe fn mark(&mut self, ptr: *mut u8) -> bool {
-        let header = ptr as *mut ObjHeader;
-        if (*header).gc_mark == self.live_color {
-            return false;
-        }
-        (*header).gc_mark = self.live_color;
-        // The lines the object covers are live; a sweep frees the rest
-        // without reading them.
-        let addr = ptr as usize;
-        if let Some(b) = self.block_containing(addr) {
-            let b = b as usize;
-            let q = (addr - self.block_bases.get(b)) / QUANTUM;
-            let code = self.objects.get(b * QUANTA_PER_BLOCK + q);
-            let first = q / QUANTA_PER_LINE;
-            // Marking is the collector's alone, so the words are updated
-            // with plain loads and stores.
-            if code & CODE_MASK != SPAN_OBJECT {
-                // A small object never straddles a line.
-                let w = b * LINE_WORDS + first / 64;
-                self.line_marks
-                    .set(w, self.line_marks.get(w) | 1u64 << (first % 64));
-            } else {
-                let quanta = self.alloc_quanta(b, q, code).max(1);
-                let last = (q + quanta - 1) / QUANTA_PER_LINE;
-                for l in first..=last {
-                    let w = b * LINE_WORDS + l / 64;
+        unsafe {
+            let header = ptr as *mut ObjHeader;
+            if (*header).gc_mark == self.live_color {
+                return false;
+            }
+            (*header).gc_mark = self.live_color;
+            // The lines the object covers are live; a sweep frees the rest
+            // without reading them.
+            let addr = ptr as usize;
+            if let Some(b) = self.block_containing(addr) {
+                let b = b as usize;
+                let q = (addr - self.block_bases.get(b)) / QUANTUM;
+                let code = self.objects.get(b * QUANTA_PER_BLOCK + q);
+                let first = q / QUANTA_PER_LINE;
+                // Marking is the collector's alone, so the words are updated
+                // with plain loads and stores.
+                if code & CODE_MASK != SPAN_OBJECT {
+                    // A small object never straddles a line.
+                    let w = b * LINE_WORDS + first / 64;
                     self.line_marks
-                        .set(w, self.line_marks.get(w) | 1u64 << (l % 64));
+                        .set(w, self.line_marks.get(w) | 1u64 << (first % 64));
+                } else {
+                    let quanta = self.alloc_quanta(b, q, code).max(1);
+                    let last = (q + quanta - 1) / QUANTA_PER_LINE;
+                    for l in first..=last {
+                        let w = b * LINE_WORDS + l / 64;
+                        self.line_marks
+                            .set(w, self.line_marks.get(w) | 1u64 << (l % 64));
+                    }
                 }
             }
+            true
         }
-        true
     }
 
     /// # Safety
     /// As [`ImmixHeap::mark`].
     #[inline(always)]
     pub unsafe fn is_marked(&self, ptr: *mut u8) -> bool {
-        (*(ptr as *mut ObjHeader)).gc_mark == self.live_color
+        unsafe { (*(ptr as *mut ObjHeader)).gc_mark == self.live_color }
     }
 
     /// Open a cycle: the other colour now means marked, so last cycle's

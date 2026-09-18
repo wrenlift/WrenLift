@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 use crate::hatch_registry;
 use crate::runtime::engine::InterpretResult;
-use crate::runtime::vm::{VMConfig, VM};
+use crate::runtime::vm::{VM, VMConfig};
 
 /// Errors from the embedder-facing loader surface. Kept narrow on
 /// purpose — the CLI's richer error machinery (with diagnostics
@@ -337,13 +337,12 @@ impl HatchRunner {
         // matching artifact. This matches the `hatch install`
         // behaviour where a version is resolved at install time and
         // parked in the cache as `name-<version>.hatch`.
-        if let Ok(cache) = hatch_registry::cache_root() {
-            if cache.exists() {
-                if let Ok(found) = scan_cache_for(&cache, name) {
-                    self.discovered.insert(name.to_string(), found.clone());
-                    return Ok(found);
-                }
-            }
+        if let Ok(cache) = hatch_registry::cache_root()
+            && cache.exists()
+            && let Ok(found) = scan_cache_for(&cache, name)
+        {
+            self.discovered.insert(name.to_string(), found.clone());
+            return Ok(found);
         }
         Err(RunnerError::NotFound(name.to_string()))
     }

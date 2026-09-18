@@ -139,13 +139,18 @@ pub enum SerializeError {
 impl std::fmt::Display for SerializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SerializeError::BadMagic => write!(f, "not a wlift bytecode cache (missing WLBC magic)"),
+            SerializeError::BadMagic => {
+                write!(f, "not a wlift bytecode cache (missing WLBC magic)")
+            }
             SerializeError::VersionMismatch { expected, found } => write!(
                 f,
                 "wlift bytecode cache version mismatch: expected v{expected}, found v{found}; \
                  rebuild the artifact with `hatch build` against the current wren_lift sources"
             ),
-            SerializeError::TruncatedPayload { declared, available } => write!(
+            SerializeError::TruncatedPayload {
+                declared,
+                available,
+            } => write!(
                 f,
                 "wlift bytecode cache payload is truncated: header says {declared} bytes, only {available} available"
             ),

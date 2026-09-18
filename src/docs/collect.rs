@@ -154,28 +154,28 @@ fn enrich_signature(
         return base.to_string();
     }
     let mut out = base.to_string();
-    if !param_types.is_empty() {
-        if let (Some(open), Some(close)) = (base.find('('), base.rfind(')')) {
-            let prefix = &base[..open + 1];
-            let inside = &base[open + 1..close];
-            let suffix = &base[close..];
-            let typed = inside
-                .split(',')
-                .map(|p| {
-                    let p = p.trim();
-                    if p.is_empty() {
-                        return p.to_string();
-                    }
-                    if let Some(info) = param_types.iter().find(|t| t.name == p) {
-                        format!("{}: {}", p, info.type_name)
-                    } else {
-                        p.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            out = format!("{}{}{}", prefix, typed, suffix);
-        }
+    if !param_types.is_empty()
+        && let (Some(open), Some(close)) = (base.find('('), base.rfind(')'))
+    {
+        let prefix = &base[..open + 1];
+        let inside = &base[open + 1..close];
+        let suffix = &base[close..];
+        let typed = inside
+            .split(',')
+            .map(|p| {
+                let p = p.trim();
+                if p.is_empty() {
+                    return p.to_string();
+                }
+                if let Some(info) = param_types.iter().find(|t| t.name == p) {
+                    format!("{}: {}", p, info.type_name)
+                } else {
+                    p.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out = format!("{}{}{}", prefix, typed, suffix);
     }
     if let Some(rt) = return_type {
         out.push_str(" → ");
@@ -263,11 +263,7 @@ fn parse_returns(rest: &str) -> Option<String> {
     let open = rest.find('{')?;
     let close = rest[open..].find('}')?;
     let ty = rest[open + 1..open + close].trim().to_string();
-    if ty.is_empty() {
-        None
-    } else {
-        Some(ty)
-    }
+    if ty.is_empty() { None } else { Some(ty) }
 }
 
 fn signature_text(sig: &MethodSig, is_static: bool, interner: &Interner) -> (String, String) {
@@ -504,12 +500,12 @@ struct SymbolTable {
 fn resolve_one(text: &str, symbols: &SymbolTable) -> RefTarget {
     let trimmed = text.trim();
 
-    if let Some(rest) = trimmed.strip_prefix('#') {
-        if !rest.is_empty() {
-            return RefTarget::Anchor {
-                anchor: rest.to_string(),
-            };
-        }
+    if let Some(rest) = trimmed.strip_prefix('#')
+        && !rest.is_empty()
+    {
+        return RefTarget::Anchor {
+            anchor: rest.to_string(),
+        };
     }
 
     if let Some(rest) = trimmed.strip_prefix('@') {
@@ -527,17 +523,16 @@ fn resolve_one(text: &str, symbols: &SymbolTable) -> RefTarget {
         }
     }
 
-    if let Some((class, member)) = trimmed.split_once('.') {
-        if symbols
+    if let Some((class, member)) = trimmed.split_once('.')
+        && symbols
             .members
             .iter()
             .any(|(c, m)| c == class && m == member)
-        {
-            return RefTarget::Member {
-                class: class.to_string(),
-                member: member.to_string(),
-            };
-        }
+    {
+        return RefTarget::Member {
+            class: class.to_string(),
+            member: member.to_string(),
+        };
     }
 
     if symbols.classes.iter().any(|c| c == trimmed) {

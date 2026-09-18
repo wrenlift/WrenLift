@@ -771,17 +771,17 @@ impl Eq for MapKey {}
 impl Hash for MapKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let v = self.0;
-        if v.is_object() {
-            if let Some(ptr) = v.as_object() {
-                let header = ptr as *const ObjHeader;
-                unsafe {
-                    if (*header).obj_type == ObjType::String {
-                        // Hash by string content so equal strings have equal hashes
-                        let s = &*(ptr as *const ObjString);
-                        0xFFu8.hash(state); // discriminant tag for strings
-                        s.value.hash(state);
-                        return;
-                    }
+        if v.is_object()
+            && let Some(ptr) = v.as_object()
+        {
+            let header = ptr as *const ObjHeader;
+            unsafe {
+                if (*header).obj_type == ObjType::String {
+                    // Hash by string content so equal strings have equal hashes
+                    let s = &*(ptr as *const ObjString);
+                    0xFFu8.hash(state); // discriminant tag for strings
+                    s.value.hash(state);
+                    return;
                 }
             }
         }
@@ -1843,7 +1843,7 @@ impl ObjInstance {
     /// Caller must ensure `index < self.num_fields`.
     #[inline(always)]
     pub unsafe fn get_field_unchecked(&self, index: usize) -> Value {
-        *self.fields.add(index)
+        unsafe { *self.fields.add(index) }
     }
 
     pub fn set_field(&mut self, index: usize, value: Value) {
@@ -1859,8 +1859,10 @@ impl ObjInstance {
     /// Caller must ensure `index < self.num_fields`.
     #[inline(always)]
     pub unsafe fn set_field_unchecked(&mut self, index: usize, value: Value) {
-        self.note_field_kind(index, value);
-        self.fields.add(index).write(value);
+        unsafe {
+            self.note_field_kind(index, value);
+            self.fields.add(index).write(value);
+        }
     }
 
     /// Or the kind of `value` into the class's byte for field `index`.
@@ -1869,20 +1871,22 @@ impl ObjInstance {
     /// `index < self.num_fields`, which is the class's field count.
     #[inline(always)]
     pub unsafe fn note_field_kind(&self, index: usize, value: Value) {
-        let class = self.header.class;
-        if class.is_null() {
-            return;
+        unsafe {
+            let class = self.header.class;
+            if class.is_null() {
+                return;
+            }
+            let kinds = (*class).field_kinds_ptr;
+            if kinds.is_null() {
+                return;
+            }
+            let bit = if value.is_num() {
+                FIELD_NUM
+            } else {
+                FIELD_OTHER
+            };
+            *kinds.add(index) |= bit;
         }
-        let kinds = (*class).field_kinds_ptr;
-        if kinds.is_null() {
-            return;
-        }
-        let bit = if value.is_num() {
-            FIELD_NUM
-        } else {
-            FIELD_OTHER
-        };
-        *kinds.add(index) |= bit;
     }
 }
 
@@ -1989,7 +1993,7 @@ impl fmt::Debug for ObjModule {
 /// The pointer must be non-null, valid, and point to an object whose
 /// `obj_type` matches the target type.
 pub unsafe fn downcast_ref<T>(header: *const ObjHeader) -> &'static T {
-    &*(header as *const T)
+    unsafe { &*(header as *const T) }
 }
 
 /// Cast an `ObjHeader` pointer to a mutable specific object type.
@@ -1997,7 +2001,7 @@ pub unsafe fn downcast_ref<T>(header: *const ObjHeader) -> &'static T {
 /// # Safety
 /// Same as `downcast_ref`, plus the caller must have unique access.
 pub unsafe fn downcast_mut<T>(header: *mut ObjHeader) -> &'static mut T {
-    &mut *(header as *mut T)
+    unsafe { &mut *(header as *mut T) }
 }
 
 // ---------------------------------------------------------------------------

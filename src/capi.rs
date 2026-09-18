@@ -24,14 +24,14 @@
 ///     wrenFreeVM(vm);
 /// }
 /// ```
-use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_double, c_int, c_void};
 use std::ptr;
 
 use crate::runtime::object::{
     NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray,
 };
 use crate::runtime::value::Value;
-use crate::runtime::vm::{VMConfig, VM};
+use crate::runtime::vm::{VM, VMConfig};
 
 // ---------------------------------------------------------------------------
 // Opaque types
@@ -523,7 +523,7 @@ pub unsafe extern "C" fn wlift_aot_enter(
     name_len: usize,
     out_saved: *mut u64,
 ) {
-    use crate::codegen::runtime_fns::{read_jit_ctx, set_jit_context, JitContext};
+    use crate::codegen::runtime_fns::{JitContext, read_jit_ctx, set_jit_context};
 
     if !out_saved.is_null() {
         // Stash the current context — same shape used by
@@ -1429,7 +1429,7 @@ pub unsafe extern "C" fn wlift_aot_set_static_field(
 #[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
-    use crate::codegen::runtime_fns::{set_jit_context, JitContext};
+    use crate::codegen::runtime_fns::{JitContext, set_jit_context};
     if saved.is_null() {
         return;
     }
@@ -1907,11 +1907,7 @@ pub extern "C" fn wrenInsertInList(
         let list = &mut *(ptr as *mut ObjList);
         let idx = if index < 0 {
             let i = list.len() as i32 + 1 + index;
-            if i < 0 {
-                0usize
-            } else {
-                i as usize
-            }
+            if i < 0 { 0usize } else { i as usize }
         } else {
             index as usize
         };
@@ -2079,11 +2075,11 @@ pub extern "C" fn wrenGetVariable(
     let mod_name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("");
     let var_name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
     let vm_ref = unsafe { &mut *vm };
-    if let Some(entry) = vm_ref.engine.modules.get(mod_name) {
-        if let Some(idx) = entry.var_names.iter().position(|n| n == var_name) {
-            let value = entry.vars[idx];
-            vm_ref.set_slot(slot as usize, value);
-        }
+    if let Some(entry) = vm_ref.engine.modules.get(mod_name)
+        && let Some(idx) = entry.var_names.iter().position(|n| n == var_name)
+    {
+        let value = entry.vars[idx];
+        vm_ref.set_slot(slot as usize, value);
     }
 }
 

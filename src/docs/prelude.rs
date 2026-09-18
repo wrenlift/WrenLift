@@ -19,7 +19,7 @@
 
 use std::sync::OnceLock;
 
-use super::{collect_module, ModuleDoc};
+use super::{ModuleDoc, collect_module};
 
 /// Prelude class stubs baked into the binary at compile time.
 /// `(module_name, source_text)` tuples.
