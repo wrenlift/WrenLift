@@ -36,13 +36,12 @@ jobs:
       # test with it and names none; one at a time, the log says which.
       - name: Serial tests with backtraces (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          echo "RUST_TEST_THREADS=1" >> "$GITHUB_ENV"
-          echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
+          "RUST_TEST_THREADS=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RUST_BACKTRACE=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Build
-        shell: bash
         run: cargo build --release --all-targets
 
       # Page heap makes a heap-corrupting write fault at the write, so
@@ -63,15 +62,12 @@ jobs:
           New-ItemProperty -Path $key -Name PageHeapFlags -PropertyType DWord -Value 3 -Force | Out-Null
 
       - name: Unit tests
-        shell: bash
         run: cargo test --release --lib
 
       - name: E2E tests
-        shell: bash
         run: cargo test --release --test e2e
 
       - name: Clippy (host)
-        shell: bash
         run: cargo clippy --all-targets -- -D warnings
 
       # Same lint bar for the wasm runtime build. The library has
@@ -136,7 +132,6 @@ jobs:
         run: cargo test --release --test wasm_smoke -- --nocapture
 
       - name: Format check
-        shell: bash
         run: cargo fmt -- --check
 
   # The LLVM top tier is off the default feature set; this job builds
@@ -167,10 +162,10 @@ jobs:
 
       - name: Serial tests with backtraces (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          echo "RUST_TEST_THREADS=1" >> "$GITHUB_ENV"
-          echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
+          "RUST_TEST_THREADS=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RUST_BACKTRACE=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - uses: ./.github/actions/llvm21
 
@@ -178,11 +173,11 @@ jobs:
       # LLVM too; Windows finds it through PATH.
       - name: LLVM DLLs on PATH (Windows)
         if: runner.os == 'Windows'
-        shell: bash
-        run: echo "$PWD/llvmenv/Library/bin" >> "$GITHUB_PATH"
+        shell: pwsh
+        run: |
+          "$PWD\llvmenv\Library\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       - name: Build
-        shell: bash
         run: cargo build --release --features llvm --bin wlift
 
       - uses: ./.github/actions/llvm21-runtime-dlls
@@ -208,21 +203,28 @@ jobs:
           New-ItemProperty -Path $key -Name PageHeapFlags -PropertyType DWord -Value 3 -Force | Out-Null
 
       - name: Unit tests
-        shell: bash
         run: cargo test --release --features llvm --lib
 
       - name: E2E tests
-        shell: bash
         run: cargo test --release --features llvm --test e2e
 
       - name: Clippy
-        shell: bash
         run: cargo clippy --release --features llvm -- -D warnings
 
       - name: Benchmarks on the LLVM tier
-        shell: bash
+        if: runner.os != 'Windows'
         run: |
           for b in fib method_call nbody binary_trees delta_blue; do
             printf '%s: ' "$b"
             ./target/release/wlift --mode tiered bench/$b.wren | grep elapsed
           done
+
+      - name: Benchmarks on the LLVM tier (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($b in "fib", "method_call", "nbody", "binary_trees", "delta_blue") {
+            Write-Host -NoNewline "${b}: "
+            & .\target\release\wlift.exe --mode tiered "bench\$b.wren" | Select-String elapsed
+            if ($LASTEXITCODE -ne 0) { throw "$b failed with exit code $LASTEXITCODE" }
+          }
