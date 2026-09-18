@@ -978,9 +978,9 @@
   <div class="install-grid">
     <div class="install-text">
       <h2>Quick <em>setup</em>.</h2>
-      <p>One curl gives you <code>wlift</code> (the runtime), <code>hatch</code> (the package + build tool), and <code>wlift-lsp</code> (the language server), pulled from the latest GitHub Release, SHA256-verified, and dropped into <code>~/.local/bin</code>.</p>
+      <p>One line gives you <code>wlift</code> (the runtime), <code>hatch</code> (the package + build tool), and <code>wlift-lsp</code> (the language server), pulled from the latest GitHub Release, SHA256-verified, and dropped into <code>~/.local/bin</code> &mdash; or <code>%LOCALAPPDATA%\Programs\wlift\bin</code> on Windows, where the PowerShell installer also puts that directory on your <code>PATH</code>.</p>
       <ol>
-        <li>Run the script. The default install dir is <code>~/.local/bin</code>; override with <code>INSTALL_DIR</code>.</li>
+        <li>Run the script. Override the install dir with <code>INSTALL_DIR</code>.</li>
         <li>Open a new shell so <code>wlift</code> and <code>hatch</code> land on your <code>PATH</code>.</li>
         <li>Run <code>wlift hello.wren</code>. That's it!</li>
       </ol>
@@ -990,9 +990,12 @@
       <pre class="codeblock"><span class="cmt"># install (macos · linux)</span>
 <span class="pr">$</span> curl -fsSL <span class="accent">wrenlift.com/install.sh</span> | sh
 
+<span class="cmt"># install (windows, powershell)</span>
+<span class="pr">&gt;</span> irm <span class="accent">wrenlift.com/install.ps1</span> | iex
+
 <span class="cmt"># verify</span>
 <span class="pr">$</span> wlift --version
-<span class="mut">  wrenlift </span><span class="em">0.1.16</span><span class="mut"> (release, jit)</span>
+<span class="mut">  wlift </span><span class="em">0.1.20</span>
 
 <span class="cmt"># run a script</span>
 <span class="pr">$</span> wlift hello.wren
