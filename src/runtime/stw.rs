@@ -331,8 +331,11 @@ pub mod poll_page {
 
     pub const PAGE: usize = 1 << 14;
 
-    /// The static page, for AOT code.
-    #[repr(C, align(16384))]
+    /// The static page, for AOT code. Aligned to the largest page
+    /// size a target uses; COFF cannot express more than 8 KiB, and
+    /// Windows pages are 4 KiB.
+    #[cfg_attr(not(windows), repr(C, align(16384)))]
+    #[cfg_attr(windows, repr(C, align(4096)))]
     pub struct Page(pub std::cell::UnsafeCell<[u8; PAGE]>);
 
     // SAFETY: nothing reads or writes the page's contents; only its

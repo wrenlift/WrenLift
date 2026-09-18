@@ -237,6 +237,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
 ] }
 
 # Wasm-specific: getrandom needs the `js` feature on wasm32-unknown-
