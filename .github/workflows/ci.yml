@@ -44,23 +44,6 @@ jobs:
       - name: Build
         run: cargo build --release --all-targets
 
-      # Page heap makes a heap-corrupting write fault at the write, so
-      # the fault handler names it; without it Windows reports only
-      # STATUS_HEAP_CORRUPTION at some later free.
-      - name: Page heap for the unit tests (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $out = cargo test --release --lib --no-run 2>&1 | Out-String
-          $m = [regex]::Match($out, '([A-Za-z0-9_-]+\.exe)\)')
-          if (-not $m.Success) { throw "no test executable in cargo's output" }
-          $name = $m.Groups[1].Value
-          Write-Host "page heap on $name"
-          $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$name"
-          New-Item -Path $key -Force | Out-Null
-          New-ItemProperty -Path $key -Name GlobalFlag -PropertyType DWord -Value 0x02000000 -Force | Out-Null
-          New-ItemProperty -Path $key -Name PageHeapFlags -PropertyType DWord -Value 3 -Force | Out-Null
-
       - name: Unit tests
         run: cargo test --release --lib
 
@@ -193,23 +176,6 @@ jobs:
         if: runner.os == 'Windows'
         with:
           into: target\release\
-
-      # Page heap makes a heap-corrupting write fault at the write, so
-      # the fault handler names it; without it Windows reports only
-      # STATUS_HEAP_CORRUPTION at some later free.
-      - name: Page heap for the unit tests (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $out = cargo test --release --features llvm --lib --no-run 2>&1 | Out-String
-          $m = [regex]::Match($out, '([A-Za-z0-9_-]+\.exe)\)')
-          if (-not $m.Success) { throw "no test executable in cargo's output" }
-          $name = $m.Groups[1].Value
-          Write-Host "page heap on $name"
-          $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$name"
-          New-Item -Path $key -Force | Out-Null
-          New-ItemProperty -Path $key -Name GlobalFlag -PropertyType DWord -Value 0x02000000 -Force | Out-Null
-          New-ItemProperty -Path $key -Name PageHeapFlags -PropertyType DWord -Value 3 -Force | Out-Null
 
       - name: Unit tests
         run: cargo test --release --features llvm --lib

@@ -6064,14 +6064,11 @@ mod tests {
     fn test_tiered_cond_branch_backedge_enters_osr() {
         let config = VMConfig {
             execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
             opt_threshold: u32::MAX,
             ..VMConfig::default()
         };
         let mut vm = VM::new(config);
-        // Only this test's function should reach the compiler: at a
-        // threshold of one from construction, the prelude's hundreds
-        // of functions queue ahead of it.
-        vm.engine.jit_threshold = 1;
         vm.engine.collect_tier_stats = true;
 
         let name = vm.interner.intern("cond_backedge_osr_test");
