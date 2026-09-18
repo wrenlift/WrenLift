@@ -6143,9 +6143,30 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        let (attempts, successes, baseline, installed) = (
+            vm.engine
+                .tier_stats
+                .iter()
+                .map(|s| s.compile_attempts)
+                .sum::<u64>(),
+            vm.engine
+                .tier_stats
+                .iter()
+                .map(|s| s.compile_successes)
+                .sum::<u64>(),
+            vm.engine
+                .tier_stats
+                .iter()
+                .map(|s| s.baseline_entries)
+                .sum::<u64>(),
+            vm.engine.jit_code.iter().filter(|p| !p.is_null()).count(),
+        );
         assert!(
             osr_entries > 0,
-            "expected the conditional back-edge loop to enter OSR within a minute"
+            "expected the conditional back-edge loop to enter OSR within a minute \
+             (compile attempts {attempts}, successes {successes}, baseline entries \
+             {baseline}, functions installed {installed}, pending {})",
+            vm.engine.has_pending_compilations()
         );
     }
 
