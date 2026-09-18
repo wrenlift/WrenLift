@@ -271,6 +271,15 @@ jobs:
              wasm/pkg/wlift_wasm_bg.simd128.wasm \
              site/playground/web/
 
+          # The fresh bundle runs a program whose compiled body keeps
+          # a value in a wasm local across a collection, under Node,
+          # so a rooting regression in the wasm tier fails the build
+          # instead of the playground.
+          for c in wasm/checks/*.wren; do
+            node site/playground/web/node-run.mjs "$c" 2>/dev/null \
+              | diff - "${c%.wren}.expected"
+          done
+
           # Public distribution endpoint. `wrenlift.com/dist/wlift.js`
           # is the canonical CDN URL embedders import; we stage
           # both `.wasm` flavours (baseline + simd128) plus the JS

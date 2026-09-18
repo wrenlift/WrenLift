@@ -11,7 +11,7 @@
 /// - MirType::Value, I64 → i64 locals (NaN-boxed values, integers)
 /// - MirType::F64 → f64 locals
 /// - MirType::Bool → i32 locals
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{
     CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, Ieee64,
@@ -156,6 +156,27 @@ pub fn subscript_set_helper_name(args: usize) -> Option<&'static str> {
 /// 0). Each call site picks the helper matching its arity;
 /// arities beyond the cap reject through
 /// `mir_needs_unsupported_helpers`.
+/// Whether lowering the instruction calls into the runtime in a way
+/// that can allocate or run Wren code, and so collect.
+fn may_collect(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::Call { .. }
+            | Instruction::CallStaticSelf { .. }
+            | Instruction::SuperCall { .. }
+            | Instruction::CallKnownFunc { .. }
+            | Instruction::MakeClosure { .. }
+            | Instruction::MakeList(..)
+            | Instruction::MakeMap(..)
+            | Instruction::MakeRange(..)
+            | Instruction::NewInstance { .. }
+            | Instruction::StringConcat(..)
+            | Instruction::ToString(..)
+            | Instruction::SubscriptGet { .. }
+            | Instruction::SubscriptSet { .. }
+    )
+}
+
 pub fn call_slow_helper_name(args: usize) -> Option<&'static str> {
     match args {
         1 => Some("wren_call_1_slow"),
@@ -333,6 +354,13 @@ struct MirWasmEmitter<'a> {
     /// observed arity needs its own type entry. Populated during
     /// `scan_imports`; consumed by the `Call` emit arm.
     call_arity_types: HashMap<usize, u32>,
+    /// For each instruction that may run a collection (keyed by
+    /// its result), the boxed values live across it. Wasm locals
+    /// are invisible to the collector, so those are pushed on the
+    /// runtime's root store around the instruction.
+    roots_across: HashMap<ValueId, Vec<ValueId>>,
+    /// i32 holding the root store's depth at function entry.
+    root_snap_local: Option<u32>,
 }
 
 impl<'a> MirWasmEmitter<'a> {
@@ -356,12 +384,15 @@ impl<'a> MirWasmEmitter<'a> {
             imports_memory,
             runtime_addrs,
             call_arity_types: HashMap::new(),
+            roots_across: HashMap::new(),
+            root_snap_local: None,
         }
     }
 
     fn emit(&mut self) -> Result<WasmModule, String> {
         // Scan MIR to discover locals and runtime imports.
         self.scan_locals();
+        self.scan_roots_across();
         self.scan_imports();
 
         // Build WASM module.
@@ -602,6 +633,87 @@ impl<'a> MirWasmEmitter<'a> {
     // -----------------------------------------------------------------------
     // Import scanning
     // -----------------------------------------------------------------------
+
+    /// Find the boxed values that live across every instruction
+    /// that may collect, and reserve what rooting them needs.
+    fn scan_roots_across(&mut self) {
+        let live_out = self.block_live_out();
+        let mut any = false;
+        for block in &self.mir.blocks {
+            let mut live: HashSet<ValueId> = live_out[block.id.0 as usize].clone();
+            live.extend(block.terminator.operands());
+            for (dst, inst) in block.instructions.iter().rev() {
+                live.remove(dst);
+                if may_collect(inst) {
+                    let mut roots: Vec<ValueId> = live
+                        .iter()
+                        .copied()
+                        .filter(|v| self.local_types[self.local(*v) as usize] == ValType::I64)
+                        .collect();
+                    if !roots.is_empty() {
+                        roots.sort();
+                        self.roots_across.insert(*dst, roots);
+                        any = true;
+                    }
+                }
+                live.extend(inst.operands());
+            }
+        }
+        if any {
+            let idx = self.num_locals;
+            self.num_locals += 1;
+            self.local_types.push(ValType::I32);
+            self.root_snap_local = Some(idx);
+            self.register_import("wren_jit_roots_snapshot_len", &[], &[ValType::I32]);
+            self.register_import("wren_jit_root_push", &[ValType::I64], &[]);
+            self.register_import("wren_jit_roots_restore_len", &[ValType::I32], &[]);
+        }
+    }
+
+    /// Values live at the end of each block, by fixpoint over the
+    /// successors: a branch's arguments are its uses.
+    fn block_live_out(&self) -> Vec<HashSet<ValueId>> {
+        let n = self.mir.blocks.len();
+        let mut uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+        let mut defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+        for (i, block) in self.mir.blocks.iter().enumerate() {
+            let mut seen: HashSet<ValueId> = block.params.iter().map(|(v, _)| *v).collect();
+            for (dst, inst) in &block.instructions {
+                for op in inst.operands() {
+                    if !seen.contains(&op) {
+                        uses[i].insert(op);
+                    }
+                }
+                seen.insert(*dst);
+            }
+            for op in block.terminator.operands() {
+                if !seen.contains(&op) {
+                    uses[i].insert(op);
+                }
+            }
+            defs[i] = seen;
+        }
+        let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+        let mut live_out: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in (0..n).rev() {
+                let mut out = HashSet::new();
+                for succ in self.mir.blocks[i].terminator.successors() {
+                    out.extend(live_in[succ.0 as usize].iter().copied());
+                }
+                let mut inp = uses[i].clone();
+                inp.extend(out.iter().filter(|v| !defs[i].contains(v)).copied());
+                if out != live_out[i] || inp != live_in[i] {
+                    live_out[i] = out;
+                    live_in[i] = inp;
+                    changed = true;
+                }
+            }
+        }
+        live_out
+    }
 
     /// Scan MIR for instructions that need runtime imports.
     fn scan_imports(&mut self) {
@@ -981,6 +1093,15 @@ impl<'a> MirWasmEmitter<'a> {
             ));
             func.instruction(&WasmInst::LocalSet(slot_local));
         }
+        // The root store's depth at entry: every site that roots
+        // values across a helper restores to it, and a callee has
+        // restored its own pushes by the time it returns.
+        if let Some(snap) = self.root_snap_local {
+            func.instruction(&WasmInst::Call(
+                self.runtime_imports["wren_jit_roots_snapshot_len"],
+            ));
+            func.instruction(&WasmInst::LocalSet(snap));
+        }
 
         // Emit structured control flow from MIR blocks.
         self.emit_blocks(&mut func)?;
@@ -1200,7 +1321,23 @@ impl<'a> MirWasmEmitter<'a> {
     ) -> Result<(), String> {
         let block = &self.mir.blocks[block_idx];
         for (dst, inst) in &block.instructions {
+            // Boxed values held only in wasm locals go on the root
+            // store while a helper that may collect runs.
+            let roots = self.roots_across.get(dst);
+            if let Some(roots) = roots {
+                for v in roots {
+                    func.instruction(&WasmInst::LocalGet(self.local(*v)));
+                    func.instruction(&WasmInst::Call(self.runtime_imports["wren_jit_root_push"]));
+                }
+            }
             self.emit_instruction(func, *dst, inst)?;
+            if roots.is_some() {
+                let snap = self.root_snap_local.expect("root snapshot local");
+                func.instruction(&WasmInst::LocalGet(snap));
+                func.instruction(&WasmInst::Call(
+                    self.runtime_imports["wren_jit_roots_restore_len"],
+                ));
+            }
         }
         self.emit_terminator_scoped(func, &block.terminator, block_idx, scope_stack)?;
         Ok(())
@@ -2719,6 +2856,54 @@ mod tests {
 
         let module = emit_mir(&mir).unwrap();
         assert_valid(&module);
+    }
+
+    #[test]
+    fn boxed_values_live_across_an_allocation_are_rooted() {
+        // v0 is a list held in a local while a second list is made;
+        // the third allocation has v0 and the branch argument v1
+        // live across it; in the second block only v0 survives, for
+        // the return.
+        let (_, mut mir) = setup();
+        let bb0 = mir.new_block();
+        let bb1 = mir.new_block();
+        let v0 = mir.new_value();
+        let v1 = mir.new_value();
+        let v2 = mir.new_value();
+        let p0 = mir.new_value();
+        let v3 = mir.new_value();
+        mir.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::MakeList(vec![])));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v1, Instruction::MakeList(vec![v0])));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v2, Instruction::MakeList(vec![])));
+        mir.block_mut(bb0).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v1],
+        };
+        mir.block_mut(bb1).params.push((p0, MirType::Value));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v3, Instruction::MakeList(vec![])));
+        mir.block_mut(bb1).terminator = Terminator::Return(v0);
+
+        let mut emitter = MirWasmEmitter::new(&mir, None, false, RuntimeAddrs::default());
+        let module = emitter.emit().unwrap();
+        assert_valid(&module);
+        assert_eq!(emitter.roots_across.get(&v0), None);
+        assert_eq!(emitter.roots_across.get(&v1), Some(&vec![v0]));
+        assert_eq!(emitter.roots_across.get(&v2), Some(&vec![v0, v1]));
+        assert_eq!(emitter.roots_across.get(&v3), Some(&vec![v0]));
+        let wat = module.dump_wat().unwrap();
+        let push = emitter.runtime_imports["wren_jit_root_push"];
+        let restore = emitter.runtime_imports["wren_jit_roots_restore_len"];
+        assert!(wat.contains("wren_jit_roots_snapshot_len"));
+        assert_eq!(wat.matches(&format!("call {push}\n")).count(), 4);
+        assert_eq!(wat.matches(&format!("call {restore}\n")).count(), 3);
     }
 
     #[test]

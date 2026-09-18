@@ -638,7 +638,7 @@ fn scalar_i32_cmp(a: [u32; 4], b: [u32; 4], op: impl Fn(i32, i32) -> bool) -> [u
 #[inline(always)]
 unsafe fn store_v128(v: simd_isa::v128) -> [u32; 4] {
     let mut out = [0u32; 4];
-    simd_isa::v128_store(out.as_mut_ptr().cast(), v);
+    unsafe { simd_isa::v128_store(out.as_mut_ptr().cast(), v) };
     out
 }
 

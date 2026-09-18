@@ -356,6 +356,11 @@ __wliftWrenImports = {
   // probe `x is Klass` reach the JIT path on wasm.
   wren_set_module_var: wasm.wren_set_module_var,
   wren_write_barrier:  wasm.wren_write_barrier,
+  // Boxed values a JIT'd body keeps in wasm locals go on the
+  // runtime's root store around anything that may collect.
+  wren_jit_roots_snapshot_len: wasm.wren_jit_roots_snapshot_len,
+  wren_jit_root_push:          wasm.wren_jit_root_push,
+  wren_jit_roots_restore_len:  wasm.wren_jit_roots_restore_len,
   wren_call_static_self_0: wasm.wren_call_static_self_0,
   wren_call_static_self_1: wasm.wren_call_static_self_1,
   wren_call_static_self_2: wasm.wren_call_static_self_2,
