@@ -576,6 +576,13 @@ pub mod poll_page {
         }
         let addr = record.ExceptionInformation[1];
         if !crate::runtime::vm::fault_is_a_safepoint(addr) {
+            // Not ours: say where it happened before the process
+            // goes, since a Windows fault leaves no other trace.
+            let rip = unsafe { (*(*info).ContextRecord).Rip };
+            eprintln!(
+                "wlift: access violation at {addr:#x} (rip {rip:#x})\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let (sp, regs) = interrupted_state(unsafe { (*info).ContextRecord });

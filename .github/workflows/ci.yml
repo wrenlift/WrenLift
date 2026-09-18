@@ -45,6 +45,20 @@ jobs:
         shell: bash
         run: cargo build --release --all-targets
 
+      # Page heap makes a heap-corrupting write fault at the write, so
+      # the fault handler names it; without it Windows reports only
+      # STATUS_HEAP_CORRUPTION at some later free.
+      - name: Page heap for the unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          exe=$(cargo test --release --lib --no-run 2>&1 | sed -n 's/.*(\(.*\.exe\))$/\1/p' | tail -1)
+          name=$(basename "$exe")
+          echo "page heap on $name"
+          key='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+          reg add "$key\\$name" /v GlobalFlag /t REG_DWORD /d 0x02000000 /f
+          reg add "$key\\$name" /v PageHeapFlags /t REG_DWORD /d 0x3 /f
+
       - name: Unit tests
         shell: bash
         run: cargo test --release --lib
@@ -172,6 +186,20 @@ jobs:
         if: runner.os == 'Windows'
         with:
           into: target\release\
+
+      # Page heap makes a heap-corrupting write fault at the write, so
+      # the fault handler names it; without it Windows reports only
+      # STATUS_HEAP_CORRUPTION at some later free.
+      - name: Page heap for the unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          exe=$(cargo test --release --features llvm --lib --no-run 2>&1 | sed -n 's/.*(\(.*\.exe\))$/\1/p' | tail -1)
+          name=$(basename "$exe")
+          echo "page heap on $name"
+          key='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+          reg add "$key\\$name" /v GlobalFlag /t REG_DWORD /d 0x02000000 /f
+          reg add "$key\\$name" /v PageHeapFlags /t REG_DWORD /d 0x3 /f
 
       - name: Unit tests
         shell: bash

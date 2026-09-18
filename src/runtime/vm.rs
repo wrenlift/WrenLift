@@ -843,6 +843,10 @@ impl VM {
             // The thread's own stack, taken here, before any fiber of
             // this program runs on it.
             thread.note_stack();
+            // Windows: the fault handler reports any access violation,
+            // so it is in place from the start.
+            #[cfg(windows)]
+            super::stw::poll_page::install_handler();
         }
         let mut vm = Self {
             shared: Arc::new(SharedCell(UnsafeCell::new(shared))),
