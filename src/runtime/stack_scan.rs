@@ -128,8 +128,16 @@ fn query_stack_bounds() -> (usize, usize) {
     }
 }
 
+/// Windows reports the stack the thread environment block names,
+/// which a fiber switch retargets to the fiber's stack; the thread's
+/// own bounds are only readable while no fiber runs, so the answer
+/// stays unknown until then and is cached by the first caller off
+/// a fiber (`VM::new` and the thread bodies ask before any fiber).
 #[cfg(all(windows, feature = "host"))]
 fn query_stack_bounds() -> (usize, usize) {
+    if krio_fiber::current_fiber_id().is_some() {
+        return (0, 0);
+    }
     let (mut lo, mut hi) = (0usize, 0usize);
     unsafe {
         windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);

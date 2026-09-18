@@ -32,6 +32,15 @@ jobs:
         with:
           shared-key: test-${{ matrix.os }}
 
+      # A crash under the parallel test harness takes every in-flight
+      # test with it and names none; one at a time, the log says which.
+      - name: Serial tests with backtraces (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "RUST_TEST_THREADS=1" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
+
       - name: Build
         shell: bash
         run: cargo build --release --all-targets
@@ -138,6 +147,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: llvm-${{ matrix.os }}
+
+      - name: Serial tests with backtraces (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "RUST_TEST_THREADS=1" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/llvm21
 

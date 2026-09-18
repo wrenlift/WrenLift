@@ -840,6 +840,9 @@ impl VM {
         #[cfg(feature = "host")]
         {
             shared.engine.safepoint_page = shared.world.page.address();
+            // The thread's own stack, taken here, before any fiber of
+            // this program runs on it.
+            thread.note_stack();
         }
         let mut vm = Self {
             shared: Arc::new(SharedCell(UnsafeCell::new(shared))),
@@ -7075,6 +7078,7 @@ impl VM {
             // The runtime seam knows the thread for as long as it holds
             // a view: the view goes before the thread is told to stop.
             unsafe { super::rt::thread_start() };
+            sent.0.thread.note_stack();
             let r = body(&mut sent.0);
             drop(sent);
             unsafe { super::rt::thread_stop() };
