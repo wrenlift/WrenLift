@@ -352,9 +352,11 @@ pub unsafe extern "C" fn wlift_run_aot_program(
     let entry_n = if entry_name.is_null() {
         "main"
     } else {
-        CStr::from_ptr(entry_name).to_str().unwrap_or("main")
+        unsafe { CStr::from_ptr(entry_name) }
+            .to_str()
+            .unwrap_or("main")
     };
-    let entry_s = match CStr::from_ptr(entry_source).to_str() {
+    let entry_s = match unsafe { CStr::from_ptr(entry_source) }.to_str() {
         Ok(s) => s,
         Err(_) => return 65,
     };
