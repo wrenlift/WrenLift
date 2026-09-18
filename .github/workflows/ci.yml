@@ -52,8 +52,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          exe=$(cargo test --release --lib --no-run 2>&1 | sed -n 's/.*(\(.*\.exe\))$/\1/p' | tail -1)
-          name=$(basename "$exe")
+          name=$(cargo test --release --lib --no-run 2>&1 | tr -d '\r' \
+            | grep -o '[A-Za-z0-9_-]*\.exe)' | tail -1 | tr -d ')')
+          test -n "$name"
           echo "page heap on $name"
           key='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
           reg add "$key\\$name" /v GlobalFlag /t REG_DWORD /d 0x02000000 /f
@@ -194,8 +195,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          exe=$(cargo test --release --features llvm --lib --no-run 2>&1 | sed -n 's/.*(\(.*\.exe\))$/\1/p' | tail -1)
-          name=$(basename "$exe")
+          name=$(cargo test --release --features llvm --lib --no-run 2>&1 | tr -d '\r' \
+            | grep -o '[A-Za-z0-9_-]*\.exe)' | tail -1 | tr -d ')')
+          test -n "$name"
           echo "page heap on $name"
           key='HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
           reg add "$key\\$name" /v GlobalFlag /t REG_DWORD /d 0x02000000 /f
