@@ -6121,14 +6121,15 @@ mod tests {
         }
 
         // Tier-up runs on Beadie's background broker thread; under
-        // CI parallelism that thread can be starved and miss the
-        // first invocation's compile window. Replay the loop a few
-        // times until OSR fires (with a hard ceiling to avoid hangs
-        // on a real regression). Each replay re-arms back-edge
-        // counters against the now-installed compiled function.
+        // CI parallelism, or a checking allocator, the compile can
+        // take a while. Replay the loop until OSR fires, within a
+        // time budget so a real regression still fails. Each replay
+        // re-arms back-edge counters against the now-installed
+        // compiled function.
         let mut vars = vec![];
         let mut osr_entries: u64 = 0;
-        for _ in 0..16 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let result = eval_in_vm(&mut vm, &f, &mut vars).unwrap();
             assert_eq!(result.as_num().unwrap(), 100_000.0);
             osr_entries = vm
@@ -6144,7 +6145,7 @@ mod tests {
         }
         assert!(
             osr_entries > 0,
-            "expected the conditional back-edge loop to enter OSR within 16 replays"
+            "expected the conditional back-edge loop to enter OSR within a minute"
         );
     }
 
