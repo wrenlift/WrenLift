@@ -207,7 +207,7 @@ pub enum WrenVm {}
 
 // -- Host exports (resolved by the dynamic / wasm linker) -------------------
 
-extern "C" {
+unsafe extern "C" {
     /// Returns the host's [`ABI_VERSION`]. Plugins compare against
     /// their compiled-in constant at load time.
     pub fn wlift_plugin_abi_version() -> u32;

@@ -871,7 +871,7 @@ mod tests {
         // Point at a scratch file so the test never touches $HOME.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("creds");
-        std::env::set_var("HATCH_CREDENTIALS_FILE", &path);
+        unsafe { std::env::set_var("HATCH_CREDENTIALS_FILE", &path) };
 
         let before = Credentials {
             access_token: "jwt-abc".to_string(),
@@ -898,7 +898,7 @@ mod tests {
         assert!(clear_credentials().expect("clear"));
         assert!(load_credentials().expect("reload").is_none());
 
-        std::env::remove_var("HATCH_CREDENTIALS_FILE");
+        unsafe { std::env::remove_var("HATCH_CREDENTIALS_FILE") };
     }
 
     #[test]

@@ -1328,7 +1328,7 @@ thread_local! {
 /// # Safety
 /// `buf` must point at `2 * n` readable u64s; compiled code passes its
 /// own stack buffer.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_osr_exit(header: u64, buf: *const u64, n: u64) -> u64 {
     let vals: Vec<(u32, Value)> = (0..n as usize)
         .map(|i| unsafe {
@@ -1350,7 +1350,7 @@ pub fn take_osr_exit() -> Option<OsrExitRecord> {
 /// Baseline code whose tier countdown reached zero: proposes the top
 /// tier when the engine's policy says so and reloads the countdown.
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_tier_tick(func_id: u64) -> u64 {
     let vm = read_jit_ctx().vm as *mut crate::runtime::vm::VM;
     if vm.is_null() {
@@ -1374,7 +1374,7 @@ pub extern "C" fn wren_tier_tick(func_id: u64) -> u64 {
 /// `buf` must point at `2 * n` readable u64s; compiled code passes its
 /// own stack buffer.
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64, n: u64) -> u64 {
     let decline = Value::UNDEFINED.to_bits();
     let vm = read_jit_ctx().vm as *mut crate::runtime::vm::VM;
@@ -1737,7 +1737,7 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
 /// entry; paired with `wren_jit_roots_restore_len` at exit so any
 /// roots leaked into `JIT_ROOTS_STORE` by the function's
 /// allocations get released at the function boundary.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_jit_roots_snapshot() -> u64 {
     jit_roots_snapshot_len() as u64
 }
@@ -1745,7 +1745,7 @@ pub extern "C" fn wren_jit_roots_snapshot() -> u64 {
 /// Restore JIT roots to a previous snapshot length. Called at AOT
 /// function exit (or any other scope boundary the lowering wants
 /// to release roots at).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_jit_roots_restore(len: u64) {
     jit_roots_restore_len(len as usize);
 }
@@ -2129,7 +2129,7 @@ fn trace_native_entry(
     eprintln!("native-entry: {kind} FuncId({}) {}", func_id.0, name);
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
     let slot = slot as usize;
     let value = Value::from_bits(value);
@@ -2145,7 +2145,7 @@ pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
     value.to_bits()
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_shadow_load(slot: u64) -> u64 {
     let slot = slot as usize;
     FLAT_SHADOW.with(|s| unsafe {
@@ -2160,7 +2160,7 @@ pub extern "C" fn wren_shadow_load(slot: u64) -> u64 {
 }
 
 /// Callee-managed shadow frame: push in JIT prologue.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_enter_shadow_frame(slot_count: u64) {
     let count = slot_count as usize;
     if count > 0 {
@@ -2169,7 +2169,7 @@ pub extern "C" fn wren_enter_shadow_frame(slot_count: u64) {
 }
 
 /// Callee-managed shadow frame: pop in JIT epilogue.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_exit_shadow_frame() {
     pop_native_shadow_frame();
 }
@@ -2254,7 +2254,7 @@ pub fn module_name() -> String {
 
 /// Get a module variable by slot index.
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_get_module_var(slot: u64) -> u64 {
     with_context(|ctx| {
         let idx = slot as usize;
@@ -2275,7 +2275,7 @@ pub extern "C" fn wren_get_module_var(slot: u64) -> u64 {
 /// that local instead of routing through `wren_get/set_upvalue`,
 /// which would re-read TLS and pay a helper-call's worth of
 /// overhead on every access.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_load_jit_closure() -> u64 {
     let ctx = read_jit_ctx();
     ctx.closure as u64
@@ -2287,7 +2287,7 @@ pub extern "C" fn wren_load_jit_closure() -> u64 {
 /// (the BC interp's per-opcode `has_error` check has no analogue),
 /// turning a single abort inside a `while (true) { … }` loop into
 /// an infinite stream of repeat-aborts.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_aot_check_error() -> u64 {
     match unsafe { vm_ref() } {
         Some(vm) if vm.has_error => 1,
@@ -2298,7 +2298,7 @@ pub extern "C" fn wren_aot_check_error() -> u64 {
 /// Load the JIT code pointer for a given function ID.
 /// Returns the function pointer as u64 (0 if not compiled).
 /// Used by CallKnownFunc to do direct JIT-to-JIT calls.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_load_jit_ptr(func_id: u64) -> u64 {
     let ctx = read_jit_ctx();
     let idx = func_id as usize;
@@ -2311,7 +2311,7 @@ pub extern "C" fn wren_load_jit_ptr(func_id: u64) -> u64 {
 
 /// Set a module variable by slot index.
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     with_context(|ctx| {
         let idx = slot as usize;
@@ -2342,7 +2342,7 @@ fn validate_barriers_enabled() -> bool {
 /// `remembered_set` on the next GC; catching it here points lldb's
 /// backtrace at the offending AOT function frame directly instead
 /// of at `trace_object` deep inside `collect_minor`.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_write_barrier(source: u64, value: u64) -> u64 {
     let source = Value::from_bits(source);
     let value = Value::from_bits(value);
@@ -3091,7 +3091,7 @@ fn dispatch_method(
 /// method arguments are NaN-boxed values produced by the JIT.
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
     core::arch::naked_asm!(
         "mov x2, x29",       // pass JIT FP as 3rd arg
@@ -3102,7 +3102,7 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
 }
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
     // SysV: rdi=receiver, rsi=method → inner gets rdx=jit_fp, rcx=ret_addr
     core::arch::naked_asm!(
@@ -3116,7 +3116,7 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     feature = "host"
 ))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0, 0)
 }
@@ -3185,7 +3185,7 @@ extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_add
 /// Called only from JIT-compiled code via `CallRuntime`.
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!(
         "mov x3, x29",
@@ -3196,7 +3196,7 @@ pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> 
 }
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
     // SysV: rdi=receiver, rsi=method, rdx=a0 → inner gets rcx=jit_fp, r8=ret_addr
     core::arch::naked_asm!(
@@ -3210,7 +3210,7 @@ pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> 
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     feature = "host"
 ))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
     wren_call_1_inner(receiver, method, a0, 0, 0)
 }
@@ -3228,7 +3228,7 @@ extern "C" fn wren_call_1_inner(
 /// Called only from JIT-compiled code via `CallRuntime`.
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!(
         "mov x4, x29",
@@ -3239,7 +3239,7 @@ pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1
 }
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
     // SysV: rdi=receiver, rsi=method, rdx=a0, rcx=a1 → inner gets r8=jit_fp, r9=ret_addr
     core::arch::naked_asm!(
@@ -3253,7 +3253,7 @@ pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     feature = "host"
 ))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
     wren_call_2_inner(receiver, method, a0, a1, 0, 0)
 }
@@ -3272,7 +3272,7 @@ extern "C" fn wren_call_2_inner(
 /// Called only from JIT-compiled code via `CallRuntime`.
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_3(
     _receiver: u64,
     _method: u64,
@@ -3289,7 +3289,7 @@ pub unsafe extern "C" fn wren_call_3(
 }
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_3(
     _receiver: u64,
     _method: u64,
@@ -3333,7 +3333,7 @@ pub unsafe extern "C" fn wren_call_3(
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     feature = "host"
 ))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_call_3_inner(receiver, method, a0, a1, a2, 0, 0)
 }
@@ -3353,7 +3353,7 @@ extern "C" fn wren_call_3_inner(
 /// Called only from JIT-compiled code via `CallRuntime`.
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_4(
     _receiver: u64,
     _method: u64,
@@ -3371,7 +3371,7 @@ pub unsafe extern "C" fn wren_call_4(
 }
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_4(
     _receiver: u64,
     _method: u64,
@@ -3407,7 +3407,7 @@ pub unsafe extern "C" fn wren_call_4(
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     feature = "host"
 ))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_4(
     receiver: u64,
     method: u64,
@@ -3473,7 +3473,7 @@ fn wren_call_n_inner(receiver: u64, method: u64, args_in: &[u64]) -> u64 {
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_5(
     receiver: u64,
     method: u64,
@@ -3487,7 +3487,7 @@ pub extern "C" fn wren_call_5(
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_6(
     receiver: u64,
     method: u64,
@@ -3502,7 +3502,7 @@ pub extern "C" fn wren_call_6(
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_7(
     receiver: u64,
     method: u64,
@@ -3518,7 +3518,7 @@ pub extern "C" fn wren_call_7(
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_8(
     receiver: u64,
     method: u64,
@@ -3544,7 +3544,7 @@ pub extern "C" fn wren_call_8(
 ///
 /// # Safety
 /// `args_ptr` must point to `count` `u64`s.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_dynamic(
     receiver: u64,
     method: u64,
@@ -3665,7 +3665,7 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
 }
 
 /// Known call with 0 extra args: (func_id, recv) -> result
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_0(func_id: u64, recv: u64) -> u64 {
     wren_known_call_inner(func_id, &[Value::from_bits(recv)])
 }
@@ -3802,32 +3802,32 @@ fn wren_construct_inner(packed: u64, class_bits: u64, args: &[u64]) -> u64 {
     inst_bits
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_construct_0(packed: u64, class: u64) -> u64 {
     wren_construct_inner(packed, class, &[])
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_construct_1(packed: u64, class: u64, a0: u64) -> u64 {
     wren_construct_inner(packed, class, &[a0])
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_construct_2(packed: u64, class: u64, a0: u64, a1: u64) -> u64 {
     wren_construct_inner(packed, class, &[a0, a1])
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_construct_3(packed: u64, class: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_construct_inner(packed, class, &[a0, a1, a2])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_0_nocheck(packed: u64, recv: u64) -> u64 {
     wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv)])
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_1_nocheck(packed: u64, recv: u64, a0: u64) -> u64 {
     wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0)])
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_2_nocheck(packed: u64, recv: u64, a0: u64, a1: u64) -> u64 {
     wren_known_call_nocheck_inner(
         packed,
@@ -3838,7 +3838,7 @@ pub extern "C" fn wren_known_call_2_nocheck(packed: u64, recv: u64, a0: u64, a1:
         ],
     )
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_3_nocheck(
     packed: u64,
     recv: u64,
@@ -3858,13 +3858,13 @@ pub extern "C" fn wren_known_call_3_nocheck(
 }
 
 /// Known call with 1 extra arg: (func_id, recv, a0) -> result
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_1(func_id: u64, recv: u64, a0: u64) -> u64 {
     wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0)])
 }
 
 /// Known call with 2 extra args: (func_id, recv, a0, a1) -> result
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_2(func_id: u64, recv: u64, a0: u64, a1: u64) -> u64 {
     wren_known_call_inner(
         func_id,
@@ -3877,7 +3877,7 @@ pub extern "C" fn wren_known_call_2(func_id: u64, recv: u64, a0: u64, a1: u64) -
 }
 
 /// Known call with 3 extra args
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_known_call_3(func_id: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_known_call_inner(
         func_id,
@@ -3899,25 +3899,25 @@ pub extern "C" fn wren_known_call_3(func_id: u64, recv: u64, a0: u64, a1: u64, a
 // ---------------------------------------------------------------------------
 
 /// IC call with 0 extra args. Signature: (ic_ptr, recv) -> result
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_call_0(ic_ptr: u64, recv: u64) -> u64 {
     wren_ic_call_inner(ic_ptr, &[recv])
 }
 
 /// IC call with 1 extra arg. Signature: (ic_ptr, recv, a0) -> result
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_call_1(ic_ptr: u64, recv: u64, a0: u64) -> u64 {
     wren_ic_call_inner(ic_ptr, &[recv, a0])
 }
 
 /// IC call with 2 extra args. Signature: (ic_ptr, recv, a0, a1) -> result
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_call_2(ic_ptr: u64, recv: u64, a0: u64, a1: u64) -> u64 {
     wren_ic_call_inner(ic_ptr, &[recv, a0, a1])
 }
 
 /// IC call with 3 extra args.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_call_3(ic_ptr: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_ic_call_inner(ic_ptr, &[recv, a0, a1, a2])
 }
@@ -4228,27 +4228,27 @@ fn call_static_self_inner(extra_args: &[u64]) -> u64 {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_static_self_0() -> u64 {
     call_static_self_inner(&[])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_static_self_1(a0: u64) -> u64 {
     call_static_self_inner(&[a0])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_static_self_2(a0: u64, a1: u64) -> u64 {
     call_static_self_inner(&[a0, a1])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_static_self_3(a0: u64, a1: u64, a2: u64) -> u64 {
     call_static_self_inner(&[a0, a1, a2])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_call_static_self_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     call_static_self_inner(&[a0, a1, a2, a3])
 }
@@ -4359,27 +4359,27 @@ fn dispatch_super_call_rooted(
 }
 
 /// Super call with 0 args. Codegen: `[method_sym]` (no receiver — shouldn't happen in practice)
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_super_call_0(method: u64) -> u64 {
     let _ = method;
     Value::null().to_bits()
 }
 /// Super call with 1 arg. Codegen: `[method_sym, this]`
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_super_call_1(method: u64, this: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_super_call(recv, sym, &[recv])
 }
 /// Super call with 2 args. Codegen: `[method_sym, this, a0]`
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_super_call_2(method: u64, this: u64, a0: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0)])
 }
 /// Super call with 3 args. Codegen: `[method_sym, this, a0, a1]`
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
@@ -4390,7 +4390,7 @@ pub extern "C" fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) ->
     )
 }
 /// Super call with 4 args. Codegen: `[method_sym, this, a0, a1, a2]`
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_super_call_4(method: u64, this: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
@@ -4444,7 +4444,7 @@ fn make_list_impl(elements: &[u64]) -> u64 {
 /// list's `elements[i]` dangling — surfaces later as the
 /// `WRITE BARRIER BUG: old List → young raw, desc: list[N]`
 /// validator panic.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_list_add(list_val: u64, elem: u64) {
     let list = Value::from_bits(list_val);
     let elem_v = Value::from_bits(elem);
@@ -4459,27 +4459,27 @@ pub extern "C" fn wren_list_add(list_val: u64, elem: u64) {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_list() -> u64 {
     make_list_impl(&[])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_list_1(a0: u64) -> u64 {
     make_list_impl(&[a0])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_list_2(a0: u64, a1: u64) -> u64 {
     make_list_impl(&[a0, a1])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_list_3(a0: u64, a1: u64, a2: u64) -> u64 {
     make_list_impl(&[a0, a1, a2])
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_list_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     make_list_impl(&[a0, a1, a2, a3])
 }
@@ -4493,7 +4493,7 @@ pub extern "C" fn wren_make_list_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 /// unreachable and sweep it, leaving the map's entries dangling
 /// (surfaces later as a SIGSEGV in `update_old_gen_pointers_inline`
 /// when the hasher dereferences the stale string).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_map_set(map_val: u64, key: u64, value: u64) {
     let map = Value::from_bits(map_val);
     let key_v = Value::from_bits(key);
@@ -4510,7 +4510,7 @@ pub extern "C" fn wren_map_set(map_val: u64, key: u64, value: u64) {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_map() -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
@@ -4527,7 +4527,7 @@ pub extern "C" fn wren_make_map() -> u64 {
 }
 
 /// Allocate a new range.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
@@ -4615,32 +4615,32 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
 }
 
 /// Allocate a closure with 0 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_0(fn_id: u64) -> u64 {
     make_closure_inner(fn_id, &[])
 }
 /// Allocate a closure with 1 upvalue.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_1(fn_id: u64, uv0: u64) -> u64 {
     make_closure_inner(fn_id, &[uv0])
 }
 /// Allocate a closure with 2 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_2(fn_id: u64, uv0: u64, uv1: u64) -> u64 {
     make_closure_inner(fn_id, &[uv0, uv1])
 }
 /// Allocate a closure with 3 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_3(fn_id: u64, uv0: u64, uv1: u64, uv2: u64) -> u64 {
     make_closure_inner(fn_id, &[uv0, uv1, uv2])
 }
 /// Allocate a closure with 4 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_4(fn_id: u64, uv0: u64, uv1: u64, uv2: u64, uv3: u64) -> u64 {
     make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3])
 }
 /// Allocate a closure with 5 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_5(
     fn_id: u64,
     uv0: u64,
@@ -4652,7 +4652,7 @@ pub extern "C" fn wren_make_closure_5(
     make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3, uv4])
 }
 /// Allocate a closure with 6 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_6(
     fn_id: u64,
     uv0: u64,
@@ -4665,7 +4665,7 @@ pub extern "C" fn wren_make_closure_6(
     make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3, uv4, uv5])
 }
 /// Allocate a closure with 7 upvalues.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_7(
     fn_id: u64,
     uv0: u64,
@@ -4681,7 +4681,7 @@ pub extern "C" fn wren_make_closure_7(
 /// Allocate a closure with 8 upvalues. AOT bodies that capture
 /// more than 8 upvalues fall through to the generic `wren_make_
 /// closure_n` slow path so the lowering doesn't silently truncate.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_make_closure_8(
     fn_id: u64,
     uv0: u64,
@@ -4702,7 +4702,7 @@ pub extern "C" fn wren_make_closure_8(
 /// past the end of its `Vec<*mut ObjUpvalue>` and crashed at the
 /// first access of the dropped index — exactly what happened to
 /// `Session.cookie`'s 7-upvalue middleware in the web spec.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_make_closure_n(fn_id: u64, count: u64, upvalues: *const u64) -> u64 {
     if upvalues.is_null() {
         return make_closure_inner(fn_id, &[]);
@@ -4712,7 +4712,7 @@ pub unsafe extern "C" fn wren_make_closure_n(fn_id: u64, count: u64, upvalues: *
 }
 
 /// Concatenate two strings.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_string_concat(a: u64, b: u64) -> u64 {
     let va = Value::from_bits(a);
     let vb = Value::from_bits(b);
@@ -4731,7 +4731,7 @@ pub extern "C" fn wren_string_concat(a: u64, b: u64) -> u64 {
 }
 
 /// Convert a value to its string representation.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_to_string(val: u64) -> u64 {
     let v = Value::from_bits(val);
 
@@ -4747,7 +4747,7 @@ pub extern "C" fn wren_to_string(val: u64) -> u64 {
 }
 
 /// Materialize a string literal from its interned symbol id.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_const_string(sym_idx: u64) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
@@ -4762,7 +4762,7 @@ pub extern "C" fn wren_const_string(sym_idx: u64) -> u64 {
 
 /// Type check: is value an instance of class?
 /// class_sym is a SymbolId identifying the class name.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_is_type(val: u64, class_sym: u64) -> u64 {
     let v = Value::from_bits(val);
     let target_sym = crate::intern::SymbolId::from_raw(class_sym as u32);
@@ -4920,7 +4920,7 @@ fn dump_stale_subscript_frames(obj_ptr: *const u8, recv: Value, idx: Value) {
 fn dump_stale_subscript_frames(_obj_ptr: *const u8, _recv: Value, _idx: Value) {}
 
 /// Subscript get (`list[idx]` or `map[key]`).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
     let recv = Value::from_bits(receiver);
     let idx = Value::from_bits(index);
@@ -5087,7 +5087,7 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
 }
 
 /// Subscript set (`list[idx] = val` or `map[key] = val`).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u64 {
     let recv = Value::from_bits(receiver);
     let idx = Value::from_bits(index);
@@ -5178,7 +5178,7 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
 }
 
 /// Get an upvalue by index from the current closure in JitContext.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_get_upvalue(index: u64) -> u64 {
     let ctx = read_jit_ctx();
     if ctx.closure.is_null() {
@@ -5198,7 +5198,7 @@ pub extern "C" fn wren_get_upvalue(index: u64) -> u64 {
 }
 
 /// Set an upvalue by index on the current closure in JitContext.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
     let ctx = read_jit_ctx();
     if ctx.closure.is_null() {
@@ -5222,7 +5222,7 @@ pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
 
 /// Get a static field from the defining class.
 /// field_sym is the raw SymbolId index.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_get_static_field(field_sym: u64) -> u64 {
     let ctx = read_jit_ctx();
     if ctx.defining_class.is_null() {
@@ -5242,7 +5242,7 @@ pub extern "C" fn wren_get_static_field(field_sym: u64) -> u64 {
 
 /// Set a static field on the defining class.
 /// field_sym is the raw SymbolId index, value is the NaN-boxed value.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
     let ctx = read_jit_ctx();
     if ctx.defining_class.is_null() {
@@ -5262,7 +5262,7 @@ pub extern "C" fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
 
 /// Guard: check that value is an instance of the expected class.
 /// Returns the value if check passes, traps otherwise.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_guard_class(value: u64, class: u64) -> u64 {
     // For now, always pass the guard. A proper implementation would
     // check the class hierarchy and deoptimize on mismatch.
@@ -5272,7 +5272,7 @@ pub extern "C" fn wren_guard_class(value: u64, class: u64) -> u64 {
 
 /// Guard: check that value's class implements the expected protocol.
 /// Returns the value if check passes (always passes for now).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_guard_protocol(value: u64, protocol_id: u64) -> u64 {
     let _ = protocol_id;
     value
@@ -5387,7 +5387,7 @@ pub fn deopt_words(r: &crate::mir::DeoptReg) -> usize {
 /// `buf` must point at `n` readable u64s laid out as `deopt_tag` and
 /// `deopt_words` describe; compiled code passes its own stack buffer.
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *const u64) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
@@ -5491,7 +5491,7 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
 /// `buf` must point at `n` readable u64s; compiled code passes its own
 /// stack buffer.
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_deopt_n(func_id: u64, n: u64, buf: *const u64) -> u64 {
     let args: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
     deopt_impl(func_id as u32, &args)
@@ -5514,31 +5514,31 @@ fn box_num(n: f64) -> u64 {
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_num_add(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "+(_)", "+", |x, y| x + y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_num_sub(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "-(_)", "-", |x, y| x - y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_num_mul(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "*(_)", "*", |x, y| x * y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_num_div(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "/(_)", "/", |x, y| x / y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "%(_)", "%", |x, y| x % y)
 }
@@ -5552,37 +5552,37 @@ pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_bit_and(a: u64, b: u64) -> u64 {
     wren_bit_binop(a, b, "&(_)", "&", |x, y| x & y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_bit_or(a: u64, b: u64) -> u64 {
     wren_bit_binop(a, b, "|(_)", "|", |x, y| x | y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_bit_xor(a: u64, b: u64) -> u64 {
     wren_bit_binop(a, b, "^(_)", "^", |x, y| x ^ y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_bit_shl(a: u64, b: u64) -> u64 {
     wren_bit_binop(a, b, "<<(_)", "<<", |x, y| x.wrapping_shl(y & 31))
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_bit_shr(a: u64, b: u64) -> u64 {
     wren_bit_binop(a, b, ">>(_)", ">>", |x, y| x.wrapping_shr(y & 31))
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_bit_not(a: u64) -> u64 {
     let va = Value::from_bits(a);
     if va.is_num() {
@@ -5688,7 +5688,7 @@ fn wren_arith_dispatch(
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_num_neg(a: u64) -> u64 {
     let va = Value::from_bits(a);
     if va.is_num() {
@@ -5719,25 +5719,25 @@ pub extern "C" fn wren_num_neg(a: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_cmp_lt(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, "<(_)", "<", |x, y| x < y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_cmp_gt(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, ">(_)", ">", |x, y| x > y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_cmp_le(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, "<=(_)", "<=", |x, y| x <= y)
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_cmp_ge(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, ">=(_)", ">=", |x, y| x >= y)
 }
@@ -5780,7 +5780,7 @@ fn wren_cmp_dispatch(
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
     // Wren's `==` is overloadable per class. Mirror the
     // interpreter's `Op::CmpEq` handler: when the LHS is a
@@ -5806,7 +5806,7 @@ pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
     let lhs = Value::from_bits(a);
     let rhs = Value::from_bits(b);
@@ -5829,13 +5829,13 @@ pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_not(a: u64) -> u64 {
     Value::bool(Value::from_bits(a).is_falsy()).to_bits()
 }
 
 #[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
     let v = Value::from_bits(value);
     // Return raw 0/1 (not NaN-boxed) so JmpZero can branch correctly.
@@ -5850,59 +5850,59 @@ pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
 // FP transcendental wrappers (raw f64 bits in/out, for JIT CallRuntime)
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_sin(bits: u64) -> u64 {
     f64::from_bits(bits).sin().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_cos(bits: u64) -> u64 {
     f64::from_bits(bits).cos().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_tan(bits: u64) -> u64 {
     f64::from_bits(bits).tan().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_asin(bits: u64) -> u64 {
     f64::from_bits(bits).asin().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_acos(bits: u64) -> u64 {
     f64::from_bits(bits).acos().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_atan(bits: u64) -> u64 {
     f64::from_bits(bits).atan().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_log(bits: u64) -> u64 {
     f64::from_bits(bits).ln().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_log2(bits: u64) -> u64 {
     f64::from_bits(bits).log2().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_exp(bits: u64) -> u64 {
     f64::from_bits(bits).exp().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_cbrt(bits: u64) -> u64 {
     f64::from_bits(bits).cbrt().to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_atan2(a: u64, b: u64) -> u64 {
     f64::from_bits(a).atan2(f64::from_bits(b)).to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_pow(a: u64, b: u64) -> u64 {
     f64::from_bits(a).powf(f64::from_bits(b)).to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_min(a: u64, b: u64) -> u64 {
     f64::from_bits(a).min(f64::from_bits(b)).to_bits()
 }
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_fp_max(a: u64, b: u64) -> u64 {
     f64::from_bits(a).max(f64::from_bits(b)).to_bits()
 }
@@ -6113,7 +6113,7 @@ pub fn resolve(name: &str) -> Option<usize> {
 
 /// Register a JIT function's frame pointer for GC stack walking.
 /// Called from JIT prologue with FP, func_id, and return address.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_jit_frame_push(fp: u64, func_id: u64) {
     // Return address is at [fp + 8] (saved LR in the JIT frame).
     let ret_addr = if fp != 0 {
@@ -6126,7 +6126,7 @@ pub extern "C" fn wren_jit_frame_push(fp: u64, func_id: u64) {
 
 /// Unregister a JIT function's frame pointer.
 /// Called from JIT epilogue before return.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_jit_frame_pop() {
     pop_jit_frame();
 }
@@ -6217,12 +6217,12 @@ ic_host_inner!(wren_ic_host_3_inner, a0, a1, a2);
 /// Called only from JIT-compiled code via inline IC dispatch (kind=8).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_host_0(_hfn: u64, _ctx: u64, _recv: u64) -> u64 {
     core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_host_0_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_host_0(hfn: u64, ctx: u64, recv: u64) -> u64 {
     wren_ic_host_0_inner(hfn, ctx, recv, 0)
 }
@@ -6231,12 +6231,12 @@ pub extern "C" fn wren_ic_host_0(hfn: u64, ctx: u64, recv: u64) -> u64 {
 /// Called only from JIT-compiled code via inline IC dispatch (kind=8).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_host_1(_hfn: u64, _ctx: u64, _recv: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_host_1_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_host_1(hfn: u64, ctx: u64, recv: u64, a0: u64) -> u64 {
     wren_ic_host_1_inner(hfn, ctx, recv, a0, 0)
 }
@@ -6245,7 +6245,7 @@ pub extern "C" fn wren_ic_host_1(hfn: u64, ctx: u64, recv: u64, a0: u64) -> u64 
 /// Called only from JIT-compiled code via inline IC dispatch (kind=8).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_host_2(
     _hfn: u64,
     _ctx: u64,
@@ -6256,7 +6256,7 @@ pub unsafe extern "C" fn wren_ic_host_2(
     core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_host_2_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_host_2(hfn: u64, ctx: u64, recv: u64, a0: u64, a1: u64) -> u64 {
     wren_ic_host_2_inner(hfn, ctx, recv, a0, a1, 0)
 }
@@ -6265,7 +6265,7 @@ pub extern "C" fn wren_ic_host_2(hfn: u64, ctx: u64, recv: u64, a0: u64, a1: u64
 /// Called only from JIT-compiled code via inline IC dispatch (kind=8).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_host_3(
     _hfn: u64,
     _ctx: u64,
@@ -6277,7 +6277,7 @@ pub unsafe extern "C" fn wren_ic_host_3(
     core::arch::naked_asm!("mov x6, x29", "b {inner}", inner = sym wren_ic_host_3_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_host_3(hfn: u64, ctx: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_ic_host_3_inner(hfn, ctx, recv, a0, a1, a2, 0)
 }
@@ -6287,12 +6287,12 @@ pub extern "C" fn wren_ic_host_3(hfn: u64, ctx: u64, recv: u64, a0: u64, a1: u64
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_native_0(_nfn: u64, _recv: u64) -> u64 {
     core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_native_0_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_native_0(nfn: u64, recv: u64) -> u64 {
     wren_ic_native_0_inner(nfn, recv, 0)
 }
@@ -6301,12 +6301,12 @@ pub extern "C" fn wren_ic_native_0(nfn: u64, recv: u64) -> u64 {
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_native_1(_nfn: u64, _recv: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_native_1_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_native_1(nfn: u64, recv: u64, a0: u64) -> u64 {
     wren_ic_native_1_inner(nfn, recv, a0, 0)
 }
@@ -6315,12 +6315,12 @@ pub extern "C" fn wren_ic_native_1(nfn: u64, recv: u64, a0: u64) -> u64 {
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_native_2(_nfn: u64, _recv: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_native_2_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_native_2(nfn: u64, recv: u64, a0: u64, a1: u64) -> u64 {
     wren_ic_native_2_inner(nfn, recv, a0, a1, 0)
 }
@@ -6329,7 +6329,7 @@ pub extern "C" fn wren_ic_native_2(nfn: u64, recv: u64, a0: u64, a1: u64) -> u64
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_native_3(
     _nfn: u64,
     _recv: u64,
@@ -6340,7 +6340,7 @@ pub unsafe extern "C" fn wren_ic_native_3(
     core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_native_3_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_native_3(nfn: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_ic_native_3_inner(nfn, recv, a0, a1, a2, 0)
 }
@@ -6393,12 +6393,12 @@ ic_ctor_inner!(wren_ic_ctor_3_inner, a0, a1, a2);
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_ctor_0(_cls: u64, _closure: u64) -> u64 {
     core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_ctor_0_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_ctor_0(cls: u64, closure: u64) -> u64 {
     wren_ic_ctor_0_inner(cls, closure, 0)
 }
@@ -6407,12 +6407,12 @@ pub extern "C" fn wren_ic_ctor_0(cls: u64, closure: u64) -> u64 {
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_ctor_1(_cls: u64, _closure: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_ctor_1_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_ctor_1(cls: u64, closure: u64, a0: u64) -> u64 {
     wren_ic_ctor_1_inner(cls, closure, a0, 0)
 }
@@ -6421,12 +6421,12 @@ pub extern "C" fn wren_ic_ctor_1(cls: u64, closure: u64, a0: u64) -> u64 {
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_ctor_2(_cls: u64, _closure: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_ctor_2_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_ctor_2(cls: u64, closure: u64, a0: u64, a1: u64) -> u64 {
     wren_ic_ctor_2_inner(cls, closure, a0, a1, 0)
 }
@@ -6435,7 +6435,7 @@ pub extern "C" fn wren_ic_ctor_2(cls: u64, closure: u64, a0: u64, a1: u64) -> u6
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_ic_ctor_3(
     _cls: u64,
     _closure: u64,
@@ -6446,14 +6446,14 @@ pub unsafe extern "C" fn wren_ic_ctor_3(
     core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_ctor_3_inner);
 }
 #[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_ctor_3(cls: u64, closure: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_ic_ctor_3_inner(cls, closure, a0, a1, a2, 0)
 }
 
 /// A fresh instance of the class object in `class_val`, ready for its
 /// initialiser, which compiled code then calls directly.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
     let class_ptr = Value::from_bits(class_val)
         .as_object()
@@ -6471,7 +6471,7 @@ pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
 }
 
 /// Allocate a `Simd4f` from raw lane bits.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_alloc_simd4f(l0: u64, l1: u64, l2: u64, l3: u64) -> u64 {
     match unsafe { vm_ref() } {
         Some(vm) => vm
@@ -6485,7 +6485,7 @@ pub extern "C" fn wren_alloc_simd4f(l0: u64, l1: u64, l2: u64, l3: u64) -> u64 {
 }
 
 /// Allocate a `Simd4i` from raw lane bits.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_alloc_simd4i(l0: u64, l1: u64, l2: u64, l3: u64) -> u64 {
     match unsafe { vm_ref() } {
         Some(vm) => vm
@@ -6535,7 +6535,7 @@ pub fn trivial_getter_check(func_id: crate::runtime::engine::FuncId) -> Option<u
 /// Inline IC enter: set JitContext for a non-leaf JIT call (kind=6).
 /// Saves current_func_id, sets new func_id + closure. Returns saved_func_id.
 /// Skips depth tracking — native stack overflow is the backstop for infinite recursion.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_enter(func_id: u64, closure: u64) -> u64 {
     unsafe {
         let ctx = &mut (*jit_state()).ctx;
@@ -6547,7 +6547,7 @@ pub extern "C" fn wren_ic_enter(func_id: u64, closure: u64) -> u64 {
 }
 
 /// Inline IC leave: restore current_func_id after a non-leaf JIT call.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_ic_leave(saved_func_id: u64) {
     unsafe {
         (*jit_state()).ctx.current_func_id = saved_func_id;

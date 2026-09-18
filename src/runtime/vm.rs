@@ -2847,7 +2847,7 @@ impl VM {
 
         // Append spawn trace if present
         let spawn_trace = unsafe { &(*fiber).spawn_trace };
-        if let Some(ref frames) = spawn_trace {
+        if let Some(frames) = spawn_trace {
             if !frames.is_empty() {
                 trace.push("  --- spawned at ---".to_string());
                 for frame in frames {

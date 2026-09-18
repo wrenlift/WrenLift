@@ -26,7 +26,7 @@ use crate::intern::SymbolId;
 // doesn't sit in the hot path under normal runs.
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn malloc_size(ptr: *const std::ffi::c_void) -> usize;
 }
 
@@ -710,8 +710,8 @@ impl Gc {
         if header.is_null() {
             return false;
         }
-        let gen = unsafe { (*header).generation };
-        if gen != GEN_OLD {
+        let r#gen = unsafe { (*header).generation };
+        if r#gen != GEN_OLD {
             return false;
         }
         let mut current = self.old_objects;
@@ -2415,7 +2415,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
             update_raw_ptr_inline(&mut class.superclass, nursery);
             for method in class.methods.iter_mut().flatten() {
                 match method {
-                    Method::Closure(ref mut ptr) | Method::Constructor(ref mut ptr) => {
+                    Method::Closure(ptr) | Method::Constructor(ptr) => {
                         update_raw_ptr_inline(ptr, nursery);
                     }
                     Method::Native(_)

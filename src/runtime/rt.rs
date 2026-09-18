@@ -369,7 +369,7 @@ static SEALED: AtomicBool = AtomicBool::new(false);
 /// # Safety
 /// `table` must be null or point at a readable `RuntimeVTable`, and every
 /// `Some` entry must have the slot's signature and contract.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_rt_install(table: *const RuntimeVTable) -> bool {
     if table.is_null() {
         return false;
@@ -387,42 +387,42 @@ pub unsafe extern "C" fn wlift_rt_install(table: *const RuntimeVTable) -> bool {
 }
 
 /// Whether a host table has been installed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_rt_installed() -> bool {
     INSTALLED.load(Ordering::Acquire)
 }
 
 /// What the `object_trace` slot dispatches to: wren_lift's per-object
 /// trace, for a host that traces wren_lift objects itself.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_rt_object_trace() -> ObjectTrace {
     unsafe { std::mem::transmute(slot::object_trace.load(Ordering::Relaxed)) }
 }
 
 /// What the `object_drop` slot dispatches to: wren_lift's per-object
 /// drop, for a host that reclaims wren_lift objects itself.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_rt_object_drop() -> ObjectDrop {
     unsafe { std::mem::transmute(slot::object_drop.load(Ordering::Relaxed)) }
 }
 
 /// What the `host_stop` slot dispatches to: how a host's collector asks
 /// every thread running Wren to reach a safepoint.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_rt_host_stop() -> HostStop {
     unsafe { std::mem::transmute(slot::host_stop.load(Ordering::Relaxed)) }
 }
 
 /// What the `task_step` slot dispatches to: one turn of a task, for a
 /// host's world that runs Wren's tasks.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_rt_task_step() -> TaskStep {
     unsafe { std::mem::transmute(slot::task_step.load(Ordering::Relaxed)) }
 }
 
 /// What the `task_suspend` slot dispatches to: the switch a host's world
 /// suspends a Wren task by from inside its step.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_rt_task_suspend() -> TaskSuspend {
     unsafe { std::mem::transmute(slot::task_suspend.load(Ordering::Relaxed)) }
 }

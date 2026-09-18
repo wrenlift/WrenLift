@@ -1,7 +1,7 @@
 [package]
 name = "wlift_abi"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Stable C-shaped ABI for WrenLift plugins. Plugin cdylibs depend only on this crate; the host binary exports the `wlift_plugin_*` symbols, and the dynamic linker resolves the plugin's calls against them at dlopen. No `wren_lift` Rust internals cross the plugin boundary."
 license = "MIT"
 

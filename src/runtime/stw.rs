@@ -339,7 +339,7 @@ pub mod poll_page {
     // protection changes.
     unsafe impl Sync for Page {}
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub static wlift_safepoint_page: Page = Page(std::cell::UnsafeCell::new([0; PAGE]));
 
     /// A page and the count of stops holding it unreadable. The

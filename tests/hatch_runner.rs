@@ -154,7 +154,7 @@ fn install_same_name_twice_is_noop() {
 fn unknown_package_returns_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     // Point the ambient cache somewhere we control (and empty).
-    std::env::set_var("HATCH_CACHE_DIR", tmp.path());
+    unsafe { std::env::set_var("HATCH_CACHE_DIR", tmp.path()) };
     let mut runner = HatchRunner::new();
     let err = runner.install("@hatch:nope-not-real").unwrap_err();
     assert!(matches!(err, RunnerError::NotFound(_)));

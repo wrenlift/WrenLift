@@ -1,6 +1,6 @@
 //! Host-side exports for the `wlift_abi` plugin surface.
 //!
-//! Every function here is `#[no_mangle] pub unsafe extern "C"` — the
+//! Every function here is `#[unsafe(no_mangle)] pub unsafe extern "C"` — the
 //! dynamic linker resolves a plugin cdylib's `extern "C"` references
 //! against these symbols at dlopen time (with the host binary built
 //! `-Wl,--export-dynamic` or platform equivalent). On wasm the same
@@ -69,14 +69,14 @@ fn typed_obj<T>(v: u64, expected: ObjType) -> Option<*mut T> {
 
 // --- ABI handshake ---------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_plugin_abi_version() -> u32 {
     PLUGIN_ABI_VERSION
 }
 
 // --- VM stack ops ----------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_slot(vm: *mut (), idx: u32) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     vm.api_stack
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn wlift_plugin_slot(vm: *mut (), idx: u32) -> u64 {
         .to_bits()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_set_return(vm: *mut (), value: u64) {
     let vm = unsafe { vm_ref(vm) };
     let v = Value::from_bits(value);
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn wlift_plugin_set_return(vm: *mut (), value: u64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_runtime_error(vm: *mut (), msg: *const u8, len: u32) {
     let vm = unsafe { vm_ref(vm) };
     let bytes = unsafe { std::slice::from_raw_parts(msg, len as usize) };
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn wlift_plugin_runtime_error(vm: *mut (), msg: *const u8,
 
 // --- Allocators ------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_alloc_string(vm: *mut (), bytes: *const u8, len: u32) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     let slice = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn wlift_plugin_alloc_string(vm: *mut (), bytes: *const u8
     vm.alloc_string(s).to_bits()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_alloc_list(vm: *mut (), capacity: u32) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     let mut storage = Vec::with_capacity(capacity as usize);
@@ -138,13 +138,13 @@ pub unsafe extern "C" fn wlift_plugin_alloc_list(vm: *mut (), capacity: u32) -> 
     vm.alloc_list(storage).to_bits()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_alloc_map(vm: *mut ()) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     vm.alloc_map().to_bits()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_alloc_typed_array(vm: *mut (), count: u32, kind: u8) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     let Some(kind) = TypedArrayKind::from_u8(kind) else {
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn wlift_plugin_alloc_typed_array(vm: *mut (), count: u32,
 
 // --- Object inspection -----------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_obj_type(value: u64) -> u8 {
     let Some(p) = obj_ptr(value) else {
         return 0xFF;
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn wlift_plugin_obj_type(value: u64) -> u8 {
     unsafe { (*hdr).obj_type as u8 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_string_bytes(
     value: u64,
     out_ptr: *mut *const u8,
@@ -185,7 +185,7 @@ pub unsafe extern "C" fn wlift_plugin_string_bytes(
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_list_count(value: u64) -> u32 {
     match typed_obj::<ObjList>(value, ObjType::List) {
         Some(l) => unsafe { (*l).count },
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn wlift_plugin_list_count(value: u64) -> u32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_list_get(value: u64, idx: u32) -> u64 {
     let Some(l) = typed_obj::<ObjList>(value, ObjType::List) else {
         return Value::null().to_bits();
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn wlift_plugin_list_get(value: u64, idx: u32) -> u64 {
     v.to_bits()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_list_add(vm: *mut (), list: u64, value: u64) {
     let vm = unsafe { vm_ref(vm) };
     let Some(l) = typed_obj::<ObjList>(list, ObjType::List) else {
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn wlift_plugin_list_add(vm: *mut (), list: u64, value: u6
     vm.gc.write_barrier(l as *mut ObjHeader, v);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_map_count(value: u64) -> u32 {
     match typed_obj::<ObjMap>(value, ObjType::Map) {
         Some(m) => unsafe { (*m).entries.len() as u32 },
@@ -230,7 +230,7 @@ pub unsafe extern "C" fn wlift_plugin_map_count(value: u64) -> u32 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_map_iter_next(
     value: u64,
     cursor: u32,
@@ -255,7 +255,7 @@ pub unsafe extern "C" fn wlift_plugin_map_iter_next(
     cursor + 1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_map_set(vm: *mut (), map: u64, key: u64, value: u64) {
     let vm = unsafe { vm_ref(vm) };
     let Some(m) = typed_obj::<ObjMap>(map, ObjType::Map) else {
@@ -270,7 +270,7 @@ pub unsafe extern "C" fn wlift_plugin_map_set(vm: *mut (), map: u64, key: u64, v
     vm.gc.write_barrier(hdr, v);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_typed_array_kind(value: u64) -> u8 {
     let Some(a) = typed_obj::<ObjTypedArray>(value, ObjType::TypedArray) else {
         return 0xFF;
@@ -278,7 +278,7 @@ pub unsafe extern "C" fn wlift_plugin_typed_array_kind(value: u64) -> u8 {
     unsafe { (*a).kind_tag() as u8 }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_typed_array_bytes(
     value: u64,
     out_ptr: *mut *mut u8,
@@ -320,14 +320,14 @@ pub unsafe extern "C" fn wlift_plugin_typed_array_bytes(
 /// Snapshot the current JIT_ROOTS_STORE depth. Pair with
 /// `wlift_plugin_jit_roots_restore` to pop everything pushed in
 /// between.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_jit_roots_snapshot(_vm: *mut ()) -> u32 {
     crate::codegen::runtime_fns::jit_roots_snapshot_len() as u32
 }
 
 /// Push a value as a GC root. Returns its absolute slot index in
 /// JIT_ROOTS_STORE for later re-read via `wlift_plugin_jit_root_at`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_push_root(_vm: *mut (), value: u64) -> u32 {
     let idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
     crate::codegen::runtime_fns::push_jit_root(Value::from_bits(value));
@@ -337,13 +337,13 @@ pub unsafe extern "C" fn wlift_plugin_push_root(_vm: *mut (), value: u64) -> u32
 /// Re-read a rooted value at the given absolute slot index. Always
 /// returns the live (post-forwarding) bits — GC updates the slot
 /// in place when nursery objects promote.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_jit_root_at(_vm: *mut (), idx: u32) -> u64 {
     crate::codegen::runtime_fns::jit_root_at(idx as usize).to_bits()
 }
 
 /// Pop JIT_ROOTS_STORE back to a snapshot depth.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_jit_roots_restore(_vm: *mut (), depth: u32) {
     crate::codegen::runtime_fns::jit_roots_restore_len(depth as usize);
 }
@@ -360,7 +360,7 @@ pub unsafe extern "C" fn wlift_plugin_jit_roots_restore(_vm: *mut (), depth: u32
 /// pre-registration path. This export is a no-op on native so the
 /// plugin source stays target-agnostic.
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_register_symbol(
     plugin: *const u8,
     plugin_len: u32,
@@ -381,7 +381,7 @@ pub unsafe extern "C" fn wlift_plugin_register_symbol(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_register_symbol(
     _plugin: *const u8,
     _plugin_len: u32,

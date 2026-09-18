@@ -402,7 +402,7 @@ mod tests {
         let mut runner = HatchRunner::new();
         // Use a tmpdir to avoid picking up the ambient cache.
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HATCH_CACHE_DIR", tmp.path());
+        unsafe { std::env::set_var("HATCH_CACHE_DIR", tmp.path()) };
         let err = runner.install("@hatch:absolutely-not-real").unwrap_err();
         match err {
             RunnerError::NotFound(_) => {}

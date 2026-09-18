@@ -24,7 +24,7 @@ resolver = "2"
 name = "wren_lift"
 version = "0.1.19"
 authors = ["Damilare Akinlaja <dami@wrenlift.com>"]
-edition = "2021"
+edition = "2024"
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]

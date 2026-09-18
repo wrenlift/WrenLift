@@ -2,7 +2,7 @@
 /// C embedding API for WrenLift.
 ///
 /// Provides a wren.h-compatible interface for embedding WrenLift in C/C++
-/// applications. All functions use `extern "C"` linkage and `#[no_mangle]`
+/// applications. All functions use `extern "C"` linkage and `#[unsafe(no_mangle)]`
 /// for direct FFI consumption.
 ///
 /// # Usage from C
@@ -152,7 +152,7 @@ pub const WREN_VERSION_MAJOR: c_int = 0;
 pub const WREN_VERSION_MINOR: c_int = 5;
 pub const WREN_VERSION_PATCH: c_int = 0;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetVersionNumber() -> c_int {
     WREN_VERSION_MAJOR * 1_000_000 + WREN_VERSION_MINOR * 1_000 + WREN_VERSION_PATCH
 }
@@ -161,7 +161,7 @@ pub extern "C" fn wrenGetVersionNumber() -> c_int {
 // Configuration
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenInitConfiguration(config: *mut WrenConfiguration) {
     if config.is_null() {
         return;
@@ -187,7 +187,7 @@ pub extern "C" fn wrenInitConfiguration(config: *mut WrenConfiguration) {
 // VM lifecycle
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenNewVM(config: *const WrenConfiguration) -> *mut WrenVM {
     let vm_config = if config.is_null() {
         VMConfig::default()
@@ -209,7 +209,7 @@ pub extern "C" fn wrenNewVM(config: *const WrenConfiguration) -> *mut WrenVM {
 /// and missing stack traces hide handler bugs in logs. Matches
 /// `hatch run`'s config (step_limit=0, fiber_stack_traces=true).
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
     // Diagnostic: optional periodic alloc dump (see `alloc_trace`
     // feature in lib.rs). Spawned once per AOT process — the
@@ -259,7 +259,7 @@ pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
     Box::into_raw(Box::new(vm))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenFreeVM(vm: *mut WrenVM) {
     if !vm.is_null() {
         unsafe {
@@ -268,7 +268,7 @@ pub extern "C" fn wrenFreeVM(vm: *mut WrenVM) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenCollectGarbage(vm: *mut WrenVM) {
     if vm.is_null() {
         return;
@@ -282,7 +282,7 @@ pub extern "C" fn wrenCollectGarbage(vm: *mut WrenVM) {
 // Interpret
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenInterpret(
     vm: *mut WrenVM,
     module: *const c_char,
@@ -338,7 +338,7 @@ pub extern "C" fn wrenInterpret(
 /// arrays are static `const char*` tables with C-string-literal
 /// contents — those contracts hold by construction.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_run_aot_program(
     entry_name: *const c_char,
     entry_source: *const c_char,
@@ -426,7 +426,7 @@ pub unsafe extern "C" fn wlift_run_aot_program(
 /// the symbol via `extern void* wlift_modvars_<n>[]` so this
 /// contract holds by construction.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_init_prelude(
     vm: *mut WrenVM,
     modvars: *mut u64,
@@ -477,7 +477,7 @@ pub unsafe extern "C" fn wlift_aot_init_prelude(
 /// bootstrap embeds these via `static const char[]` literals so
 /// the constraint holds by construction.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_alloc_const_string(
     vm: *mut WrenVM,
     text: *const c_char,
@@ -514,7 +514,7 @@ pub unsafe extern "C" fn wlift_aot_alloc_const_string(
 /// body's execution. `name` is a UTF-8 C string; `out_saved`
 /// must point at a writable 48-byte buffer.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_enter(
     vm: *mut WrenVM,
     modvars: *mut u64,
@@ -606,7 +606,7 @@ pub struct WliftAotMethodDesc {
 /// via `Linkage::Local` `Data` blobs sized + initialised at AOT
 /// build time.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_install_class(
     vm: *mut WrenVM,
     modvars: *mut u64,
@@ -762,7 +762,7 @@ pub unsafe extern "C" fn wlift_aot_install_class(
 /// convention. The bootstrap takes the pointer from a
 /// `Linkage::Import` Cranelift FuncId, so the contract holds by
 /// construction.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_register_closure(
     vm: *mut WrenVM,
@@ -844,7 +844,7 @@ pub struct WliftAotSafepointDesc {
 /// `safepoints` and `roots` must be valid `[WliftAotSafepointDesc]`
 /// and `[i32]` arrays of the given lengths; the bootstrap satisfies
 /// these by emitting them as `Linkage::Local` `Data` blobs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_register_code_range(
     vm: *mut WrenVM,
@@ -964,7 +964,7 @@ pub struct WliftAotForeignMethodDesc {
 /// `methods` must point at `methods_count` consecutive
 /// `WliftAotForeignMethodDesc` records. The bootstrap satisfies
 /// these via Cranelift `Linkage::Local` `Data` blobs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_bind_foreign_class(
     vm: *mut WrenVM,
@@ -1091,7 +1091,7 @@ pub unsafe extern "C" fn wlift_aot_bind_foreign_class(
 ///
 /// `path` must be a valid pointer to `len` UTF-8 bytes for the
 /// duration of the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_add_native_search_path(
     vm: *mut WrenVM,
@@ -1127,7 +1127,7 @@ pub unsafe extern "C" fn wlift_aot_add_native_search_path(
 /// The temp path leaks for the lifetime of the process, matching
 /// the runtime's behaviour (libraries can't be unmapped while
 /// foreign methods may dispatch into them).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_install_native_lib(
     vm: *mut WrenVM,
@@ -1203,7 +1203,7 @@ pub unsafe extern "C" fn wlift_aot_install_native_lib(
 /// `name` must be a valid pointer to `len` UTF-8 bytes. The
 /// bootstrap embeds the bytes via Cranelift `Data` symbols so
 /// the contract holds by construction.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_intern_symbol(
     vm: *mut WrenVM,
@@ -1243,7 +1243,7 @@ pub unsafe extern "C" fn wlift_aot_intern_symbol(
 /// blobs — those live in the binary's `.bss` for as long as the
 /// process runs.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_register_root_region(
     vm: *mut WrenVM,
     region: *mut u64,
@@ -1279,7 +1279,7 @@ pub unsafe extern "C" fn wlift_aot_register_root_region(
 ///
 /// Pointers must be valid UTF-8 byte ranges.
 #[cfg(feature = "aot")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_resolve_runtime_import(
     vm: *mut WrenVM,
     modvars: *mut u64,
@@ -1328,7 +1328,7 @@ pub unsafe extern "C" fn wlift_aot_resolve_runtime_import(
 /// `closure_bits` must be the NaN-boxed `Value` of an `ObjClosure`
 /// and `class_bits` that of an `ObjClass`, as the AOT lowering emits
 /// them.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_set_closure_class(closure_bits: u64, class_bits: u64) -> u64 {
     use crate::codegen::runtime_fns::read_jit_ctx;
@@ -1362,7 +1362,7 @@ pub unsafe extern "C" fn wlift_aot_set_closure_class(closure_bits: u64, class_bi
 ///
 /// `class_bits` must be the NaN-boxed `Value` of an `ObjClass`,
 /// matching what AOT modvars hold post-`wlift_aot_install_class`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_get_static_field(class_bits: u64, field_sym: u64) -> u64 {
     use crate::runtime::object::ObjClass;
@@ -1391,7 +1391,7 @@ pub unsafe extern "C" fn wlift_aot_get_static_field(class_bits: u64, field_sym: 
 /// # Safety
 ///
 /// `class_bits` must be the NaN-boxed `Value` of an `ObjClass`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_set_static_field(
     class_bits: u64,
@@ -1426,7 +1426,7 @@ pub unsafe extern "C" fn wlift_aot_set_static_field(
 ///
 /// `saved` must point at a 48-byte buffer previously populated
 /// by `wlift_aot_enter`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
     use crate::codegen::runtime_fns::{set_jit_context, JitContext};
@@ -1448,7 +1448,7 @@ pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
 /// guarantees this by emitting the call against the module's
 /// declared function.
 #[cfg(all(feature = "aot", feature = "host"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_invoke_module_body(fn_ptr: *const u8) -> u64 {
     if fn_ptr.is_null() {
         return crate::runtime::value::Value::null().to_bits();
@@ -1458,7 +1458,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_module_body(fn_ptr: *const u8) -> u64 
 }
 
 #[cfg(all(feature = "aot", not(feature = "host")))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_invoke_module_body(fn_ptr: *const u8) -> u64 {
     if fn_ptr.is_null() {
         return crate::runtime::value::Value::null().to_bits();
@@ -1471,7 +1471,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_module_body(fn_ptr: *const u8) -> u64 
 // Call handles
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenMakeCallHandle(vm: *mut WrenVM, signature: *const c_char) -> *mut WrenHandle {
     if vm.is_null() || signature.is_null() {
         return ptr::null_mut();
@@ -1486,7 +1486,7 @@ pub extern "C" fn wrenMakeCallHandle(vm: *mut WrenVM, signature: *const c_char) 
     }))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenCall(vm: *mut WrenVM, method: *mut WrenHandle) -> WrenInterpretResult {
     if vm.is_null() || method.is_null() {
         return WrenInterpretResult::RuntimeError;
@@ -1516,7 +1516,7 @@ pub extern "C" fn wrenCall(vm: *mut WrenVM, method: *mut WrenHandle) -> WrenInte
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenReleaseHandle(vm: *mut WrenVM, handle: *mut WrenHandle) {
     if vm.is_null() || handle.is_null() {
         return;
@@ -1531,7 +1531,7 @@ pub extern "C" fn wrenReleaseHandle(vm: *mut WrenVM, handle: *mut WrenHandle) {
 // Slot API — reading values
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotCount(vm: *mut WrenVM) -> c_int {
     if vm.is_null() {
         return 0;
@@ -1539,7 +1539,7 @@ pub extern "C" fn wrenGetSlotCount(vm: *mut WrenVM) -> c_int {
     unsafe { (*vm).api_stack.len() as c_int }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenEnsureSlots(vm: *mut WrenVM, num_slots: c_int) {
     if vm.is_null() {
         return;
@@ -1552,7 +1552,7 @@ pub extern "C" fn wrenEnsureSlots(vm: *mut WrenVM, num_slots: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotType(vm: *mut WrenVM, slot: c_int) -> WrenType {
     if vm.is_null() {
         return WrenType::Unknown;
@@ -1581,7 +1581,7 @@ pub extern "C" fn wrenGetSlotType(vm: *mut WrenVM, slot: c_int) -> WrenType {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotBool(vm: *mut WrenVM, slot: c_int) -> bool {
     if vm.is_null() {
         return false;
@@ -1589,7 +1589,7 @@ pub extern "C" fn wrenGetSlotBool(vm: *mut WrenVM, slot: c_int) -> bool {
     unsafe { (*vm).get_slot(slot as usize).as_bool().unwrap_or(false) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotDouble(vm: *mut WrenVM, slot: c_int) -> c_double {
     if vm.is_null() {
         return 0.0;
@@ -1597,7 +1597,7 @@ pub extern "C" fn wrenGetSlotDouble(vm: *mut WrenVM, slot: c_int) -> c_double {
     unsafe { (*vm).get_slot(slot as usize).as_num().unwrap_or(0.0) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotString(vm: *mut WrenVM, slot: c_int) -> *const c_char {
     if vm.is_null() {
         return ptr::null();
@@ -1617,7 +1617,7 @@ pub extern "C" fn wrenGetSlotString(vm: *mut WrenVM, slot: c_int) -> *const c_ch
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotBytes(
     vm: *mut WrenVM,
     slot: c_int,
@@ -1658,7 +1658,7 @@ pub extern "C" fn wrenGetSlotBytes(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotForeign(vm: *mut WrenVM, slot: c_int) -> *mut c_void {
     if vm.is_null() {
         return ptr::null_mut();
@@ -1671,7 +1671,7 @@ pub extern "C" fn wrenGetSlotForeign(vm: *mut WrenVM, slot: c_int) -> *mut c_voi
     val.as_object().unwrap() as *mut c_void
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetSlotHandle(vm: *mut WrenVM, slot: c_int) -> *mut WrenHandle {
     if vm.is_null() {
         return ptr::null_mut();
@@ -1688,7 +1688,7 @@ pub extern "C" fn wrenGetSlotHandle(vm: *mut WrenVM, slot: c_int) -> *mut WrenHa
 // Slot API — writing values
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotBool(vm: *mut WrenVM, slot: c_int, value: bool) {
     if vm.is_null() {
         return;
@@ -1698,7 +1698,7 @@ pub extern "C" fn wrenSetSlotBool(vm: *mut WrenVM, slot: c_int, value: bool) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotDouble(vm: *mut WrenVM, slot: c_int, value: c_double) {
     if vm.is_null() {
         return;
@@ -1708,7 +1708,7 @@ pub extern "C" fn wrenSetSlotDouble(vm: *mut WrenVM, slot: c_int, value: c_doubl
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotNull(vm: *mut WrenVM, slot: c_int) {
     if vm.is_null() {
         return;
@@ -1718,7 +1718,7 @@ pub extern "C" fn wrenSetSlotNull(vm: *mut WrenVM, slot: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotString(vm: *mut WrenVM, slot: c_int, text: *const c_char) {
     if vm.is_null() || text.is_null() {
         return;
@@ -1733,7 +1733,7 @@ pub extern "C" fn wrenSetSlotString(vm: *mut WrenVM, slot: c_int, text: *const c
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotBytes(
     vm: *mut WrenVM,
     slot: c_int,
@@ -1751,7 +1751,7 @@ pub extern "C" fn wrenSetSlotBytes(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotHandle(vm: *mut WrenVM, slot: c_int, handle: *mut WrenHandle) {
     if vm.is_null() || handle.is_null() {
         return;
@@ -1766,7 +1766,7 @@ pub extern "C" fn wrenSetSlotHandle(vm: *mut WrenVM, slot: c_int, handle: *mut W
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotNewList(vm: *mut WrenVM, slot: c_int) {
     if vm.is_null() {
         return;
@@ -1777,7 +1777,7 @@ pub extern "C" fn wrenSetSlotNewList(vm: *mut WrenVM, slot: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotNewMap(vm: *mut WrenVM, slot: c_int) {
     if vm.is_null() {
         return;
@@ -1788,7 +1788,7 @@ pub extern "C" fn wrenSetSlotNewMap(vm: *mut WrenVM, slot: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetSlotNewForeign(
     vm: *mut WrenVM,
     slot: c_int,
@@ -1811,7 +1811,7 @@ pub extern "C" fn wrenSetSlotNewForeign(
 // List operations
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetListCount(vm: *mut WrenVM, slot: c_int) -> c_int {
     if vm.is_null() {
         return 0;
@@ -1827,7 +1827,7 @@ pub extern "C" fn wrenGetListCount(vm: *mut WrenVM, slot: c_int) -> c_int {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetListElement(
     vm: *mut WrenVM,
     list_slot: c_int,
@@ -1855,7 +1855,7 @@ pub extern "C" fn wrenGetListElement(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetListElement(
     vm: *mut WrenVM,
     list_slot: c_int,
@@ -1887,7 +1887,7 @@ pub extern "C" fn wrenSetListElement(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenInsertInList(
     vm: *mut WrenVM,
     list_slot: c_int,
@@ -1926,7 +1926,7 @@ pub extern "C" fn wrenInsertInList(
 // Map operations
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetMapCount(vm: *mut WrenVM, slot: c_int) -> c_int {
     if vm.is_null() {
         return 0;
@@ -1942,7 +1942,7 @@ pub extern "C" fn wrenGetMapCount(vm: *mut WrenVM, slot: c_int) -> c_int {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetMapContainsKey(vm: *mut WrenVM, map_slot: c_int, key_slot: c_int) -> bool {
     if vm.is_null() {
         return false;
@@ -1959,7 +1959,7 @@ pub extern "C" fn wrenGetMapContainsKey(vm: *mut WrenVM, map_slot: c_int, key_sl
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetMapValue(
     vm: *mut WrenVM,
     map_slot: c_int,
@@ -1982,7 +1982,7 @@ pub extern "C" fn wrenGetMapValue(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetMapValue(
     vm: *mut WrenVM,
     map_slot: c_int,
@@ -2011,7 +2011,7 @@ pub extern "C" fn wrenSetMapValue(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenRemoveMapValue(
     vm: *mut WrenVM,
     map_slot: c_int,
@@ -2038,7 +2038,7 @@ pub extern "C" fn wrenRemoveMapValue(
 // Module / variable lookup
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenHasModule(vm: *mut WrenVM, module: *const c_char) -> bool {
     if vm.is_null() || module.is_null() {
         return false;
@@ -2047,7 +2047,7 @@ pub extern "C" fn wrenHasModule(vm: *mut WrenVM, module: *const c_char) -> bool 
     unsafe { (&mut *vm).engine.modules.contains_key(name) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenHasVariable(
     vm: *mut WrenVM,
     module: *const c_char,
@@ -2066,7 +2066,7 @@ pub extern "C" fn wrenHasVariable(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetVariable(
     vm: *mut WrenVM,
     module: *const c_char,
@@ -2091,7 +2091,7 @@ pub extern "C" fn wrenGetVariable(
 // Error handling
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenAbortFiber(vm: *mut WrenVM, slot: c_int) {
     if vm.is_null() {
         return;
@@ -2120,7 +2120,7 @@ pub extern "C" fn wrenAbortFiber(vm: *mut WrenVM, slot: c_int) {
 // User data
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenGetUserData(vm: *mut WrenVM) -> *mut c_void {
     if vm.is_null() {
         return ptr::null_mut();
@@ -2128,7 +2128,7 @@ pub extern "C" fn wrenGetUserData(vm: *mut WrenVM) -> *mut c_void {
     unsafe { (&mut *vm).user_data }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenSetUserData(vm: *mut WrenVM, user_data: *mut c_void) {
     if vm.is_null() {
         return;
@@ -2153,7 +2153,7 @@ pub extern "C" fn wrenSetUserData(vm: *mut WrenVM, user_data: *mut c_void) {
 /// null-pointer inputs, -2 on builds without hatch packaging
 /// (wasm). Useful for embedders that ship packages baked into the
 /// binary via `include_bytes!` / a resource file.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenInstallHatchBytes(vm: *mut WrenVM, bytes: *const u8, len: usize) -> c_int {
     if vm.is_null() || bytes.is_null() {
         return -1;
@@ -2179,7 +2179,7 @@ pub extern "C" fn wrenInstallHatchBytes(vm: *mut WrenVM, bytes: *const u8, len: 
 /// Install a `.hatch` file from disk. Returns 0 on success, 1 on
 /// compile error, 2 on runtime error, 3 if the file can't be read,
 /// -1 on null-pointer inputs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenInstallHatchFile(vm: *mut WrenVM, path: *const c_char) -> c_int {
     if vm.is_null() || path.is_null() {
         return -1;
@@ -2200,7 +2200,7 @@ pub extern "C" fn wrenInstallHatchFile(vm: *mut WrenVM, path: *const c_char) -> 
 /// imported classes. Per-hatch `native_search_paths` are already
 /// picked up automatically; this is for embedder overrides.
 /// Returns 0 on success, -1 on null-pointer inputs.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenAddNativeSearchPath(vm: *mut WrenVM, path: *const c_char) -> c_int {
     if vm.is_null() || path.is_null() {
         return -1;
@@ -2222,7 +2222,7 @@ pub extern "C" fn wrenAddNativeSearchPath(vm: *mut WrenVM, path: *const c_char) 
 /// imports as. Returns the number of artifacts installed on
 /// success, or a negative error code (-1 null / -2 read-dir /
 /// -3 install failed partway through).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wrenInstallHatchDir(vm: *mut WrenVM, path: *const c_char) -> c_int {
     if vm.is_null() || path.is_null() {
         return -1;
