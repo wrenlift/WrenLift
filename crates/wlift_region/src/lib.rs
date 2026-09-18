@@ -386,11 +386,11 @@ unsafe fn munmap(ptr: *mut u8, bytes: usize) {
 
 #[cfg(not(unix))]
 unsafe fn munmap(ptr: *mut u8, bytes: usize) {
-    if !ptr.is_null() {
-        if let Ok(layout) = std::alloc::Layout::from_size_align(bytes, 4096) {
-            unsafe {
-                std::alloc::dealloc(ptr, layout);
-            }
+    if !ptr.is_null()
+        && let Ok(layout) = std::alloc::Layout::from_size_align(bytes, 4096)
+    {
+        unsafe {
+            std::alloc::dealloc(ptr, layout);
         }
     }
 }

@@ -3107,7 +3107,7 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
         inner = sym wren_call_0_inner,
     );
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(naked)]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
@@ -3120,11 +3120,14 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
     );
 }
 #[cfg(all(
-    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(target_arch = "x86_64", windows)
+    ),
     feature = "host"
 ))]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
+pub unsafe extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0, 0)
 }
 #[inline(always)]
@@ -3201,7 +3204,7 @@ pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> 
         inner = sym wren_call_1_inner,
     );
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(naked)]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
@@ -3214,11 +3217,14 @@ pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> 
     );
 }
 #[cfg(all(
-    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(target_arch = "x86_64", windows)
+    ),
     feature = "host"
 ))]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
+pub unsafe extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
     wren_call_1_inner(receiver, method, a0, 0, 0)
 }
 extern "C" fn wren_call_1_inner(
@@ -3244,7 +3250,7 @@ pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1
         inner = sym wren_call_2_inner,
     );
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(naked)]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
@@ -3257,11 +3263,14 @@ pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1
     );
 }
 #[cfg(all(
-    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(target_arch = "x86_64", windows)
+    ),
     feature = "host"
 ))]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
+pub unsafe extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
     wren_call_2_inner(receiver, method, a0, a1, 0, 0)
 }
 extern "C" fn wren_call_2_inner(
@@ -3294,7 +3303,7 @@ pub unsafe extern "C" fn wren_call_3(
         inner = sym wren_call_3_inner,
     );
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(naked)]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_3(
@@ -3337,11 +3346,14 @@ pub unsafe extern "C" fn wren_call_3(
     );
 }
 #[cfg(all(
-    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(target_arch = "x86_64", windows)
+    ),
     feature = "host"
 ))]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+pub unsafe extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_call_3_inner(receiver, method, a0, a1, a2, 0, 0)
 }
 extern "C" fn wren_call_3_inner(
@@ -3376,7 +3388,7 @@ pub unsafe extern "C" fn wren_call_4(
         inner = sym wren_call_4_inner,
     );
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(naked)]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_call_4(
@@ -3411,11 +3423,14 @@ pub unsafe extern "C" fn wren_call_4(
     );
 }
 #[cfg(all(
-    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    any(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        all(target_arch = "x86_64", windows)
+    ),
     feature = "host"
 ))]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub extern "C" fn wren_call_4(
+pub unsafe extern "C" fn wren_call_4(
     receiver: u64,
     method: u64,
     a0: u64,

@@ -4822,7 +4822,7 @@ impl VM {
     /// thread inside a fiber of a host's making, or whose chain resumes
     /// from one, has that stack and everything below it left to the
     /// host's collector.
-    #[cfg(all(unix, feature = "host"))]
+    #[cfg(feature = "host")]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         let mut spill = [0usize; super::stack_scan::SPILL_WORDS];
         super::stack_scan::spill_callee_saved(&mut spill);
@@ -4926,7 +4926,7 @@ impl VM {
         ranges
     }
 
-    #[cfg(not(all(unix, feature = "host")))]
+    #[cfg(not(feature = "host"))]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         Vec::new()
     }
@@ -5151,6 +5151,7 @@ impl VM {
                                                 };
                                                 #[cfg(not(unix))]
                                                 let dl: Option<String> = None;
+                                                #[allow(clippy::unnecessary_literal_unwrap)]
                                                 (dl.unwrap_or(n), cr.start)
                                             }
                                             None => ("<unknown>".to_string(), 0),

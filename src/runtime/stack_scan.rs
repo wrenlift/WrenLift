@@ -30,7 +30,7 @@ pub fn spill_callee_saved(buf: &mut [usize; SPILL_WORDS]) {
             options(nostack)
         );
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(windows)))]
     unsafe {
         std::arch::asm!(
             "mov [{b}], rbx",
@@ -39,6 +39,22 @@ pub fn spill_callee_saved(buf: &mut [usize; SPILL_WORDS]) {
             "mov [{b} + 24], r13",
             "mov [{b} + 32], r14",
             "mov [{b} + 40], r15",
+            b = in(reg) buf.as_mut_ptr(),
+            options(nostack)
+        );
+    }
+    // The Windows x64 ABI also keeps rsi and rdi across a call.
+    #[cfg(all(target_arch = "x86_64", windows))]
+    unsafe {
+        std::arch::asm!(
+            "mov [{b}], rbx",
+            "mov [{b} + 8], rbp",
+            "mov [{b} + 16], r12",
+            "mov [{b} + 24], r13",
+            "mov [{b} + 32], r14",
+            "mov [{b} + 40], r15",
+            "mov [{b} + 48], rsi",
+            "mov [{b} + 56], rdi",
             b = in(reg) buf.as_mut_ptr(),
             options(nostack)
         );
@@ -112,9 +128,19 @@ fn query_stack_bounds() -> (usize, usize) {
     }
 }
 
+#[cfg(all(windows, feature = "host"))]
+fn query_stack_bounds() -> (usize, usize) {
+    let (mut lo, mut hi) = (0usize, 0usize);
+    unsafe {
+        windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);
+    }
+    (lo, hi)
+}
+
 #[cfg(not(any(
     all(target_os = "macos", feature = "host"),
-    all(target_os = "linux", feature = "host")
+    all(target_os = "linux", feature = "host"),
+    all(windows, feature = "host")
 )))]
 fn query_stack_bounds() -> (usize, usize) {
     (0, 0)

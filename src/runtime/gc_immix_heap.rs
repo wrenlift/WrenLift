@@ -132,7 +132,7 @@ struct Reservation {
     ptr: *mut u8,
     #[cfg(all(unix, feature = "host"))]
     len: usize,
-    #[cfg(not(all(unix, feature = "host")))]
+    #[cfg(not(any(all(unix, feature = "host"), all(windows, feature = "host"))))]
     layout: std::alloc::Layout,
 }
 
@@ -165,7 +165,26 @@ impl Reservation {
                 len,
             })
         }
-        #[cfg(not(all(unix, feature = "host")))]
+        #[cfg(all(windows, feature = "host"))]
+        {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            // Committed pages are zero and cost nothing until touched.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    bytes + align,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            if p.is_null() {
+                return None;
+            }
+            Some(Reservation { ptr: p as *mut u8 })
+        }
+        #[cfg(not(any(all(unix, feature = "host"), all(windows, feature = "host"))))]
         {
             let layout = std::alloc::Layout::from_size_align(bytes, align).ok()?;
             let p = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -188,7 +207,12 @@ impl Drop for Reservation {
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
-        #[cfg(not(all(unix, feature = "host")))]
+        #[cfg(all(windows, feature = "host"))]
+        unsafe {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            VirtualFree(self.ptr as *mut _, 0, MEM_RELEASE);
+        }
+        #[cfg(not(any(all(unix, feature = "host"), all(windows, feature = "host"))))]
         unsafe {
             std::alloc::dealloc(self.ptr, self.layout);
         }

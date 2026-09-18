@@ -205,7 +205,7 @@ pub fn load_library(
         }
         #[cfg(windows)]
         {
-            return unsafe { libloading::os::windows::Library::this() }
+            return libloading::os::windows::Library::this()
                 .map(Library::from)
                 .map_err(|_| ForeignLoadError::LibraryNotFound {
                     name: name.to_string(),
@@ -465,6 +465,8 @@ mod tests {
         assert_eq!(libbed, "libcrypto.dylib");
         #[cfg(all(unix, not(target_os = "macos")))]
         assert_eq!(libbed, "libcrypto.so");
+        #[cfg(windows)]
+        assert_eq!(libbed, "libcrypto.dll");
     }
 
     #[test]

@@ -1,0 +1,34 @@
+name: Bundle LLVM runtime DLLs
+description: |
+  Copy the DLLs LLVM pulls in through import libraries next to the built
+  executable. Windows searches the executable's own directory first, and
+  without them the process cannot start at all -- which surfaces as a bare
+  exit 127 with no output, not a missing-DLL message. Run after the build.
+inputs:
+  into:
+    description: Directory holding the built executable, e.g. target\debug\
+    required: true
+runs:
+  using: composite
+  steps:
+  - name: Bundle the runtime DLLs the binary links against (Windows)
+    shell: pwsh
+    run: |
+      $envBin = "$PWD\llvmenv\Library\bin"
+      $needed = @('zlib.dll', 'zstd.dll', 'libxml2.dll')
+      $missing = @()
+      foreach ($dll in $needed) {
+        $src = Join-Path $envBin $dll
+        if (Test-Path $src) {
+          Copy-Item $src ${{ inputs.into }} -Force
+          Write-Host "bundled $dll"
+        } else {
+          $missing += $dll
+        }
+      }
+      if ($missing.Count) {
+        Write-Host "--- $envBin ---"
+        Get-ChildItem $envBin -Filter *.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+        throw "the env provides no $($missing -join ', ') to sit beside the binary"
+      }
+    if: runner.os == 'Windows'

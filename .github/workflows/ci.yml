@@ -115,13 +115,17 @@ jobs:
 
   # The LLVM top tier is off the default feature set; this job builds
   # it against the same LLVM 21 the code is pinned to and runs the
-  # suites that exercise promotion.
+  # suites that exercise promotion. The toolchain comes from the
+  # llvm21 action on both runners; Windows needs the DLLs beside the
+  # binary before anything runs it.
   llvm-tier:
-    name: LLVM tier (ubuntu-latest)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      LLVM_SYS_211_PREFIX: /usr/lib/llvm-21
+    name: LLVM tier (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022]
 
     steps:
       - uses: actions/checkout@v4
@@ -131,39 +135,42 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-llvm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-llvm-
+          shared-key: llvm-${{ matrix.os }}
 
-      - name: Install LLVM 21
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gpg software-properties-common \
-            libzstd-dev zlib1g-dev libxml2-dev libtinfo-dev libedit-dev libffi-dev
-          wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21 all
-          llvm-config-21 --version
+      - uses: ./.github/actions/llvm21
+
+      # The test binaries under target/release/deps link the shared
+      # LLVM too; Windows finds it through PATH.
+      - name: LLVM DLLs on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "$PWD/llvmenv/Library/bin" >> "$GITHUB_PATH"
 
       - name: Build
+        shell: bash
         run: cargo build --release --features llvm --bin wlift
 
+      - uses: ./.github/actions/llvm21-runtime-dlls
+        if: runner.os == 'Windows'
+        with:
+          into: target\release\
+
       - name: Unit tests
+        shell: bash
         run: cargo test --release --features llvm --lib
 
       - name: E2E tests
+        shell: bash
         run: cargo test --release --features llvm --test e2e
 
       - name: Clippy
+        shell: bash
         run: cargo clippy --release --features llvm -- -D warnings
 
       - name: Benchmarks on the LLVM tier
+        shell: bash
         run: |
           for b in fib method_call nbody binary_trees delta_blue; do
             printf '%s: ' "$b"

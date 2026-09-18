@@ -438,6 +438,15 @@ pub mod poll_page {
                 };
                 libc::mprotect(self.addr as *mut libc::c_void, PAGE, prot);
             }
+            #[cfg(all(windows, feature = "host"))]
+            unsafe {
+                use windows_sys::Win32::System::Memory::{
+                    PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect,
+                };
+                let prot = if on { PAGE_NOACCESS } else { PAGE_READWRITE };
+                let mut old = 0;
+                VirtualProtect(self.addr as *const _, PAGE, prot, &mut old);
+            }
         }
     }
 
@@ -465,6 +474,11 @@ pub mod poll_page {
             if self.mapped && self.addr != 0 {
                 unsafe { libc::munmap(self.addr as *mut libc::c_void, PAGE) };
             }
+            #[cfg(all(windows, feature = "host"))]
+            if self.mapped && self.addr != 0 {
+                use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+                unsafe { VirtualFree(self.addr as *mut _, 0, MEM_RELEASE) };
+            }
         }
     }
 
@@ -483,7 +497,24 @@ pub mod poll_page {
         if p == libc::MAP_FAILED { 0 } else { p as usize }
     }
 
-    #[cfg(not(all(unix, feature = "host")))]
+    #[cfg(all(windows, feature = "host"))]
+    fn map() -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // Page-granular reservations are 64 KiB aligned, so the
+        // 16 KiB page is whole.
+        unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as usize
+        }
+    }
+
+    #[cfg(not(any(all(unix, feature = "host"), all(windows, feature = "host"))))]
     fn map() -> usize {
         0
     }
@@ -512,8 +543,42 @@ pub mod poll_page {
         }
     }
 
-    #[cfg(not(all(unix, feature = "host")))]
+    /// A vectored handler sees the fault before structured exception
+    /// handling does, on every thread.
+    #[cfg(all(windows, feature = "host"))]
+    fn install() {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(on_exception));
+        }
+    }
+
+    #[cfg(not(any(all(unix, feature = "host"), all(windows, feature = "host"))))]
     fn install() {}
+
+    /// The exception handler: an access violation on a safepoint page
+    /// parks the thread and resumes the load; anything else goes on
+    /// to the next handler.
+    #[cfg(all(windows, feature = "host"))]
+    unsafe extern "system" fn on_exception(
+        info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+    ) -> i32 {
+        use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        };
+        let record = unsafe { &*(*info).ExceptionRecord };
+        if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let addr = record.ExceptionInformation[1];
+        if !crate::runtime::vm::fault_is_a_safepoint(addr) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let (sp, regs) = interrupted_state(unsafe { (*info).ContextRecord });
+        crate::runtime::vm::park_interrupted(addr, sp, &regs);
+        EXCEPTION_CONTINUE_EXECUTION
+    }
 
     /// The fault handler: a load from a safepoint page parks the
     /// thread; any other fault goes to whoever handled it before.
@@ -624,5 +689,20 @@ pub mod poll_page {
             0,
         ];
         (ss.__rsp as usize, regs)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64", feature = "host"))]
+    fn interrupted_state(
+        ctx: *mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    ) -> (usize, [usize; 32]) {
+        let c = unsafe { &*ctx };
+        let mut regs = [0usize; 32];
+        for (slot, r) in regs.iter_mut().zip([
+            c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rdi, c.Rsi, c.Rbp, c.Rsp, c.R8, c.R9, c.R10, c.R11,
+            c.R12, c.R13, c.R14, c.R15,
+        ]) {
+            *slot = r as usize;
+        }
+        (c.Rsp as usize, regs)
     }
 }
