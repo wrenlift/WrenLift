@@ -577,11 +577,22 @@ pub mod poll_page {
         let addr = record.ExceptionInformation[1];
         if !crate::runtime::vm::fault_is_a_safepoint(addr) {
             // Not ours: say where it happened before the process
-            // goes, since a Windows fault leaves no other trace.
-            let rip = unsafe { (*(*info).ContextRecord).Rip };
-            eprintln!(
-                "wlift: access violation at {addr:#x} (rip {rip:#x})\n{}",
-                std::backtrace::Backtrace::force_capture()
+            // goes, since a Windows fault leaves no other trace. On
+            // the process's own stderr: a test harness captures the
+            // macros' output and loses it with the process.
+            use std::io::Write;
+            let ctx = unsafe { &*(*info).ContextRecord };
+            let kind = match record.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                _ => "execute",
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "wlift: access violation ({kind}) at {addr:#x}, rip {rip:#x}, rsp {rsp:#x}\n{bt}",
+                rip = ctx.Rip,
+                rsp = ctx.Rsp,
+                bt = std::backtrace::Backtrace::force_capture()
             );
             return EXCEPTION_CONTINUE_SEARCH;
         }

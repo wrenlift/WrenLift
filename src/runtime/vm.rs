@@ -1645,6 +1645,14 @@ impl VM {
         {
             self.interpret_depth -= 1;
             if self.interpret_depth == 0 {
+                // The run's frames are gone, and the JIT context's
+                // module pointers with them; the next entry sets its own.
+                crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                    ctx.module_name = std::ptr::null();
+                    ctx.module_name_len = 0;
+                    ctx.module_vars = std::ptr::null_mut();
+                    ctx.module_var_count = 0;
+                });
                 // Back in the embedder: safe where the stack stands.
                 let mut spill = Spill::new();
                 self.enter_safe(&mut spill);
@@ -2655,7 +2663,13 @@ impl VM {
                 ip: 0,
                 pc: 0,
                 values: vec![Value::UNDEFINED; reg_size],
-                module_name: std::sync::Arc::new(module_key.clone()),
+                // The engine's own name for the module: the JIT context
+                // points at its bytes past this frame's life.
+                module_name: self
+                    .engine
+                    .func_module(func_id)
+                    .cloned()
+                    .unwrap_or_else(|| std::sync::Arc::new(module_key.clone())),
                 return_dst: None,
                 closure: None,
                 defining_class: None,

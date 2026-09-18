@@ -67,6 +67,15 @@ jobs:
       - name: E2E tests
         run: cargo test --release --test e2e
 
+      # Guard Malloc puts every allocation at the end of a page with a
+      # guard page after it, so a read past a Rust allocation faults
+      # where it happens; the same net page heap casts on Windows.
+      - name: Unit tests under Guard Malloc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          bin=$(cargo test --release --lib --no-run 2>&1 | sed -n 's/.*(\(.*\))$/\1/p' | tail -1)
+          DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib "$bin" --test-threads=1
+
       - name: Clippy (host)
         run: cargo clippy --all-targets -- -D warnings
 
