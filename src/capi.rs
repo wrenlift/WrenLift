@@ -346,63 +346,63 @@ pub unsafe extern "C" fn wlift_run_aot_program(
     extras_names: *const *const c_char,
     extras_sources: *const *const c_char,
 ) -> c_int {
-    if entry_source.is_null() {
-        return 70;
-    }
-    let entry_n = if entry_name.is_null() {
-        "main"
-    } else {
-        unsafe { CStr::from_ptr(entry_name) }
-            .to_str()
-            .unwrap_or("main")
-    };
-    let entry_s = match unsafe { CStr::from_ptr(entry_source) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return 65,
-    };
+    unsafe {
+        if entry_source.is_null() {
+            return 70;
+        }
+        let entry_n = if entry_name.is_null() {
+            "main"
+        } else {
+            CStr::from_ptr(entry_name).to_str().unwrap_or("main")
+        };
+        let entry_s = match CStr::from_ptr(entry_source).to_str() {
+            Ok(s) => s,
+            Err(_) => return 65,
+        };
 
-    use crate::runtime::engine::InterpretResult;
-    // Match `hatch run`'s long-running-server config: unlimited
-    // step budget (default 1B fails-closed on legitimate server
-    // loops) and real fiber stack traces (default "<not enabled>"
-    // hides caller context in production error logs).
-    let config = VMConfig {
-        step_limit: 0,
-        fiber_stack_traces: true,
-        ..VMConfig::default()
-    };
-    let mut vm = VM::new(config);
+        use crate::runtime::engine::InterpretResult;
+        // Match `hatch run`'s long-running-server config: unlimited
+        // step budget (default 1B fails-closed on legitimate server
+        // loops) and real fiber stack traces (default "<not enabled>"
+        // hides caller context in production error logs).
+        let config = VMConfig {
+            step_limit: 0,
+            fiber_stack_traces: true,
+            ..VMConfig::default()
+        };
+        let mut vm = VM::new(config);
 
-    // Install every bundled dependency before running the entry.
-    // Dependency-first walker order keeps each module's own
-    // imports satisfied by the time it gets installed.
-    if extras_count > 0 && !extras_names.is_null() && !extras_sources.is_null() {
-        for i in 0..extras_count {
-            let name_ptr = *extras_names.add(i);
-            let src_ptr = *extras_sources.add(i);
-            if name_ptr.is_null() || src_ptr.is_null() {
-                return 65;
-            }
-            let name = match CStr::from_ptr(name_ptr).to_str() {
-                Ok(s) => s,
-                Err(_) => return 65,
-            };
-            let src = match CStr::from_ptr(src_ptr).to_str() {
-                Ok(s) => s,
-                Err(_) => return 65,
-            };
-            match vm.interpret(name, src) {
-                InterpretResult::Success => {}
-                InterpretResult::CompileError => return 65,
-                InterpretResult::RuntimeError => return 70,
+        // Install every bundled dependency before running the entry.
+        // Dependency-first walker order keeps each module's own
+        // imports satisfied by the time it gets installed.
+        if extras_count > 0 && !extras_names.is_null() && !extras_sources.is_null() {
+            for i in 0..extras_count {
+                let name_ptr = *extras_names.add(i);
+                let src_ptr = *extras_sources.add(i);
+                if name_ptr.is_null() || src_ptr.is_null() {
+                    return 65;
+                }
+                let name = match CStr::from_ptr(name_ptr).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return 65,
+                };
+                let src = match CStr::from_ptr(src_ptr).to_str() {
+                    Ok(s) => s,
+                    Err(_) => return 65,
+                };
+                match vm.interpret(name, src) {
+                    InterpretResult::Success => {}
+                    InterpretResult::CompileError => return 65,
+                    InterpretResult::RuntimeError => return 70,
+                }
             }
         }
-    }
 
-    match vm.interpret(entry_n, entry_s) {
-        InterpretResult::Success => 0,
-        InterpretResult::CompileError => 65,
-        InterpretResult::RuntimeError => 70,
+        match vm.interpret(entry_n, entry_s) {
+            InterpretResult::Success => 0,
+            InterpretResult::CompileError => 65,
+            InterpretResult::RuntimeError => 70,
+        }
     }
 }
 
@@ -773,15 +773,17 @@ pub unsafe extern "C" fn wlift_aot_register_closure(
     name_ptr: *const c_char,
     name_len: usize,
 ) -> u64 {
-    if vm.is_null() || fn_ptr.is_null() {
-        return u64::MAX;
+    unsafe {
+        if vm.is_null() || fn_ptr.is_null() {
+            return u64::MAX;
+        }
+        let vm_ref = &mut *vm;
+        let name_sym = aot_intern_name(vm_ref, name_ptr, name_len, "<aot-closure>");
+        let func_id = vm_ref
+            .engine
+            .register_aot_function(name_sym, arity, fn_ptr, None);
+        func_id.0 as u64
     }
-    let vm_ref = unsafe { &mut *vm };
-    let name_sym = aot_intern_name(vm_ref, name_ptr, name_len, "<aot-closure>");
-    let func_id = vm_ref
-        .engine
-        .register_aot_function(name_sym, arity, fn_ptr, None);
-    func_id.0 as u64
 }
 
 /// Resolve a (name_ptr, name_len) pair into an interned symbol,

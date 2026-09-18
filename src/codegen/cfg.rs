@@ -125,10 +125,10 @@ impl Cfg {
             for inst in &insts[start..end] {
                 match inst {
                     MachInst::Jmp { target } => {
-                        if let Some(&b) = label_to_block.get(target) {
-                            if !block.succs.contains(&b) {
-                                block.succs.push(b);
-                            }
+                        if let Some(&b) = label_to_block.get(target)
+                            && !block.succs.contains(&b)
+                        {
+                            block.succs.push(b);
                         }
                         ends_with_unconditional = true;
                     }
@@ -137,10 +137,10 @@ impl Cfg {
                     | MachInst::JmpNonZero { target, .. }
                     | MachInst::TestBitJmpZero { target, .. }
                     | MachInst::TestBitJmpNonZero { target, .. } => {
-                        if let Some(&b) = label_to_block.get(target) {
-                            if !block.succs.contains(&b) {
-                                block.succs.push(b);
-                            }
+                        if let Some(&b) = label_to_block.get(target)
+                            && !block.succs.contains(&b)
+                        {
+                            block.succs.push(b);
                         }
                         // Conditional branches also fall through.
                     }

@@ -262,10 +262,10 @@ fn collect_native_search_paths(entry_path: &Path) -> Vec<String> {
         } else {
             root.join(rel)
         };
-        if let Some(s) = p.to_str() {
-            if !out.iter().any(|existing| existing == s) {
-                out.push(s.to_string());
-            }
+        if let Some(s) = p.to_str()
+            && !out.iter().any(|existing| existing == s)
+        {
+            out.push(s.to_string());
         }
     };
 
@@ -274,33 +274,33 @@ fn collect_native_search_paths(entry_path: &Path) -> Vec<String> {
     };
     let workspace_root = hatchfile.parent().unwrap_or(Path::new("."));
 
-    if let Ok(text) = std::fs::read_to_string(&hatchfile) {
-        if let Ok(manifest) = toml::from_str::<crate::hatch::Manifest>(&text) {
-            for path in &manifest.native_search_paths {
-                push_resolved(&mut out, workspace_root, path);
-            }
-            // Recurse into path-link deps' hatchfiles to pull
-            // their `native_search_paths` too — mirrors the
-            // runtime's `apply_hatch_native_manifest_rooted` walk.
-            for dep in manifest
-                .dependencies
-                .values()
-                .chain(manifest.spec_dependencies.values())
-            {
-                let crate::hatch::Dependency::Path { path, .. } = dep else {
-                    continue;
-                };
-                let dep_dir = workspace_root.join(path);
-                let dep_hatchfile = dep_dir.join("hatchfile");
-                let Ok(dep_text) = std::fs::read_to_string(&dep_hatchfile) else {
-                    continue;
-                };
-                let Ok(dep_manifest) = toml::from_str::<crate::hatch::Manifest>(&dep_text) else {
-                    continue;
-                };
-                for sp in &dep_manifest.native_search_paths {
-                    push_resolved(&mut out, &dep_dir, sp);
-                }
+    if let Ok(text) = std::fs::read_to_string(&hatchfile)
+        && let Ok(manifest) = toml::from_str::<crate::hatch::Manifest>(&text)
+    {
+        for path in &manifest.native_search_paths {
+            push_resolved(&mut out, workspace_root, path);
+        }
+        // Recurse into path-link deps' hatchfiles to pull
+        // their `native_search_paths` too — mirrors the
+        // runtime's `apply_hatch_native_manifest_rooted` walk.
+        for dep in manifest
+            .dependencies
+            .values()
+            .chain(manifest.spec_dependencies.values())
+        {
+            let crate::hatch::Dependency::Path { path, .. } = dep else {
+                continue;
+            };
+            let dep_dir = workspace_root.join(path);
+            let dep_hatchfile = dep_dir.join("hatchfile");
+            let Ok(dep_text) = std::fs::read_to_string(&dep_hatchfile) else {
+                continue;
+            };
+            let Ok(dep_manifest) = toml::from_str::<crate::hatch::Manifest>(&dep_text) else {
+                continue;
+            };
+            for sp in &dep_manifest.native_search_paths {
+                push_resolved(&mut out, &dep_dir, sp);
             }
         }
     }
@@ -1114,13 +1114,13 @@ fn emit_aot_function(
     // on successful compile — helpful for understanding runtime hangs
     // where MIR alone isn't enough. Gated on WLIFT_AOT_DUMP_FN matching
     // and WLIFT_AOT_DUMP_IR=1 (separate from the on-error WLIFT_AOT_DUMP).
-    if std::env::var_os("WLIFT_AOT_DUMP_IR").is_some() {
-        if let Ok(want) = std::env::var("WLIFT_AOT_DUMP_FN") {
-            let mir_name = interner.resolve(mir.name).to_string();
-            if symbol.contains(&want) || mir_name.contains(&want) {
-                eprintln!("=== AOT IR for {symbol} (mir.name={mir_name}) ===");
-                eprintln!("{}", ctx.func.display());
-            }
+    if std::env::var_os("WLIFT_AOT_DUMP_IR").is_some()
+        && let Ok(want) = std::env::var("WLIFT_AOT_DUMP_FN")
+    {
+        let mir_name = interner.resolve(mir.name).to_string();
+        if symbol.contains(&want) || mir_name.contains(&want) {
+            eprintln!("=== AOT IR for {symbol} (mir.name={mir_name}) ===");
+            eprintln!("{}", ctx.func.display());
         }
     }
     module.define_function(func_id, &mut ctx).map_err(|e| {
@@ -2099,12 +2099,12 @@ pub fn locate_runtime_staticlib() -> Option<PathBuf> {
         "libwren_lift.a"
     };
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(staticlib_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(staticlib_name);
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
 

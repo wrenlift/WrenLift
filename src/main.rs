@@ -894,14 +894,15 @@ fn aot_build_executable(input: &str, out_path: &str) {
     // linker error from clang. Read-only filesystems and
     // missing parent directories both produce vague `ld`
     // errors that don't point at the wlift invocation.
-    if let Some(parent) = resolved_out.parent() {
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
-            eprintln!(
-                "error: --aot output path's parent directory '{}' doesn't exist",
-                parent.display()
-            );
-            process::exit(1);
-        }
+    if let Some(parent) = resolved_out.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        eprintln!(
+            "error: --aot output path's parent directory '{}' doesn't exist",
+            parent.display()
+        );
+        process::exit(1);
     }
     match std::fs::OpenOptions::new()
         .write(true)

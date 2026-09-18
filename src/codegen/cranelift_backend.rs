@@ -3467,14 +3467,13 @@ pub mod cl {
                 emit_safepoint_poll(builder, module, aot_config);
             }
             #[cfg(feature = "aot")]
-            if loop_headers.contains(&bid) {
-                if let Some(cfg) = aot_config {
-                    if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
-                        let snap = builder.use_var(snap_var);
-                        let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
-                        let _ = builder.ins().call(f, &[snap]);
-                    }
-                }
+            if loop_headers.contains(&bid)
+                && let Some(cfg) = aot_config
+                && let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow()
+            {
+                let snap = builder.use_var(snap_var);
+                let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
+                let _ = builder.ins().call(f, &[snap]);
             }
 
             // Lower each instruction
