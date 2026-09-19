@@ -345,7 +345,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "beadie"
 version = "0.3.0"
-source = "git+https://github.com/darmie/beadie.git?rev=868d1069eeda1ea162460273869597a9b0866ebf#868d1069eeda1ea162460273869597a9b0866ebf"
+source = "git+https://github.com/darmie/beadie.git?rev=c403f29c8dd66635b545debcd2406847f613470e#c403f29c8dd66635b545debcd2406847f613470e"
 dependencies = [
  "beadie-backend",
  "beadie-core",
@@ -354,7 +354,7 @@ dependencies = [
 [[package]]
 name = "beadie-backend"
 version = "0.3.0"
-source = "git+https://github.com/darmie/beadie.git?rev=868d1069eeda1ea162460273869597a9b0866ebf#868d1069eeda1ea162460273869597a9b0866ebf"
+source = "git+https://github.com/darmie/beadie.git?rev=c403f29c8dd66635b545debcd2406847f613470e#c403f29c8dd66635b545debcd2406847f613470e"
 dependencies = [
  "beadie-core",
  "crossbeam-channel",
@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "beadie-core"
 version = "0.3.0"
-source = "git+https://github.com/darmie/beadie.git?rev=868d1069eeda1ea162460273869597a9b0866ebf#868d1069eeda1ea162460273869597a9b0866ebf"
+source = "git+https://github.com/darmie/beadie.git?rev=c403f29c8dd66635b545debcd2406847f613470e#c403f29c8dd66635b545debcd2406847f613470e"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
