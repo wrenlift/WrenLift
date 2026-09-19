@@ -79,8 +79,16 @@ pub mod llvm {
     }
 
     /// `WLIFT_LLVM_PASSES` overrides the middle-end pipeline; `off` skips it.
+    /// The default is O2 and one non-trivial loop unswitch after it: a
+    /// guard on a loop-invariant condition, such as a field-kind byte
+    /// or a receiver's class, then leaves the loop, which O2 does not do
+    /// and O3 does at a compile cost the rest of the pipeline is not
+    /// worth.
     fn pass_spec() -> String {
-        std::env::var("WLIFT_LLVM_PASSES").unwrap_or_else(|_| "default<O2>".to_string())
+        std::env::var("WLIFT_LLVM_PASSES").unwrap_or_else(|_| {
+            "default<O2>,function(loop-mssa(simple-loop-unswitch<nontrivial>),instcombine,simplifycfg)"
+                .to_string()
+        })
     }
 
     /// `WLIFT_LLVM_CODEGEN=0|1|2|3` sets MCJIT's code generation level.
