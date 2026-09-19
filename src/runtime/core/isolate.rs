@@ -29,7 +29,7 @@ pub(crate) fn handle_of(receiver: Value) -> u64 {
 pub(crate) fn wrap_handle(ctx: &mut dyn NativeContext, class: &str, id: u64) -> Value {
     let class = ctx.lookup_class(class).expect("isolate module loaded");
     let inst = ctx.alloc_instance(class);
-    set_instance_field(ctx, inst, 0, Value::num(id as f64));
+    set_instance_field(inst, 0, Value::num(id as f64));
     inst
 }
 

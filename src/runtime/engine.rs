@@ -2995,9 +2995,6 @@ impl ExecutionEngine {
     }
 
     fn bump_region_for_compile() -> usize {
-        if crate::runtime::gc_trait::jit_needs_write_barriers() {
-            return 0;
-        }
         let vm = crate::codegen::runtime_fns::read_jit_ctx().vm as *const crate::runtime::vm::VM;
         if vm.is_null() {
             return 0;

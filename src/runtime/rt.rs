@@ -703,15 +703,11 @@ mod wren {
 mod tests {
     use super::*;
     use crate::runtime::engine::InterpretResult;
-    use crate::runtime::gc_trait::GcStrategy;
     use crate::runtime::vm::{VM, VMConfig};
     use std::sync::atomic::AtomicUsize;
 
     fn immix_vm() -> VM {
-        VM::new(VMConfig {
-            gc_strategy: GcStrategy::Immix,
-            ..VMConfig::default()
-        })
+        VM::new(VMConfig::default())
     }
 
     static ALLOCS: AtomicUsize = AtomicUsize::new(0);

@@ -2,10 +2,8 @@ pub mod core;
 pub mod engine;
 pub mod fiber;
 pub mod gc;
-pub mod gc_arena;
 pub mod gc_immix;
 pub mod gc_immix_heap;
-pub mod gc_marksweep;
 pub mod gc_ringbuf;
 pub mod gc_trait;
 #[cfg(feature = "host")]

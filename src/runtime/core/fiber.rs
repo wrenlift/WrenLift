@@ -156,10 +156,6 @@ pub(crate) fn fiber_new_inner(
             // frame's `closure` field will dangle. The validator
             // direction-1 check catches this; the barrier closes
             // it.
-            ctx.write_barrier(
-                Value::object(fiber as *mut u8),
-                Value::object(closure as *mut u8),
-            );
 
             // krio-fiber backing: when the VM gives fibers stacks, attach
             // a per-fiber mmap stack and a body closure that runs the
@@ -247,21 +243,7 @@ pub(crate) fn fiber_new_inner(
                 }
             }
 
-            // Root the fresh fiber in JIT_ROOTS_STORE so a GC fired
-            // before the AOT caller's stack-map safepoint reads it
-            // back doesn't reap the fresh allocation. Without this,
-            // sustained load on AOT-compiled servers (the hatch site
-            // accept loop spawns a new ObjFiber per request) crashes
-            // within a few requests as "Fiber has already been
-            // called." — the slab was freed + reused. No-op in JIT
-            // / interpreter mode (push gates on `aot_gc_enabled()`
-            // via `finish_alloc`).
-            let fiber_val = Value::object(fiber as *mut u8);
-            #[cfg(feature = "host")]
-            if crate::codegen::runtime_fns::aot_gc_enabled() {
-                crate::codegen::runtime_fns::push_jit_root(fiber_val);
-            }
-            fiber_val
+            Value::object(fiber as *mut u8)
         }
         None => {
             ctx.runtime_error("Fiber.new expects a function.".to_string());
@@ -303,12 +285,6 @@ unsafe fn get_or_init_context_map(ctx: &mut dyn NativeContext, fiber: *mut ObjFi
         }
         let map = ctx.alloc_map();
         (*fiber).context_map = map;
-        // Old(fiber)->young(map) edge if the fiber has already been
-        // promoted. Without a barrier, the next minor GC misses the
-        // map and a subsequent access faults at 0x4 (same channel as
-        // the prior fiber set_reg / list subscript-set barrier fixes).
-        let fiber_val = Value::object(fiber as *mut u8);
-        ctx.write_barrier(fiber_val, map);
         map
     }
 }
@@ -899,13 +875,6 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
                 let err = unsafe { (*vm_ptr).escape_to_gc_if_arena(err) };
                 unsafe {
                     (*target).error = err;
-                    // target fiber is old-gen pinned; err may be a
-                    // young object. Without the barrier the next
-                    // minor GC won't trace err through fiber.error
-                    // and the slot dangles.
-                    (&mut *vm_ptr)
-                        .gc
-                        .write_barrier(target as *mut ObjHeader, err);
                 }
             }
             unsafe {
@@ -1000,9 +969,6 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
                 };
                 let err_val = (*vm_ptr).new_string(message);
                 (*target_ptr).error = err_val;
-                (&mut *vm_ptr)
-                    .gc
-                    .write_barrier(target_ptr as *mut ObjHeader, err_val);
                 (*target_ptr).krio_return_value = Value::null();
                 (*target_ptr).state = FiberState::Error;
             }
@@ -1343,7 +1309,6 @@ fn fiber_transfer_error(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                         (*f).error = args[1];
                     }
                     // Fiber is old-gen pinned; args[1] may be young.
-                    ctx.write_barrier(Value::object(f as *mut u8), args[1]);
                     ctx.set_fiber_action_transfer(f, args[1]);
                 }
                 _ => {

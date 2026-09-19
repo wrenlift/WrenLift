@@ -532,24 +532,15 @@ impl<'a> MirWasmEmitter<'a> {
         // shared i32 scratch local for the call_indirect slot. Each
         // Call site overwrites it ephemerally so one local is
         // enough — keeping `emit_instruction` `&self`. The inline
-        // `GetUpvalue` / `SetUpvalue` lowerings reuse the same
-        // scratch (Get caches the closure ptr across its null-
-        // guard; Set caches the upvalue ptr between the location
-        // store and the GC write-barrier call), so they also
-        // force the slot to be reserved.
+        // `GetUpvalue` lowering reuses the same scratch (it caches
+        // the closure ptr across its null guard), so it also forces
+        // the slot to be reserved.
         let has_call_or_inline_upvalue = self
             .mir
             .blocks
             .iter()
             .flat_map(|b| b.instructions.iter())
-            .any(|(_, inst)| {
-                matches!(
-                    inst,
-                    Instruction::Call { .. }
-                        | Instruction::GetUpvalue(_)
-                        | Instruction::SetUpvalue(..)
-                )
-            });
+            .any(|(_, inst)| matches!(inst, Instruction::Call { .. } | Instruction::GetUpvalue(_)));
         if has_call_or_inline_upvalue {
             let idx = self.num_locals;
             self.num_locals += 1;
@@ -811,27 +802,16 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     Instruction::SetField(..) => {
-                        // Inline path emits the i64.store inline +
-                        // a `wren_write_barrier` call for the GC
-                        // hand-off; falls back to `wren_set_field`
-                        // on the slow path for non-Instance
-                        // receivers (and on the no-runtime-addrs
-                        // codegen-test path). Always register the
-                        // slow-path import; register the barrier
-                        // import only when the inline path is
-                        // active.
+                        // The inline path stores the field itself
+                        // and falls back to `wren_set_field` for
+                        // non-Instance receivers (and on the
+                        // no-runtime-addrs codegen-test path), so
+                        // the helper is always registered.
                         self.register_import(
                             "wren_set_field",
                             &[ValType::I64, ValType::I64, ValType::I64],
                             &[ValType::I64],
                         );
-                        if self.runtime_addrs.module_vars_ptr_addr.is_some() {
-                            self.register_import(
-                                "wren_write_barrier",
-                                &[ValType::I64, ValType::I64],
-                                &[ValType::I64],
-                            );
-                        }
                     }
                     Instruction::GetStaticField(..) => {
                         self.register_import(
@@ -886,23 +866,13 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_get_upvalue", &[ValType::I64], &[ValType::I64]);
                     }
                     Instruction::SetUpvalue(..) => {
-                        // Inline path emits the chase + i64.store
-                        // inline and calls `wren_write_barrier`
-                        // (NOT `wren_set_upvalue`) for the GC inter-
-                        // generational hand-off. Register
-                        // `wren_set_upvalue` only when the inline
-                        // path is disabled (codegen tests under
-                        // wasmtime); register `wren_write_barrier`
-                        // for the inline path's barrier call.
-                        if self.runtime_addrs.current_closure_addr.is_some()
-                            && self.runtime_addrs.upvalues_data_offset != 0
+                        // The inline path chases the upvalue and
+                        // stores itself; the helper is only for the
+                        // codegen tests under wasmtime, where the
+                        // inline path is off.
+                        if self.runtime_addrs.current_closure_addr.is_none()
+                            || self.runtime_addrs.upvalues_data_offset == 0
                         {
-                            self.register_import(
-                                "wren_write_barrier",
-                                &[ValType::I64, ValType::I64],
-                                &[ValType::I64],
-                            );
-                        } else {
                             self.register_import(
                                 "wren_set_upvalue",
                                 &[ValType::I64, ValType::I64],
@@ -1646,15 +1616,6 @@ impl<'a> MirWasmEmitter<'a> {
                     //     i32.load offset=$fields_offset    ;; data ptr
                     //     local.get $val
                     //     i64.store offset=idx*8            ;; fields[idx] = val
-                    //     ;; GC inter-generational write barrier
-                    //     local.get $recv                   ;; recv is already a
-                    //                                       ;; NaN-boxed object
-                    //                                       ;; Value, no extend/or
-                    //                                       ;; needed (cf. SetUpvalue
-                    //                                       ;; which had a raw ptr).
-                    //     local.get $val
-                    //     call $wren_write_barrier
-                    //     drop
                     //     local.get $val                    ;; expression result
                     //   else
                     //     ;; slow path: full helper for non-Instance
@@ -1698,13 +1659,6 @@ impl<'a> MirWasmEmitter<'a> {
                             align: 3,
                             memory_index: 0,
                         }));
-                        // Barrier.
-                        func.instruction(&WasmInst::LocalGet(self.local(*recv)));
-                        func.instruction(&WasmInst::LocalGet(self.local(*val)));
-                        func.instruction(&WasmInst::Call(
-                            self.runtime_imports["wren_write_barrier"],
-                        ));
-                        func.instruction(&WasmInst::Drop);
                         func.instruction(&WasmInst::LocalGet(self.local(*val)));
                     }
                     func.instruction(&WasmInst::Else);
@@ -2055,22 +2009,9 @@ impl<'a> MirWasmEmitter<'a> {
                     //     i32.load
                     //     i32.load offset=$upv_data_off   ;; data ptr
                     //     i32.load offset=idx*4           ;; *mut ObjUpvalue
-                    //     local.tee $upv_scratch          ;; cache for barrier
                     //     i32.load offset=$location_off   ;; *mut Value
                     //     local.get $val                  ;; new Value bits
                     //     i64.store offset=0              ;; *location = val
-                    //
-                    //     ;; GC inter-generational write barrier — passes
-                    //     ;; uv ptr NaN-boxed as an object Value (TAG_OBJ
-                    //     ;; | (ptr & PTR_MASK)) so wren_write_barrier
-                    //     ;; can extract via `Value::as_object`.
-                    //     local.get $upv_scratch
-                    //     i64.extend_i32_u
-                    //     i64.const TAG_OBJ
-                    //     i64.or                          ;; src bits
-                    //     local.get $val                  ;; val bits
-                    //     call $wren_write_barrier
-                    //     drop                            ;; barrier returns u64
                     //
                     //     ;; SetUpvalue's expression result is the written
                     //     ;; Value — feed it into local.set $dst.
@@ -2080,15 +2021,7 @@ impl<'a> MirWasmEmitter<'a> {
                     let location_offset =
                         std::mem::offset_of!(crate::runtime::object::ObjUpvalue, location) as u64;
                     let upv_array_offset = (*idx as u64) * 4;
-                    // TAG_OBJ = SIGN_BIT | QNAN = 0xFFFC_0000_0000_0000.
-                    // wasm32 ptrs are <= 32 bits so the low 32 bits hold
-                    // the address with no PTR_MASK truncation needed.
-                    const TAG_OBJ: i64 = 0xFFFC_0000_0000_0000u64 as i64;
                     let null_bits = crate::runtime::value::Value::null().to_bits() as i64;
-
-                    let scratch = self
-                        .call_slot_local
-                        .expect("scan_locals should have reserved a call_slot_local");
 
                     // Closure-cell null guard.
                     func.instruction(&WasmInst::I32Const(closure_addr as i32));
@@ -2121,7 +2054,6 @@ impl<'a> MirWasmEmitter<'a> {
                             align: 2,
                             memory_index: 0,
                         }));
-                        func.instruction(&WasmInst::LocalTee(scratch));
                         func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
                             offset: location_offset,
                             align: 2,
@@ -2133,18 +2065,6 @@ impl<'a> MirWasmEmitter<'a> {
                             align: 3,
                             memory_index: 0,
                         }));
-                        // GC write barrier: NaN-box the upvalue ptr
-                        // and pass it as the source Value to
-                        // wren_write_barrier.
-                        func.instruction(&WasmInst::LocalGet(scratch));
-                        func.instruction(&WasmInst::I64ExtendI32U);
-                        func.instruction(&WasmInst::I64Const(TAG_OBJ));
-                        func.instruction(&WasmInst::I64Or);
-                        func.instruction(&WasmInst::LocalGet(self.local(*val)));
-                        func.instruction(&WasmInst::Call(
-                            self.runtime_imports["wren_write_barrier"],
-                        ));
-                        func.instruction(&WasmInst::Drop);
                         // Return the written value.
                         func.instruction(&WasmInst::LocalGet(self.local(*val)));
                     }

@@ -370,7 +370,7 @@ pub unsafe fn task_step(ctx: *mut TaskCtx) -> bool {
                 .as_object()
                 .map_or(std::ptr::null_mut(), |p| p as *mut ObjFiber);
             if !fiber.is_null() {
-                crate::runtime::core::thread::attach(vm_ctx, handle, fiber);
+                crate::runtime::core::thread::attach(handle, fiber);
             }
             fiber
         } else {

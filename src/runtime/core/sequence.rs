@@ -340,25 +340,19 @@ pub(crate) fn instance_field(receiver: Value, index: usize) -> Value {
 }
 
 /// Helper to write an ObjInstance field.
-pub(crate) fn set_instance_field(
-    ctx: &mut dyn NativeContext,
-    receiver: Value,
-    index: usize,
-    value: Value,
-) {
+pub(crate) fn set_instance_field(receiver: Value, index: usize, value: Value) {
     unsafe {
         let ptr = receiver.as_object().unwrap();
         let inst = &mut *(ptr as *mut ObjInstance);
         inst.set_field(index, value);
     }
-    ctx.write_barrier(receiver, value);
 }
 
 fn seq_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let class = ctx.lookup_class("MapSequence").unwrap();
     let inst = ctx.alloc_instance(class);
-    set_instance_field(ctx, inst, 0, args[0]); // _sequence
-    set_instance_field(ctx, inst, 1, args[1]); // _fn
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _fn
     inst
 }
 
@@ -374,8 +368,8 @@ fn seq_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
     let class = ctx.lookup_class("SkipSequence").unwrap();
     let inst = ctx.alloc_instance(class);
-    set_instance_field(ctx, inst, 0, args[0]); // _sequence
-    set_instance_field(ctx, inst, 1, args[1]); // _count
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _count
     inst
 }
 
@@ -391,16 +385,16 @@ fn seq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
     let class = ctx.lookup_class("TakeSequence").unwrap();
     let inst = ctx.alloc_instance(class);
-    set_instance_field(ctx, inst, 0, args[0]); // _sequence
-    set_instance_field(ctx, inst, 1, args[1]); // _count
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _count
     inst
 }
 
 fn seq_where(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let class = ctx.lookup_class("WhereSequence").unwrap();
     let inst = ctx.alloc_instance(class);
-    set_instance_field(ctx, inst, 0, args[0]); // _sequence
-    set_instance_field(ctx, inst, 1, args[1]); // _fn (predicate)
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _fn (predicate)
     inst
 }
 
@@ -478,7 +472,7 @@ fn take_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         instance_field(args[0], 2).as_num().unwrap_or(0.0) + 1.0
     };
 
-    set_instance_field(ctx, args[0], 2, Value::num(taken));
+    set_instance_field(args[0], 2, Value::num(taken));
 
     if taken > max_count {
         return Value::null();

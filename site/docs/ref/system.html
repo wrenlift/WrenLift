@@ -188,14 +188,14 @@ System.print((System.clock - t) * 1000)  // ms</code></pre>
       <table>
         <thead><tr><th>Method</th><th>What it does</th></tr></thead>
         <tbody>
-          <tr><td><code>System.gc()</code></td><td>Trigger a GC cycle. Useful between batches in long-running scripts so short-lived allocations don't get promoted to the old gen.</td></tr>
+          <tr><td><code>System.gc()</code></td><td>Trigger a GC cycle. Useful between batches in long-running scripts to free short-lived allocations at a point you choose.</td></tr>
         </tbody>
       </table>
 <pre><code>// In a game loop:
 _frame = _frame + 1
 if (_frame % 30 == 0) System.gc()</code></pre>
       <aside class="note">
-        Wrenlift's default GC is generational; you almost never
+        Wrenlift's collector runs on its own; you almost never
         need to call <code>System.gc()</code> manually. The hook
         is there for games and other steady-state loops where
         you want to enforce a known GC cadence.

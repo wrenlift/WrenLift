@@ -96,21 +96,18 @@ fn list_subscript_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let list = receiver_list_mut(args);
     list.set(index, args[2]);
-    ctx.write_barrier(args[0], args[2]);
     args[2]
 }
 
-fn list_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn list_add(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
     list.add(args[1]);
-    ctx.write_barrier(args[0], args[1]);
     args[0]
 }
 
-fn list_add_core(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn list_add_core(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
     list.add(args[1]);
-    ctx.write_barrier(args[0], args[1]);
     args[0]
 }
 
@@ -133,7 +130,6 @@ fn list_insert(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let list = receiver_list_mut(args);
     list.insert(index, args[2]);
-    ctx.write_barrier(args[0], args[2]);
     args[2]
 }
 
@@ -211,13 +207,6 @@ fn list_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let list = receiver_list_mut(args);
     list.swap(index_a, index_b);
-    // Same minor-GC-misses-edge channel as list_sort_by /
-    // random_shuffle: post-swap values are old(list)→? edges and
-    // may be young. Re-arm the barrier defensively.
-    let a = receiver_list(args).get(index_a).unwrap_or(Value::null());
-    let b = receiver_list(args).get(index_b).unwrap_or(Value::null());
-    ctx.write_barrier(args[0], a);
-    ctx.write_barrier(args[0], b);
     Value::null()
 }
 
@@ -244,12 +233,11 @@ fn list_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         }
         let list = receiver_list_mut(args);
         list.add(element);
-        ctx.write_barrier(args[0], element);
     }
     other
 }
 
-fn list_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn list_sort(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
     let len = list.len();
     if len <= 1 {
@@ -265,16 +253,9 @@ fn list_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         // If both are the same type, fall back to bit comparison for stability.
         std::cmp::Ordering::Equal
     });
-    // Write sorted elements back into the list. Each set() can
-    // create an old(list) -> young(value) edge if the list has
-    // already been promoted; without a write_barrier the next
-    // minor GC won't see those references and will free the value.
     let list = receiver_list_mut(args);
-    for (i, v) in elements.iter().copied().enumerate() {
+    for (i, v) in elements.into_iter().enumerate() {
         list.set(i, v);
-    }
-    for v in elements {
-        ctx.write_barrier(args[0], v);
     }
     args[0]
 }
@@ -310,14 +291,6 @@ fn list_sort_by(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         if min_idx != i {
             let list = receiver_list_mut(args);
             list.swap(i, min_idx);
-            // Swap moves two pre-existing slot values around; both
-            // post-swap values are old(list) -> ? edges and may be
-            // young, so re-arm the barrier defensively. (Cheap: no
-            // work happens unless the value is actually young.)
-            let a = receiver_list(args).get(i).unwrap_or(Value::null());
-            let b = receiver_list(args).get(min_idx).unwrap_or(Value::null());
-            ctx.write_barrier(args[0], a);
-            ctx.write_barrier(args[0], b);
         }
     }
     args[0]

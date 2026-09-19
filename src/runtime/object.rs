@@ -1584,7 +1584,6 @@ pub trait NativeContext {
 
     // -- Garbage collection --
     fn trigger_gc(&mut self);
-    fn write_barrier(&mut self, source: Value, value: Value);
 
     // -- Function metadata --
     /// Defining module for the function with this id, if one was

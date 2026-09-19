@@ -624,7 +624,7 @@ pub mod cl {
         let which = match interner.resolve(method) {
             "iterate(_)" => 0,
             "iteratorValue(_)" => 1,
-            "add(_)" if !crate::runtime::gc_trait::jit_needs_write_barriers() => 2,
+            "add(_)" => 2,
             _ => return Ok(None),
         };
         let arg = args[0];
@@ -2464,7 +2464,6 @@ pub mod cl {
             "wren_cmp_ne",
             "wren_not",
             "wren_is_truthy",
-            "wren_write_barrier",
             "wren_string_concat",
             "wren_to_string",
             "wren_is_type",
@@ -2774,9 +2773,7 @@ pub mod cl {
         // A collector that scans native frames conservatively reads no
         // stack map; `WLIFT_DISABLE_STACK_MAPS=1` turns them off for the
         // others too, which is unsafe to run with.
-        let mark_stack_map = f64_self_id.is_none()
-            && env_stack_maps()
-            && (aot_config.is_some() || crate::runtime::gc_trait::jit_needs_stack_maps());
+        let mark_stack_map = f64_self_id.is_none() && env_stack_maps() && aot_config.is_some();
         let value_types = if mark_stack_map {
             infer_osr_value_types(mir)
         } else {
@@ -4375,12 +4372,6 @@ pub mod cl {
                         _ => emit_note_field_kind(builder, obj_ptr, *idx, store_val),
                     }
                 }
-                // Write barrier; AOT cannot know the binary's collector,
-                // JIT code skips it when no barrier collector is live.
-                if aot_config.is_some() || crate::runtime::gc_trait::jit_needs_write_barriers() {
-                    let wb = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
-                    let _result = builder.ins().call(wb, &[recv_val, store_val]);
-                }
                 // SetField result is the stored value
                 Ok(Some(store_val))
             }
@@ -5936,12 +5927,6 @@ pub mod cl {
                     );
                     let v = get(val);
                     builder.ins().store(MemFlags::trusted(), v, location_ptr, 0);
-                    // Generational write barrier: the upvalue
-                    // header is the slot's owner; a young value
-                    // stored into an old upvalue must surface to
-                    // the major GC's remembered set.
-                    let barrier = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
-                    builder.ins().call(barrier, &[upvalue_ptr, v]);
                     return Ok(Some(v));
                 }
                 let f = get_runtime_fn(module, builder, "wren_set_upvalue", 2)?;

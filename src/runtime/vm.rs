@@ -86,39 +86,10 @@ fn file_mtime_secs(_path: &str) -> Option<f64> {
 }
 
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
-use super::gc_trait::{GcImpl, GcStrategy};
+use super::gc_trait::{GcAllocator, GcImpl};
 use super::object::*;
 use super::value::Value;
 use crate::intern::{Interner, SymbolId};
-
-/// Resolve a runtime code address to its linker symbol name via
-/// POSIX `dladdr`. Used by `validate_stackmap_coverage` so the
-/// coverage-gap panic names the actual AOT function (e.g.
-/// `wlift_aot_mod_10__method_5_15`) instead of the synthetic MIR
-/// name (`<aot-frame>`) every AOT-compiled function shares.
-///
-/// Returns `None` when `dladdr` fails or the resolved name doesn't
-/// look like an AOT-generated symbol — better to surface the raw
-/// runtime address than a misleading nearby symbol.
-///
-/// # Safety
-/// `addr` must be a valid pointer into the process address space.
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
-unsafe fn dladdr_symbol(addr: *const ()) -> Option<String> {
-    unsafe {
-        let mut info: libc::Dl_info = std::mem::zeroed();
-        if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
-            return None;
-        }
-        let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
-        cstr.to_str().ok().map(|s| s.to_string())
-    }
-}
-
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
-unsafe fn dladdr_symbol(_addr: *const ()) -> Option<String> {
-    None
-}
 
 fn core_prelude_symbols(interner: &mut Interner) -> Vec<SymbolId> {
     crate::sema::CORE_PRELUDE_NAMES
@@ -222,8 +193,6 @@ pub struct VMConfig {
     pub step_limit: usize,
     /// Maximum call frame depth before aborting (default: 1024).
     pub max_call_depth: usize,
-    /// GC strategy to use.
-    pub gc_strategy: GcStrategy,
 }
 
 impl Default for VMConfig {
@@ -245,7 +214,6 @@ impl Default for VMConfig {
             fiber_stack_traces: false,
             step_limit: 1_000_000_000,
             max_call_depth: 1024,
-            gc_strategy: GcStrategy::from_env().unwrap_or_default(),
         }
     }
 }
@@ -745,7 +713,7 @@ impl VM {
 
         #[cfg_attr(not(feature = "host"), allow(unused_mut))]
         let mut shared = Shared {
-            gc: GcImpl::new(config.gc_strategy),
+            gc: GcImpl::new(),
             interner: Interner::new(),
 
             object_class: ptr::null_mut(),
@@ -897,7 +865,6 @@ impl VM {
             fiber_stack_traces: self.config.fiber_stack_traces,
             step_limit: self.config.step_limit,
             max_call_depth: self.config.max_call_depth,
-            gc_strategy: self.config.gc_strategy,
             ..VMConfig::default()
         }
     }
@@ -2514,10 +2481,6 @@ impl VM {
                     // young. Without the barrier the next minor
                     // GC won't trace closure through class.methods
                     // and the slot dangles.
-                    self.gc.write_barrier(
-                        class_ptr as *mut ObjHeader,
-                        Value::object(closure_ptr as *mut u8),
-                    );
                 }
             }
 
@@ -3832,549 +3795,12 @@ impl VM {
         self.sync_fiber_pool.push(fiber);
     }
 
-    /// Scan active JIT frames for GC roots using the explicit JIT frame list
-    /// and safepoint metadata (stack maps).
-    ///
-    /// Each JIT function registers (frame_pointer, func_id) on entry via
-    /// `wren_jit_frame_push`. For each registered frame, we look up the
-    /// function's NativeFrameMetadata by func_id and conservatively scan
-    /// all spill slots that could contain boxed values.
-    ///
-    /// Returns (values, slot_addresses) for GC write-back.
-    fn scan_native_stack_roots(&self) -> (Vec<Value>, Vec<*mut u64>) {
-        use crate::codegen::native_meta::RootLocation;
-        let mut found_roots = Vec::new();
-        let mut slot_addrs = Vec::new();
-        let mut covered_fps: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-        // Pass 1: explicitly-pushed JIT frames. The JIT lowering
-        // calls `push_jit_frame` at every wren_call_N boundary, so
-        // each entry directly names the (fp, func_id, ret_addr)
-        // triple. AOT bodies don't push these — they hit pass 2.
-        let jit_entries = crate::codegen::runtime_fns::jit_frame_entries();
-        for &(jit_fp, func_id, ret_addr) in &jit_entries {
-            if jit_fp == 0 {
-                continue;
-            }
-
-            // Look up the function's metadata by func_id. Defer adding
-            // `jit_fp` to `covered_fps` until after we know we can
-            // actually scan this frame — otherwise the AOT path (which
-            // calls `push_jit_frame` with the MIR func_id while
-            // metadata is stored under a separate AOT func_id) marks
-            // the frame covered, returns None from the metadata
-            // lookup, skips its own scan, and then Pass 2 ALSO skips
-            // the frame (because its caller's saved_fp matches the
-            // covered jit_fp). The result: the AOT body's spill slots
-            // never get scanned for that GC, and nursery-allocated
-            // values held in them get freed under our feet on the
-            // next nursery reset.
-            let meta = self
-                .engine
-                .jit_metadata
-                .get(func_id as usize)
-                .and_then(|m| m.as_ref());
-            let Some(meta) = meta else { continue };
-
-            // Find the code range for this function to compute the safepoint offset.
-            let code_range = self
-                .engine
-                .code_ranges
-                .iter()
-                .find(|r| r.func_id == crate::runtime::engine::FuncId(func_id));
-
-            // Precise safepoint scanning: use the return address to find the
-            // ACTIVE safepoint, then only scan roots that are live at that point.
-            // Falls back to conservative (all safepoints) if no match found.
-            let active_safepoint = code_range.and_then(|cr| {
-                let offset = ret_addr.wrapping_sub(cr.start) as u32;
-                meta.safepoints.iter().find(|sp| sp.code_offset == offset)
-            });
-
-            let roots_to_scan: &[crate::codegen::native_meta::LiveRootMetadata] =
-                if let Some(sp) = active_safepoint {
-                    &sp.live_roots
-                } else {
-                    // No precise match — skip (don't conservatively scan,
-                    // which would corrupt non-object spill slots).
-                    continue;
-                };
-
-            covered_fps.insert(jit_fp);
-
-            for root in roots_to_scan {
-                if let RootLocation::Spill(spill_offset) = root.location {
-                    let addr = (jit_fp as isize + spill_offset as isize) as *mut u64;
-                    let bits = unsafe { *addr };
-                    let val = Value::from_bits(bits);
-                    if val.is_object() {
-                        found_roots.push(val);
-                        slot_addrs.push(addr);
-                    }
-                }
-            }
-        }
-
-        // Pass 2: AOT frames discovered via the native fp chain.
-        // AOT bodies don't push_jit_frame (they're entered straight
-        // from the linker's main, no per-call helper to do the
-        // push), so a GC fired from inside an alloc helper would
-        // miss them entirely under pass 1 alone. Walk x29 → caller's
-        // fp → caller's caller's fp via the standard aarch64 frame
-        // chain, look up each return address against `code_ranges`,
-        // and scan whatever safepoint matches.
-        //
-        // The frame chain dies as soon as we cross out of code we
-        // emitted (the linker's main, libc startup, ...) — those
-        // frames don't have return addresses inside any registered
-        // code range, so they get skipped silently.
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        {
-            let mut fp: usize;
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack))
-            };
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack))
-            };
-
-            let max_frames = 256;
-            let mut walked = 0;
-            while fp != 0 && walked < max_frames {
-                walked += 1;
-                if fp & 7 != 0 {
-                    break; // misaligned — corrupt frame, bail.
-                }
-                let saved_fp = unsafe { *(fp as *const usize) };
-                let saved_ret = unsafe { *((fp + 8) as *const usize) };
-                if saved_ret == 0 {
-                    break;
-                }
-
-                // The frame whose body executed up to `saved_ret`
-                // has fp == saved_fp. Skip frames already scanned
-                // via pass 1.
-                if saved_fp == 0 || covered_fps.contains(&saved_fp) {
-                    fp = saved_fp;
-                    continue;
-                }
-
-                let code_range = self
-                    .engine
-                    .code_ranges
-                    .iter()
-                    .find(|r| saved_ret >= r.start && saved_ret < r.end);
-                let trace = std::env::var_os("WLIFT_GC_TRACE_STACK").is_some();
-                if let Some(cr) = code_range {
-                    let meta = self
-                        .engine
-                        .jit_metadata
-                        .get(cr.func_id.0 as usize)
-                        .and_then(|m| m.as_ref());
-                    if let Some(meta) = meta {
-                        let offset = saved_ret.wrapping_sub(cr.start) as u32;
-                        let sp_match = meta.safepoints.iter().find(|sp| sp.code_offset == offset);
-                        if trace {
-                            let total_sps = meta.safepoints.len();
-                            eprintln!(
-                                "  [gc] AOT frame fp={:#x} ret={:#x} cr=[{:#x},{:#x}) offset={} sps={} matched={} live_roots={}",
-                                saved_fp,
-                                saved_ret,
-                                cr.start,
-                                cr.end,
-                                offset,
-                                total_sps,
-                                sp_match.is_some(),
-                                sp_match.map(|s| s.live_roots.len()).unwrap_or(0),
-                            );
-                            if sp_match.is_none() && total_sps > 0 {
-                                let mut sps_dump: Vec<u32> =
-                                    meta.safepoints.iter().map(|s| s.code_offset).collect();
-                                sps_dump.sort();
-                                let nearest =
-                                    sps_dump.iter().copied().filter(|o| *o <= offset).max();
-                                let next = sps_dump.iter().copied().find(|o| *o > offset);
-                                eprintln!(
-                                    "    [gc] unmatched offset={}, nearest≤={:?} next>={:?} (first={:?} last={:?})",
-                                    offset,
-                                    nearest,
-                                    next,
-                                    sps_dump.first(),
-                                    sps_dump.last()
-                                );
-                            }
-                        }
-                        if let Some(sp) = sp_match {
-                            for root in &sp.live_roots {
-                                if let RootLocation::Spill(spill_offset) = root.location {
-                                    let addr =
-                                        (saved_fp as isize + spill_offset as isize) as *mut u64;
-                                    let bits = unsafe { *addr };
-                                    let val = Value::from_bits(bits);
-                                    if trace && val.is_object() {
-                                        eprintln!(
-                                            "    [gc] spill@fp+{}: bits={:#x} obj=true",
-                                            spill_offset, bits
-                                        );
-                                    }
-                                    if val.is_object() {
-                                        found_roots.push(val);
-                                        slot_addrs.push(addr);
-                                    }
-                                }
-                            }
-                        }
-                    } else if trace {
-                        eprintln!(
-                            "  [gc] AOT frame fp={:#x} ret={:#x} cr=[{:#x},{:#x}) — NO METADATA",
-                            saved_fp, saved_ret, cr.start, cr.end
-                        );
-                    }
-                } else if trace && saved_ret != 0 {
-                    eprintln!(
-                        "  [gc] skip frame fp={:#x} ret={:#x} (not in any code_range)",
-                        saved_fp, saved_ret
-                    );
-                }
-                fp = saved_fp;
-            }
-        }
-
-        // Pass 3: suspended krio-fiber stacks. The integration runs
-        // each fiber's body on its own mmap stack; when the fiber is
-        // suspended, its frames live entirely off the host thread's
-        // stack chain (Pass 2 misses them by construction — that walk
-        // starts from the host's `x29`/`rbp`, which has been swapped
-        // out across the context switch). Walk each suspended krio-
-        // backed fiber's frame chain from its saved fp + ret using
-        // the *same* safepoint-driven spill scan as Pass 2.
-        //
-        // Enumeration goes through the GC's live-object list rather
-        // than a side table. That guarantees every fiber the walker
-        // sees is currently allocated, so the deref of saved_fp /
-        // saved_ret can't hit freed memory. (A side table accumulates
-        // pointers to swept ObjFibers — observed as SIGSEGV on
-        // hatch-buffers + similar specs that churn through many
-        // short-lived try-fibers.)
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        let mut pass3_fibers: Vec<*mut ObjFiber> = Vec::new();
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        self.gc.for_each_fiber(|f| {
-            // Only suspended krio-backed fibers have meaningful
-            // saved state to walk. (New / Done / Error / non-krio
-            // are skipped at the per-fiber check below.)
-            if unsafe { (*f).state } != crate::runtime::object::FiberState::Suspended {
-                return;
-            }
-            if unsafe { (*f).krio_fiber.is_none() } {
-                return;
-            }
-            pass3_fibers.push(f);
-        });
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        for fiber_ptr in pass3_fibers {
-            let krio = match unsafe { (*fiber_ptr).krio_fiber.as_deref() } {
-                Some(k) => k,
-                None => continue,
-            };
-            let Some(saved_fp_ptr) = krio.saved_fp() else {
-                continue;
-            };
-            let Some(saved_ret_ptr) = krio.saved_ret() else {
-                continue;
-            };
-            let mut fp = saved_fp_ptr as usize;
-            let initial_saved_ret = saved_ret_ptr as usize;
-            // The first frame's return address is the saved x30 /
-            // implicit ret from the krio_fiber_switch call site;
-            // subsequent frames use the standard chain (fp[1] = ret).
-            let mut current_ret = initial_saved_ret;
-            let max_frames = 256;
-            let mut walked = 0;
-            // Track whether we actually recorded any spill slots from
-            // this fiber's stack. If so, we must pin the fiber as a
-            // root: the write-back loop in `collect_garbage` will
-            // later write the forwarded value back to those slot
-            // addresses, and if the fiber gets swept this cycle its
-            // krio Box drops + the stack is munmap'd, so the writes
-            // fault on freed pages. Pinning only fibers we scanned
-            // (rather than every Suspended fiber) avoids zombies for
-            // fibers that have no usable stack to walk.
-            let mut recorded_slot_for_fiber = false;
-            // User-space virtual addresses on 64-bit Unix top out at
-            // 2^47 (47-bit address space). Anything with bits
-            // outside that range is either an OS-reserved kernel
-            // pointer or — more often in our case — leaked NaN-
-            // tagged Wren `Value` bits that drifted onto a register-
-            // sized stack slot. Dereferencing them faults the
-            // kernel and crashes the GC mid-mark. Treat any
-            // pointer outside the 47-bit range as "end of trustable
-            // chain" and stop walking. The frames below that point
-            // miss root scanning, which is the worst the GC sees;
-            // we'd rather under-scan than segfault.
-            const USER_VA_LIMIT: usize = 1usize << 47;
-            while fp != 0 && walked < max_frames {
-                walked += 1;
-                if fp & 7 != 0 || fp >= USER_VA_LIMIT {
-                    break;
-                }
-                if current_ret != 0 && current_ret < USER_VA_LIMIT {
-                    let code_range = self
-                        .engine
-                        .code_ranges
-                        .iter()
-                        .find(|r| current_ret >= r.start && current_ret < r.end);
-                    if let Some(cr) = code_range {
-                        let meta = self
-                            .engine
-                            .jit_metadata
-                            .get(cr.func_id.0 as usize)
-                            .and_then(|m| m.as_ref());
-                        if let Some(meta) = meta {
-                            let offset = current_ret.wrapping_sub(cr.start) as u32;
-                            if let Some(sp) =
-                                meta.safepoints.iter().find(|sp| sp.code_offset == offset)
-                            {
-                                for root in &sp.live_roots {
-                                    if let RootLocation::Spill(spill_offset) = root.location {
-                                        let addr =
-                                            (fp as isize + spill_offset as isize) as *mut u64;
-                                        let bits = unsafe { *addr };
-                                        let val = Value::from_bits(bits);
-                                        if val.is_object() {
-                                            found_roots.push(val);
-                                            slot_addrs.push(addr);
-                                            recorded_slot_for_fiber = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Step to caller's frame using the standard chain.
-                let next_fp = unsafe { *(fp as *const usize) };
-                let next_ret = unsafe { *((fp + 8) as *const usize) };
-                if next_fp == 0 || next_fp <= fp || next_fp >= USER_VA_LIMIT {
-                    break;
-                }
-                fp = next_fp;
-                current_ret = next_ret;
-            }
-            // Pin the fiber as a root iff we recorded any spill-slot
-            // addresses from its stack. Without this, a Suspended
-            // fiber with no other roots could get swept this cycle,
-            // its krio stack munmap'd, and the write-back loop would
-            // fault on the freed page. We pair the pin with a null
-            // slot_addrs entry — the write-back loop already skips
-            // null addresses, and we don't want to forward the
-            // ObjFiber pointer via the spill-slot path.
-            if recorded_slot_for_fiber {
-                found_roots.push(Value::object(fiber_ptr as *mut u8));
-                slot_addrs.push(std::ptr::null_mut());
-            }
-        }
-
-        (found_roots, slot_addrs)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[allow(dead_code)]
-    fn scan_native_stack_roots_debug(&self) -> (Vec<Value>, u32, u32) {
-        use crate::codegen::native_meta::RootLocation;
-        let mut found_roots = Vec::new();
-        let mut frames_walked = 0u32;
-        let mut jit_frames = 0u32;
-
-        let mut fp: usize;
-        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)) };
-
-        let max_frames = 256;
-
-        while fp != 0 && frames_walked < max_frames {
-            frames_walked += 1;
-            let return_addr = unsafe { *((fp + 8) as *const usize) };
-            if return_addr == 0 {
-                break;
-            }
-
-            if std::env::var_os("WLIFT_TRACE_STACKWALK").is_some() && frames_walked <= 15 {
-                let in_range = self
-                    .engine
-                    .code_ranges
-                    .iter()
-                    .any(|r| return_addr >= r.start && return_addr < r.end);
-                eprintln!(
-                    "  frame {}: fp={:#x} ret={:#x} in_jit={}",
-                    frames_walked, fp, return_addr, in_range
-                );
-            }
-            if let Some(code_range) = self.engine.find_code_range(return_addr) {
-                jit_frames += 1;
-                let offset = (return_addr - code_range.start) as u32;
-                if let Some(safepoint) = code_range.metadata.find_safepoint(offset) {
-                    let jit_fp = unsafe { *(fp as *const usize) };
-                    if jit_fp != 0 {
-                        for root in &safepoint.live_roots {
-                            if let RootLocation::Spill(spill_offset) = root.location {
-                                let addr = (jit_fp as isize + spill_offset as isize) as *const u64;
-                                let bits = unsafe { *addr };
-                                found_roots.push(Value::from_bits(bits));
-                            }
-                        }
-                    }
-                }
-            }
-
-            fp = unsafe { *(fp as *const usize) };
-        }
-
-        (found_roots, frames_walked, jit_frames)
-    }
-
-    // Fallback stub kept so the debug signature is callable on any arch.
-    // aarch64 has its own implementation further up; other hosts don't
-    // unwind native frames today, so the helper just returns empties.
-    #[cfg(not(target_arch = "aarch64"))]
-    #[allow(dead_code)]
-    fn scan_native_stack_roots_debug(&self) -> (Vec<Value>, u32, u32) {
-        (Vec::new(), 0, 0)
-    }
-
-    /// Walk the native frame chain and panic on the first AOT frame
-    /// that lands inside a registered code range but has no safepoint
-    /// entry at the return offset. Surfaces stack-map coverage gaps
-    /// at GC time — every reported gap is a `declare_value_needs_stack_map`
-    /// missing somewhere in the lowering.
-    ///
-    /// Called only when `WLIFT_VALIDATE_STACKMAP=1`. On non-FP-chain
-    /// architectures this is a no-op (matches the fallback shape of
-    /// `scan_native_stack_roots_debug`).
-    ///
-    /// The panic message resolves each unmatched frame's runtime
-    /// address via `dladdr_symbol` so the report names the real
-    /// linker symbol (e.g. `wlift_aot_mod_10__method_5_15`) rather
-    /// than the synthetic MIR name every AOT function shares.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    fn validate_stackmap_coverage(&self) {
-        let mut fp: usize;
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack))
-        };
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack))
-        };
-
-        let max_frames = 256;
-        let mut walked = 0;
-        // (saved_ret, cr.start, offset, resolved function name)
-        let mut unmatched: Vec<(usize, usize, usize, String)> = Vec::new();
-        while fp != 0 && walked < max_frames {
-            walked += 1;
-            if fp & 7 != 0 {
-                break;
-            }
-            let saved_fp = unsafe { *(fp as *const usize) };
-            let saved_ret = unsafe { *((fp + 8) as *const usize) };
-            if saved_ret == 0 {
-                break;
-            }
-            if let Some(cr) = self
-                .engine
-                .code_ranges
-                .iter()
-                .find(|r| saved_ret >= r.start && saved_ret < r.end)
-            {
-                let meta = self
-                    .engine
-                    .jit_metadata
-                    .get(cr.func_id.0 as usize)
-                    .and_then(|m| m.as_ref());
-                if let Some(meta) = meta {
-                    let offset = saved_ret.wrapping_sub(cr.start) as u32;
-                    if !meta.safepoints.iter().any(|sp| sp.code_offset == offset) {
-                        // AOT-registered functions all share the
-                        // synthetic name `<aot-frame>` (see
-                        // capi.rs's wlift_aot_init_module). Fall
-                        // back to `dladdr` on the runtime address
-                        // so the real linker symbol — e.g.
-                        // `wlift_aot_mod_10__method_5_15` — shows
-                        // up in the panic message and Phase 1
-                        // audit can grep directly to it.
-                        let mir_name = self
-                            .engine
-                            .functions
-                            .get(cr.func_id.0 as usize)
-                            .map(|fb| self.interner.resolve(fb.mir().name).to_string())
-                            .unwrap_or_else(|| format!("<func_id={}>", cr.func_id.0));
-                        let dl_name = unsafe { dladdr_symbol(cr.start as *const ()) };
-                        let func_name = match dl_name {
-                            Some(sym) if mir_name == "<aot-frame>" => sym,
-                            Some(sym) => format!("{mir_name} ({sym})"),
-                            None => mir_name,
-                        };
-                        unmatched.push((saved_ret, cr.start, offset as usize, func_name));
-                    }
-                }
-            }
-            fp = saved_fp;
-        }
-        if !unmatched.is_empty() {
-            let summary: String = unmatched
-                .iter()
-                .take(16)
-                .map(|(ret, start, off, name)| {
-                    format!("{name}: ret={ret:#x} (cr_base={start:#x}, +{off})")
-                })
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            // Cranelift only emits a `user_stack_maps()` entry at a
-            // call when at least one Value was declared via
-            // `declare_value_needs_stack_map` and was live across
-            // that call. A call site with zero live Wren values
-            // (e.g. the first allocator in a function body) is
-            // legitimately absent from the metadata. So we can't
-            // distinguish "gap that masks held roots" from "gap
-            // because nothing was held" from inside the GC walker.
-            // Default behaviour: log the candidate list so Phase 1
-            // audit can triage each. Strict mode
-            // (`WLIFT_VALIDATE_STACKMAP=strict` or `=2`) panics on
-            // first gap — useful once the audit is complete.
-            let strict = std::env::var("WLIFT_VALIDATE_STACKMAP")
-                .ok()
-                .is_some_and(|v| v == "strict" || v == "2");
-            if strict {
-                panic!(
-                    "STACKMAP COVERAGE GAP (strict): {} AOT frame(s) on the native stack landed \
-                     inside registered code ranges but had no safepoint at their return offset.\n  {}",
-                    unmatched.len(),
-                    summary
-                );
-            } else {
-                eprintln!(
-                    "stackmap-validate: {} candidate gap(s) — calls without a user_stack_maps() \
-                     entry at the return offset. May be benign (no live Wren values at that \
-                     point) or a missing declare_value_needs_stack_map. Sample:\n  {}",
-                    unmatched.len(),
-                    summary
-                );
-            }
-        }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    fn validate_stackmap_coverage(&self) {}
-
     pub fn collect_garbage(&mut self) {
         // With other threads in the program, they stop for the
         // collection; a request already out means one of them is the
         // collector, and this thread parks for it first.
         #[cfg(feature = "host")]
-        let stopped = if self.gc.is_immix() && self.world.thread_count() > 1 {
+        let stopped = if self.world.thread_count() > 1 {
             if self.world.requested() {
                 self.park();
                 if !self.gc.should_collect() {
@@ -4422,18 +3848,14 @@ impl VM {
         let mut roots: Vec<Value> = Vec::new();
 
         // 1. API stack
-        let api_len = self.api_stack.len();
         roots.extend_from_slice(&self.api_stack);
 
         // 2. Handles
-        let handles_start = roots.len();
         for h in &self.handles {
             roots.push(h.value);
         }
 
-        // 3. VM-owned class pointers — may be nursery-allocated, so they can
-        //    be promoted/forwarded during GC.
-        let classes_start = roots.len();
+        // 3. VM-owned class pointers.
         let core_classes: [*mut ObjClass; 27] = [
             self.object_class,
             self.class_class,
@@ -4466,19 +3888,14 @@ impl VM {
         for &ptr in &core_classes {
             if !ptr.is_null() {
                 roots.push(Value::object(ptr as *mut u8));
-            } else {
-                roots.push(Value::null());
             }
         }
 
         // 3a. Shared closure function objects.
-        let closure_fns_start = roots.len();
         for &ptr in &self.closure_fns {
-            roots.push(if ptr.is_null() {
-                Value::null()
-            } else {
-                Value::object(ptr as *mut u8)
-            });
+            if !ptr.is_null() {
+                roots.push(Value::object(ptr as *mut u8));
+            }
         }
 
         // 3b. Register files interpreter activations currently hold
@@ -4486,77 +3903,29 @@ impl VM {
         super::live_regs::collect_live_values(&mut roots);
 
         // 4. Current fiber (GC traces its mir_frames/caller chain internally)
-        let fiber_idx = roots.len();
         if !self.fiber.is_null() {
             roots.push(Value::object(self.fiber as *mut u8));
         }
 
         // 5. Reusable synchronous temp fibers.
-        let sync_fiber_pool_start = roots.len();
         for &fiber in &self.sync_fiber_pool {
             roots.push(Value::object(fiber as *mut u8));
         }
 
         // 6. JIT roots — values held in native frames invisible to normal root scanning.
-        let jit_roots_start = roots.len();
-        let mut jit_roots = crate::codegen::runtime_fns::take_jit_roots();
-        roots.append(&mut jit_roots);
-        let jit_roots_end = roots.len();
+        roots.extend(crate::codegen::runtime_fns::jit_roots_snapshot());
 
         // 7. Native shadow stack roots for active compiled frames.
-        let native_shadow_start = roots.len();
-        let (native_shadow_lengths, mut native_shadow_roots) =
-            crate::codegen::runtime_fns::take_native_shadow_roots();
-        roots.append(&mut native_shadow_roots);
-        let native_shadow_end = roots.len();
-
-        // 7b. Stack map roots: scan native stack frames for GC roots using
-        // frame pointer chain + safepoint metadata. These are added to the
-        // root set alongside shadow roots. After GC, updated values are
-        // written back directly to the spill slots on the native stack.
-        let native_stack_start = roots.len();
-        let (stack_roots, stack_slot_addrs) = if self.gc.is_immix() {
-            // Conservative scan below covers native frames; nothing to
-            // write back because nothing moves.
-            (Vec::new(), Vec::new())
-        } else {
-            self.scan_native_stack_roots()
-        };
-        let native_stack_count = stack_roots.len();
-        roots.extend(stack_roots);
-
-        if std::env::var_os("WLIFT_VALIDATE_STACKMAP").is_some() {
-            let shadow_count = native_shadow_end - native_shadow_start;
-            let jit_entries = crate::codegen::runtime_fns::jit_frame_entries();
-            eprintln!(
-                "stackmap-validate: shadow={} stack_roots={} jit_frames={} code_ranges={}",
-                shadow_count,
-                native_stack_count,
-                jit_entries.len(),
-                self.engine.code_ranges.len(),
-            );
-            // Per-frame coverage check: walk the FP chain a second
-            // time and panic if any frame landed in a registered
-            // code range but the metadata lookup found no safepoint
-            // at the return offset. That's the exact "stack-map
-            // gap" we're chasing — the GC walked past an AOT frame
-            // whose Values it can't see, so any nursery references
-            // in spill slots won't be marked live.
-            self.validate_stackmap_coverage();
-        }
+        roots.extend(crate::codegen::runtime_fns::native_shadow_roots_snapshot());
 
         // 8. JitContext GC-managed pointers (closure, defining_class).
-        let jit_ctx_start = roots.len();
         let (jit_closure, jit_class) = crate::codegen::runtime_fns::jit_context_roots();
         roots.push(jit_closure);
         roots.push(jit_class);
 
         // 9. Module variables
-        let mut module_ranges: Vec<(String, usize, usize)> = Vec::new();
-        for (name, entry) in &self.engine.modules {
-            let start = roots.len();
+        for entry in self.engine.modules.values() {
             roots.extend_from_slice(&entry.vars);
-            module_ranges.push((name.clone(), start, roots.len()));
         }
 
         // 9b. AOT root regions — `wlift_modvars_<n>` and
@@ -4565,12 +3934,8 @@ impl VM {
         // (the bootstrap doesn't go through `interpret`), so
         // const strings + closure pointers + class pointers
         // would otherwise be unreachable to the GC. Each region
-        // is a contiguous u64 array; we read each slot as a
-        // `Value` root and write back the forwarded pointer.
-        let aot_regions = self.engine.aot_root_regions.clone();
-        let mut aot_region_starts: Vec<usize> = Vec::with_capacity(aot_regions.len());
-        for &(addr, count) in &aot_regions {
-            aot_region_starts.push(roots.len());
+        // is a contiguous u64 array read as `Value` roots.
+        for &(addr, count) in &self.engine.aot_root_regions {
             for i in 0..count {
                 let bits = unsafe { *addr.add(i) };
                 roots.push(Value::from_bits(bits));
@@ -4578,21 +3943,15 @@ impl VM {
         }
 
         // 10. Reload callbacks — closures registered via Hatch.onReload.
-        let reload_cb_start = roots.len();
         roots.extend_from_slice(&self.reload_callbacks);
-        let reload_cb_end = roots.len();
 
         // 10b. Pre-reload callbacks — Hatch.beforeReload.
-        let before_reload_cb_start = roots.len();
         roots.extend_from_slice(&self.before_reload_callbacks);
-        let before_reload_cb_end = roots.len();
 
         // 10c. File-watch callbacks — Hatch.watchFile.
-        let file_watch_start = roots.len();
         for fw in &self.file_watches {
             roots.push(fw.callback);
         }
-        let file_watch_end = roots.len();
 
         // 10d. Fibers the scheduler holds as tasks, and the runs set
         // aside by a host's world.
@@ -4632,200 +3991,8 @@ impl VM {
             roots.extend(unsafe { (*ctx).roots() });
         }
 
-        // `WLIFT_VALIDATE_BARRIERS=1` opts the GC into a pre-collect
-        // sanity check covering both directions of the remembered-set
-        // invariant — missed barriers (old→young not recorded) and
-        // stale sources (recorded entries pointing at freed objects).
-        // O(N+R) per GC; gated on the env var so production builds
-        // pay nothing when unset.
-        if std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some() {
-            self.gc.validate_write_barriers();
-        }
-
-        // Collect
-        if self.gc.is_immix() {
-            let ranges = self.conservative_stack_ranges();
-            if let GcImpl::Immix(gc) = &mut self.gc {
-                gc.collect_with_ranges(&roots, &ranges);
-            }
-        } else {
-            self.gc.collect(&mut roots);
-        }
-
-        // Write back updated values (GC may have forwarded nursery pointers)
-        self.api_stack.copy_from_slice(&roots[..api_len]);
-        for (i, h) in self.handles.iter_mut().enumerate() {
-            h.value = roots[handles_start + i];
-        }
-
-        // Write back core class pointers
-        let shared = self.shared_mut();
-        let class_fields: [&mut *mut ObjClass; 27] = [
-            &mut shared.object_class,
-            &mut shared.class_class,
-            &mut shared.bool_class,
-            &mut shared.num_class,
-            &mut shared.string_class,
-            &mut shared.list_class,
-            &mut shared.map_class,
-            &mut shared.range_class,
-            &mut shared.null_class,
-            &mut shared.fn_class,
-            &mut shared.fiber_class,
-            &mut shared.system_class,
-            &mut shared.sequence_class,
-            &mut shared.map_sequence_class,
-            &mut shared.skip_sequence_class,
-            &mut shared.take_sequence_class,
-            &mut shared.where_sequence_class,
-            &mut shared.string_byte_seq_class,
-            &mut shared.string_code_point_seq_class,
-            &mut shared.map_entry_class,
-            &mut shared.byte_array_class,
-            &mut shared.int32_array_class,
-            &mut shared.float32_array_class,
-            &mut shared.float64_array_class,
-            &mut shared.simd_class,
-            &mut shared.simd4f_class,
-            &mut shared.simd4i_class,
-        ];
-        for (i, field) in class_fields.into_iter().enumerate() {
-            let val = roots[classes_start + i];
-            if let Some(ptr) = val.as_object() {
-                *field = ptr as *mut ObjClass;
-            }
-        }
-
-        for (i, fn_ptr) in self.closure_fns.iter_mut().enumerate() {
-            if let Some(ptr) = roots[closure_fns_start + i].as_object() {
-                *fn_ptr = ptr as *mut ObjFn;
-            }
-        }
-
-        // Write back fiber pointer
-        if !self.fiber.is_null() {
-            let val = roots[fiber_idx];
-            if let Some(ptr) = val.as_object() {
-                self.fiber = ptr as *mut ObjFiber;
-            }
-        }
-
-        // Write back pooled sync fibers (nursery forwarding)
-        for (i, fiber) in self.sync_fiber_pool.iter_mut().enumerate() {
-            let val = roots[sync_fiber_pool_start + i];
-            if let Some(ptr) = val.as_object() {
-                *fiber = ptr as *mut ObjFiber;
-            }
-        }
-
-        // Write back JIT roots (nursery forwarding)
-        if jit_roots_end > jit_roots_start {
-            crate::codegen::runtime_fns::set_jit_roots(
-                roots[jit_roots_start..jit_roots_end].to_vec(),
-            );
-        }
-
-        if native_shadow_end > native_shadow_start {
-            crate::codegen::runtime_fns::set_native_shadow_roots(
-                native_shadow_lengths,
-                roots[native_shadow_start..native_shadow_end].to_vec(),
-            );
-        } else if !native_shadow_lengths.is_empty() {
-            crate::codegen::runtime_fns::set_native_shadow_roots(native_shadow_lengths, Vec::new());
-        }
-
-        // Write back stack map roots directly to native stack spill slots.
-        // This ensures GC-forwarded pointers are visible when JIT code resumes.
-        //
-        // The only invariants we can rely on:
-        //  - addr != 0 (NULL slot would mean the safepoint metadata was bogus)
-        //  - addr is 8-byte aligned (we're writing a u64)
-        //
-        // We can't bound the high half of the address. Linux aarch64
-        // userspace mapped through Docker on Apple Silicon hands out
-        // stacks in the 0xffff_xxxx_xxxx range — bytes that look like
-        // a kernel pointer under the standard 48-bit canonical split,
-        // but are perfectly valid userspace memory in the container's
-        // VA layout. A previous `addr < 1<<47` guard silently dropped
-        // every writeback into those slots, leaving the GC walker's
-        // visit useless and the next AOT load reading the pre-promote
-        // (FORWARDED) pointer.
-        for i in 0..native_stack_count {
-            let updated = roots[native_stack_start + i];
-            let addr = stack_slot_addrs[i] as usize;
-            if addr == 0 || addr & 7 != 0 {
-                continue;
-            }
-            if std::env::var_os("WLIFT_GC_TRACE_WRITEBACK").is_some() {
-                let before = unsafe { *stack_slot_addrs[i] };
-                let after = updated.to_bits();
-                if before != after {
-                    eprintln!(
-                        "  [gc] writeback slot=@{:#x} before={:#x} after={:#x}",
-                        addr, before, after
-                    );
-                }
-            }
-            unsafe { std::ptr::write(stack_slot_addrs[i], updated.to_bits()) };
-        }
-
-        // Write back JitContext pointers (nursery forwarding)
-        crate::codegen::runtime_fns::update_jit_context_roots(
-            roots[jit_ctx_start],
-            roots[jit_ctx_start + 1],
-        );
-
-        // Write back module vars (may contain nursery objects that were promoted)
-        for (name, start, end) in &module_ranges {
-            if let Some(entry) = self.engine.modules.get_mut(name) {
-                entry.vars.copy_from_slice(&roots[*start..*end]);
-            }
-        }
-
-        // Write back AOT root regions (modvars + consts data
-        // sections in the linked binary) with forwarded pointers.
-        for (region_idx, &(addr, count)) in aot_regions.iter().enumerate() {
-            let start = aot_region_starts[region_idx];
-            for i in 0..count {
-                let bits = roots[start + i].to_bits();
-                unsafe {
-                    *addr.add(i) = bits;
-                }
-            }
-        }
-
-        // Write back reload callbacks (forwarded if their closures were
-        // promoted out of the nursery).
-        if reload_cb_end > reload_cb_start {
-            self.reload_callbacks
-                .copy_from_slice(&roots[reload_cb_start..reload_cb_end]);
-        }
-        if before_reload_cb_end > before_reload_cb_start {
-            self.before_reload_callbacks
-                .copy_from_slice(&roots[before_reload_cb_start..before_reload_cb_end]);
-        }
-        if file_watch_end > file_watch_start {
-            for (i, fw) in self.file_watches.iter_mut().enumerate() {
-                fw.callback = roots[file_watch_start + i];
-            }
-        }
-
-        // Conservative FP-chain forwarding fixup: after the regular
-        // writebacks, walk the native FP chain and scan each AOT
-        // frame's stack window for any 8-byte-aligned slot whose
-        // bits match a NaN-boxed object Value pointing at a
-        // FORWARDED nursery object. Replace such slots with the
-        // forwarded pointer. Catches values that Cranelift's stack
-        // map missed — typically values held in callee-saved
-        // registers across calls (invisible to the GC walker) or
-        // values whose declared-but-not-spilled live range Cranelift
-        // pruned away. The fixup is a no-op when nothing is in the
-        // nursery (e.g. Arena / MarkSweep GCs) so it's safe to call
-        // unconditionally; the `WLIFT_AOT_FP_FIXUP=0` env var opts
-        // out for measurement / regression bisection.
-        if std::env::var("WLIFT_AOT_FP_FIXUP").as_deref() != Ok("0") {
-            self.conservative_fp_chain_forward_fixup();
-        }
+        let ranges = self.conservative_stack_ranges();
+        self.gc.collect_with_ranges(&roots, &ranges);
     }
 
     /// Native stack windows for the conservative scan, for this thread
@@ -4951,263 +4118,6 @@ impl VM {
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         Vec::new()
     }
-
-    /// See call site in `collect_garbage` for the design rationale.
-    /// SAFETY of writes is gated on three checks per candidate slot:
-    /// (1) bits match the NaN-boxed object tag, (2) the pointed-to
-    /// header has `gc_mark == FORWARDED` (3 per `gc::FORWARDED`),
-    /// (3) the forwarded target is aligned, in user VA, has the
-    /// same `obj_type`, and is not itself FORWARDED. A random scalar
-    /// has to clear all three to be miswritten — a 1-in-2^64 odds
-    /// path in practice.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    fn conservative_fp_chain_forward_fixup(&self) {
-        const TAG_OBJ_MASK: u64 = 0xFFFC_0000_0000_0000;
-        const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-        const FORWARDED_MARK: u8 = 3;
-        // Toggle with `WLIFT_AOT_FP_FIXUP_TRACE=1` to dump per-GC
-        // (aot_frames_scanned, slots_scanned, slots_patched) and a
-        // per-patch line. Useful for diagnosing platforms where the
-        // walk finds zero frames (e.g. a Linux-vs-Mac VA-limit
-        // difference) or where patches are unexpectedly absent.
-        let trace = std::env::var_os("WLIFT_AOT_FP_FIXUP_TRACE").is_some();
-        let mut aot_frames_scanned = 0u32;
-        let mut slots_scanned = 0u32;
-        let mut slots_patched = 0u32;
-        // Maximum bytes scanned per frame. Typical AOT frame is
-        // 100-500 bytes; 4 KiB gives a wide safety margin without
-        // risking unbounded scan of a malformed chain.
-        const MAX_FRAME_BYTES: usize = 4096;
-        const MAX_FRAMES: usize = 128;
-
-        let mut fp: usize;
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack))
-        };
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack))
-        };
-
-        // Track the previous (callee) frame's fp so each iteration
-        // can bound its scan window by the next frame down — without
-        // this we read past the bottom of the actual frame and hit
-        // unmapped guard pages on Linux. Seeded with the initial
-        // x29 read above; the topmost AOT frame's locals begin just
-        // above that callee_fp.
-        let mut callee_fp = fp;
-        let mut walked = 0;
-        while fp != 0 && walked < MAX_FRAMES {
-            walked += 1;
-            if fp & 7 != 0 {
-                // Misaligned fp: corrupt or non-standard frame —
-                // bail rather than risk a fault. Don't gate on
-                // `fp >= USER_VA_LIMIT` here: on Linux/aarch64
-                // both the thread stack and the loaded code can
-                // sit above the 47-bit Mac-style limit (Linux
-                // defaults to a 48-bit user VA), and applying the
-                // check at the loop head bails immediately, never
-                // reaching the AOT frames we need to scan. The
-                // existing GC stack walker at scan_native_stack_roots
-                // omits the same check for the same reason.
-                break;
-            }
-            let saved_fp = unsafe { *(fp as *const usize) };
-            let saved_ret = unsafe { *((fp + 8) as *const usize) };
-            if saved_ret == 0 {
-                break;
-            }
-            // Sanity-check the chain link before trusting saved_fp
-            // as the callee_fp boundary for the next scan: stacks
-            // grow down so a valid caller fp must be strictly
-            // higher than the current fp, and we cap the gap at 1
-            // MiB. Anything bigger is almost certainly the saved_fp
-            // word holding data rather than a chain link.
-            if saved_fp <= fp || saved_fp - fp > 1 << 20 {
-                break;
-            }
-
-            // Only scan frames that lie within a registered AOT
-            // code range — same gate the regular walker uses. Skips
-            // rust/libc frames whose stack contents we shouldn't
-            // touch.
-            let in_aot = self
-                .engine
-                .code_ranges
-                .iter()
-                .any(|r| saved_ret >= r.start && saved_ret < r.end);
-            if !in_aot {
-                callee_fp = fp;
-                fp = saved_fp;
-                continue;
-            }
-
-            // Stack grows DOWN: this frame's locals live in
-            // [callee_fp + 16, fp). The +16 skips this frame's own
-            // saved (x29, x30) pair on aarch64 (the callee_fp we
-            // tracked from the prior iteration points at the next
-            // frame down's saved-pair). Cap the scan to
-            // MAX_FRAME_BYTES so a runaway frame can't make us read
-            // unbounded stack.
-            let scan_top = fp;
-            let scan_bottom = (callee_fp + 16).max(fp.saturating_sub(MAX_FRAME_BYTES));
-            if scan_bottom >= scan_top {
-                callee_fp = fp;
-                fp = saved_fp;
-                continue;
-            }
-            aot_frames_scanned += 1;
-            let mut slot_addr = scan_bottom;
-            while slot_addr + 8 <= scan_top {
-                slots_scanned += 1;
-                let slot_ptr = slot_addr as *mut u64;
-                let bits = unsafe { *slot_ptr };
-                if bits & TAG_OBJ_MASK == TAG_OBJ_MASK {
-                    let obj_addr = (bits & PTR_MASK) as usize;
-                    // `nursery_contains` is the authoritative gate
-                    // — it bounds the read against the actual GC
-                    // nursery buffer. VA-limit checks are too
-                    // brittle across platforms (Linux/aarch64
-                    // routinely lives above the 47-bit Mac line).
-                    if obj_addr != 0
-                        && obj_addr & 7 == 0
-                        && self.gc.nursery_contains(obj_addr as *const u8)
-                    {
-                        let header = obj_addr as *const ObjHeader;
-                        let gc_mark = unsafe { (*header).gc_mark };
-                        if gc_mark == FORWARDED_MARK {
-                            let new_header = unsafe { (*header).next as usize };
-                            // Validate the dst header before
-                            // dereferencing it (we can't undo a SEGV
-                            // mid-collection):
-                            //   - alignment + non-null
-                            //   - in the old-gen arena (so the
-                            //     bytes are still mapped after a
-                            //     major-GC sweep cycle could have
-                            //     freed individual entries — a stale
-                            //     FORWARDED.next from a prior cycle
-                            //     might point at unmapped memory
-                            //     otherwise)
-                            // The arena check is the load-bearing
-                            // one for Linux: nursery resets reuse
-                            // FORWARDED slots, and the `next` field
-                            // can survive long after the dst was
-                            // freed elsewhere.
-                            if new_header != 0
-                                && new_header & 7 == 0
-                                && self.gc.old_arena_contains(new_header as *const u8)
-                            {
-                                let src_ty = unsafe { (*header).obj_type as u8 };
-                                let dst_hdr = new_header as *const ObjHeader;
-                                let dst_ty = unsafe { (*dst_hdr).obj_type as u8 };
-                                let dst_mark = unsafe { (*dst_hdr).gc_mark };
-                                let dst_gen = unsafe { (*dst_hdr).generation };
-                                // dst.generation must be GEN_OLD (1):
-                                // promote_typed sets it explicitly
-                                // before storing the forwarding
-                                // pointer back on the source.
-                                if src_ty == dst_ty
-                                    && dst_mark != FORWARDED_MARK
-                                    && dst_mark <= 2
-                                    && dst_gen == 1
-                                {
-                                    let new_bits = TAG_OBJ_MASK | new_header as u64;
-                                    unsafe { *slot_ptr = new_bits };
-                                    slots_patched += 1;
-                                    if trace {
-                                        // `saved_ret` points into the
-                                        // AOT caller's code, just past
-                                        // its call into the Rust helper
-                                        // whose frame we're scanning.
-                                        // That call site is the one
-                                        // missing a `user_stack_maps()`
-                                        // entry — the GC walker
-                                        // couldn't find the receiver
-                                        // root, so the value sat in the
-                                        // helper's stack slot as a
-                                        // stale FORWARDED pointer.
-                                        // call_off = saved_ret - cr.start
-                                        // is the byte offset *after* the
-                                        // BL inside the AOT caller; the
-                                        // BL itself is at -4.
-                                        let cr =
-                                            self.engine.code_ranges.iter().find(|r| {
-                                                saved_ret >= r.start && saved_ret < r.end
-                                            });
-                                        let (fname, base) = match cr {
-                                            Some(cr) => {
-                                                let func_id = cr.func_id.0 as usize;
-                                                let n = self
-                                                    .engine
-                                                    .functions
-                                                    .get(func_id)
-                                                    .map(|fb| {
-                                                        self.interner
-                                                            .resolve(fb.mir().name)
-                                                            .to_string()
-                                                    })
-                                                    .unwrap_or_else(|| format!("<func#{func_id}>"));
-                                                // `dladdr` is POSIX-only; Windows has
-                                                // `SymFromAddr` via `dbghelp` but the
-                                                // diagnostic value here is the AOT
-                                                // function name we already pulled from
-                                                // the interner, so the resolver is just
-                                                // a "stronger" alternative on Unix.
-                                                #[cfg(unix)]
-                                                let dl = unsafe {
-                                                    let mut info: libc::Dl_info =
-                                                        std::mem::zeroed();
-                                                    if libc::dladdr(cr.start as *const _, &mut info)
-                                                        != 0
-                                                        && !info.dli_sname.is_null()
-                                                    {
-                                                        std::ffi::CStr::from_ptr(info.dli_sname)
-                                                            .to_str()
-                                                            .ok()
-                                                            .map(|s| s.to_string())
-                                                    } else {
-                                                        None
-                                                    }
-                                                };
-                                                #[cfg(not(unix))]
-                                                let dl: Option<String> = None;
-                                                #[allow(clippy::unnecessary_literal_unwrap)]
-                                                (dl.unwrap_or(n), cr.start)
-                                            }
-                                            None => ("<unknown>".to_string(), 0),
-                                        };
-                                        let call_off = saved_ret.wrapping_sub(base);
-                                        eprintln!(
-                                            "  [fp-fixup] caller_fn={} call_after=+{} slot=@fp{:+} \
-                                             src=0x{:x} -> dst=0x{:x} type={}",
-                                            fname,
-                                            call_off,
-                                            slot_addr as isize - fp as isize,
-                                            bits & PTR_MASK,
-                                            new_header as u64,
-                                            src_ty
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                slot_addr += 8;
-            }
-            callee_fp = fp;
-            fp = saved_fp;
-        }
-        if trace {
-            eprintln!(
-                "[fp-fixup] aot_frames={aot_frames_scanned} slots_scanned={slots_scanned} patched={slots_patched}"
-            );
-        }
-    }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    fn conservative_fp_chain_forward_fixup(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -5235,13 +4145,7 @@ impl NativeContext for VM {
     }
 
     fn alloc_string(&mut self, s: String) -> Value {
-        let v = self.new_string(s);
-        // Root the fresh allocation through `finish_alloc` so any
-        // GC fired before the foreign primitive returns to AOT
-        // code (where Cranelift stack maps take over) doesn't reap
-        // it. No-op in JIT / interpreter mode (finish_alloc gates
-        // on `aot_gc_enabled()`).
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        self.new_string(s)
     }
 
     fn intern_string(&mut self, s: String) -> Value {
@@ -5249,33 +4153,27 @@ impl NativeContext for VM {
         unsafe {
             (*obj).header.class = self.string_class;
         }
-        let v = Value::object(obj as *mut u8);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        Value::object(obj as *mut u8)
     }
 
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value {
-        let v = self.new_list(elements);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        self.new_list(elements)
     }
 
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value {
-        let v = self.new_range(from, to, inclusive);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        self.new_range(from, to, inclusive)
     }
 
     fn alloc_map(&mut self) -> Value {
-        let v = self.new_map();
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        self.new_map()
     }
 
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value {
-        let v = self.new_typed_array(count, kind);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        self.new_typed_array(count, kind)
     }
 
     fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> Value {
-        let v = self.new_simd(kind, lanes);
-        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
+        self.new_simd(kind, lanes)
     }
 
     // Reported once, with a stack trace, by whoever unwinds the flag.
@@ -5571,12 +4469,6 @@ impl NativeContext for VM {
 
     fn trigger_gc(&mut self) {
         self.gc_requested = true;
-    }
-
-    fn write_barrier(&mut self, source: Value, value: Value) {
-        if let Some(ptr) = source.as_object() {
-            self.gc.write_barrier(ptr as *mut ObjHeader, value);
-        }
     }
 
     fn func_module(&self, func_id: u32) -> Option<std::sync::Arc<String>> {
@@ -7128,7 +6020,7 @@ impl VM {
     /// install, a class or function table growing. Nothing to do
     /// while the program has one thread. Resumes them on drop.
     pub fn stop_world(&mut self) -> StoppedWorld {
-        if !(self.gc.is_immix() && self.world.thread_count() > 1) {
+        if self.world.thread_count() <= 1 {
             return StoppedWorld {
                 vm: std::ptr::null_mut(),
                 guard: None,

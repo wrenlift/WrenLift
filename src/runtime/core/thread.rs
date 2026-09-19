@@ -73,9 +73,9 @@ fn init(ctx: &mut dyn NativeContext, class: &str, state: Value) -> Value {
     let class = ctx.lookup_class(class).expect("thread module loaded");
     let inst = ctx.alloc_instance(class);
     let waiters = ctx.alloc_list(Vec::new());
-    set_instance_field(ctx, inst, GUARD, Value::num(0.0));
-    set_instance_field(ctx, inst, STATE, state);
-    set_instance_field(ctx, inst, WAITERS, waiters);
+    set_instance_field(inst, GUARD, Value::num(0.0));
+    set_instance_field(inst, STATE, state);
+    set_instance_field(inst, WAITERS, waiters);
     inst
 }
 
@@ -121,16 +121,16 @@ fn thread_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         return Value::null();
     }
     let handle = init(ctx, "Thread", Value::num(0.0));
-    set_instance_field(ctx, handle, ERROR, Value::null());
-    set_instance_field(ctx, handle, FIBER, Value::null());
+    set_instance_field(handle, ERROR, Value::null());
+    set_instance_field(handle, FIBER, Value::null());
     sched::spawn_on_pool(vm, args[1], handle);
     handle
 }
 
 /// Record the task's fiber on its handle, on the worker that made it.
-pub(crate) fn attach(ctx: &mut dyn NativeContext, handle: Value, fiber: *mut ObjFiber) {
+pub(crate) fn attach(handle: Value, fiber: *mut ObjFiber) {
     if !handle.is_null() {
-        set_instance_field(ctx, handle, FIBER, Value::object(fiber as *mut u8));
+        set_instance_field(handle, FIBER, Value::object(fiber as *mut u8));
     }
 }
 
@@ -139,18 +139,8 @@ pub(crate) fn attach(ctx: &mut dyn NativeContext, handle: Value, fiber: *mut Obj
 pub(crate) fn finish(handle: Value, fiber: *mut ObjFiber) {
     let error = unsafe { (*fiber).error };
     guard(handle);
-    let vm = crate::runtime::vm::current_vm_ptr();
-    if vm.is_null() {
-        unsafe {
-            let inst = &mut *(handle.as_object().unwrap() as *mut ObjInstance);
-            inst.set_field(STATE, Value::num(1.0));
-            inst.set_field(ERROR, error);
-        }
-    } else {
-        let ctx: &mut dyn NativeContext = unsafe { &mut *vm };
-        set_instance_field(ctx, handle, STATE, Value::num(1.0));
-        set_instance_field(ctx, handle, ERROR, error);
-    }
+    set_instance_field(handle, STATE, Value::num(1.0));
+    set_instance_field(handle, ERROR, error);
     let waiters: Vec<u64> = list_field(handle, WAITERS)
         .as_slice()
         .iter()
@@ -245,7 +235,7 @@ fn mutex_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     loop {
         guard(m);
         if num_field(m, STATE) == 0.0 {
-            set_instance_field(ctx, m, STATE, Value::num(1.0));
+            set_instance_field(m, STATE, Value::num(1.0));
             unguard(m);
             return Value::null();
         }
@@ -258,21 +248,21 @@ fn mutex_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 }
 
-fn mutex_try_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn mutex_try_acquire(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let m = args[0];
     guard(m);
     let free = num_field(m, STATE) == 0.0;
     if free {
-        set_instance_field(ctx, m, STATE, Value::num(1.0));
+        set_instance_field(m, STATE, Value::num(1.0));
     }
     unguard(m);
     Value::bool(free)
 }
 
-fn mutex_release(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn mutex_release(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let m = args[0];
     guard(m);
-    set_instance_field(ctx, m, STATE, Value::num(0.0));
+    set_instance_field(m, STATE, Value::num(0.0));
     let next = pop_waiter(m);
     unguard(m);
     if let Some(token) = next {
@@ -301,7 +291,7 @@ fn lock_wait(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     guard(l);
     let units = num_field(l, STATE);
     if units > 0.0 {
-        set_instance_field(ctx, l, STATE, Value::num(units - 1.0));
+        set_instance_field(l, STATE, Value::num(units - 1.0));
         unguard(l);
         return Value::bool(true);
     }
@@ -323,13 +313,13 @@ fn lock_wait(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 }
 
-fn lock_release(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn lock_release(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let l = args[0];
     guard(l);
     let next = pop_waiter(l);
     if next.is_none() {
         let units = num_field(l, STATE);
-        set_instance_field(ctx, l, STATE, Value::num(units + 1.0));
+        set_instance_field(l, STATE, Value::num(units + 1.0));
     }
     unguard(l);
     if let Some(token) = next {
@@ -341,7 +331,7 @@ fn lock_release(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             // back for the next waiter.
             guard(l);
             let units = num_field(l, STATE);
-            set_instance_field(ctx, l, STATE, Value::num(units + 1.0));
+            set_instance_field(l, STATE, Value::num(units + 1.0));
             unguard(l);
         }
     }
@@ -355,7 +345,7 @@ fn deque_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     init(ctx, "Deque", items)
 }
 
-fn deque_put(ctx: &mut dyn NativeContext, args: &[Value], front: bool) -> Value {
+fn deque_put(args: &[Value], front: bool) -> Value {
     let d = args[0];
     guard(d);
     let items = list_field(d, STATE);
@@ -364,7 +354,6 @@ fn deque_put(ctx: &mut dyn NativeContext, args: &[Value], front: bool) -> Value 
     } else {
         items.add(args[1]);
     }
-    ctx.write_barrier(instance_field(d, STATE), args[1]);
     let next = pop_waiter(d);
     unguard(d);
     if let Some(token) = next {
@@ -373,12 +362,12 @@ fn deque_put(ctx: &mut dyn NativeContext, args: &[Value], front: bool) -> Value 
     Value::null()
 }
 
-fn deque_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    deque_put(ctx, args, false)
+fn deque_add(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    deque_put(args, false)
 }
 
-fn deque_push(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    deque_put(ctx, args, true)
+fn deque_push(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    deque_put(args, true)
 }
 
 /// `pop(block)`: the first item; with `block`, wait for one.

@@ -127,7 +127,7 @@ fn worker_main(vm: &mut VM, shutdown: Arc<AtomicBool>) {
             let fiber = crate::runtime::core::fiber::fiber_new_inner(vm, closure, None);
             if let Some(ptr) = fiber.as_object() {
                 let fiber = ptr as *mut crate::runtime::object::ObjFiber;
-                crate::runtime::core::thread::attach(vm, handle, fiber);
+                crate::runtime::core::thread::attach(handle, fiber);
                 vm.sched
                     .get_or_insert_with(Default::default)
                     .spawn_with(fiber, handle);

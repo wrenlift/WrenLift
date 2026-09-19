@@ -71,19 +71,17 @@ through JIT-execute smoke tests. These tests are feature-gated to
 
 ## GC safety
 
-The generational garbage collector is tested for pointer
-integrity after promotion (nursery to old generation), write
-barrier correctness (old-to-young references tracked in the
-remembered set), forwarding table accuracy, and self-referential
-pointer fixup (closed upvalues whose `location` field points into
-their own struct). String interning is tested for deduplication,
-collection of unreachable interned strings, and pointer equality
-after interning.
+The collector is tested for keeping what its roots reach and
+freeing what they do not, for resolving interior and raw pointers
+found on a native stack to their allocation, for tracing each
+child of every object type, and for noticing when a class or
+closure is freed so address-keyed caches are dropped. String
+interning is tested for deduplication, collection of unreachable
+interned strings, and pointer equality after interning.
 
-For native execution, a thread-local JIT frame stack registers
-each active native call so stack walking can root live boxed
-values. That registration is what fixed the binary-trees SIGABRT
-under heavy allocation pressure.
+For native execution, the collector scans every native stack
+conservatively, so values compiled code keeps in registers or
+spill slots are found without a stack map.
 
 ## Diagnostic-driven error reporting
 

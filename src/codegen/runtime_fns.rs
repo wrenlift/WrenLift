@@ -21,6 +21,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::object::{
     MapKey, Method, NativeContext, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap,
     ObjSimd, ObjString, ObjType, SimdKind,
@@ -171,7 +172,6 @@ fn try_dispatch_list_native_fastpath(
         unsafe {
             (*list_ptr).add(value);
         }
-        vm.gc.write_barrier(list_ptr as *mut ObjHeader, value);
         note_list_native_fastpath(vm);
         return Some(args[0].to_bits());
     }
@@ -190,7 +190,6 @@ fn try_dispatch_list_native_fastpath(
         unsafe {
             (*list_ptr).set(index, value);
         }
-        vm.gc.write_barrier(list_ptr as *mut ObjHeader, value);
         note_list_native_fastpath(vm);
         return Some(value.to_bits());
     }
@@ -272,7 +271,6 @@ fn try_dispatch_trivial_accessor_fastpath(
                 unsafe {
                     (*instance).set_field_unchecked(fn_ref.trivial_setter_field as usize, value);
                 }
-                vm.gc.write_barrier(receiver_obj as *mut ObjHeader, value);
                 vm.engine.note_runtime_call_stats(|s| {
                     s.dispatch_method_closure += 1;
                     s.dispatch_method_trivial_setter += 1;
@@ -854,10 +852,7 @@ fn populate_callsite_ic(
                     func_id: fn_idx as u64,
                     kind: 1,
                 }
-            } else if !jit_ptr.is_null()
-                && !jit_disabled()
-                && allow_nonleaf_native(vm, crate::runtime::engine::FuncId(fn_idx as u32))
-            {
+            } else if !jit_ptr.is_null() && !jit_disabled() {
                 // Kind=6: non-leaf direct JIT dispatch (bypasses call_closure_jit_or_sync)
                 crate::mir::bytecode::CallSiteIC {
                     class: cache_key_class as usize,
@@ -1621,26 +1616,6 @@ pub fn push_jit_root(v: Value) {
 }
 
 thread_local! {
-    /// Toggle that gates helper-driven GC. Off by default so JIT
-    /// and interpreter modes keep their existing safepoint
-    /// schedule (the bytecode interpreter loop runs
-    /// `vm.collect_garbage()` every ~4096 ops). The AOT bootstrap
-    /// flips this on inside `wlift_aot_enter` because AOT bodies
-    /// never re-enter the interpreter and the loop's safepoint
-    /// is unreachable. Without the gate, firing GC mid-helper
-    /// for JIT/tiered runs corrupts state — the JIT lowering
-    /// only emits stack maps for safepoints it knows about, so a
-    /// helper-driven GC at a not-pre-declared point reads garbage
-    /// for spilled live roots.
-    static AOT_GC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[inline(always)]
-pub fn aot_gc_enabled() -> bool {
-    AOT_GC_ENABLED.with(|c| c.get())
-}
-
-thread_local! {
     /// Depth of native callbacks in progress. While non-zero the
     /// conservative collector does not collect from allocation
     /// helpers: a native may hold values in a Rust `Vec` across the
@@ -1675,104 +1650,32 @@ fn collect_suppressed() -> bool {
     COLLECT_SUPPRESS.with(|c| c.get() != 0)
 }
 
-/// `finish_alloc` for values allocated by a native: natives may keep
-/// earlier allocations in Rust heap memory, so under the conservative
-/// collector they are never a safepoint.
+/// The end of an allocation helper called from compiled code, which
+/// is a safepoint in every tier: native frames are scanned, not
+/// mapped, so the value needs no root entry, and it is pinned in this
+/// frame across the collection.
 ///
-/// # Safety
-/// `vm` must be the current thread's running VM.
-#[inline]
-pub unsafe fn finish_alloc_native(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
-    unsafe {
-        if vm.gc.is_immix() {
-            return val.to_bits();
-        }
-        finish_alloc(vm, val)
-    }
-}
-
-#[inline(always)]
-pub fn set_aot_gc_enabled(v: bool) {
-    AOT_GC_ENABLED.with(|c| c.set(v));
-}
-
-/// End-of-alloc-helper safepoint. Pushes `val` as a JIT root,
-/// runs GC if nursery pressure trips `should_collect()`, then
-/// reads back the (possibly forwarded) value's NaN-boxed bits.
-///
-/// AOT-mode contract: the value is pushed onto `JIT_ROOTS_STORE`
-/// and **stays** there. The AOT lowering pairs each function with
-/// an entry-time `wren_jit_roots_snapshot` and an exit-time
-/// `wren_jit_roots_restore_len` so per-function leaked roots get
-/// reclaimed at function boundaries — same shape `wren_call_N`'s
-/// snapshot/restore uses. This sidesteps the gap where Cranelift's
-/// stack maps don't cover every Value live across a helper call:
-/// every allocated value is unconditionally tracked through the
-/// roots Vec, end of story.
-///
-/// **Long-running-function release:** the AOT lowering also
-/// emits `wren_jit_roots_restore(snap)` at the top of every loop
-/// header so functions that never return (canonical case:
-/// `App.listen`'s accept loop in @hatch:web) don't accumulate one
-/// entry per allocation forever. The release runs every iteration;
-/// Cranelift's stack maps cover anything still live across the
-/// back-edge, so the GC still sees those values. Any false-
-/// negative in the stack maps surfaces as a UAF crash here —
-/// preferable to a silent leak because the gap can be fixed.
-///
-/// JIT / interpreter mode keeps the no-op behaviour — the
-/// bytecode interpreter loop's safepoint already runs GC at safe
-/// boundaries and the JIT path's existing root-tracking machinery
-/// handles the rest.
+/// wasm32 JIT frames keep values in locals no scan reaches, so
+/// allocation stays a non-safepoint there until the shadow stack
+/// lands.
 ///
 /// # Safety
 /// `vm` must be the current thread's running VM.
 #[inline]
 pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
-    // Under the conservative collector any allocation is a safepoint
-    // in every tier: native frames are scanned, not mapped, so the
-    // value needs no root entry. It is pinned in this frame across
-    // the collection.
-    // wasm32 JIT frames keep values in locals no scan reaches, so
-    // allocation stays a non-safepoint there until the shadow stack
-    // lands.
     #[cfg(not(target_arch = "wasm32"))]
-    if vm.gc.is_immix() {
-        if vm.safepoint_due() && !collect_suppressed() {
-            let pinned = std::hint::black_box(val);
-            vm.safepoint_work(false);
-            if vm.gc.take_freed_code_objects() {
-                vm.method_cache.invalidate();
-                vm.engine.invalidate_inline_caches();
-            }
-            return std::hint::black_box(&pinned).to_bits();
-        }
-        return val.to_bits();
-    }
-    #[cfg(target_arch = "wasm32")]
-    if vm.gc.is_immix() {
-        return val.to_bits();
-    }
-    if !aot_gc_enabled() {
-        return val.to_bits();
-    }
-    push_jit_root(val);
-    if vm.gc.should_collect() {
-        vm.collect_garbage();
-        // Mirror the bytecode interpreter's post-GC cleanup —
-        // method_cache and inline-cache entries can hold pointers
-        // to freed/forwarded objects. Without invalidation, a
-        // subsequent dispatch path reads stale data (or follows a
-        // pointer into reused memory) and segfaults.
+    if vm.safepoint_due() && !collect_suppressed() {
+        let pinned = std::hint::black_box(val);
+        vm.safepoint_work(false);
         if vm.gc.take_freed_code_objects() {
             vm.method_cache.invalidate();
             vm.engine.invalidate_inline_caches();
         }
+        return std::hint::black_box(&pinned).to_bits();
     }
-    // Read back the (possibly forwarded) value and return it,
-    // leaving the root in place for the AOT function's lifetime.
-    let len = jit_roots_snapshot_len();
-    jit_root_at(len - 1).to_bits()
+    #[cfg(target_arch = "wasm32")]
+    let _ = vm;
+    val.to_bits()
 }
 
 /// Snapshot the current JIT roots length. Called at AOT function
@@ -1798,13 +1701,12 @@ pub fn jit_roots_snapshot() -> Vec<Value> {
     unsafe { (*jit_state()).roots.clone() }
 }
 
-/// Take all JIT roots for GC scanning. Returns the values (caller must write back
-/// after collection via `set_jit_roots` for nursery forwarding).
+/// Take this thread's JIT roots, for a fiber switch that keeps its own.
 pub fn take_jit_roots() -> Vec<Value> {
     unsafe { std::mem::take(&mut (*jit_state()).roots) }
 }
 
-/// Write back JIT roots after GC (with nursery-forwarded pointers).
+/// Put a fiber's JIT roots back.
 pub fn set_jit_roots(roots: Vec<Value>) {
     unsafe { (*jit_state()).roots = roots };
 }
@@ -1875,14 +1777,6 @@ pub fn jit_context_roots() -> (Value, Value) {
         Value::object(ctx.defining_class)
     };
     (closure, defining_class)
-}
-
-/// Write back JitContext's GC-managed pointers after collection (nursery forwarding).
-pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
-    mutate_jit_ctx(|ctx| {
-        ctx.closure = closure.as_object().unwrap_or(std::ptr::null_mut());
-        ctx.defining_class = defining_class.as_object().unwrap_or(std::ptr::null_mut());
-    });
 }
 
 /// Push the GC-managed pointers of `ctx` (closure + defining_class)
@@ -1958,199 +1852,6 @@ pub fn pop_native_shadow_frame() {
 /// A copy of this thread's native shadow roots.
 pub fn native_shadow_roots_snapshot() -> Vec<Value> {
     FLAT_SHADOW.with(|s| unsafe { (*s.get()).roots.clone() })
-}
-
-pub fn take_native_shadow_roots() -> (Vec<usize>, Vec<Value>) {
-    FLAT_SHADOW.with(|s| unsafe {
-        let stack = &mut *s.get();
-        set_current_native_shadow_roots_ptr(std::ptr::null_mut());
-        if stack.boundaries.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        // Build per-frame lengths from boundary offsets.
-        let mut lengths = Vec::with_capacity(stack.boundaries.len());
-        for i in 0..stack.boundaries.len() {
-            let start = stack.boundaries[i] as usize;
-            let end = if i + 1 < stack.boundaries.len() {
-                stack.boundaries[i + 1] as usize
-            } else {
-                stack.roots.len()
-            };
-            lengths.push(end - start);
-        }
-        let roots = std::mem::take(&mut stack.roots);
-        stack.boundaries.clear();
-        (lengths, roots)
-    })
-}
-
-pub fn set_native_shadow_roots(lengths: Vec<usize>, roots: Vec<Value>) {
-    FLAT_SHADOW.with(|s| unsafe {
-        let stack = &mut *s.get();
-        stack.roots = roots;
-        stack.boundaries.clear();
-        let mut offset = 0u16;
-        for len in &lengths {
-            stack.boundaries.push(offset);
-            offset += *len as u16;
-        }
-        sync_flat_shadow_ptr(stack);
-    });
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-fn current_shadow_slot_count(
-    vm: &crate::runtime::vm::VM,
-    func_id: crate::runtime::engine::FuncId,
-) -> usize {
-    vm.engine
-        .jit_metadata
-        .get(func_id.0 as usize)
-        .and_then(|meta| meta.as_ref())
-        // Only return nonzero when the function actually has shadow stores
-        // (safepoints). Functions with boxed values but no safepoints (e.g.,
-        // pure arithmetic) don't emit shadow stores and don't need a frame.
-        .filter(|meta| !meta.safepoints.is_empty())
-        .map(|meta| meta.boxed_values.len())
-        .unwrap_or(0)
-}
-
-#[inline(always)]
-fn nonleaf_shadow_safe(
-    vm: &crate::runtime::vm::VM,
-    func_id: crate::runtime::engine::FuncId,
-) -> bool {
-    vm.engine
-        .jit_metadata
-        .get(func_id.0 as usize)
-        .and_then(|meta| meta.as_ref())
-        .map(|meta| meta.spill_safe_nonleaf)
-        .unwrap_or(false)
-}
-
-#[inline(always)]
-fn nonleaf_moving_gc_safe(
-    _vm: &crate::runtime::vm::VM,
-    _func_id: crate::runtime::engine::FuncId,
-) -> bool {
-    // All non-leaf JIT functions are safe for nested execution:
-    // - JIT frame registration (#[naked] wren_call_N) makes frames visible to GC
-    // - force_boxed_gp_spills ensures all boxed values are in known spill slots
-    // - GC stack walker (scan_native_stack_roots) reads/writes spill slots directly
-    // - x20 holds JitContext pointer, eliminating TLS for context access
-    true
-    /* Old conservative check (no longer needed with stack map infrastructure):
-    vm.engine
-        .jit_metadata
-        .get(func_id.0 as usize)
-        .and_then(|meta| meta.as_ref())
-        .map(|meta| {
-            meta.spill_safe_nonleaf
-                && meta
-                    .safepoints
-                    .iter()
-                    .map(|sp| sp.live_roots.len())
-                    .max()
-                    .unwrap_or(0)
-                    <= 5
-                && meta.safepoints.iter().all(|sp| {
-                    sp.live_roots.iter().all(|root| {
-                        matches!(
-                            root.location,
-                            crate::codegen::native_meta::RootLocation::Spill(_)
-                        )
-                    })
-                })
-        })
-        .unwrap_or(false)
-    */
-}
-
-fn trace_nonleaf_gate(
-    vm: &crate::runtime::vm::VM,
-    func_id: crate::runtime::engine::FuncId,
-    allow_nonleaf_native: bool,
-) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !env_flag(&ON, "WLIFT_TRACE_NONLEAF") {
-        return;
-    }
-
-    let (boxed_values, safepoints, max_live_roots, spill_safe_nonleaf) = vm
-        .engine
-        .jit_metadata
-        .get(func_id.0 as usize)
-        .and_then(|meta| meta.as_ref())
-        .map(|meta| {
-            (
-                meta.boxed_values.len(),
-                meta.safepoints.len(),
-                meta.safepoints
-                    .iter()
-                    .map(|sp| sp.live_roots.len())
-                    .max()
-                    .unwrap_or(0),
-                meta.spill_safe_nonleaf,
-            )
-        })
-        .unwrap_or((0, 0, 0, false));
-    let name = vm
-        .engine
-        .get_mir(func_id)
-        .map(|mir| vm.interner.resolve(mir.name).to_string())
-        .unwrap_or_else(|| "<unknown>".to_string());
-    eprintln!(
-        "nonleaf gate: FuncId({}) {} allow={} spill_safe={} boxed={} safepoints={} max_live_roots={}",
-        func_id.0,
-        name,
-        allow_nonleaf_native,
-        spill_safe_nonleaf,
-        boxed_values,
-        safepoints,
-        max_live_roots
-    );
-}
-
-pub fn allow_nonleaf_native(
-    vm: &crate::runtime::vm::VM,
-    func_id: crate::runtime::engine::FuncId,
-) -> bool {
-    // With Cranelift, all non-leaf JIT functions are safe to call —
-    // Cranelift handles register allocation and stack frames correctly.
-    // The non-cranelift fallback still needs shadow-stack/spill-slot
-    // safety checks.
-    #[cfg(feature = "cranelift")]
-    {
-        let _ = (vm, func_id);
-        true
-    }
-    #[cfg(not(feature = "cranelift"))]
-    {
-        let allow_nonleaf_native = match vm.config.gc_strategy {
-            crate::runtime::gc_trait::GcStrategy::Generational => {
-                nonleaf_moving_gc_safe(vm, func_id)
-            }
-            crate::runtime::gc_trait::GcStrategy::Immix => true,
-            _ => nonleaf_shadow_safe(vm, func_id),
-        };
-        trace_nonleaf_gate(vm, func_id, allow_nonleaf_native);
-        allow_nonleaf_native
-    }
-}
-
-pub fn allow_root_nonleaf_native(
-    vm: &crate::runtime::vm::VM,
-    func_id: crate::runtime::engine::FuncId,
-) -> bool {
-    let allow_root_nonleaf_native = match vm.config.gc_strategy {
-        crate::runtime::gc_trait::GcStrategy::Generational => nonleaf_moving_gc_safe(vm, func_id),
-        // Conservative scanning covers every native frame.
-        crate::runtime::gc_trait::GcStrategy::Immix => true,
-        _ => nonleaf_shadow_safe(vm, func_id),
-    };
-    trace_nonleaf_gate(vm, func_id, allow_root_nonleaf_native);
-    allow_root_nonleaf_native
 }
 
 #[inline(always)]
@@ -2366,49 +2067,6 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     value
 }
 
-/// Cached read of `WLIFT_VALIDATE_BARRIERS`. The env var is checked
-/// once at first access; this avoids paying a `getenv`-equivalent
-/// syscall on every barrier call when the validator is off.
-fn validate_barriers_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some())
-}
-
-/// Record an old->young edge for a just-performed object write.
-///
-/// Under `WLIFT_VALIDATE_BARRIERS=1`, also runs a per-call check that
-/// `source` is not a stale (freed-but-bytes-still-read-as-GEN_OLD)
-/// pointer. This is the surface where AOT codegen holding a raw
-/// object pointer across a safepoint manifests as a corrupt
-/// `remembered_set` on the next GC; catching it here points lldb's
-/// backtrace at the offending AOT function frame directly instead
-/// of at `trace_object` deep inside `collect_minor`.
-#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub extern "C" fn wren_write_barrier(source: u64, value: u64) -> u64 {
-    let source = Value::from_bits(source);
-    let value = Value::from_bits(value);
-    if let Some(ptr) = source.as_object() {
-        unsafe {
-            if let Some(vm) = vm_ref() {
-                let hdr = ptr as *mut ObjHeader;
-                if validate_barriers_enabled() && vm.gc.is_stale_old_source(hdr) {
-                    let ty = (*hdr).obj_type;
-                    panic!(
-                        "STALE-SOURCE: wren_write_barrier called with source {:p} ({:?}) — \
-                         header.generation says OLD but pointer not in old_objects. AOT codegen \
-                         held a freed pointer across a safepoint. Attach lldb to the parent \
-                         frames for the calling AOT function name.",
-                        hdr, ty
-                    );
-                }
-                vm.gc.write_barrier(hdr, value);
-            }
-        }
-    }
-    value.to_bits()
-}
-
 /// Try to call a closure via native code if it's compiled; fall back to interpreter.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn call_closure_jit_or_sync(
@@ -2497,26 +2155,6 @@ pub fn call_closure_jit_or_sync(
                 .get(func_id.0 as usize)
                 .copied()
                 .unwrap_or(false);
-            let allow_nonleaf_native = allow_nonleaf_native(vm, func_id);
-            // Nested non-leaf native calls are not safe yet: if the callee
-            // allocates or re-enters the interpreter, the caller's native frame
-            // still has live boxed values with no stack map / root metadata.
-            // That is fatal for moving GC and can still lead to collection of
-            // live objects under non-moving GC. Keep top-level non-leaf native
-            // execution available, but route nested non-leaf calls through the
-            // interpreter until native frame rooting exists.
-            if !is_leaf && !allow_nonleaf_native {
-                vm.engine.note_fallback_to_interpreter(func_id);
-                vm.engine
-                    .note_runtime_call_stats(|s| s.call_closure_interpreter_fallbacks += 1);
-                let result = vm
-                    .call_closure_sync(closure_ptr, args, defining_class)
-                    .map(|v| v.to_bits())
-                    .unwrap_or(Value::null().to_bits());
-                restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
-                return result;
-            }
-
             if depth < MAX_JIT_DEPTH {
                 trace_native_entry(
                     vm,
@@ -3751,12 +3389,9 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
         .get(fid)
         .copied()
         .unwrap_or(std::ptr::null());
-    // The conservative collector scans this frame, so the arguments
-    // need no root entries; a moving collector re-reads them from the
-    // root set after the call may have collected.
-    let conservative = vm.gc.is_immix();
-    let arg_count = args.len();
-    if !jit_ptr.is_null() && arg_count <= 4 {
+    // The collector scans this frame, so the arguments need no root
+    // entries.
+    if !jit_ptr.is_null() && args.len() <= 4 {
         let depth = unsafe { (*j).depth };
         if depth < MAX_JIT_DEPTH {
             // A leaf callee never looks up an IC table, so its
@@ -3767,21 +3402,7 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
                 unsafe { (*j).ctx.current_func_id = func_id as u64 };
             }
             unsafe { (*j).depth = depth + 1 };
-            let result = if conservative {
-                unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, args) }
-            } else {
-                let roots = unsafe { &mut (*j).roots };
-                let root_base = roots.len();
-                roots.extend_from_slice(args);
-                let collected: smallvec::SmallVec<[Value; 5]> = unsafe { &(*j).roots }
-                    [root_base..root_base + arg_count]
-                    .iter()
-                    .copied()
-                    .collect();
-                let r = unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &collected) };
-                unsafe { (*j).roots.truncate(root_base) };
-                r
-            };
+            let result = unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, args) };
             unsafe {
                 (*j).depth = depth;
                 if !is_leaf {
@@ -3827,12 +3448,7 @@ fn wren_construct_inner(packed: u64, class_bits: u64, args: &[u64]) -> u64 {
         .as_object()
         .map(|p| p as *mut ObjClass)
         .unwrap_or(std::ptr::null_mut());
-    if jit_ptr.is_null()
-        || class_ptr.is_null()
-        || args.len() > 3
-        || depth >= MAX_JIT_DEPTH
-        || crate::runtime::gc_trait::jit_needs_write_barriers()
-    {
+    if jit_ptr.is_null() || class_ptr.is_null() || args.len() > 3 || depth >= MAX_JIT_DEPTH {
         let mut all: smallvec::SmallVec<[Value; 5]> = smallvec::SmallVec::new();
         all.push(class_val);
         all.extend(args.iter().map(|a| Value::from_bits(*a)));
@@ -4514,9 +4130,6 @@ pub extern "C" fn wren_list_add(list_val: u64, elem: u64) {
         let list_ptr = ptr as *mut crate::runtime::object::ObjList;
         unsafe {
             (*list_ptr).add(elem_v);
-            if let Some(vm) = vm_ref() {
-                vm.gc.write_barrier(list_ptr as *mut ObjHeader, elem_v);
-            }
         }
     }
 }
@@ -4564,10 +4177,6 @@ pub extern "C" fn wren_map_set(map_val: u64, key: u64, value: u64) {
         let map_ptr = ptr as *mut ObjMap;
         unsafe {
             (*map_ptr).set(key_v, value_v);
-            if let Some(vm) = vm_ref() {
-                vm.gc.write_barrier(map_ptr as *mut ObjHeader, key_v);
-                vm.gc.write_barrier(map_ptr as *mut ObjHeader, value_v);
-            }
         }
     }
 }
@@ -4625,12 +4234,7 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
         // The body reaches the static fields of the class whose
         // method is making it.
         (*closure_ptr).defining_class = defining_class;
-        if !defining_class.is_null() {
-            vm.gc.write_barrier(
-                closure_ptr as *mut ObjHeader,
-                Value::object(defining_class as *mut u8),
-            );
-        }
+        if !defining_class.is_null() {}
     }
     // Root the closure before upvalue allocations.
     push_jit_root(Value::object(closure_ptr as *mut u8));
@@ -4657,10 +4261,6 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
                 as *mut crate::runtime::object::ObjClosure;
             if i < (*live_closure).upvalues.len() {
                 (&mut (*live_closure).upvalues)[i] = uv_obj;
-                vm.gc.write_barrier(
-                    live_closure as *mut crate::runtime::object::ObjHeader,
-                    Value::object(uv_obj as *mut u8),
-                );
             }
         }
     }
@@ -5171,9 +4771,6 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                     if i < count {
                         unsafe {
                             (*list).set(i, value);
-                            if let Some(vm) = vm_ref() {
-                                vm.gc.write_barrier(ptr as *mut ObjHeader, value);
-                            }
                         }
                         return value.to_bits();
                     }
@@ -5184,10 +4781,6 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                 let map_key = MapKey::new(idx);
                 unsafe {
                     (*map).entries.insert(map_key, value);
-                    if let Some(vm) = vm_ref() {
-                        vm.gc.write_barrier(ptr as *mut ObjHeader, idx);
-                        vm.gc.write_barrier(ptr as *mut ObjHeader, value);
-                    }
                 }
                 return value.to_bits();
             }
@@ -5276,9 +4869,6 @@ pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
         if idx < upvalues.len() {
             let uv = upvalues[idx];
             (*uv).set(value);
-            if let Some(vm) = vm_ref() {
-                vm.gc.write_barrier(uv as *mut ObjHeader, value);
-            }
         }
     }
     value.to_bits()
@@ -5317,9 +4907,6 @@ pub extern "C" fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
     let value = Value::from_bits(value);
     unsafe {
         (*class).static_fields.insert(sym, value);
-        if let Some(vm) = vm_ref() {
-            vm.gc.write_barrier(class as *mut ObjHeader, value);
-        }
     }
     value.to_bits()
 }
@@ -6001,7 +5588,6 @@ pub fn resolve(name: &str) -> Option<usize> {
     match name {
         "wren_get_module_var" => Some(wren_get_module_var as *const () as usize),
         "wren_set_module_var" => Some(wren_set_module_var as *const () as usize),
-        "wren_write_barrier" => Some(wren_write_barrier as *const () as usize),
         // Arity-specific call dispatch
         "wren_call_0" => Some(wren_call_0 as *const () as usize),
         "wren_call_1" => Some(wren_call_1 as *const () as usize),
@@ -7224,31 +6810,6 @@ mod tests {
 
         // Clean up
         set_jit_context(JitContext::default());
-    }
-
-    #[test]
-    fn test_native_shadow_roots_round_trip() {
-        push_native_shadow_frame(2);
-        assert_eq!(
-            wren_shadow_store(0, Value::num(7.0).to_bits()),
-            Value::num(7.0).to_bits()
-        );
-        assert_eq!(
-            wren_shadow_store(1, Value::bool(true).to_bits()),
-            Value::bool(true).to_bits()
-        );
-
-        let (lengths, roots) = take_native_shadow_roots();
-        assert_eq!(lengths, vec![2]);
-        assert_eq!(roots, vec![Value::num(7.0), Value::bool(true)]);
-
-        set_native_shadow_roots(lengths, vec![Value::null(), Value::num(11.0)]);
-        let (lengths, roots) = take_native_shadow_roots();
-        assert_eq!(lengths, vec![2]);
-        assert_eq!(roots, vec![Value::null(), Value::num(11.0)]);
-
-        set_native_shadow_roots(Vec::new(), Vec::new());
-        pop_native_shadow_frame();
     }
 
     #[test]

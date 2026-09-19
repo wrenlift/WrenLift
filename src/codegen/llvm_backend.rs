@@ -923,9 +923,8 @@ pub mod llvm {
         }
 
         /// A load of an object word that never changes while the object
-        /// is alive (its class, its fields pointer). Under a non-moving
-        /// collector LLVM may keep it across stores it cannot
-        /// disambiguate; a moving collector rewrites those words.
+        /// is alive (its class, its fields pointer): LLVM may keep it
+        /// across stores it cannot disambiguate.
         fn load64_stable(
             &mut self,
             base: IntValue<'ctx>,
@@ -936,14 +935,12 @@ pub mod llvm {
                 .b
                 .build_load(self.i64t(), p, "ld")
                 .map_err(|e| e.to_string())?;
-            if !crate::runtime::gc_trait::jit_needs_write_barriers() {
-                let ctx = self.sh.ctx;
-                let kind = ctx.get_kind_id("invariant.load");
-                ld.as_instruction_value()
-                    .ok_or("load is not an instruction")?
-                    .set_metadata(ctx.metadata_node(&[]), kind)
-                    .map_err(|e| e.to_string())?;
-            }
+            let ctx = self.sh.ctx;
+            let kind = ctx.get_kind_id("invariant.load");
+            ld.as_instruction_value()
+                .ok_or("load is not an instruction")?
+                .set_metadata(ctx.metadata_node(&[]), kind)
+                .map_err(|e| e.to_string())?;
             Ok(ld.into_int_value())
         }
 
@@ -1691,9 +1688,6 @@ pub mod llvm {
                         self.note_field_kind_static(class, *idx, v)?;
                     } else if !self.num_values.contains(&v) {
                         self.note_field_kind(obj, *idx, v)?;
-                    }
-                    if crate::runtime::gc_trait::jit_needs_write_barriers() {
-                        self.call_helper("wren_write_barrier", &[r, v])?;
                     }
                     v.into()
                 }
@@ -2488,9 +2482,6 @@ pub mod llvm {
             let other = self.new_block("sso");
             let p = self.list_element(r, idx, other)?;
             self.b.build_store(p, v).map_err(|e| e.to_string())?;
-            if crate::runtime::gc_trait::jit_needs_write_barriers() {
-                self.call_helper("wren_write_barrier", &[r, v])?;
-            }
             self.br(merge)?;
             self.b.position_at_end(other);
             let (_, i, data, kind) = self.typed_array_probe(r, idx, slow)?;
@@ -3340,10 +3331,7 @@ pub mod llvm {
                 let ic_idx = self.take_ic_idx();
                 return self.list_iterator_value(r, arg_vals[0], method, ic_idx);
             }
-            if args.len() == 1
-                && Some(method) == self.sh.add_sym
-                && !crate::runtime::gc_trait::jit_needs_write_barriers()
-            {
+            if args.len() == 1 && Some(method) == self.sh.add_sym {
                 let ic_idx = self.take_ic_idx();
                 return self.list_add(r, arg_vals[0], method, ic_idx);
             }

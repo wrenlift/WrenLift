@@ -207,19 +207,11 @@ pub unsafe extern "C" fn wlift_plugin_list_get(value: u64, idx: u32) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_plugin_list_add(vm: *mut (), list: u64, value: u64) {
-    let vm = unsafe { vm_ref(vm) };
+pub unsafe extern "C" fn wlift_plugin_list_add(_vm: *mut (), list: u64, value: u64) {
     let Some(l) = typed_obj::<ObjList>(list, ObjType::List) else {
         return;
     };
-    let v = Value::from_bits(value);
-    unsafe { (*l).add(v) }
-    // Old(list)->young(value) inter-gen edge: minor GC scans the
-    // old list only if its header is enrolled in remembered_set.
-    // Plugin callers (@hatch:gpu/image/audio/window/physics) stash
-    // per-frame Wren values into long-lived host containers, so
-    // the list is reliably old-gen by the time this fires.
-    vm.gc.write_barrier(l as *mut ObjHeader, v);
+    unsafe { (*l).add(Value::from_bits(value)) }
 }
 
 #[unsafe(no_mangle)]
@@ -256,18 +248,11 @@ pub unsafe extern "C" fn wlift_plugin_map_iter_next(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_plugin_map_set(vm: *mut (), map: u64, key: u64, value: u64) {
-    let vm = unsafe { vm_ref(vm) };
+pub unsafe extern "C" fn wlift_plugin_map_set(_vm: *mut (), map: u64, key: u64, value: u64) {
     let Some(m) = typed_obj::<ObjMap>(map, ObjType::Map) else {
         return;
     };
-    let k = Value::from_bits(key);
-    let v = Value::from_bits(value);
-    unsafe { (*m).set(k, v) }
-    // Both key AND value need the barrier — see capi::wrenSetMapValue.
-    let hdr = m as *mut ObjHeader;
-    vm.gc.write_barrier(hdr, k);
-    vm.gc.write_barrier(hdr, v);
+    unsafe { (*m).set(Value::from_bits(key), Value::from_bits(value)) }
 }
 
 #[unsafe(no_mangle)]

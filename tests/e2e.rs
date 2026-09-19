@@ -8,7 +8,7 @@ use std::{
     time::Instant,
 };
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
-use wren_lift::runtime::gc_trait::GcStrategy;
+use wren_lift::runtime::gc_trait::GcAllocator;
 use wren_lift::runtime::vm::{VM, VMConfig};
 
 // ---------------------------------------------------------------------------
@@ -2366,7 +2366,6 @@ for (i in 0...20) {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::Arena,
             ..VMConfig::default()
         },
     );
@@ -2446,7 +2445,6 @@ for (i in 0...20) {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::Arena,
             ..VMConfig::default()
         },
     );
@@ -2525,7 +2523,6 @@ for (i in 0...20) {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::Arena,
             ..VMConfig::default()
         },
     );
@@ -2621,7 +2618,6 @@ for (i in 0...20) {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::Arena,
             ..VMConfig::default()
         },
     );
@@ -3348,42 +3344,7 @@ fn e2e_delta_blue_tiered_stress_smoke() {
 }
 
 #[test]
-fn e2e_delta_blue_generational_tiered_full_default_threshold() {
-    let source =
-        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
-
-    let (result, output, elapsed) = run_with_config(
-        &source,
-        VMConfig {
-            execution_mode: ExecutionMode::Tiered,
-            jit_threshold: 100,
-            ..VMConfig::default()
-        },
-    );
-    let t = fmt_elapsed(elapsed);
-    assert!(
-        matches!(result, InterpretResult::Success),
-        "generational tiered full delta_blue failed: {:?} ({})\nOutput:\n{}",
-        result,
-        t,
-        output
-    );
-    assert!(
-        !output.contains("failed"),
-        "generational tiered full delta_blue has projection failures:\n{}",
-        output
-    );
-    let lines: Vec<&str> = output.lines().collect();
-    assert_eq!(
-        lines.first().copied(),
-        Some("14065400"),
-        "generational tiered full delta_blue total mismatch ({})",
-        t
-    );
-}
-
-#[test]
-fn e2e_delta_blue_generational_tiered_full_threshold_one() {
+fn e2e_delta_blue_tiered_full() {
     let source =
         std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
 
@@ -3398,134 +3359,27 @@ fn e2e_delta_blue_generational_tiered_full_threshold_one() {
     let t = fmt_elapsed(elapsed);
     assert!(
         matches!(result, InterpretResult::Success),
-        "generational tiered full delta_blue threshold-one failed: {:?} ({})\nOutput:\n{}",
+        "tiered full delta_blue failed: {:?} ({})\nOutput:\n{}",
         result,
         t,
         output
     );
     assert!(
         !output.contains("failed"),
-        "generational tiered full delta_blue threshold-one has projection failures:\n{}",
+        "tiered full delta_blue has projection failures:\n{}",
         output
     );
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(
         lines.first().copied(),
         Some("14065400"),
-        "generational tiered full delta_blue threshold-one total mismatch ({})",
+        "tiered full delta_blue total mismatch ({})",
         t
     );
 }
 
 #[test]
-fn e2e_delta_blue_mark_sweep_tiered_projection_smoke() {
-    let source =
-        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
-    let prefix = source
-        .split("var start = System.clock")
-        .next()
-        .expect("delta_blue benchmark footer must exist");
-    let smoke = format!("{}projectionTest.call(5)\nSystem.print(total)\n", prefix);
-
-    let (result, output, elapsed) = run_with_config(
-        &smoke,
-        VMConfig {
-            execution_mode: ExecutionMode::Tiered,
-            jit_threshold: 1,
-            gc_strategy: GcStrategy::MarkSweep,
-            ..VMConfig::default()
-        },
-    );
-    let t = fmt_elapsed(elapsed);
-    assert!(
-        matches!(result, InterpretResult::Success),
-        "mark-sweep tiered projection smoke failed: {:?} ({})\nOutput:\n{}",
-        result,
-        t,
-        output
-    );
-    assert!(
-        !output.contains("failed"),
-        "mark-sweep tiered projection smoke has projection failures:\n{}",
-        output
-    );
-}
-
-#[test]
-fn e2e_delta_blue_mark_sweep_tiered_stress_smoke() {
-    let source =
-        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
-    let prefix = source
-        .split("var start = System.clock")
-        .next()
-        .expect("delta_blue benchmark footer must exist");
-    let smoke = format!(
-        "{}for (i in 0...5) {{\n  chainTest.call(20)\n  projectionTest.call(20)\n}}\nSystem.print(total)\n",
-        prefix
-    );
-
-    let (result, output, elapsed) = run_with_config(
-        &smoke,
-        VMConfig {
-            execution_mode: ExecutionMode::Tiered,
-            jit_threshold: 1,
-            gc_strategy: GcStrategy::MarkSweep,
-            ..VMConfig::default()
-        },
-    );
-    let t = fmt_elapsed(elapsed);
-    assert!(
-        matches!(result, InterpretResult::Success),
-        "mark-sweep tiered stress smoke failed: {:?} ({})\nOutput:\n{}",
-        result,
-        t,
-        output
-    );
-    assert!(
-        !output.contains("failed"),
-        "mark-sweep tiered stress smoke has projection failures:\n{}",
-        output
-    );
-}
-
-#[test]
-fn e2e_delta_blue_mark_sweep_tiered_full() {
-    let source =
-        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
-
-    let (result, output, elapsed) = run_with_config(
-        &source,
-        VMConfig {
-            execution_mode: ExecutionMode::Tiered,
-            jit_threshold: 1,
-            gc_strategy: GcStrategy::MarkSweep,
-            ..VMConfig::default()
-        },
-    );
-    let t = fmt_elapsed(elapsed);
-    assert!(
-        matches!(result, InterpretResult::Success),
-        "mark-sweep tiered full delta_blue failed: {:?} ({})\nOutput:\n{}",
-        result,
-        t,
-        output
-    );
-    assert!(
-        !output.contains("failed"),
-        "mark-sweep tiered full delta_blue has projection failures:\n{}",
-        output
-    );
-    let lines: Vec<&str> = output.lines().collect();
-    assert_eq!(
-        lines.first().copied(),
-        Some("14065400"),
-        "mark-sweep tiered full delta_blue total mismatch ({})",
-        t
-    );
-}
-
-#[test]
-fn e2e_tiered_mark_sweep_where_predicate_survives_explicit_gc() {
+fn e2e_tiered_where_predicate_survives_explicit_gc() {
     let source = r#"
 class Holder {
   construct new(values) {
@@ -3555,14 +3409,13 @@ for (i in 0...10) {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::MarkSweep,
             ..VMConfig::default()
         },
     );
     let t = fmt_elapsed(elapsed);
     assert!(
         matches!(result, InterpretResult::Success),
-        "mark-sweep where predicate GC failed: {:?} ({})\nOutput:\n{}",
+        "where predicate GC failed: {:?} ({})\nOutput:\n{}",
         result,
         t,
         output
@@ -3571,13 +3424,13 @@ for (i in 0...10) {
     assert_eq!(
         output.trim(),
         expected,
-        "mark-sweep where predicate GC output mismatch ({})",
+        "where predicate GC output mismatch ({})",
         t
     );
 }
 
 #[test]
-fn e2e_tiered_mark_sweep_repeated_where_sequence_reassignment() {
+fn e2e_tiered_repeated_where_sequence_reassignment() {
     let source = r#"
 class Holder {
   construct new(values) {
@@ -3613,14 +3466,13 @@ for (i in 0...40) {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::MarkSweep,
             ..VMConfig::default()
         },
     );
     let t = fmt_elapsed(elapsed);
     assert!(
         matches!(result, InterpretResult::Success),
-        "mark-sweep repeated where-sequence reassignment failed: {:?} ({})\nOutput:\n{}",
+        "repeated where-sequence reassignment failed: {:?} ({})\nOutput:\n{}",
         result,
         t,
         output
@@ -3628,7 +3480,7 @@ for (i in 0...40) {
     assert_eq!(
         output.trim(),
         "",
-        "mark-sweep repeated where-sequence reassignment output mismatch ({})",
+        "repeated where-sequence reassignment output mismatch ({})",
         t
     );
 }
@@ -3672,7 +3524,6 @@ fn e2e_delta_blue_chain_then_projection_debug_values() {
         VMConfig {
             execution_mode: ExecutionMode::Tiered,
             jit_threshold: 1,
-            gc_strategy: GcStrategy::MarkSweep,
             ..VMConfig::default()
         },
     );
@@ -5933,9 +5784,9 @@ fn e2e_two_threads_allocate_and_collect_one_heap() {
     assert_eq!(kept_b.len(), 200_000 / 97 + 1);
     // Both threads asked for collections; each stopped the other.
     assert!(
-        a.gc.stats().major_collections >= 8,
+        a.gc.stats().collections >= 8,
         "{}",
-        a.gc.stats().major_collections
+        a.gc.stats().collections
     );
 }
 

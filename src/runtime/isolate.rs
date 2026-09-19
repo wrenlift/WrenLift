@@ -290,14 +290,13 @@ fn factory_of(parent: &VM) -> Factory {
         return f.clone();
     }
     let config = parent.isolate_config();
-    let (mode, jit, opt, traces, steps, depth, gc) = (
+    let (mode, jit, opt, traces, steps, depth) = (
         config.execution_mode,
         config.jit_threshold,
         config.opt_threshold,
         config.fiber_stack_traces,
         config.step_limit,
         config.max_call_depth,
-        config.gc_strategy,
     );
     Arc::new(move || {
         VM::new(crate::runtime::vm::VMConfig {
@@ -307,7 +306,6 @@ fn factory_of(parent: &VM) -> Factory {
             fiber_stack_traces: traces,
             step_limit: steps,
             max_call_depth: depth,
-            gc_strategy: gc,
             ..Default::default()
         })
     })

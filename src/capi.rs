@@ -27,6 +27,7 @@
 use std::ffi::{CStr, CString, c_char, c_double, c_int, c_void};
 use std::ptr;
 
+use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::object::{
     NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray,
 };
@@ -552,21 +553,6 @@ pub unsafe extern "C" fn wlift_aot_enter(
         jit_code_len: 0,
     };
     set_jit_context(new_ctx);
-    // Flip on the helper-driven GC trigger. AOT-emitted bodies
-    // never re-enter the bytecode interpreter loop where the
-    // standard safepoint runs, so without this every alloc helper
-    // is a no-op for GC and the heap grows unboundedly. JIT /
-    // interpreter modes leave the flag at its default `false` so
-    // they don't fire GC at points Cranelift's stack-map metadata
-    // doesn't cover.
-    //
-    // Default ON for AOT bootstrap. `WLIFT_AOT_GC=0` is the
-    // emergency opt-out — leaves the AOT binary running without
-    // GC (memory grows unboundedly) but functionally correct, so
-    // a workload that surfaces a fresh stack-map gap can still
-    // ship while the gap is investigated.
-    let opt_out = std::env::var("WLIFT_AOT_GC").ok().as_deref() == Some("0");
-    crate::codegen::runtime_fns::set_aot_gc_enabled(!opt_out);
 }
 
 /// One method's worth of class-install descriptor: `(sig, fn_ptr,
@@ -728,10 +714,6 @@ pub unsafe extern "C" fn wlift_aot_install_class(
             // doesn't trace closure through class.methods and
             // the slot dangles. Validator direction-1 surfaces
             // this as `class.method[N]`.
-            vm_ref.gc.write_barrier(
-                class_ptr as *mut ObjHeader,
-                crate::runtime::value::Value::object(closure_ptr as *mut u8),
-            );
         }
     }
 
@@ -1335,7 +1317,6 @@ pub unsafe extern "C" fn wlift_aot_resolve_runtime_import(
 #[unsafe(no_mangle)]
 #[cfg(feature = "aot")]
 pub unsafe extern "C" fn wlift_aot_set_closure_class(closure_bits: u64, class_bits: u64) -> u64 {
-    use crate::codegen::runtime_fns::read_jit_ctx;
     use crate::runtime::object::{ObjClass, ObjClosure};
     use crate::runtime::value::Value;
     let closure_val = Value::from_bits(closure_bits);
@@ -1343,11 +1324,6 @@ pub unsafe extern "C" fn wlift_aot_set_closure_class(closure_bits: u64, class_bi
     if let (Some(closure), Some(class)) = (closure_val.as_object(), class_val.as_object()) {
         unsafe {
             (*(closure as *mut ObjClosure)).defining_class = class as *mut ObjClass;
-            let ctx = read_jit_ctx();
-            if !ctx.vm.is_null() {
-                let vm = &mut *(ctx.vm as *mut crate::runtime::vm::VM);
-                vm.gc.write_barrier(closure as *mut ObjHeader, class_val);
-            }
         }
     }
     closure_bits
@@ -1402,8 +1378,7 @@ pub unsafe extern "C" fn wlift_aot_set_static_field(
     field_sym: u64,
     value: u64,
 ) -> u64 {
-    use crate::codegen::runtime_fns::read_jit_ctx;
-    use crate::runtime::object::{ObjClass, ObjHeader};
+    use crate::runtime::object::ObjClass;
     use crate::runtime::value::Value;
     let class_val = Value::from_bits(class_bits);
     let Some(obj) = class_val.as_object() else {
@@ -1414,11 +1389,6 @@ pub unsafe extern "C" fn wlift_aot_set_static_field(
     let value = Value::from_bits(value);
     unsafe {
         (*class).static_fields.insert(sym, value);
-        let ctx = read_jit_ctx();
-        if !ctx.vm.is_null() {
-            let vm = &mut *(ctx.vm as *mut crate::runtime::vm::VM);
-            vm.gc.write_barrier(class as *mut ObjHeader, value);
-        }
     }
     value.to_bits()
 }
@@ -1887,7 +1857,6 @@ pub extern "C" fn wrenSetListElement(
         // value from a plugin write. Without this barrier the
         // edge never enters the remembered_set and the next
         // minor GC drops the young object behind the list.
-        (&mut *vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
     }
 }
 
@@ -1918,7 +1887,6 @@ pub extern "C" fn wrenInsertInList(
         let idx = idx.min(list.len());
         list.insert(idx, elem);
         // Inter-gen edge — same shape as wrenSetListElement.
-        (&mut *vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
     }
 }
 
@@ -2002,12 +1970,6 @@ pub extern "C" fn wrenSetMapValue(
     unsafe {
         let map = &mut *(ptr as *mut ObjMap);
         map.set(key, val);
-        // Map needs both key AND value barriers — either edge
-        // can drag a young object into an old-gen container.
-        // Mirrors wren_map_set in runtime_fns.rs.
-        let hdr = ptr as *mut ObjHeader;
-        (&mut *vm).gc.write_barrier(hdr, key);
-        (&mut *vm).gc.write_barrier(hdr, val);
     }
 }
 

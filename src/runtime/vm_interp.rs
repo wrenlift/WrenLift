@@ -19,6 +19,7 @@ use crate::mir::interp::InterpError;
 use crate::mir::{BlockId, ValueId};
 use crate::runtime::engine::ExecutionMode;
 use crate::runtime::engine::FuncId;
+use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::object::*;
 use crate::runtime::value::Value;
 use crate::runtime::vm::{FiberAction, VM};
@@ -398,12 +399,6 @@ fn try_run_root_frame_native(
         .copied()
         .unwrap_or(std::ptr::null());
     if native_fn_ptr.is_null() {
-        return Ok(RootNative::NotRun);
-    }
-
-    let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-    let allow_nonleaf_native = crate::codegen::runtime_fns::allow_root_nonleaf_native(vm, func_id);
-    if !is_leaf && !allow_nonleaf_native {
         return Ok(RootNative::NotRun);
     }
 
@@ -1927,7 +1922,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         if idx < upvalues.len() {
                             let uv_ptr = upvalues[idx];
                             unsafe { (*uv_ptr).set(v) };
-                            vm.gc.write_barrier(uv_ptr as *mut ObjHeader, v);
                         }
                     }
                     set_reg(&mut values, dst, v);
@@ -1979,7 +1973,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         unsafe {
                             (*class_ptr).static_fields.insert(sym, v);
                         }
-                        vm.gc.write_barrier(class_ptr as *mut ObjHeader, v);
                     }
                     set_reg(&mut values, dst, v);
                 }
@@ -2167,7 +2160,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     if let Some(ptr) = recv.as_object() {
                         let inst = ptr as *mut ObjInstance;
                         unsafe { (*inst).set_field_unchecked(field_idx, val) };
-                        vm.gc.write_barrier(ptr as *mut ObjHeader, val);
                     }
                     set_reg(&mut values, dst, val);
                 }
@@ -4006,10 +3998,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             (*fiber).mir_frames.last().and_then(|f| f.defining_class)
                         {
                             (*closure_ptr).defining_class = class;
-                            vm.gc.write_barrier(
-                                closure_ptr as *mut ObjHeader,
-                                Value::object(class as *mut u8),
-                            );
                         }
                     }
 
@@ -4543,7 +4531,7 @@ fn dispatch_closure_bc_inner(
     closure_ptr: *mut ObjClosure,
     arg_vals: &[Value],
     pc: u32,
-    mut values: Vec<Value>,
+    values: Vec<Value>,
     module_name: &Arc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
@@ -4604,6 +4592,7 @@ fn dispatch_closure_bc_inner(
             crate::runtime::tier::restore_module_vars(prev_vars);
             crate::runtime::tier::restore_closure(prev_closure);
             let result_val = Value::from_bits(result_bits);
+            let mut values = values;
             set_reg(&mut values, return_dst.0 as u16, result_val);
             unsafe {
                 if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -4673,12 +4662,6 @@ fn dispatch_closure_bc_inner(
             .unwrap_or(std::ptr::null());
 
         if !fn_ptr_raw.is_null() {
-            let allow_shadow_nonleaf =
-                crate::codegen::runtime_fns::allow_nonleaf_native(vm, target_func_id);
-            // Only dispatch leaf functions via JIT. Non-leaf JIT dispatch is
-            // correct but too slow (each method call pays ~100ns Rust FFI
-            // overhead vs ~5ns interpreter frame push). Needs inline caching
-            // + direct JIT-to-JIT calls to be viable.
             let jit_depth = crate::codegen::runtime_fns::jit_depth();
             if jit_depth < crate::codegen::runtime_fns::MAX_JIT_DEPTH {
                 // Save caller's frame for GC tracing.
@@ -4759,45 +4742,33 @@ fn dispatch_closure_bc_inner(
                     }
                     return Ok(());
                 }
-                if allow_shadow_nonleaf {
-                    let result_bits = crate::codegen::runtime_fns::call_closure_jit_or_sync(
-                        vm,
-                        closure_ptr,
-                        arg_vals,
-                        defining_class,
-                    );
-                    take_jit_error(vm, fiber)?;
+                let result_bits = crate::codegen::runtime_fns::call_closure_jit_or_sync(
+                    vm,
+                    closure_ptr,
+                    arg_vals,
+                    defining_class,
+                );
+                take_jit_error(vm, fiber)?;
 
-                    let mut values = unsafe {
-                        (*fiber)
-                            .mir_frames
-                            .last_mut()
-                            .map(|f| std::mem::take(&mut f.values))
-                            .unwrap_or_default()
-                    };
-                    let result_val = Value::from_bits(result_bits);
-
-                    if !values.is_empty() {
-                        set_reg(&mut values, return_dst.0 as u16, result_val);
-                    }
-                    unsafe {
-                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
-                            frame.pc = pc;
-                            frame.values = values;
-                        }
-                    }
-                    return Ok(());
-                }
-                vm.engine.note_fallback_to_interpreter(target_func_id);
-                // Non-leaf: fall through to interpreter path.
-                // Restore values from saved frame before continuing.
-                values = unsafe {
+                let mut values = unsafe {
                     (*fiber)
                         .mir_frames
                         .last_mut()
                         .map(|f| std::mem::take(&mut f.values))
                         .unwrap_or_default()
                 };
+                let result_val = Value::from_bits(result_bits);
+
+                if !values.is_empty() {
+                    set_reg(&mut values, return_dst.0 as u16, result_val);
+                }
+                unsafe {
+                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                        frame.pc = pc;
+                        frame.values = values;
+                    }
+                }
+                return Ok(());
             }
         }
     }
@@ -5373,7 +5344,6 @@ pub unsafe fn route_method_error_through_fiber_try(
             (*cur).error = err_val;
             (*cur).state = FiberState::Done;
             // Old-gen fiber, young err string.
-            vm.gc.write_barrier(cur as *mut ObjHeader, err_val);
             let caller = (*cur).caller;
             (*cur).caller = std::ptr::null_mut();
             if (*cur).is_try {
@@ -5421,12 +5391,10 @@ fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
                 // JIT barrier path: caller's frames were temporarily removed.
                 // Store the resume value so handle_jit_fiber_action can read it.
                 (*caller).jit_resume_value = Some(value);
-                vm.gc.write_barrier(caller as *mut ObjHeader, value);
             }
         } else if (*caller).mir_frames.is_empty() {
             // No resume_value_dst and no frames: JIT barrier path.
             (*caller).jit_resume_value = Some(value);
-            vm.gc.write_barrier(caller as *mut ObjHeader, value);
         }
     }
     vm.fiber = caller;

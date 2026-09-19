@@ -267,7 +267,7 @@ impl ImmixGc {
         self.stats.objects_freed = m.freed_objects;
         self.object_count = self.stats.objects_allocated.saturating_sub(m.freed_objects);
         self.stats.peak_objects = self.stats.peak_objects.max(self.object_count);
-        self.stats.major_collections += 1;
+        self.stats.collections += 1;
         self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
     }
 
@@ -562,10 +562,7 @@ impl GcAllocator for ImmixGc {
         ptr
     }
 
-    #[inline(always)]
-    fn write_barrier(&mut self, _source: *mut ObjHeader, _value: Value) {}
-
-    fn collect(&mut self, roots: &mut [Value]) {
+    fn collect(&mut self, roots: &[Value]) {
         self.collect_with_ranges(roots, &[]);
     }
 
@@ -610,18 +607,18 @@ mod tests {
             gc.alloc_string("garbage".to_string());
         }
         let before = gc.object_count;
-        let mut roots = roots_of(&[keep]);
-        gc.collect(&mut roots);
+        let roots = roots_of(&[keep]);
+        gc.collect(&roots);
         assert_eq!(gc.object_count, 1);
         assert!(gc.stats.objects_freed >= before - 1);
         assert_eq!(unsafe { (*keep).obj_type }, ObjType::List);
-        assert_eq!(gc.stats().major_collections, 1);
+        assert_eq!(gc.stats().collections, 1);
         assert!(gc.stats().total_freed > 0);
         // Reuse the freed lines.
         for _ in 0..50_000 {
             gc.alloc_string("again".to_string());
         }
-        gc.collect(&mut roots);
+        gc.collect(&roots);
         assert_eq!(gc.object_count, 1);
     }
 
@@ -640,8 +637,8 @@ mod tests {
             (*inst).set_field(2, Value::num(7.0));
             assert_eq!((*inst).get_field(2).unwrap().as_num(), Some(7.0));
         }
-        let mut roots = roots_of(&[class as *mut ObjHeader, inst as *mut ObjHeader]);
-        gc.collect(&mut roots);
+        let roots = roots_of(&[class as *mut ObjHeader, inst as *mut ObjHeader]);
+        gc.collect(&roots);
         assert_eq!(unsafe { (*inst).get_field(2).unwrap().as_num() }, Some(7.0));
     }
 
@@ -652,8 +649,8 @@ mod tests {
         let b = gc.intern_string("hello".to_string());
         assert_eq!(a, b);
         let _dead = gc.intern_string("bye".to_string());
-        let mut roots = roots_of(&[a as *mut ObjHeader]);
-        gc.collect(&mut roots);
+        let roots = roots_of(&[a as *mut ObjHeader]);
+        gc.collect(&roots);
         assert_eq!(gc.intern_string("hello".to_string()), a);
         let bye_hash = fnv1a_hash_bytes(b"bye");
         assert!(
@@ -720,8 +717,8 @@ mod tests {
         let held = gc.alloc_string("held".to_string());
         unsafe { (*list).add(Value::object(held as *mut u8)) };
         let _dead_class = gc.alloc_class(SymbolId::from_raw(0), std::ptr::null_mut());
-        let mut roots = roots_of(&[list as *mut ObjHeader]);
-        gc.collect(&mut roots);
+        let roots = roots_of(&[list as *mut ObjHeader]);
+        gc.collect(&roots);
         assert!(gc.take_freed_code_objects());
         assert!(!gc.take_freed_code_objects());
         let mut live = Vec::new();

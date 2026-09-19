@@ -298,16 +298,6 @@ fn op_set_field(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
         let inst = obj_ptr as *mut crate::runtime::object::ObjInstance;
         (*inst).set_field_unchecked(idx, val);
     }
-    // Write barrier: same contract as the JIT direct path
-    // (codegen/mod.rs SubscriptSet/SetField) and the bytecode
-    // SetField path. Without this, a hot `this.field = obj`
-    // setter that threadifies stores a young-gen value into an
-    // old-gen instance without recording the inter-gen edge;
-    // the next minor GC drops the young object and the field
-    // holds a stale pointer, surfacing later as a malloc
-    // double-free or trace_object 0x4 fault. Same class of bug
-    // as the SubscriptSet barrier fix.
-    crate::codegen::runtime_fns::wren_write_barrier(recv.to_bits(), val.to_bits());
     set(state, op.dst, val);
     state.pc + 1
 }
@@ -598,15 +588,6 @@ fn op_is_type(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
         get(state, op.b).to_bits(),
     );
     set(state, op.dst, Value::from_bits(r));
-    state.pc + 1
-}
-
-#[allow(dead_code)] // Reserved for a future threaded SetField emission path.
-fn op_write_barrier(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
-    crate::codegen::runtime_fns::wren_write_barrier(
-        get(state, op.a).to_bits(),
-        get(state, op.b).to_bits(),
-    );
     state.pc + 1
 }
 

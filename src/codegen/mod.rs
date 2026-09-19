@@ -2101,9 +2101,7 @@ pub fn top_tier() -> TopTier {
     use std::sync::OnceLock;
     static CACHED: OnceLock<TopTier> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        let default = if cfg!(feature = "llvm")
-            && !crate::runtime::gc_trait::jit_needs_write_barriers()
-        {
+        let default = if cfg!(feature = "llvm") {
             TopTier::Llvm
         } else {
             TopTier::Off
@@ -2185,10 +2183,9 @@ pub fn jit_bump_region() -> usize {
 }
 
 /// Compiled code calls a known compiled callee straight through its
-/// `jit_code` slot under the conservative collector, which scans the
-/// native frames a helper would otherwise root; a collector that needs
-/// barriers, call-site caches passed to the helpers
-/// (`WLIFT_ENABLE_JIT_CALLSITE_IC`), or `WLIFT_DISABLE_DIRECT_CALLS=1`
+/// `jit_code` slot; the collector scans the native frames a helper
+/// would otherwise root. Call-site caches passed to the helpers
+/// (`WLIFT_ENABLE_JIT_CALLSITE_IC`) or `WLIFT_DISABLE_DIRECT_CALLS=1`
 /// keep the helper. Safe to run with either way.
 pub fn direct_calls_enabled() -> bool {
     use std::sync::OnceLock;
@@ -2196,7 +2193,7 @@ pub fn direct_calls_enabled() -> bool {
     *CACHED.get_or_init(|| {
         std::env::var_os("WLIFT_DISABLE_DIRECT_CALLS").is_none()
             && std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_none()
-    }) && !crate::runtime::gc_trait::jit_needs_write_barriers()
+    })
 }
 
 /// Compile a MIR function to native code or WASM for the given target.
@@ -3589,22 +3586,8 @@ impl<'a> LowerCtx<'a> {
                     mem: Mem::new(fields_ptr, field_offset),
                 });
 
-                if self
-                    .gc_value_reps
-                    .get(val.0 as usize)
-                    .copied()
-                    .unwrap_or(GcValueRep::MaybeObject)
-                    .is_gc_root()
-                {
-                    self.mf.emit(MachInst::CallRuntime {
-                        name: "wren_write_barrier",
-                        args: vec![recv_reg, v],
-                        ret: Some(dst),
-                    });
-                } else {
-                    // SetField result is the stored value.
-                    self.mf.emit(MachInst::Mov { dst, src: v });
-                }
+                // SetField result is the stored value.
+                self.mf.emit(MachInst::Mov { dst, src: v });
             }
             Instruction::GetModuleVar(idx) => {
                 let dst = self.vreg_for(dst_val);
@@ -4928,33 +4911,7 @@ impl<'a> LowerCtx<'a> {
                     src: val_reg,
                     mem: Mem::new(elem_addr, 0),
                 });
-                // Write barrier: the runtime fallback `wren_subscript_set`
-                // calls write_barrier after the store; the direct JIT path
-                // must do the same, or an old-gen List → young-gen value
-                // edge becomes invisible to the next minor GC and the
-                // young value is freed while the list still references it.
-                // trace_object then dereferences the dangling pointer and
-                // faults at offset 0x4 in the recycled header (see
-                // project_jit_list_subscript_set_barrier).
-                //
-                // Only emit when the value's inferred rep could be an
-                // object — primitives don't create inter-gen edges, and
-                // the existing SetField path uses the same gate.
-                if self
-                    .gc_value_reps
-                    .get(value.0 as usize)
-                    .copied()
-                    .unwrap_or(GcValueRep::MaybeObject)
-                    .is_gc_root()
-                {
-                    self.mf.emit(MachInst::CallRuntime {
-                        name: "wren_write_barrier",
-                        args: vec![recv_reg, val_reg],
-                        ret: Some(dst),
-                    });
-                } else {
-                    self.mf.emit(MachInst::Mov { dst, src: val_reg });
-                }
+                self.mf.emit(MachInst::Mov { dst, src: val_reg });
             }
             // Multi-index subscript: fall back to runtime call
             Instruction::SubscriptGet { receiver, args } => {

@@ -12,7 +12,7 @@ use wren_lift::mir::opt::{
 };
 use wren_lift::parse::{lexer, parser};
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
-use wren_lift::runtime::gc_trait::GcStrategy;
+use wren_lift::runtime::gc_trait::GcAllocator;
 use wren_lift::runtime::vm::{VM, VMConfig};
 use wren_lift::sema;
 
@@ -148,10 +148,6 @@ struct Cli {
     #[arg(long)]
     opt_threshold: Option<u32>,
 
-    /// Garbage collector strategy (default: WLIFT_GC env var, else immix).
-    #[arg(long, value_enum)]
-    gc: Option<GcMode>,
-
     /// Enable SIGUSR1-driven in-process hot reload.
     ///
     /// When passed, `wlift` installs a SIGUSR1 handler that flips a
@@ -162,18 +158,6 @@ struct Cli {
     /// `wlift` child on every file save.
     #[arg(long)]
     watch: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum GcMode {
-    /// Generational nursery + old gen mark-sweep.
-    Generational,
-    /// Allocate-only, free on drop. Best for short-lived scripts / benchmarks.
-    Arena,
-    /// Simple non-generational mark-sweep.
-    MarkSweep,
-    /// Block/line bump allocation with non-moving mark-sweep (default).
-    Immix,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -226,16 +210,6 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
         ExecutionMode::Interpreter => 1_000_000_000,
         _ => 10_000_000_000, // tiered/jit: 10x headroom since JIT code doesn't count steps
     });
-    let gc_strategy = cli
-        .gc
-        .map(|g| match g {
-            GcMode::Generational => GcStrategy::Generational,
-            GcMode::Arena => GcStrategy::Arena,
-            GcMode::MarkSweep => GcStrategy::MarkSweep,
-            GcMode::Immix => GcStrategy::Immix,
-        })
-        .or_else(GcStrategy::from_env)
-        .unwrap_or_default();
     let (load_module_fn, resolve_module_fn) = match source_dir {
         Some(dir) => {
             let (l, r) = make_module_io(dir);
@@ -246,7 +220,6 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
     let config = VMConfig {
         execution_mode: mode,
         step_limit,
-        gc_strategy,
         jit_threshold: cli
             .jit_threshold
             .unwrap_or(VMConfig::default().jit_threshold),
@@ -600,11 +573,9 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
     if cli.gc_stats {
         let stats = vm.gc.stats();
         eprintln!("--- GC Stats ---");
-        eprintln!("  minor collections: {}", stats.minor_collections);
-        eprintln!("  major collections: {}", stats.major_collections);
+        eprintln!("  collections:        {}", stats.collections);
         eprintln!("  objects allocated:  {}", stats.objects_allocated);
         eprintln!("  objects freed:      {}", stats.objects_freed);
-        eprintln!("  objects promoted:   {}", stats.objects_promoted);
         eprintln!("  peak objects:       {}", stats.peak_objects);
         eprintln!("  total allocated:    {} KB", stats.total_allocated / 1024);
         eprintln!("  total freed:        {} KB", stats.total_freed / 1024);
@@ -1299,8 +1270,7 @@ fn run_hatch(bytes: &[u8], cli: &Cli) {
     if cli.gc_stats {
         let stats = vm.gc.stats();
         eprintln!("--- GC Stats ---");
-        eprintln!("  minor collections: {}", stats.minor_collections);
-        eprintln!("  major collections: {}", stats.major_collections);
+        eprintln!("  collections:        {}", stats.collections);
     }
 }
 
@@ -1331,8 +1301,7 @@ fn run_bytecode(bytes: &[u8], filename: &str, cli: &Cli) {
     if cli.gc_stats {
         let stats = vm.gc.stats();
         eprintln!("--- GC Stats ---");
-        eprintln!("  minor collections: {}", stats.minor_collections);
-        eprintln!("  major collections: {}", stats.major_collections);
+        eprintln!("  collections:        {}", stats.collections);
     }
 }
 
