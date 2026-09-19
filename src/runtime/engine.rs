@@ -2763,6 +2763,7 @@ impl ExecutionEngine {
         ics: &[CallSiteIC],
         interner: &crate::intern::Interner,
         exits: Option<&HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>>,
+        tier: CompileTier,
     ) -> HashMap<crate::mir::ValueId, crate::mir::opt::inline_calls::KnownCallee> {
         use crate::mir::Instruction;
         use crate::mir::opt::inline_calls::{CalleeGuard, KnownCallee};
@@ -2865,12 +2866,17 @@ impl ExecutionEngine {
                 if !crate::mir::opt::inline_calls::inlinable_body(&body) {
                     continue;
                 }
-                // The backend already splices small bodies behind a guard;
-                // MIR inlining earns its keep only where the caller's types
-                // can reach arithmetic in the body. A constructor is
-                // different: inlined, its allocation and field stores fuse.
+                // The backend splices an accessor behind a guard itself;
+                // MIR inlining earns its keep only where the caller's
+                // types can reach arithmetic in the body. A constructor
+                // is different: inlined, its allocation and field stores
+                // fuse. `WLIFT_INLINE_ACCESSORS=1` inlines accessors at
+                // the top tier as well, where the baseline's result
+                // profile still covers the call; safe to run with.
                 if constructor.is_none()
                     && !crate::mir::opt::inline_calls::body_has_arithmetic(&body)
+                    && (tier == CompileTier::Baseline
+                        || std::env::var_os("WLIFT_INLINE_ACCESSORS").is_none())
                 {
                     continue;
                 }
@@ -3238,6 +3244,9 @@ impl ExecutionEngine {
             else {
                 continue;
             };
+            // The result is the call's, or the parameter an inlined
+            // call's continuation receives it as; the guard goes right
+            // after either.
             let Some((bi, pos)) = out.blocks.iter().enumerate().find_map(|(bi, b)| {
                 b.instructions
                     .iter()
@@ -3250,7 +3259,10 @@ impl ExecutionEngine {
                                     | Instruction::SubscriptSet { .. }
                             )
                     })
-                    .map(|pos| (bi, pos))
+                    .map(|pos| (bi, pos + 1))
+                    .or_else(|| {
+                        (guard && b.params.iter().any(|(v, _)| *v == dst)).then_some((bi, 0))
+                    })
             }) else {
                 continue;
             };
@@ -3305,7 +3317,7 @@ impl ExecutionEngine {
         let count = placed.len();
         for (bi, pos, guard, dst) in placed {
             let g = out.new_value();
-            out.blocks[bi].instructions.insert(pos + 1, (g, guard));
+            out.blocks[bi].instructions.insert(pos, (g, guard));
             if let Some(dst) = dst
                 && !out.speculated_num_params.contains(&dst)
             {
@@ -3334,6 +3346,7 @@ impl ExecutionEngine {
 
     /// The compile clone with known calls inlined. `WLIFT_DISABLE_MIR_INLINE`
     /// turns it off; safe to run with.
+    #[allow(clippy::too_many_arguments)]
     fn inline_known(
         &self,
         caller: FuncId,
@@ -3342,6 +3355,7 @@ impl ExecutionEngine {
         ics: Option<&[CallSiteIC]>,
         interner: &crate::intern::Interner,
         exits: Option<&HashMap<crate::mir::ValueId, (u32, Vec<crate::mir::DeoptReg>)>>,
+        tier: CompileTier,
     ) -> Arc<MirFunction> {
         if std::env::var_os("WLIFT_DISABLE_MIR_INLINE").is_some() {
             return clone;
@@ -3355,7 +3369,7 @@ impl ExecutionEngine {
         let Some(ics) = ics else {
             return clone;
         };
-        let sites = self.known_call_sites(caller, mir, ics, interner, exits);
+        let sites = self.known_call_sites(caller, mir, ics, interner, exits, tier);
         if sites.is_empty() {
             return clone;
         }
@@ -3437,6 +3451,17 @@ impl ExecutionEngine {
         };
         let osr_entries = executable.osr_entries().to_vec();
         let installed_code_size = executable.code_size();
+        // `WLIFT_JIT_CODE_DIR=<dir>` writes each installed body's machine
+        // code to `<dir>/<id>-<tier>.bin` for a disassembler; safe to
+        // run with.
+        if let Some(dir) = std::env::var_os("WLIFT_JIT_CODE_DIR")
+            && !native_ptr.is_null()
+            && installed_code_size > 0
+        {
+            let path = std::path::Path::new(&dir).join(format!("{idx}-{tier:?}.bin"));
+            let bytes = unsafe { std::slice::from_raw_parts(native_ptr, installed_code_size) };
+            let _ = std::fs::write(path, bytes);
+        }
         if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
             eprintln!(
                 "INSTALL: idx={} tier={:?} native={} ptr={:p}",
@@ -4001,6 +4026,7 @@ impl ExecutionEngine {
             callsite_ic_ptrs.as_deref(),
             interner,
             None,
+            tier,
         );
         let speculate = !self.speculation_failed[idx];
         let compile_mir =
@@ -4246,6 +4272,7 @@ impl ExecutionEngine {
             callsite_ic_ptrs.as_deref(),
             interner,
             exits.as_ref(),
+            tier,
         );
         let sroa_mir = if speculating {
             let out = self.speculate_call_results(id, &mir, sroa_mir, interner);

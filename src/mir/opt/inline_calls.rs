@@ -236,9 +236,12 @@ struct SlowCopy {
     fast_to_slow: HashMap<ValueId, ValueId>,
     /// Copy value → the fast-world value it stands for.
     slow_to_fast: HashMap<ValueId, ValueId>,
-    /// `(fast-world block, copy block)`: a guard's failure path enters
-    /// the copy there, after its generic call.
-    entries: Vec<(BlockId, BlockId)>,
+    /// `(fast-world block, copy block, (copy value, generic result))`:
+    /// a guard's failure path enters the copy there, after its generic
+    /// call, whose result stands for the site's value on that edge
+    /// alone; every other edge hands over the fast continuation's
+    /// parameter.
+    entries: Vec<(BlockId, BlockId, (ValueId, ValueId))>,
 }
 
 /// Give every copy block a parameter for each value the copy defines
@@ -302,11 +305,20 @@ fn repair_copy_ssa(func: &mut MirFunction, copy: &SlowCopy) {
         }
     }
     // Failure edges pass the fast world's values.
-    for &(from, post) in &copy.entries {
+    for &(from, post, (site, result)) in &copy.entries {
         let Some(need) = needed.get(&post) else {
             continue;
         };
-        let args: Vec<ValueId> = need.iter().map(|v| copy.slow_to_fast[v]).collect();
+        let args: Vec<ValueId> = need
+            .iter()
+            .map(|v| {
+                if *v == site {
+                    result
+                } else {
+                    copy.slow_to_fast[v]
+                }
+            })
+            .collect();
         func.block_mut(from).terminator = Terminator::Branch { target: post, args };
     }
 }
@@ -606,9 +618,9 @@ fn inline_site(
         },
         Some(copy) => {
             let slow_dst = copy.fast_to_slow[&dst];
-            copy.slow_to_fast.insert(slow_dst, slow_result);
             let target = slow_continuation(func, copy, slow_dst);
-            copy.entries.push((slow_block, target));
+            copy.entries
+                .push((slow_block, target, (slow_dst, slow_result)));
             // `repair_copy_ssa` supplies the arguments once every site
             // in the loop is done.
             Terminator::Branch {
