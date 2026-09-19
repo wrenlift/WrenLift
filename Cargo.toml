@@ -22,7 +22,7 @@ resolver = "2"
 
 [package]
 name = "wren_lift"
-version = "0.1.21"
+version = "0.1.22"
 authors = ["Damilare Akinlaja <dami@wrenlift.com>"]
 edition = "2024"
 
