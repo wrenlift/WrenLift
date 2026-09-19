@@ -3360,6 +3360,11 @@ pub mod cl {
                             let idx = *idx as usize;
                             if idx < entry_params.len() {
                                 val_map.insert(vid, entry_params[idx]);
+                                // A parameter a loop entry also loads
+                                // is read through its variable.
+                                if let Some(var) = osr_vars.get(&vid) {
+                                    builder.def_var(*var, entry_params[idx]);
+                                }
                                 // Entry-block BlockParam instructions
                                 // bind function args, all of which are
                                 // i64 Wren Value bits by ABI — but
