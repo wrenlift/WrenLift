@@ -2057,6 +2057,15 @@ impl ExecutableFunction {
         }
     }
 
+    /// Whether the LLVM tier produced this code.
+    pub fn is_llvm(&self) -> bool {
+        #[cfg(feature = "llvm")]
+        let llvm = matches!(self, ExecutableFunction::Llvm(_));
+        #[cfg(not(feature = "llvm"))]
+        let llvm = false;
+        llvm
+    }
+
     /// Whether this function can be called on the current host.
     pub fn is_native(&self) -> bool {
         match self {
@@ -2088,8 +2097,14 @@ impl ExecutableFunction {
     }
 }
 
-/// Which backend the optimised tier uses. `WLIFT_TIER1=off|cranelift|llvm`;
-/// the default is llvm when built with the `llvm` feature and cranelift
+/// Iterations of a loop compiled cold before its body asks to be
+/// compiled again from the caches the loop filled.
+pub const COLD_LOOP_EXIT_AFTER: i64 = 256;
+
+/// How far the optimised tier goes. `WLIFT_TIER1=off|cranelift|llvm`:
+/// `llvm` compiles an optimised body with Cranelift first and again
+/// with LLVM once it has run long enough to pay for the compile; the
+/// default is llvm when built with the `llvm` feature and cranelift
 /// otherwise. Safe to set at any time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopTier {
@@ -2129,6 +2144,21 @@ pub fn top_tier() -> TopTier {
 
 pub fn top_tier_is_llvm() -> bool {
     top_tier() == TopTier::Llvm
+}
+
+thread_local! {
+    /// Whether this thread's next optimised compile is the LLVM
+    /// tier's; the Cranelift tier's body comes first.
+    static JIT_USE_LLVM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_jit_use_llvm(on: bool) {
+    JIT_USE_LLVM.with(|c| c.set(on));
+}
+
+#[cfg(feature = "llvm")]
+fn jit_use_llvm() -> bool {
+    JIT_USE_LLVM.with(|c| c.get())
 }
 
 thread_local! {
@@ -2372,7 +2402,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 mir
             };
             #[cfg(feature = "llvm")]
-            if compile_tier == CompileTier::Optimized && top_tier_is_llvm() {
+            if compile_tier == CompileTier::Optimized && jit_use_llvm() {
                 let compiled = llvm_backend::llvm::compile_mir(
                     mir_ref,
                     interner,

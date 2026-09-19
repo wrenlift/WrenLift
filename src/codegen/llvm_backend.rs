@@ -967,6 +967,21 @@ pub mod llvm {
             Ok(())
         }
 
+        /// Store zero to the stack slot `p` at function entry.
+        fn zero_at_entry(&mut self, p: PointerValue<'ctx>) -> Result<(), String> {
+            let entry = self.f.get_first_basic_block().unwrap();
+            let cur = self.b.get_insert_block().unwrap();
+            match entry.get_terminator() {
+                Some(term) => self.b.position_before(&term),
+                None => self.b.position_at_end(entry),
+            }
+            self.b
+                .build_store(p, self.c64(0))
+                .map_err(|e| e.to_string())?;
+            self.b.position_at_end(cur);
+            Ok(())
+        }
+
         /// Stack buffer of `n` i64 slots, as an integer address.
         fn stack_buf(&mut self, n: usize) -> Result<(PointerValue<'ctx>, IntValue<'ctx>), String> {
             let entry = self.f.get_first_basic_block().unwrap();
@@ -2156,8 +2171,39 @@ pub mod llvm {
                     }
                     return Ok(None);
                 }
-                // The LLVM tier keeps a loop it compiled cold.
-                I::ColdLoopExit { .. } => return Ok(None),
+                // A loop compiled cold: its generic calls fill their
+                // caches as it runs, and the 256th iteration asks for
+                // the function to be compiled again from them. The
+                // body finishes its call on this code; there is no
+                // transfer out of it.
+                I::ColdLoopExit { .. } => {
+                    if self.inline_depth == 0 {
+                        let (slot, counter) = self.stack_buf(1)?;
+                        self.zero_at_entry(slot)?;
+                        let c = self.load64(counter, 0)?;
+                        let c1 = self
+                            .b
+                            .build_int_add(c, self.c64(1), "cold")
+                            .map_err(|e| e.to_string())?;
+                        self.store64(counter, 0, c1)?;
+                        let hot = self.icmp(
+                            IntPredicate::EQ,
+                            c1,
+                            self.c64(crate::codegen::COLD_LOOP_EXIT_AFTER as u64),
+                        )?;
+                        let ask = self.new_block("cold_hot");
+                        let cont = self.new_block("cold_cont");
+                        self.cbr(hot, ask, cont)?;
+                        self.b.position_at_end(ask);
+                        let fid = self.c64(jit_func_id() as u64);
+                        self.call_helper("wren_cold_loop_hot", &[fid])?;
+                        self.b
+                            .build_unconditional_branch(cont)
+                            .map_err(|e| e.to_string())?;
+                        self.b.position_at_end(cont);
+                    }
+                    return Ok(None);
+                }
                 I::GuardNumAt {
                     value, pc, live, ..
                 } => {

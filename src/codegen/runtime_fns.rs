@@ -1423,11 +1423,14 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     }
     let vm = unsafe { &mut *vm };
     let id = crate::runtime::engine::FuncId(func_id as u32);
+    // The caller's generation rides above the header id.
+    let caller_gen = (header >> 32) as u32;
+    let header = header as u32;
     let Some(entry) = vm
         .engine
-        .top_tier_osr_entry(id, crate::mir::BlockId(header as u32))
+        .top_tier_osr_entry(id, crate::mir::BlockId(header), caller_gen)
     else {
-        vm.engine.stop_retier(id);
+        vm.retier_declined(id, caller_gen);
         return decline;
     };
     let pairs: Vec<(u32, Value)> = (0..n as usize)
@@ -1467,7 +1470,7 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
                         func_id, header, reg
                     );
                 }
-                vm.engine.stop_retier(id);
+                vm.retier_declined(id, caller_gen);
                 return decline;
             }
         }

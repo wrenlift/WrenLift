@@ -1341,24 +1341,29 @@ pub mod cl {
             const { std::cell::Cell::new(None) };
     }
 
-    /// Iterations of a cold loop before its compiled code hands back to the
-    /// interpreter.
-    const COLD_LOOP_EXIT_AFTER: i64 = 256;
+    use crate::codegen::COLD_LOOP_EXIT_AFTER;
 
-    /// What baseline code does for the tier above it: count its entries
-    /// and outermost-loop iterations in `cell`, calling `wren_tier_tick`
-    /// when the count reaches the cell's next tick, and poll the cell's
-    /// re-tier word at each header in `retier_headers` (outermost loops
-    /// only), handing the header's live-ins to `wren_retier` when the
-    /// word is set. Every loop header in `tick_headers` counts too, so
-    /// a body that lives in one long outer loop still reaches its
-    /// proposal. Every call's result kind is or'd into the byte at
-    /// `result_kinds + register` when that base is non-zero.
+    /// What compiled code does for the tier above it. Baseline code
+    /// counts its entries and loop iterations in `cell`, calling
+    /// `wren_tier_tick` when the count reaches the cell's next tick;
+    /// every loop header in `tick_headers` counts, so a body that
+    /// lives in one long outer loop still reaches its proposal. Every
+    /// body polls the cell's re-tier word at each header in
+    /// `retier_headers` (outermost loops only), handing the header's
+    /// live-ins to `wren_retier` when the word is set; an optimised
+    /// body, which counts nothing, polls the word at entry too and
+    /// reports in through `wren_tier_tick`. Every call's result kind
+    /// is or'd into the byte at `result_kinds + register` when that
+    /// base is non-zero.
     #[derive(Clone, Default)]
     pub struct TierHook {
         pub func_id: u32,
         pub cell: usize,
+        /// The body's optimised generation, 0 for baseline code; it
+        /// polls for a newer one.
+        pub generation: u32,
         pub retier_headers: HashSet<BlockId>,
+        /// Empty for an optimised body.
         pub tick_headers: HashSet<BlockId>,
         pub result_kinds: usize,
         /// Bytes at `result_kinds`: one per bytecode register. Values
@@ -1377,17 +1382,48 @@ pub mod cl {
     }
 
     thread_local! {
-        /// The function's tier cell for this thread's next top-tier
-        /// compile: a cold loop polls its re-tier word.
-        static JIT_RETIER_CELL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The function's tier cell and the body's generation for this
+        /// thread's next top-tier compile: a cold loop polls the cell's
+        /// re-tier word for a newer generation.
+        static JIT_RETIER_CELL: std::cell::Cell<(usize, u32)> = const { std::cell::Cell::new((0, 0)) };
     }
 
-    pub fn set_jit_retier_cell(cell: usize) {
-        JIT_RETIER_CELL.with(|c| c.set(cell));
+    pub fn set_jit_retier_cell(cell: usize, generation: u32) {
+        JIT_RETIER_CELL.with(|c| c.set((cell, generation)));
     }
 
-    fn jit_retier_cell() -> usize {
+    fn jit_retier_cell() -> (usize, u32) {
         JIT_RETIER_CELL.with(|c| c.get())
+    }
+
+    /// The re-tier word a body of generation `generation` polls.
+    fn retier_word_offset(generation: u32) -> i32 {
+        if generation == 0 {
+            TIER_CELL_RETIER
+        } else {
+            TIER_CELL_RETIER_TOP
+        }
+    }
+
+    /// The header word `wren_retier` decodes: the caller's generation
+    /// above the block id.
+    fn retier_header_word(header: BlockId, generation: u32) -> i64 {
+        header.0 as i64 | ((generation as i64) << 32)
+    }
+
+    thread_local! {
+        /// Whether this thread's next compile notes the kind of every
+        /// field it stores for the LLVM tier's speculation: baseline
+        /// bodies only, so optimised code pays nothing for it.
+        static JIT_NOTE_FIELD_KINDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub fn set_jit_note_field_kinds(on: bool) {
+        JIT_NOTE_FIELD_KINDS.with(|c| c.set(on));
+    }
+
+    fn jit_note_field_kinds() -> bool {
+        JIT_NOTE_FIELD_KINDS.with(|c| c.get())
     }
 
     thread_local! {
@@ -1412,6 +1448,7 @@ pub mod cl {
     /// Byte offsets inside `engine::TierCell`.
     const TIER_CELL_COUNTDOWN: i32 = 0;
     const TIER_CELL_RETIER: i32 = 4;
+    const TIER_CELL_RETIER_TOP: i32 = 16;
 
     /// Load a word from the safepoint page: unreadable while a
     /// collector waits, so the load faults and the fault handler parks
@@ -1465,6 +1502,39 @@ pub mod cl {
         let cont_block = builder.create_block();
         builder.set_cold_block(tick_block);
         builder.ins().brif(tick, tick_block, &[], cont_block, &[]);
+        builder.switch_to_block(tick_block);
+        let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
+        let f = get_runtime_fn(module, builder, "wren_tier_tick", 1)?;
+        builder.ins().call(f, &[fid]);
+        builder.ins().jump(cont_block, &[]);
+        builder.switch_to_block(cont_block);
+        Ok(())
+    }
+
+    /// Call `wren_tier_tick` when the body's re-tier word is set: an
+    /// optimised body reporting in for the tier above it.
+    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
+    fn emit_entry_poll(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        hook: &TierHook,
+    ) -> Result<(), String> {
+        let cell = builder.ins().iconst(types::I64, hook.cell as i64);
+        let word = builder.ins().uload32(
+            MemFlags::trusted(),
+            cell,
+            retier_word_offset(hook.generation),
+        );
+        let tick_block = builder.create_block();
+        let cont_block = builder.create_block();
+        builder.set_cold_block(tick_block);
+        builder.ins().brif(word, tick_block, &[], cont_block, &[]);
         builder.switch_to_block(tick_block);
         let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
         let f = get_runtime_fn(module, builder, "wren_tier_tick", 1)?;
@@ -3207,13 +3277,15 @@ pub mod cl {
                     .get(&bid)
                     .filter(|(_, live)| live.iter().all(|v| val_map.contains_key(v))),
             ) {
-                if !hook.tick_headers.contains(&bid) {
+                if hook.generation == 0 && !hook.tick_headers.contains(&bid) {
                     emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
                 }
                 let cell = builder.ins().iconst(types::I64, hook.cell as i64);
-                let word = builder
-                    .ins()
-                    .uload32(MemFlags::trusted(), cell, TIER_CELL_RETIER);
+                let word = builder.ins().uload32(
+                    MemFlags::trusted(),
+                    cell,
+                    retier_word_offset(hook.generation),
+                );
                 let exit_block = builder.create_block();
                 let cont_block = builder.create_block();
                 builder.set_cold_block(exit_block);
@@ -3222,7 +3294,9 @@ pub mod cl {
                 emit_live_snapshot(builder, live, &val_map, &raw_bools, &exit_value_types, *buf)?;
                 let buf_ptr = builder.ins().stack_addr(types::I64, *buf, 0);
                 let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
-                let header_id = builder.ins().iconst(types::I64, bid.0 as i64);
+                let header_id = builder
+                    .ins()
+                    .iconst(types::I64, retier_header_word(bid, hook.generation));
                 let n = builder.ins().iconst(types::I64, live.len() as i64);
                 let retier_fn = get_runtime_fn(module, builder, "wren_retier", 4)?;
                 let call = builder.ins().call(retier_fn, &[fid, header_id, buf_ptr, n]);
@@ -3345,7 +3419,11 @@ pub mod cl {
                 // SetUpvalue lowering site without re-reading TLS or
                 // calling the per-access helper.
                 if let Some(hook) = tier_hook.as_ref().filter(|h| h.cell != 0) {
-                    emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+                    if hook.generation == 0 {
+                        emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
+                    } else {
+                        emit_entry_poll(builder, module, &mut get_runtime_fn, hook)?;
+                    }
                 }
                 if let Some(cfg) = aot_config {
                     if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
@@ -3443,7 +3521,7 @@ pub mod cl {
                         .into_iter()
                         .chain(mir.blocks[header.0 as usize].params.iter().map(|(p, _)| *p))
                         .collect();
-                    let cell_addr = jit_retier_cell();
+                    let (cell_addr, generation) = jit_retier_cell();
                     if let Some(counter) = cold_counters.get(header)
                         && cell_addr != 0
                         && live.iter().all(|v| val_map.contains_key(v))
@@ -3470,10 +3548,11 @@ pub mod cl {
                         builder.ins().jump(poll_block, &[]);
                         builder.switch_to_block(poll_block);
                         let cell = builder.ins().iconst(types::I64, cell_addr as i64);
-                        let word =
-                            builder
-                                .ins()
-                                .uload32(MemFlags::trusted(), cell, TIER_CELL_RETIER);
+                        let word = builder.ins().uload32(
+                            MemFlags::trusted(),
+                            cell,
+                            retier_word_offset(generation),
+                        );
                         let exit_block = builder.create_block();
                         let cont_block = builder.create_block();
                         builder.set_cold_block(exit_block);
@@ -3495,7 +3574,9 @@ pub mod cl {
                             buf,
                         )?;
                         let buf_ptr = builder.ins().stack_addr(types::I64, buf, 0);
-                        let header_id = builder.ins().iconst(types::I64, header.0 as i64);
+                        let header_id = builder
+                            .ins()
+                            .iconst(types::I64, retier_header_word(*header, generation));
                         let n = builder.ins().iconst(types::I64, live.len() as i64);
                         let retier_fn = get_runtime_fn(module, builder, "wren_retier", 4)?;
                         let call = builder.ins().call(retier_fn, &[fid, header_id, buf_ptr, n]);
@@ -4395,8 +4476,9 @@ pub mod cl {
                 builder
                     .ins()
                     .store(MemFlags::trusted(), store_val, fields_ptr, offset);
-                // Only the LLVM tier reads the field kinds.
-                if aot_config.is_none() && crate::codegen::top_tier_is_llvm() {
+                // Only the LLVM tier reads the field kinds, and only
+                // baseline code notes them.
+                if aot_config.is_none() && jit_note_field_kinds() {
                     match INLINE_CLASS.get() {
                         Some((r, class)) if r == recv_val => {
                             emit_note_field_kind_static(builder, class, *idx, store_val);
