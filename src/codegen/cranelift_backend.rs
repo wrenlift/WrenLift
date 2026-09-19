@@ -1511,6 +1511,24 @@ pub mod cl {
         Ok(())
     }
 
+    /// The i64 a boxed value was converted from: `Box(I64ToF64(i))`.
+    fn int_source(mir: &MirFunction, v: &ValueId) -> Option<ValueId> {
+        let def = |x: &ValueId| {
+            mir.blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter())
+                .find(|(d, _)| d == x)
+                .map(|(_, i)| i)
+        };
+        match def(v)? {
+            Instruction::Box(f) => match def(f)? {
+                Instruction::I64ToF64(i) => Some(*i),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Iterations an optimised body's outermost loop runs between
     /// debits of its cell.
     const LOOP_TICK: i64 = 256;
@@ -4187,7 +4205,7 @@ pub mod cl {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // Instruction lowering threads builder/module/val-map/IC/JIT-code-base — wide by design.
     fn lower_instruction(
         inst: &Instruction,
-        _mir: &MirFunction,
+        mir: &MirFunction,
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,
@@ -6318,9 +6336,23 @@ pub mod cl {
 
                 // 2b. List: an integral Num index within the count reads
                 //     the element; anything else (a negative index, a
-                //     range) is the helper's.
+                //     range) is the helper's. An index boxed from an
+                //     i64 is read as that integer.
                 builder.switch_to_block(list_block);
-                let list_idx = {
+                let list_idx = if let Some(i) =
+                    int_source(mir, &args[0]).and_then(|i| val_map.get(&i).copied())
+                {
+                    let count = builder
+                        .ins()
+                        .uload32(MemFlags::trusted(), obj_ptr, LIST_COUNT);
+                    let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, i, count);
+                    let load_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(in_range, load_block, &[], slow_block, &[]);
+                    builder.switch_to_block(load_block);
+                    i
+                } else {
                     let qnan = builder.ins().iconst(types::I64, QNAN as i64);
                     let masked = builder.ins().band(idx, qnan);
                     let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
@@ -6949,7 +6981,7 @@ pub mod cl {
                 // is exact for every finite `a` because each step only
                 // moves or clears the low bits of `a`; the sign of a zero
                 // result follows the dividend as fmod's does.
-                if let Some(c) = const_f64_of(_mir, *b).filter(|c| is_positive_power_of_two(*c)) {
+                if let Some(c) = const_f64_of(mir, *b).filter(|c| is_positive_power_of_two(*c)) {
                     let inv = builder.ins().f64const(1.0 / c);
                     let q = builder.ins().fmul(av, inv);
                     let q = builder.ins().trunc(q);

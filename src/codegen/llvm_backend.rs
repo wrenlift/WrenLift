@@ -971,6 +971,73 @@ pub mod llvm {
                 .map_err(|e| e.to_string())
         }
 
+        /// An object's type byte: written once at allocation.
+        fn load_obj_type(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(obj, HEADER_OBJ_TYPE as i64)?;
+            let ld = self
+                .b
+                .build_load(self.sh.ctx.i8_type(), p, "ty")
+                .map_err(|e| e.to_string())?;
+            let ctx = self.sh.ctx;
+            ld.as_instruction_value()
+                .ok_or("load is not an instruction")?
+                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_int_z_extend(ld.into_int_value(), self.i64t(), "zx")
+                .map_err(|e| e.to_string())
+        }
+
+        /// The TBAA tag of a List's count and elements words: disjoint
+        /// from instance fields, so a loop that stores fields keeps
+        /// its list reads hoisted.
+        fn list_tag(&mut self) -> MetadataValue<'ctx> {
+            let ctx = self.sh.ctx;
+            let root = *self.field_tbaa_root.get_or_insert_with(|| {
+                ctx.metadata_node(&[ctx.metadata_string("wren fields").into()])
+            });
+            *self.field_tbaa.entry(u16::MAX - 1).or_insert_with(|| {
+                let ty = ctx.metadata_node(&[
+                    ctx.metadata_string("list header").into(),
+                    root.into(),
+                    ctx.i64_type().const_zero().into(),
+                ]);
+                ctx.metadata_node(&[ty.into(), ty.into(), ctx.i64_type().const_zero().into()])
+            })
+        }
+
+        /// A List's count, tagged.
+        fn load_list_count(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(obj, LIST_COUNT as i64)?;
+            let ld = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), p, "count")
+                .map_err(|e| e.to_string())?;
+            let tag = self.list_tag();
+            ld.as_instruction_value()
+                .ok_or("load is not an instruction")?
+                .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_int_z_extend(ld.into_int_value(), self.i64t(), "count64")
+                .map_err(|e| e.to_string())
+        }
+
+        /// A List's elements pointer, tagged.
+        fn load_list_elements(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(obj, LIST_ELEMENTS as i64)?;
+            let ld = self
+                .b
+                .build_load(self.i64t(), p, "elements")
+                .map_err(|e| e.to_string())?;
+            let tag = self.list_tag();
+            ld.as_instruction_value()
+                .ok_or("load is not an instruction")?
+                .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                .map_err(|e| e.to_string())?;
+            Ok(ld.into_int_value())
+        }
+
         fn store64(
             &mut self,
             base: IntValue<'ctx>,
@@ -2123,15 +2190,10 @@ pub mod llvm {
                 I::ListCount(recv) => {
                     let r = self.boxed(recv)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let p = self.addr(obj, LIST_COUNT as i64)?;
-                    let count32 = self
-                        .b
-                        .build_load(self.sh.ctx.i32_type(), p, "count")
-                        .map_err(|e| e.to_string())?
-                        .into_int_value();
+                    let count = self.load_list_count(obj)?;
                     let f = self
                         .b
-                        .build_unsigned_int_to_float(count32, self.f64t(), "countf")
+                        .build_unsigned_int_to_float(count, self.f64t(), "countf")
                         .map_err(|e| e.to_string())?;
                     self.bits(f)?.into()
                 }
@@ -2403,7 +2465,7 @@ pub mod llvm {
             self.cbr(is_obj, obj_bb, slow)?;
             self.b.position_at_end(obj_bb);
             let obj = self.and(r, self.c64(PTR_MASK))?;
-            let ty = self.load8(obj, HEADER_OBJ_TYPE as i64)?;
+            let ty = self.load_obj_type(obj)?;
             let is_ta = self.icmp(IntPredicate::EQ, ty, self.c64(OBJ_TYPE_TYPED_ARRAY as u64))?;
             let ta_bb = self.new_block("ta");
             self.cbr(is_ta, ta_bb, slow)?;
@@ -2424,21 +2486,32 @@ pub mod llvm {
             count_off: i64,
             slow: BasicBlock<'ctx>,
         ) -> Result<IntValue<'ctx>, String> {
+            let count = self.load_count_at(obj, count_off)?;
+            let in_range = self.icmp(IntPredicate::ULT, idx_i, count)?;
+            let ok_bb = self.new_block("ixr");
+            self.cbr(in_range, ok_bb, slow)?;
+            self.b.position_at_end(ok_bb);
+            Ok(idx_i)
+        }
+
+        /// The u32 count at `count_off`, tagged when it is a List's.
+        fn load_count_at(
+            &mut self,
+            obj: IntValue<'ctx>,
+            count_off: i64,
+        ) -> Result<IntValue<'ctx>, String> {
+            if count_off == LIST_COUNT as i64 {
+                return self.load_list_count(obj);
+            }
             let count_p = self.addr(obj, count_off)?;
             let count32 = self
                 .b
                 .build_load(self.sh.ctx.i32_type(), count_p, "count")
                 .map_err(|e| e.to_string())?
                 .into_int_value();
-            let count = self
-                .b
+            self.b
                 .build_int_z_extend(count32, self.i64t(), "count64")
-                .map_err(|e| e.to_string())?;
-            let in_range = self.icmp(IntPredicate::ULT, idx_i, count)?;
-            let ok_bb = self.new_block("ixr");
-            self.cbr(in_range, ok_bb, slow)?;
-            self.b.position_at_end(ok_bb);
-            Ok(idx_i)
+                .map_err(|e| e.to_string())
         }
 
         fn int_index(
@@ -2468,16 +2541,7 @@ pub mod llvm {
             let int_bb = self.new_block("ixi");
             self.cbr(integral, int_bb, slow)?;
             self.b.position_at_end(int_bb);
-            let count_p = self.addr(obj, count_off)?;
-            let count32 = self
-                .b
-                .build_load(self.sh.ctx.i32_type(), count_p, "count")
-                .map_err(|e| e.to_string())?
-                .into_int_value();
-            let count = self
-                .b
-                .build_int_z_extend(count32, self.i64t(), "count64")
-                .map_err(|e| e.to_string())?;
+            let count = self.load_count_at(obj, count_off)?;
             let in_range = self.icmp(IntPredicate::ULT, idx_i, count)?;
             let ok_bb = self.new_block("ixr");
             self.cbr(in_range, ok_bb, slow)?;
@@ -2503,7 +2567,7 @@ pub mod llvm {
             self.cbr(is_obj, obj_bb, other)?;
             self.b.position_at_end(obj_bb);
             let obj = self.and(r, self.c64(PTR_MASK))?;
-            let ty = self.load8(obj, HEADER_OBJ_TYPE as i64)?;
+            let ty = self.load_obj_type(obj)?;
             let is_list = self.icmp(
                 IntPredicate::EQ,
                 ty,
@@ -2516,7 +2580,7 @@ pub mod llvm {
                 Some(i) => self.bounded_index(i, obj, LIST_COUNT as i64, other)?,
                 None => self.int_index(idx, obj, LIST_COUNT as i64, other)?,
             };
-            let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
+            let elements = self.load_list_elements(obj)?;
             self.element_addr(elements, i, VALUE_SIZE as u64)
         }
 
@@ -3720,7 +3784,7 @@ pub mod llvm {
             self.cbr(is_obj, obj_bb, slow)?;
             self.b.position_at_end(obj_bb);
             let obj = self.and(r, self.c64(PTR_MASK))?;
-            let ty = self.load8(obj, HEADER_OBJ_TYPE as i64)?;
+            let ty = self.load_obj_type(obj)?;
             let is_list = self.icmp(
                 IntPredicate::EQ,
                 ty,
