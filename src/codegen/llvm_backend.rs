@@ -451,9 +451,15 @@ pub mod llvm {
         /// A guarded getter whose class keeps its field as Nums: the
         /// guard that follows checks the class's field-kind byte at
         /// this address instead of the value.
-        /// The value, the class's field-kind bytes with their count,
-        /// and the field: the guard that consumes it reads the byte.
-        field_invariant: Option<(ValueId, *mut u8, usize, u16)>,
+        /// The value, the class, its field-kind bytes with their count,
+        /// and the field: the guard that consumes it reads the bytes.
+        field_invariant: Option<(ValueId, usize, *mut u8, usize, u16)>,
+        /// Per class, every field this body guards by kind byte: one
+        /// guard tests them all, so the loop unswitches on one
+        /// condition instead of one per field.
+        kind_sets: HashMap<usize, Vec<u16>>,
+        /// Values proven Num earlier in the current block.
+        num_in_block: HashSet<IntValue<'ctx>>,
         /// The instruction being lowered, at inline depth zero.
         cur_vid: ValueId,
         raw_bools: HashSet<ValueId>,
@@ -496,6 +502,8 @@ pub mod llvm {
                 class_facts: HashMap::new(),
                 move_roots: HashMap::new(),
                 int_sources: HashMap::new(),
+                kind_sets: HashMap::new(),
+                num_in_block: HashSet::new(),
                 cur_block: 0,
                 inline_class: None,
                 field_invariant: None,
@@ -879,7 +887,80 @@ pub mod llvm {
             if seen != crate::runtime::object::FIELD_NUM {
                 return;
             }
-            self.field_invariant = Some((dst, kinds, len, idx));
+            self.field_invariant = Some((dst, class as usize, kinds, len, idx));
+        }
+
+        /// Every (class, field) a kind-byte guard will test in this
+        /// body: a field read on a receiver of known class, followed by a
+        /// Num guard on the value, whose byte says Num today. The class
+        /// facts are the static ones plus the in-place guards passed so
+        /// far in the block, as the lowering will see them.
+        fn collect_kind_sets(&self, mir: &MirFunction) -> HashMap<usize, Vec<u16>> {
+            use crate::runtime::object::{FIELD_NUM, ObjClass};
+            let mut sets: HashMap<usize, Vec<u16>> = HashMap::new();
+            for (bi, block) in mir.blocks.iter().enumerate() {
+                let mut facts: Vec<(ValueId, usize)> =
+                    self.class_facts.get(&bi).cloned().unwrap_or_default();
+                let insts = &block.instructions;
+                for (k, (v, inst)) in insts.iter().enumerate() {
+                    match inst {
+                        Instruction::GuardClassAt { value, class, .. } => {
+                            facts.push((self.root(*value), *class));
+                        }
+                        Instruction::GetField(recv, idx) => {
+                            let r = self.root(*recv);
+                            let Some(class) = facts.iter().find(|(x, _)| *x == r).map(|(_, c)| *c)
+                            else {
+                                continue;
+                            };
+                            // The guard follows, through copies.
+                            let mut cur = *v;
+                            let mut guarded = false;
+                            for (nv, ni) in insts.iter().skip(k + 1) {
+                                match ni {
+                                    Instruction::Move(s) if *s == cur => cur = *nv,
+                                    Instruction::GuardNumAt { value, .. } if *value == cur => {
+                                        guarded = true;
+                                        break;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if !guarded {
+                                continue;
+                            }
+                            let cls = class as *const ObjClass;
+                            let kinds = unsafe { (*cls).field_kinds_ptr };
+                            let len = unsafe { (*cls).field_kinds.len() };
+                            if kinds.is_null() || *idx as usize >= len {
+                                continue;
+                            }
+                            let seen = unsafe { std::ptr::read_volatile(kinds.add(*idx as usize)) };
+                            if seen != FIELD_NUM {
+                                continue;
+                            }
+                            let set = sets.entry(class).or_default();
+                            if !set.contains(idx) {
+                                set.push(*idx);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for set in sets.values_mut() {
+                set.sort_unstable();
+            }
+            sets
+        }
+
+        /// The fields of `class` this body guards by kind byte, or the
+        /// one field when none were collected.
+        fn kind_set(&self, class: usize, idx: u16) -> Vec<u16> {
+            match self.kind_sets.get(&class) {
+                Some(set) if set.contains(&idx) => set.clone(),
+                _ => vec![idx],
+            }
         }
 
         /// The class's field-kind bytes as a global of the array's size
@@ -1465,6 +1546,7 @@ pub mod llvm {
             let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
             self.move_roots = move_roots(mir);
+            self.kind_sets = self.collect_kind_sets(mir);
             // A receiver carried around a loop stands for the value the
             // loop was entered with; the guard on it may be there.
             let mut clone = mir.clone();
@@ -1490,6 +1572,7 @@ pub mod llvm {
                     continue;
                 }
                 self.cur_block = bi;
+                self.num_in_block.clear();
                 if loop_headers.contains(&bi) {
                     self.safepoint_poll()?;
                 }
@@ -1729,10 +1812,10 @@ pub mod llvm {
                 I::Move(s) => {
                     // A copy carries a pending field invariant of its
                     // source.
-                    if let Some((guarded, kinds, len, idx)) = self.field_invariant
+                    if let Some((guarded, class, kinds, len, idx)) = self.field_invariant
                         && guarded == *s
                     {
-                        self.field_invariant = Some((vid, kinds, len, idx));
+                        self.field_invariant = Some((vid, class, kinds, len, idx));
                     }
                     self.get(s)?
                 }
@@ -2343,44 +2426,62 @@ pub mod llvm {
                     value, pc, live, ..
                 } => {
                     let v = self.boxed(value)?;
+                    // Proven a Num earlier in this block.
+                    if self.num_in_block.contains(&v) {
+                        self.field_invariant = None;
+                        return Ok(Some(v.into()));
+                    }
                     let fails = match self.field_invariant.take() {
-                        Some((guarded, kinds, len, idx)) if guarded == *value => {
+                        Some((guarded, class, kinds, len, idx)) if guarded == *value => {
                             let global = self.kinds_global(kinds, len);
-                            let p = unsafe {
-                                self.b
-                                    .build_in_bounds_gep(
-                                        self.sh.ctx.i8_type(),
-                                        global.as_pointer_value(),
-                                        &[self.sh.ctx.i64_type().const_int(idx as u64, false)],
-                                        "fkp",
+                            let mut fails: Option<IntValue<'ctx>> = None;
+                            for idx in self.kind_set(class, idx) {
+                                let p = unsafe {
+                                    self.b
+                                        .build_in_bounds_gep(
+                                            self.sh.ctx.i8_type(),
+                                            global.as_pointer_value(),
+                                            &[self.sh.ctx.i64_type().const_int(idx as u64, false)],
+                                            "fkp",
+                                        )
+                                        .map_err(|e| e.to_string())?
+                                };
+                                let kind = self
+                                    .b
+                                    .build_load(self.sh.ctx.i8_type(), p, "fk")
+                                    .map_err(|e| e.to_string())?;
+                                let tag = self.kinds_tag();
+                                kind.as_instruction_value()
+                                    .ok_or("load is not an instruction")?
+                                    .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                                    .map_err(|e| e.to_string())?;
+                                let f = self
+                                    .b
+                                    .build_int_compare(
+                                        IntPredicate::NE,
+                                        kind.into_int_value(),
+                                        self.sh.ctx.i8_type().const_int(
+                                            crate::runtime::object::FIELD_NUM as u64,
+                                            false,
+                                        ),
+                                        "fkfail",
                                     )
-                                    .map_err(|e| e.to_string())?
-                            };
-                            let kind = self
-                                .b
-                                .build_load(self.sh.ctx.i8_type(), p, "fk")
-                                .map_err(|e| e.to_string())?;
-                            let tag = self.kinds_tag();
-                            kind.as_instruction_value()
-                                .ok_or("load is not an instruction")?
-                                .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
-                                .map_err(|e| e.to_string())?;
-                            self.b
-                                .build_int_compare(
-                                    IntPredicate::NE,
-                                    kind.into_int_value(),
-                                    self.sh
-                                        .ctx
-                                        .i8_type()
-                                        .const_int(crate::runtime::object::FIELD_NUM as u64, false),
-                                    "fkfail",
-                                )
-                                .map_err(|e| e.to_string())?
+                                    .map_err(|e| e.to_string())?;
+                                fails = Some(match fails {
+                                    Some(acc) => self
+                                        .b
+                                        .build_or(acc, f, "fkany")
+                                        .map_err(|e| e.to_string())?,
+                                    None => f,
+                                });
+                            }
+                            fails.expect("a guarded field")
                         }
                         _ => self.is_nan_boxed(v)?,
                     };
                     self.guard_deopt_at(fails, *pc, live)?;
                     self.num_values.insert(v);
+                    self.num_in_block.insert(v);
                     v.into()
                 }
                 I::GuardBool(s) => {
