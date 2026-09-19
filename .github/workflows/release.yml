@@ -60,6 +60,25 @@ jobs:
             echo "::error::tag must start with 'v' (got '$tag')" && exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # The build jobs check out the tag's tree, and the composite
+      # actions and scripts they run come from it, not from this
+      # file: a tag that predates the release tooling fails in
+      # minutes with an unrelated error. Fail here instead.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.out.outputs.tag }}
+          sparse-checkout: |
+            tools/package_release.sh
+            .github/actions/llvm21/action.yml
+          sparse-checkout-cone-mode: false
+      - name: Check the tag carries the release tooling
+        shell: bash
+        run: |
+          set -eu
+          if [ ! -x tools/package_release.sh ] \
+             || ! grep -q "Install LLVM 21 (macOS)" .github/actions/llvm21/action.yml; then
+            echo "::error::tag ${{ steps.out.outputs.tag }} predates the release tooling; tag a commit at or after the one that added tools/package_release.sh" && exit 1
+          fi
 
   # ---------------------------------------------------------------
   # Build: one matrix entry per supported target. Each job emits a
