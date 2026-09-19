@@ -1906,7 +1906,8 @@ pub mod cl {
                 .declare_data(&format!("{safe_name}_osr"), Linkage::Local, true, false)
                 .map_err(|e| e.to_string())?;
             let mut desc = cranelift_module::DataDescription::new();
-            desc.define_zeroinit(16);
+            desc.define_zeroinit(8);
+            desc.set_align(8);
             module
                 .define_data(request, &desc)
                 .map_err(|e| e.to_string())?;
@@ -2098,9 +2099,8 @@ pub mod cl {
         mir.blocks.iter().any(has_backward_successor)
     }
 
-    /// One stub per loop entry: it records the entry and the frame in
-    /// the body's request words and calls the body, which reads them
-    /// at its entry.
+    /// One stub per loop entry: it posts the frame for the calling
+    /// thread and calls the body, which takes it at its entry.
     fn define_osr_stubs(
         mir: &MirFunction,
         module: &mut dyn Module,
@@ -2145,11 +2145,18 @@ pub mod cl {
                 builder.append_block_params_for_function_params(entry);
                 builder.switch_to_block(entry);
                 let frame = builder.block_params(entry)[0];
+                let kind = builder.ins().iconst(types::I64, i as i64 + 1);
+                // The entry index goes in the word the caller keeps
+                // before the live-ins; the frame is posted for this
+                // thread alone, and the body's pending count tells its
+                // entry to look.
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), kind, frame, -VALUE_SIZE);
                 let gv = module.declare_data_in_func(entries.request, builder.func);
                 let request = builder.ins().symbol_value(types::I64, gv);
-                let kind = builder.ins().iconst(types::I64, i as i64 + 1);
-                builder.ins().store(MemFlags::trusted(), kind, request, 0);
-                builder.ins().store(MemFlags::trusted(), frame, request, 8);
+                let post = declare_runtime_fn(module, &mut builder, "wren_osr_post", 2)?;
+                builder.ins().call(post, &[request, frame]);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let args: Vec<Value> = body_sig.params.iter().map(|_| zero).collect();
                 let body_ref = module.declare_func_in_func(body, builder.func);
@@ -2370,8 +2377,7 @@ pub mod cl {
     }
 
     /// The loop entries a body carries: one layout per header, and the
-    /// module's request words (entry index, then the frame pointer) a
-    /// stub writes before calling the body.
+    /// body's pending count, raised by a stub before it calls the body.
     pub(crate) struct OsrEntries {
         pub layouts: Vec<OsrEntryLayout>,
         pub request: cranelift_module::DataId,
@@ -2473,6 +2479,8 @@ pub mod cl {
             "wren_alloc_simd4f",
             "wren_alloc_simd4i",
             "wren_osr_exit",
+            "wren_osr_post",
+            "wren_osr_take",
             "wren_tier_tick",
             "wren_retier",
             "wren_deopt_n",
@@ -2910,8 +2918,8 @@ pub mod cl {
         };
 
         // The function's entry: its arguments, then a jump to the body
-        // or, when a loop entry stub left a request, to that loop's
-        // header with the interpreter's frame loaded.
+        // or, when a loop entry stub posted a frame for this thread, to
+        // that loop's header with the interpreter's frame loaded.
         let mut entry_params: Option<Vec<Value>> = None;
         let mut entry_kind: Option<cranelift_frontend::Variable> = None;
         if let Some(entries) = entries {
@@ -2932,24 +2940,36 @@ pub mod cl {
                     }
                 }
             }
+            // The pending count is the only word threads share; a
+            // thread that finds it set but has no frame of its own
+            // takes the normal entry.
+            let kind_var = builder.declare_var(types::I64);
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.def_var(kind_var, zero);
             let gv = module.declare_data_in_func(entries.request, builder.func);
             let request = builder.ins().symbol_value(types::I64, gv);
-            let kind = builder
+            let pending = builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), request, 0);
-            let kind_var = builder.declare_var(types::I64);
-            builder.def_var(kind_var, kind);
+            let look = builder.create_block();
             let osr = builder.create_block();
+            builder.set_cold_block(look);
             builder.set_cold_block(osr);
             builder
                 .ins()
-                .brif(kind, osr, &[], block_map[&mir.entry_block()], &[]);
-            builder.switch_to_block(osr);
-            let args_ptr = builder
+                .brif(pending, look, &[], block_map[&mir.entry_block()], &[]);
+            builder.switch_to_block(look);
+            let take = declare_runtime_fn(module, builder, "wren_osr_take", 1)?;
+            let call = builder.ins().call(take, &[request]);
+            let args_ptr = builder.inst_results(call)[0];
+            builder
                 .ins()
-                .load(types::I64, MemFlags::trusted(), request, 8);
-            let zero = builder.ins().iconst(types::I64, 0);
-            builder.ins().store(MemFlags::trusted(), zero, request, 0);
+                .brif(args_ptr, osr, &[], block_map[&mir.entry_block()], &[]);
+            builder.switch_to_block(osr);
+            let kind = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), args_ptr, -VALUE_SIZE);
+            builder.def_var(kind_var, kind);
             let prologues: Vec<cranelift_codegen::ir::Block> = entries
                 .layouts
                 .iter()

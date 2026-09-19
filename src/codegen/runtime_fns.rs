@@ -1278,6 +1278,9 @@ pub struct JitThread {
     pub depth: u32,
     /// All JIT dispatch off, for a shadow check against the interpreter.
     pub disabled: bool,
+    /// The frame a loop entry stub posted for the body it is about to
+    /// call; 0 between stubs.
+    pub osr_frame: u64,
 }
 
 thread_local! {
@@ -1298,6 +1301,7 @@ thread_local! {
         frames: Vec::new(),
         depth: 0,
         disabled: false,
+        osr_frame: 0,
     }) };
 
     /// Flat shadow root stack — zero-alloc push/pop after warmup.
@@ -1322,6 +1326,37 @@ pub type OsrExitRecord = (u32, Vec<(u32, Value)>);
 
 thread_local! {
     static OSR_EXIT: std::cell::RefCell<Option<OsrExitRecord>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A loop entry stub about to call its body: `frame` points at the
+/// live-ins, with the entry index in the word before them. The frame
+/// is kept for this thread; `pending` is the body's count of posted
+/// frames, which its entry checks before looking for one.
+///
+/// # Safety
+/// `pending` is the body's request word; the stub calls the body next
+/// on this thread.
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub unsafe extern "C" fn wren_osr_post(pending: *mut u64, frame: u64) -> u64 {
+    unsafe { (*jit_state()).osr_frame = frame };
+    unsafe { std::sync::atomic::AtomicU64::from_ptr(pending) }
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+/// A body's entry taking the frame a stub posted for this thread, or 0
+/// when another thread's stub raised the count.
+///
+/// # Safety
+/// `pending` is the body's request word.
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub unsafe extern "C" fn wren_osr_take(pending: *mut u64) -> u64 {
+    let frame = unsafe { std::mem::replace(&mut (*jit_state()).osr_frame, 0) };
+    if frame != 0 {
+        unsafe { std::sync::atomic::AtomicU64::from_ptr(pending) }
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    frame
 }
 
 /// Compiled code leaving a cold loop: `buf` holds `n` (register, value)
@@ -1406,7 +1441,9 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
             .map(|n| n == n.trunc() && n.abs() <= 9007199254740992.0)
             .unwrap_or(false)
     };
-    let mut args: Vec<Value> = Vec::with_capacity(entry.live_in_regs.len());
+    // The word before the live-ins is the entry stub's.
+    let mut args: Vec<Value> = Vec::with_capacity(entry.live_in_regs.len() + 1);
+    args.push(Value::null());
     for (i, reg) in entry.live_in_regs.iter().enumerate() {
         let needs_field = entry.live_in_field.get(i).copied().flatten().is_some();
         let needs_num = entry.live_in_num.get(i).copied().unwrap_or(false);
@@ -1443,7 +1480,7 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
             crate::runtime::engine::trace_clock_ms(),
             func_id,
             header,
-            args.len()
+            args.len() - 1
         );
     }
     vm.engine.note_osr_entry(id);
@@ -1451,7 +1488,7 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     unsafe { (*jit_state()).ctx.current_func_id = func_id };
     set_jit_depth(depth + 1);
     let f: extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(entry.ptr) };
-    let result = f(args.as_ptr() as *const u64);
+    let result = f(args[1..].as_ptr() as *const u64);
     set_jit_depth(depth);
     unsafe { (*jit_state()).ctx.current_func_id = saved_func_id };
     result
@@ -6034,6 +6071,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Strings
         "wren_string_concat" => Some(wren_string_concat as *const () as usize),
         "wren_osr_exit" => Some(wren_osr_exit as *const () as usize),
+        "wren_osr_post" => Some(wren_osr_post as *const () as usize),
+        "wren_osr_take" => Some(wren_osr_take as *const () as usize),
         #[cfg(feature = "host")]
         "wren_tier_tick" => Some(wren_tier_tick as *const () as usize),
         #[cfg(feature = "host")]

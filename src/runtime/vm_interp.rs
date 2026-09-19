@@ -556,7 +556,9 @@ fn try_enter_loop_osr(
     // The entry names its live-ins by register; a register the
     // interpreter never defined means the compiled body's value set
     // drifted from the bytecode's, so decline rather than guess.
+    // The word before the live-ins is the stub's, for its entry index.
     let mut osr_args = SmallVec::<[Value; 8]>::new();
+    osr_args.push(Value::null());
     for (i, &reg) in entry.live_in_regs.iter().enumerate() {
         let mut value = values.get(reg as usize).copied();
         // A split parameter: the register holds the object, the entry
@@ -693,14 +695,14 @@ fn try_enter_loop_osr(
             func_id.0,
             name,
             point.target_block.0,
-            osr_args.len()
+            osr_args.len() - 1
         );
     }
 
     vm.engine.note_native_entry(func_id);
     vm.engine.note_osr_entry(func_id);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-    let result_bits = unsafe { call_osr_entry(entry.ptr, &osr_args) };
+    let result_bits = unsafe { call_osr_entry(entry.ptr, &osr_args[1..]) };
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
     let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
