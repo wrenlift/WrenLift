@@ -4658,6 +4658,7 @@ impl ExecutionEngine {
             0
         };
         let raise_top = tier == CompileTier::Optimized && generation > 1;
+        let defining_class = self.method_binding[idx].1 as usize;
         let note_field_kinds = crate::codegen::top_tier_is_llvm();
         let modvars_cell = self.modvars_cell_addr(id);
         let callee_purity = self.compute_callee_purity_map();
@@ -4724,6 +4725,7 @@ impl ExecutionEngine {
             cl::set_jit_tier_hook(tier_hook.clone());
             cl::set_jit_retier_cell(tier_cell_addr, generation);
             cl::set_jit_func_id(id.0);
+            crate::codegen::set_jit_defining_class(defining_class);
             crate::codegen::set_jit_use_llvm(use_llvm);
             cl::set_jit_note_field_kinds(note_field_kinds);
             crate::codegen::set_jit_bump_region(bump_region);
@@ -4744,6 +4746,7 @@ impl ExecutionEngine {
             );
             cl::set_jit_tier_hook(None);
             cl::set_jit_retier_cell(0, 0);
+            crate::codegen::set_jit_defining_class(0);
             crate::codegen::set_jit_use_llvm(false);
             cl::set_jit_note_field_kinds(false);
             crate::codegen::set_jit_bump_region(0);

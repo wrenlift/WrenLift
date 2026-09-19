@@ -2048,14 +2048,31 @@ pub mod llvm {
                     if args.len() > 4 {
                         bail!("SuperCall with arity {} not supported by JIT", args.len());
                     }
-                    let name = [
-                        "wren_super_call_0",
-                        "wren_super_call_1",
-                        "wren_super_call_2",
-                        "wren_super_call_3",
-                        "wren_super_call_4",
-                    ][args.len()];
-                    let mut call_args = vec![self.c64(method.index() as u64)];
+                    if self.inline_depth > 0 {
+                        bail!("super call inside an inlined body");
+                    }
+                    // The method's class, known at compile time: the
+                    // context's may be a direct caller's.
+                    let defining = crate::codegen::jit_defining_class();
+                    let mut call_args = Vec::with_capacity(2 + args.len());
+                    let name = if defining != 0 && !args.is_empty() {
+                        call_args.push(self.c64(defining as u64));
+                        [
+                            "wren_super_call_from_1",
+                            "wren_super_call_from_2",
+                            "wren_super_call_from_3",
+                            "wren_super_call_from_4",
+                        ][args.len() - 1]
+                    } else {
+                        [
+                            "wren_super_call_0",
+                            "wren_super_call_1",
+                            "wren_super_call_2",
+                            "wren_super_call_3",
+                            "wren_super_call_4",
+                        ][args.len()]
+                    };
+                    call_args.push(self.c64(method.index() as u64));
                     for a in args {
                         call_args.push(self.boxed(a)?);
                     }

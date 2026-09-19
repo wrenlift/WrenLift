@@ -2193,6 +2193,21 @@ thread_local! {
     static JIT_LIST_CLASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// The class the method this thread compiles was bound in, for its
+    /// super calls; 0 for a function that is not a method.
+    static JIT_DEFINING_CLASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the defining class for this thread's next compile; 0 clears it.
+pub fn set_jit_defining_class(class: usize) {
+    JIT_DEFINING_CLASS.with(|c| c.set(class));
+}
+
+pub fn jit_defining_class() -> usize {
+    JIT_DEFINING_CLASS.with(|c| c.get())
+}
+
 /// Set the List class for this thread's next compile; 0 clears it.
 pub fn set_jit_list_class(class: usize) {
     JIT_LIST_CLASS.with(|c| c.set(class));

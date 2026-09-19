@@ -4077,6 +4077,81 @@ fn dispatch_super_call_rooted(
     }
 }
 
+/// `dispatch_super_call` from a body compiled for a method of
+/// `class`: the class is the compile's, not the context's, since a
+/// body entered by a direct call from other compiled code finds the
+/// context still naming the caller's.
+fn dispatch_super_call_from(
+    class: u64,
+    recv: Value,
+    method_sym: crate::intern::SymbolId,
+    args: &[Value],
+) -> u64 {
+    let ctx = read_jit_ctx();
+    let saved = ctx.defining_class;
+    unsafe { (*jit_state()).ctx.defining_class = class as *mut u8 };
+    let r = dispatch_super_call(recv, method_sym, args);
+    unsafe { (*jit_state()).ctx.defining_class = saved };
+    r
+}
+
+/// Super call with 1 arg from a method of `class`: `[class, method_sym, this]`.
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub extern "C" fn wren_super_call_from_1(class: u64, method: u64, this: u64) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call_from(class, recv, sym, &[recv])
+}
+/// Super call with 2 args from a method of `class`.
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub extern "C" fn wren_super_call_from_2(class: u64, method: u64, this: u64, a0: u64) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call_from(class, recv, sym, &[recv, Value::from_bits(a0)])
+}
+/// Super call with 3 args from a method of `class`.
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub extern "C" fn wren_super_call_from_3(
+    class: u64,
+    method: u64,
+    this: u64,
+    a0: u64,
+    a1: u64,
+) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call_from(
+        class,
+        recv,
+        sym,
+        &[recv, Value::from_bits(a0), Value::from_bits(a1)],
+    )
+}
+/// Super call with 4 args from a method of `class`.
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub extern "C" fn wren_super_call_from_4(
+    class: u64,
+    method: u64,
+    this: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call_from(
+        class,
+        recv,
+        sym,
+        &[
+            recv,
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+            Value::from_bits(a2),
+        ],
+    )
+}
+
 /// Super call with 0 args. Codegen: `[method_sym]` (no receiver — shouldn't happen in practice)
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_super_call_0(method: u64) -> u64 {
@@ -5650,6 +5725,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_super_call_2" => Some(wren_super_call_2 as *const () as usize),
         "wren_super_call_3" => Some(wren_super_call_3 as *const () as usize),
         "wren_super_call_4" => Some(wren_super_call_4 as *const () as usize),
+        "wren_super_call_from_1" => Some(wren_super_call_from_1 as *const () as usize),
+        "wren_super_call_from_2" => Some(wren_super_call_from_2 as *const () as usize),
+        "wren_super_call_from_3" => Some(wren_super_call_from_3 as *const () as usize),
+        "wren_super_call_from_4" => Some(wren_super_call_from_4 as *const () as usize),
         // Collections
         // Known-function dispatch (devirtualized)
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),

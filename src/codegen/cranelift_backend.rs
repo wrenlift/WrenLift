@@ -5914,20 +5914,37 @@ pub mod cl {
                 } else {
                     builder.ins().iconst(types::I64, method.index() as i64)
                 };
-                let call_name = match args.len() {
-                    0 => "wren_super_call_0",
-                    1 => "wren_super_call_1",
-                    2 => "wren_super_call_2",
-                    3 => "wren_super_call_3",
-                    _ => "wren_super_call_4",
+                // A JIT body knows its method's class at compile time
+                // and passes it: the context's may be a direct
+                // caller's.
+                let defining = if aot_config.is_none() {
+                    crate::codegen::jit_defining_class()
+                } else {
+                    0
                 };
-                let arg_count = 1 + args.len().min(4);
-                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-
-                let mut call_args = vec![method_val];
+                let mut call_args = Vec::with_capacity(2 + args.len());
+                let call_name = if defining != 0 && !args.is_empty() {
+                    call_args.push(builder.ins().iconst(types::I64, defining as i64));
+                    match args.len() {
+                        1 => "wren_super_call_from_1",
+                        2 => "wren_super_call_from_2",
+                        3 => "wren_super_call_from_3",
+                        _ => "wren_super_call_from_4",
+                    }
+                } else {
+                    match args.len() {
+                        0 => "wren_super_call_0",
+                        1 => "wren_super_call_1",
+                        2 => "wren_super_call_2",
+                        3 => "wren_super_call_3",
+                        _ => "wren_super_call_4",
+                    }
+                };
+                call_args.push(method_val);
                 for a in args.iter().take(4) {
                     call_args.push(get(a));
                 }
+                let f = get_runtime_fn(module, builder, call_name, call_args.len())?;
                 let result = builder.ins().call(f, &call_args);
                 Ok(Some(builder.inst_results(result)[0]))
             }
