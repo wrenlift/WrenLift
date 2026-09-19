@@ -1,14 +1,9 @@
-# Test binaries load their own `#[no_mangle]` symbols via
-# `libloading::Library::this()` (i.e. `dlopen(NULL)`) so integration
-# tests can exercise the foreign-method round-trip without a fixture
-# cdylib. By default neither macOS nor Linux exports an executable's
-# symbols to dyld's global scope — `-Wl,-export_dynamic` flips that.
-# The flag is a no-op for non-dlsym'd code; main binaries pick up a
-# slightly larger exported-symbol table but no runtime perf hit.
+# The symbols plugins and tests resolve against the executable are
+# exported by build.rs from tools/link/exports.*; nothing here touches
+# the export table.
 
 [target.'cfg(target_os = "macos")']
 rustflags = [
-    "-C", "link-arg=-Wl,-export_dynamic",
     # Frame pointers required for the GC stack walker.
     # `scan_native_stack_roots` Pass 2 chases x29/rbp through every
     # frame to find AOT-compiled Wren frames whose return address
@@ -26,6 +21,5 @@ rustflags = [
 
 [target.'cfg(all(unix, not(target_os = "macos")))']
 rustflags = [
-    "-C", "link-arg=-Wl,--export-dynamic",
     "-C", "force-frame-pointers=yes",
 ]

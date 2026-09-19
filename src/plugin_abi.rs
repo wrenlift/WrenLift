@@ -3,7 +3,7 @@
 //! Every function here is `#[unsafe(no_mangle)] pub unsafe extern "C"` — the
 //! dynamic linker resolves a plugin cdylib's `extern "C"` references
 //! against these symbols at dlopen time (with the host binary built
-//! `-Wl,--export-dynamic` or platform equivalent). On wasm the same
+//! exporting them; see build.rs). On wasm the same
 //! `extern "C"` blocks resolve against these exports at static-link
 //! time.
 //!
