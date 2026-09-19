@@ -2004,20 +2004,12 @@ pub mod llvm {
                     live,
                 } => {
                     let v = self.boxed(value)?;
-                    let cur = self.b.get_insert_block().unwrap();
-                    let merge = self.new_block("gcm");
-                    let (_, recv_class) = self.class_load_guarded(v, merge)?;
+                    // Branchless: the class load runs on every path, so
+                    // LLVM hoists it out of a loop the value is invariant
+                    // in and the exit with it. A non-object reads the
+                    // null object's zero class and misses.
+                    let (_, _, recv_class) = self.class_of(v)?;
                     let hit = self.icmp(IntPredicate::EQ, recv_class, self.c64(*class as u64))?;
-                    let obj_end = self.b.get_insert_block().unwrap();
-                    self.br(merge)?;
-                    self.b.position_at_end(merge);
-                    let no = self.i1t().const_zero();
-                    let hit = self
-                        .phi(
-                            self.i1t().into(),
-                            &[(no.into(), cur), (hit.into(), obj_end)],
-                        )?
-                        .into_int_value();
                     let fails = self.b.build_not(hit, "fails").map_err(|e| e.to_string())?;
                     self.guard_deopt_at(fails, *pc, live)?;
                     // From here on in this block the value has the class.
