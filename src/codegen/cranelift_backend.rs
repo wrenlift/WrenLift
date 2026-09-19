@@ -6167,11 +6167,55 @@ pub mod cl {
                     .ins()
                     .brif(is_ta, typed_array_block, &[], type_miss_block, &[]);
                 builder.switch_to_block(type_miss_block);
+                let list_block = builder.create_block();
+                let list_tag = builder
+                    .ins()
+                    .iconst(types::I64, crate::runtime::object::ObjType::List as i64);
+                let is_list = builder.ins().icmp(IntCC::Equal, obj_type_byte, list_tag);
+                let not_list_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_list, list_block, &[], not_list_block, &[]);
+                builder.switch_to_block(not_list_block);
                 let simd_tag = builder.ins().iconst(types::I64, OBJ_TYPE_SIMD as i64);
                 let is_simd = builder.ins().icmp(IntCC::Equal, obj_type_byte, simd_tag);
                 builder
                     .ins()
                     .brif(is_simd, simd_block, &[], slow_block, &[]);
+
+                // 2b. List: an integral Num index within the count reads
+                //     the element; anything else (a negative index, a
+                //     range) is the helper's.
+                builder.switch_to_block(list_block);
+                let list_idx = {
+                    let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                    let masked = builder.ins().band(idx, qnan);
+                    let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                    let num_block = builder.create_block();
+                    builder.ins().brif(is_box, slow_block, &[], num_block, &[]);
+                    builder.switch_to_block(num_block);
+                    let f = builder.ins().bitcast(types::F64, MemFlags::new(), idx);
+                    let i = builder.ins().fcvt_to_sint_sat(types::I64, f);
+                    let back = builder.ins().fcvt_from_sint(types::F64, i);
+                    let integral = builder.ins().fcmp(FloatCC::Equal, back, f);
+                    let count = builder
+                        .ins()
+                        .uload32(MemFlags::trusted(), obj_ptr, LIST_COUNT);
+                    let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, i, count);
+                    let ok = builder.ins().band(integral, in_range);
+                    let load_block = builder.create_block();
+                    builder.ins().brif(ok, load_block, &[], slow_block, &[]);
+                    builder.switch_to_block(load_block);
+                    i
+                };
+                let elements =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj_ptr, LIST_ELEMENTS);
+                let off = builder.ins().imul_imm_s(list_idx, VALUE_SIZE as i64);
+                let addr = builder.ins().iadd(elements, off);
+                let elem = builder.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                builder.ins().jump(merge_block, &[BlockArg::Value(elem)]);
 
                 // 3. TypedArray fast path: convert NaN-boxed Num
                 //    index to i64, bounds-check against element
@@ -6600,6 +6644,41 @@ pub mod cl {
                 builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
                 builder.switch_to_block(merge_block);
                 Ok(Some(builder.block_params(merge_block)[0]))
+            }
+            Instruction::GuardClassAt {
+                value,
+                class,
+                pc,
+                live,
+            } => {
+                let v = get(value);
+                if aot_config.is_some() {
+                    return Ok(Some(v));
+                }
+                let Some((raw_bools, value_types)) = deopt_state else {
+                    return Err("mid-body guard inside an inlined body".into());
+                };
+                let deopt_block = builder.create_block();
+                let cont_block = builder.create_block();
+                builder.set_cold_block(deopt_block);
+                let (_, recv_class) = emit_class_load_guarded(builder, v, deopt_block);
+                let expected = builder.ins().iconst(types::I64, *class as i64);
+                let hit = builder.ins().icmp(IntCC::Equal, recv_class, expected);
+                builder.ins().brif(hit, cont_block, &[], deopt_block, &[]);
+                builder.switch_to_block(deopt_block);
+                emit_deopt_at(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    jit_func_id(),
+                    *pc,
+                    live,
+                    val_map,
+                    raw_bools,
+                    value_types,
+                )?;
+                builder.switch_to_block(cont_block);
+                Ok(Some(v))
             }
             // === Integer arithmetic on proven-integral values ===
             Instruction::AddI64(a, b) => Ok(Some(builder.ins().iadd(get(a), get(b)))),

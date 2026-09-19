@@ -451,6 +451,16 @@ pub enum Instruction {
         call_pc: u32,
         call_live: Vec<DeoptReg>,
     },
+    /// The value is an object of the class at this pointer: when it is
+    /// not, the interpreter resumes at bytecode offset `pc` with each
+    /// `live` register in place. Planted by the call inliner before an
+    /// accessor body spliced in place; JIT compile clones only.
+    GuardClassAt {
+        value: ValueId,
+        class: usize,
+        pc: u32,
+        live: Vec<DeoptReg>,
+    },
     /// The instruction just before has an inline fast path: where it
     /// would otherwise call a helper, it may resume the interpreter at
     /// bytecode offset `pc`, the instruction itself, with `live` in
@@ -534,6 +544,7 @@ impl Instruction {
                 | Instruction::SetModuleVar(..)
                 | Instruction::GuardNum(..)
                 | Instruction::GuardNumAt { .. }
+                | Instruction::GuardClassAt { .. }
                 | Instruction::SlowPathExit { .. }
                 | Instruction::GuardBool(..)
                 | Instruction::GuardClass(..)
@@ -645,6 +656,11 @@ impl Instruction {
                 let mut ops = vec![*value];
                 ops.extend(live.iter().flat_map(|r| r.source.operands()));
                 ops.extend(call_live.iter().flat_map(|r| r.source.operands()));
+                ops
+            }
+            Instruction::GuardClassAt { value, live, .. } => {
+                let mut ops = vec![*value];
+                ops.extend(live.iter().flat_map(|r| r.source.operands()));
                 ops
             }
             Instruction::SlowPathExit { live, .. } => {
@@ -1579,6 +1595,18 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::SlowPathExit { pc, live } => {
             format!("slow.exit pc={} live={}", pc, live.len())
         }
+        Instruction::GuardClassAt {
+            value,
+            class,
+            pc,
+            live,
+        } => format!(
+            "guard.class.at {} {:#x} pc={} live={}",
+            value,
+            class,
+            pc,
+            live.len()
+        ),
         Instruction::NewInstance { class, assigned } => {
             format!("new_instance {:#x} assigned={:#b}", class, assigned)
         }
@@ -1757,6 +1785,7 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 | Instruction::NegI64(_) => MirType::I64,
                 Instruction::I64ToF64(_) => MirType::F64,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
+                Instruction::GuardClassAt { .. } => MirType::Value,
                 Instruction::SlowPathExit { .. } => MirType::Void,
                 Instruction::NewInstance { .. } => MirType::Value,
                 Instruction::GuardNum(src)

@@ -1952,6 +1952,31 @@ pub mod llvm {
                     let expected = self.c64(TAG_OBJ | (*obj_ptr as u64 & PTR_MASK));
                     self.icmp(IntPredicate::EQ, v, expected)?.into()
                 }
+                I::GuardClassAt {
+                    value,
+                    class,
+                    pc,
+                    live,
+                } => {
+                    let v = self.boxed(value)?;
+                    let cur = self.b.get_insert_block().unwrap();
+                    let merge = self.new_block("gcm");
+                    let (_, recv_class) = self.class_load_guarded(v, merge)?;
+                    let hit = self.icmp(IntPredicate::EQ, recv_class, self.c64(*class as u64))?;
+                    let obj_end = self.b.get_insert_block().unwrap();
+                    self.br(merge)?;
+                    self.b.position_at_end(merge);
+                    let no = self.i1t().const_zero();
+                    let hit = self
+                        .phi(
+                            self.i1t().into(),
+                            &[(no.into(), cur), (hit.into(), obj_end)],
+                        )?
+                        .into_int_value();
+                    let fails = self.b.build_not(hit, "fails").map_err(|e| e.to_string())?;
+                    self.guard_deopt_at(fails, *pc, live)?;
+                    v.into()
+                }
                 I::NewInstance { class, assigned } => {
                     let class_val = self.c64(TAG_OBJ | (*class as u64 & PTR_MASK));
                     let nf = unsafe {

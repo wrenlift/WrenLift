@@ -1425,6 +1425,9 @@ impl<'a> MirWasmEmitter<'a> {
 
             // -- Guards (pass-through for now) --
             Instruction::SlowPathExit { .. } => {}
+            Instruction::GuardClassAt { .. } => {
+                return Err("GuardClassAt is planted in native compile clones only".into());
+            }
             Instruction::GuardNum(a)
             | Instruction::GuardNumAt { value: a, .. }
             | Instruction::GuardBool(a) => {

@@ -152,6 +152,12 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
                 r.source.map(f);
             }
         }
+        GuardClassAt { value, live, .. } => {
+            *value = f(*value);
+            for r in live.iter_mut() {
+                r.source.map(f);
+            }
+        }
         SlowPathExit { live, .. } => {
             for r in live.iter_mut() {
                 r.source.map(f);

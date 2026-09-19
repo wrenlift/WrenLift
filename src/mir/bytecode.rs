@@ -547,6 +547,9 @@ impl<'a> Encoder<'a> {
             Instruction::ToString(a) => self.emit_unary(Op::ToStringOp, dst, *a),
             Instruction::GuardNum(a) => self.emit_unary(Op::GuardNum, dst, *a),
             Instruction::GuardNumAt { value, .. } => self.emit_unary(Op::GuardNum, dst, *value),
+            Instruction::GuardClassAt { .. } => {
+                unreachable!("GuardClassAt is planted in JIT compile clones only")
+            }
             Instruction::SlowPathExit { .. } => {}
             Instruction::NewInstance { .. } => {
                 unreachable!("NewInstance is planted in JIT compile clones only")

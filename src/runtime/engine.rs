@@ -2866,17 +2866,20 @@ impl ExecutionEngine {
                 if !crate::mir::opt::inline_calls::inlinable_body(&body) {
                     continue;
                 }
-                // The backend splices an accessor behind a guard itself;
-                // MIR inlining earns its keep only where the caller's
-                // types can reach arithmetic in the body. A constructor
-                // is different: inlined, its allocation and field stores
-                // fuse. `WLIFT_INLINE_ACCESSORS=1` inlines accessors at
-                // the top tier as well, where the baseline's result
-                // profile still covers the call; safe to run with.
+                let exit = exits.and_then(|e| e.get(dst).cloned());
+                // A body without arithmetic is inlined only where it goes
+                // in place behind a guard that exits to the interpreter:
+                // at the top tier, whose result profile the baseline's
+                // call filled. Splitting the block and versioning the
+                // loop for it costs more than the call. A constructor is
+                // different: inlined, its allocation and field stores
+                // fuse.
                 if constructor.is_none()
                     && !crate::mir::opt::inline_calls::body_has_arithmetic(&body)
                     && (tier == CompileTier::Baseline
-                        || std::env::var_os("WLIFT_INLINE_ACCESSORS").is_none())
+                        || exit.is_none()
+                        || !matches!(guard, CalleeGuard::Class(_))
+                        || body.blocks.len() != 1)
                 {
                     continue;
                 }
@@ -2889,10 +2892,6 @@ impl ExecutionEngine {
                 {
                     continue;
                 }
-                let exit = match constructor {
-                    Some(_) => exits.and_then(|e| e.get(dst).cloned()),
-                    None => None,
-                };
                 sites.insert(
                     *dst,
                     KnownCallee {
@@ -3257,6 +3256,7 @@ impl ExecutionEngine {
                                 Instruction::Call { .. }
                                     | Instruction::SubscriptGet { .. }
                                     | Instruction::SubscriptSet { .. }
+                                    | Instruction::Move(_)
                             )
                     })
                     .map(|pos| (bi, pos + 1))

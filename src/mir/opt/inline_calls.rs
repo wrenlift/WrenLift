@@ -162,6 +162,7 @@ struct Site {
 /// whether the function changed.
 pub fn inline_known_calls(func: &mut MirFunction, sites: &HashMap<ValueId, KnownCallee>) -> bool {
     let mut pending: Vec<Site> = Vec::new();
+    let mut in_place: Vec<Site> = Vec::new();
     for block in &func.blocks {
         for (dst, inst) in &block.instructions {
             if let Instruction::Call { args, .. } = inst
@@ -169,13 +170,20 @@ pub fn inline_known_calls(func: &mut MirFunction, sites: &HashMap<ValueId, Known
             {
                 let expected = args.len() + usize::from(callee.takes_receiver());
                 if callee.body.arity as usize == expected && inlinable_body(&callee.body) {
-                    pending.push(Site { dst: *dst });
+                    if splices_in_place(callee) {
+                        in_place.push(Site { dst: *dst });
+                    } else {
+                        pending.push(Site { dst: *dst });
+                    }
                 }
             }
         }
     }
-    if pending.is_empty() {
+    if pending.is_empty() && in_place.is_empty() {
         return false;
+    }
+    for site in in_place {
+        inline_in_place(func, site.dst, sites);
     }
 
     while let Some(site) = pending.pop() {
@@ -215,6 +223,80 @@ pub fn inline_known_calls(func: &mut MirFunction, sites: &HashMap<ValueId, Known
     }
     func.compute_predecessors();
     true
+}
+
+/// A body of one block behind a class guard, with an exit to resume
+/// the interpreter at the call, goes in where the call was: no split,
+/// no loop copy.
+fn splices_in_place(callee: &KnownCallee) -> bool {
+    matches!(callee.guard, CalleeGuard::Class(_))
+        && callee.constructor.is_none()
+        && callee.exit.is_some()
+        && callee.body.blocks.len() == 1
+        && matches!(
+            callee.body.blocks[0].terminator,
+            Terminator::Return(_) | Terminator::ReturnNull
+        )
+}
+
+/// Replace the call with a guard on the receiver's class and the
+/// body's instructions, its parameters reading the call's operands
+/// and its return defining the call's value.
+fn inline_in_place(func: &mut MirFunction, dst: ValueId, sites: &HashMap<ValueId, KnownCallee>) {
+    let Some((block, k)) = locate(func, dst) else {
+        return;
+    };
+    let Instruction::Call { receiver, args, .. } = func.block(block).instructions[k].1.clone()
+    else {
+        return;
+    };
+    let callee = &sites[&dst];
+    let CalleeGuard::Class(class) = callee.guard else {
+        return;
+    };
+    let Some((pc, live)) = callee.exit.clone() else {
+        return;
+    };
+    let body = &callee.body.blocks[0];
+    let mut operands = Vec::with_capacity(1 + args.len());
+    operands.push(receiver);
+    operands.extend_from_slice(&args);
+    let mut out: Vec<(ValueId, Instruction)> = Vec::with_capacity(body.instructions.len() + 2);
+    // An object's class never changes: a guard earlier in the block on
+    // the same receiver covers this site.
+    let guarded = func.block(block).instructions[..k].iter().any(|(_, inst)| {
+        matches!(inst, Instruction::GuardClassAt { value, class: c, .. }
+                if *value == receiver && *c == class)
+    });
+    if !guarded {
+        let guard = func.new_value();
+        out.push((
+            guard,
+            Instruction::GuardClassAt {
+                value: receiver,
+                class,
+                pc,
+                live,
+            },
+        ));
+    }
+    let mut vmap: HashMap<ValueId, ValueId> = HashMap::new();
+    for (v, inst) in &body.instructions {
+        if let Instruction::BlockParam(idx) = inst {
+            vmap.insert(*v, operands[*idx as usize]);
+            continue;
+        }
+        let nv = func.new_value();
+        vmap.insert(*v, nv);
+        let mut inst = inst.clone();
+        remap_inst(&mut inst, &vmap);
+        out.push((nv, inst));
+    }
+    match &body.terminator {
+        Terminator::Return(v) => out.push((dst, Instruction::Move(vmap[v]))),
+        _ => out.push((dst, Instruction::ConstNull)),
+    }
+    func.block_mut(block).instructions.splice(k..=k, out);
 }
 
 fn locate(func: &MirFunction, dst: ValueId) -> Option<(BlockId, usize)> {

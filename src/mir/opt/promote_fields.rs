@@ -548,6 +548,25 @@ pub fn promote_fields(func: &mut MirFunction, classes: &Classes) -> bool {
                     }
                     out.push((vid, Instruction::SlowPathExit { pc, live }));
                 }
+                Instruction::GuardClassAt {
+                    value,
+                    class,
+                    pc,
+                    mut live,
+                } => {
+                    for r in live.iter_mut() {
+                        rebuild(r, &cur, &shapes);
+                    }
+                    out.push((
+                        vid,
+                        Instruction::GuardClassAt {
+                            value,
+                            class,
+                            pc,
+                            live,
+                        },
+                    ));
+                }
                 other => out.push((vid, other)),
             }
         }
@@ -636,6 +655,16 @@ fn object_uses(
         } => {
             need(*value);
             for r in live.iter().chain(call_live.iter()) {
+                if !matches!(r.source, DeoptSource::Value(_)) {
+                    for v in r.source.operands() {
+                        need(v);
+                    }
+                }
+            }
+        }
+        Instruction::GuardClassAt { value, live, .. } => {
+            need(*value);
+            for r in live.iter() {
                 if !matches!(r.source, DeoptSource::Value(_)) {
                     for v in r.source.operands() {
                         need(v);

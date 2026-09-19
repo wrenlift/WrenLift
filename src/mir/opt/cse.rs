@@ -301,7 +301,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         CmpGeI64(..) => 78,
         I64ToF64(..) => 79,
         IsNum(..) => 80,
-        GuardNumAt { .. } | SlowPathExit { .. } => 35,
+        GuardNumAt { .. } | GuardClassAt { .. } | SlowPathExit { .. } => 35,
         NewInstance { .. } => 81,
     }
 }
