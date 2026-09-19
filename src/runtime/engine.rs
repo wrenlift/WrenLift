@@ -594,6 +594,13 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     let cse = Cse::default();
     let type_spec = TypeSpecialize::with_math(interner);
     let licm = Licm;
+    let hoist_guards = crate::mir::opt::hoist_guards::HoistGuards;
+    // WLIFT_HOIST_GUARDS=1 moves a class guard on a loop-invariant
+    // receiver out of its loop; off, since on x86-64 the wider live
+    // range costs the loop more in spills than the guard did. Safe to
+    // run with.
+    let hoist_off = std::env::var_os("WLIFT_HOIST_GUARDS").is_none();
+    let noop = crate::mir::opt::dce::Dce;
     let sra = Sra;
 
     let passes: Vec<&dyn MirPass> = vec![
@@ -605,6 +612,7 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
         &constfold,
         &dce,
         &licm,
+        if hoist_off { &noop } else { &hoist_guards },
         &sra,
         &dce,
     ];

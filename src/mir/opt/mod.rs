@@ -7,6 +7,7 @@ pub mod cse;
 pub mod dce;
 pub mod devirt;
 pub mod escape;
+pub mod hoist_guards;
 pub mod inline;
 pub mod inline_calls;
 pub mod int_loop;

@@ -1465,6 +1465,14 @@ pub mod llvm {
             let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
             self.move_roots = move_roots(mir);
+            // A receiver carried around a loop stands for the value the
+            // loop was entered with; the guard on it may be there.
+            let mut clone = mir.clone();
+            for (v, r) in crate::mir::opt::hoist_guards::value_roots(&mut clone) {
+                if v != r {
+                    self.move_roots.insert(v, r);
+                }
+            }
             self.int_sources = int_sources(mir);
             self.class_facts = class_facts(mir, &self.move_roots);
             let loop_headers: HashSet<usize> = mir
