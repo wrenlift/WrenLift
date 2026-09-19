@@ -20,7 +20,7 @@ const QNAN: u64 = 0x7FFC_0000_0000_0000;
 const TAG_NULL: u64 = QNAN;
 const TAG_FALSE: u64 = QNAN | 1;
 const TAG_TRUE: u64 = QNAN | 2;
-const TAG_UNDEFINED: u64 = QNAN | 3;
+pub const TAG_UNDEFINED: u64 = QNAN | 3;
 
 /// Sign bit set + QNAN = object pointer tag.
 const SIGN_BIT: u64 = 1 << 63;

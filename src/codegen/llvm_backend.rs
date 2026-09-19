@@ -2156,6 +2156,8 @@ pub mod llvm {
                     }
                     return Ok(None);
                 }
+                // The LLVM tier keeps a loop it compiled cold.
+                I::ColdLoopExit { .. } => return Ok(None),
                 I::GuardNumAt {
                     value, pc, live, ..
                 } => {

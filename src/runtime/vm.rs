@@ -603,6 +603,9 @@ impl Shared {
     pub fn native_tick(&mut self, id: super::engine::FuncId) {
         self.engine.native_tick(id, &self.interner);
     }
+    pub fn cold_loop_hot(&mut self, id: super::engine::FuncId) {
+        self.engine.recompile_top_tier(id, &self.interner);
+    }
     pub fn osr_entry_is_cold(
         &mut self,
         id: super::engine::FuncId,

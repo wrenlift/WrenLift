@@ -326,6 +326,7 @@ fn find_invariants(
                     Instruction::GuardNum(_)
                         | Instruction::GuardNumAt { .. }
                         | Instruction::GuardClassAt { .. }
+                        | Instruction::ColdLoopExit { .. }
                         | Instruction::SlowPathExit { .. }
                         | Instruction::GuardBool(_)
                         | Instruction::GuardClass(_, _)

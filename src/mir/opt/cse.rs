@@ -52,6 +52,15 @@ impl MirPass for Cse {
 
     fn run(&self, func: &mut MirFunction) -> bool {
         let mut replacements: HashMap<ValueId, ValueId> = HashMap::new();
+        // Copies, followed when keying an instruction so a read through
+        // a copy of an object matches a read through the object. The
+        // copies themselves stay: a bytecode register the deopt and OSR
+        // maps name must keep its definition.
+        let mut aliases: HashMap<ValueId, ValueId> = HashMap::new();
+        // Instructions to drop: a class guard an identical one in the
+        // block already made, and a store the block overwrites before
+        // anything could read it.
+        let mut dropped: Vec<ValueId> = Vec::new();
 
         // Self-recursion purity: when the surrounding function makes only
         // pure ops + builtin-pure calls, every `CallStaticSelf` dispatches
@@ -78,16 +87,85 @@ impl MirPass for Cse {
             //    mutates it).
             let mut pure: HashMap<CseKey, ValueId> = HashMap::new();
             let mut memory: HashMap<CseKey, ValueId> = HashMap::new();
+            // Class guards made so far in the block.
+            let mut guarded: HashMap<(ValueId, usize), ()> = HashMap::new();
+            // The last store to an object's field or a module variable
+            // that nothing has read since.
+            let mut field_stores: HashMap<(ValueId, u16), ValueId> = HashMap::new();
+            let mut modvar_stores: HashMap<u16, ValueId> = HashMap::new();
             for (val_id, inst) in &block.instructions {
-                // Side-effecting instructions invalidate every cached
-                // memory-dependent read. Pure cache survives.
+                if let Instruction::GuardClassAt { value, class, .. } = inst {
+                    let key = (resolve_with(*value, &replacements, &aliases), *class);
+                    if guarded.insert(key, ()).is_some() {
+                        dropped.push(*val_id);
+                        continue;
+                    }
+                }
+                // A pending store stays dead only across instructions
+                // that touch no memory and cannot leave the body.
+                let keeps_stores = matches!(inst, Instruction::Move(_))
+                    || (!inst.has_side_effects()
+                        && !inst_reads_memory(inst)
+                        && !matches!(inst, Instruction::GetUpvalue(_)));
+                if !keeps_stores {
+                    match inst {
+                        Instruction::SetField(obj, idx, _) => {
+                            let key = (resolve_with(*obj, &replacements, &aliases), *idx);
+                            if let Some(prev) = field_stores.insert(key, *val_id) {
+                                dropped.push(prev);
+                            }
+                        }
+                        Instruction::SetModuleVar(idx, _) => {
+                            if let Some(prev) = modvar_stores.insert(*idx, *val_id) {
+                                dropped.push(prev);
+                            }
+                        }
+                        _ => {
+                            field_stores.clear();
+                            modvar_stores.clear();
+                        }
+                    }
+                }
+                if let Instruction::Move(src) = inst {
+                    aliases.insert(*val_id, resolve_with(*src, &replacements, &aliases));
+                    continue;
+                }
+                // A store keeps the reads of other slots and answers the
+                // next read of its own; every other side effect
+                // invalidates every cached memory-dependent read. The
+                // pure cache survives.
                 if inst.has_side_effects() {
-                    if inst_may_write_memory(inst, self_pure, self) {
-                        memory.clear();
+                    match inst {
+                        Instruction::SetField(obj, idx, val) => {
+                            let idx = *idx as u64;
+                            memory.retain(|k, _| !k.is_field(idx));
+                            let key = make_key(
+                                &Instruction::GetField(*obj, idx as u16),
+                                &replacements,
+                                &aliases,
+                            );
+                            if let Some(key) = key {
+                                memory.insert(key, resolve(*val, &replacements));
+                            }
+                        }
+                        Instruction::SetModuleVar(idx, val) => {
+                            let idx = *idx as u64;
+                            memory.retain(|k, _| !k.is_module_var(idx));
+                            let key = make_key(
+                                &Instruction::GetModuleVar(idx as u16),
+                                &replacements,
+                                &aliases,
+                            );
+                            if let Some(key) = key {
+                                memory.insert(key, resolve(*val, &replacements));
+                            }
+                        }
+                        _ if inst_may_write_memory(inst, self_pure, self) => memory.clear(),
+                        _ => {}
                     }
                     continue;
                 }
-                if let Some(key) = make_key(inst, &replacements) {
+                if let Some(key) = make_key(inst, &replacements, &aliases) {
                     let cache = if inst_reads_memory(inst) {
                         &mut memory
                     } else {
@@ -102,11 +180,17 @@ impl MirPass for Cse {
             }
         }
 
-        if replacements.is_empty() {
+        if replacements.is_empty() && dropped.is_empty() {
             return false;
         }
 
         replace_uses_in_func(func, &replacements);
+        if !dropped.is_empty() {
+            let dropped: std::collections::HashSet<ValueId> = dropped.into_iter().collect();
+            for block in &mut func.blocks {
+                block.instructions.retain(|(v, _)| !dropped.contains(v));
+            }
+        }
         true
     }
 }
@@ -117,6 +201,30 @@ impl MirPass for Cse {
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct CseKey(Vec<u64>);
+
+impl CseKey {
+    /// A field read of index `idx`, of any object.
+    fn is_field(&self, idx: u64) -> bool {
+        self.0.first() == Some(&(inst_discriminant(&Instruction::GetField(ValueId(0), 0)) as u64))
+            && self.0.get(1) == Some(&idx)
+    }
+
+    /// A read of module variable `idx`.
+    fn is_module_var(&self, idx: u64) -> bool {
+        self.0.first() == Some(&(inst_discriminant(&Instruction::GetModuleVar(0)) as u64))
+            && self.0.get(1) == Some(&idx)
+    }
+}
+
+/// `v` through the replacements, then through the copies.
+fn resolve_with(
+    v: ValueId,
+    replacements: &HashMap<ValueId, ValueId>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> ValueId {
+    let v = resolve(v, replacements);
+    aliases.get(&v).map_or(v, |a| resolve(*a, replacements))
+}
 
 fn resolve(v: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
     let mut current = v;
@@ -135,7 +243,10 @@ fn resolve(v: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
 /// they should be dropped from the CSE cache whenever a side-effecting
 /// instruction (call, store, etc.) intervenes within the block.
 fn inst_reads_memory(inst: &Instruction) -> bool {
-    matches!(inst, Instruction::SubscriptGet { .. })
+    matches!(
+        inst,
+        Instruction::SubscriptGet { .. } | Instruction::GetField(..) | Instruction::GetModuleVar(_)
+    )
 }
 
 /// True for instructions that can mutate observable heap state — anything
@@ -169,16 +280,18 @@ fn inst_may_write_memory(inst: &Instruction, self_pure: bool, cse: &Cse) -> bool
     }
 }
 
-fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Option<CseKey> {
+fn make_key(
+    inst: &Instruction,
+    replacements: &HashMap<ValueId, ValueId>,
+    aliases: &HashMap<ValueId, ValueId>,
+) -> Option<CseKey> {
     // Don't CSE block params, mutable reads that need observed identity,
     // or allocations (each must produce a distinct object).
     if matches!(
         inst,
         Instruction::BlockParam(_)
-            | Instruction::GetModuleVar(_)
             | Instruction::GetStaticField(_)
             | Instruction::GetUpvalue(_)
-            | Instruction::GetField(..)
             | Instruction::MakeClosure { .. }
             | Instruction::NewInstance { .. }
             | Instruction::MakeList(..)
@@ -197,6 +310,7 @@ fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Opt
         Instruction::ConstI64(n) => key.push(*n as u64),
         Instruction::ConstString(idx) => key.push(*idx as u64),
         Instruction::GetField(_, idx) => key.push(*idx as u64),
+        Instruction::GetModuleVar(idx) => key.push(*idx as u64),
         Instruction::GuardClass(_, sym) | Instruction::IsType(_, sym) => {
             key.push(sym.index() as u64);
         }
@@ -211,7 +325,7 @@ fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Opt
 
     // Resolved operands.
     for op in inst.operands() {
-        key.push(resolve(op, replacements).0 as u64);
+        key.push(resolve_with(op, replacements, aliases).0 as u64);
     }
 
     Some(CseKey(key))
@@ -301,7 +415,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         CmpGeI64(..) => 78,
         I64ToF64(..) => 79,
         IsNum(..) => 80,
-        GuardNumAt { .. } | GuardClassAt { .. } | SlowPathExit { .. } => 35,
+        GuardNumAt { .. } | GuardClassAt { .. } | SlowPathExit { .. } | ColdLoopExit { .. } => 35,
         NewInstance { .. } => 81,
     }
 }

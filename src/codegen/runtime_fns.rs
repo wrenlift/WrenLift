@@ -85,16 +85,36 @@ fn trace_jit_ic(msg: impl FnOnce() -> String) {
     }
 }
 
+/// The method symbol in a call's packed word, and the call site's
+/// inline cache when the word names one: its index in the calling
+/// function's table, with that function when the word names it too
+/// (the thread's current function otherwise).
 #[inline(always)]
-fn decode_method_and_ic(packed: u64) -> (crate::intern::SymbolId, Option<usize>) {
+fn decode_method_and_ic(packed: u64) -> (crate::intern::SymbolId, Option<(usize, Option<u32>)>) {
     let method = crate::intern::SymbolId::from_raw(packed as u32);
-    let ic_tag = (packed >> 32) as u32;
-    let ic_idx = if ic_tag == 0 {
+    let ic_tag = ((packed >> 32) & 0xffff) as u32;
+    let func_tag = (packed >> 48) as u32;
+    let ic = if ic_tag == 0 {
         None
     } else {
-        Some((ic_tag - 1) as usize)
+        Some(((ic_tag - 1) as usize, (func_tag != 0).then(|| func_tag - 1)))
     };
-    (method, ic_idx)
+    (method, ic)
+}
+
+/// A call's packed method word: the symbol, and the site's inline
+/// cache index and function when the compile asks for the cache to
+/// be filled. Sites past the packing's range go without.
+pub fn pack_method_word(method: u32, site: Option<(usize, u32)>) -> u64 {
+    let mut bits = method as u64;
+    if let Some((i, func_id)) = site
+        && i < 0xffff
+        && func_id < 0xffff
+    {
+        bits |= ((i as u64) + 1) << 32;
+        bits |= ((func_id as u64) + 1) << 48;
+    }
+    bits
 }
 
 fn with_rooted_args<T>(args: &[Value], f: impl FnOnce(&[Value]) -> T) -> T {
@@ -346,9 +366,12 @@ fn current_jit_callsite_ic(
     vm: &mut crate::runtime::vm::VM,
     j: *mut JitThread,
     ic_idx: usize,
+    func: Option<u32>,
 ) -> Option<*mut crate::mir::bytecode::CallSiteIC> {
     let ctx = unsafe { &(*j).ctx };
-    let func_id = if ctx.current_func_id != u32::MAX as u64 {
+    let func_id = if let Some(f) = func {
+        crate::runtime::engine::FuncId(f)
+    } else if ctx.current_func_id != u32::MAX as u64 {
         crate::runtime::engine::FuncId(ctx.current_func_id as u32)
     } else {
         let closure_ptr = ctx.closure as *mut ObjClosure;
@@ -1315,14 +1338,6 @@ pub fn jit_state() -> *mut JitThread {
     JIT.with(|j| j.get())
 }
 
-/// A loop header left through an OSR exit and the (register, value)
-/// pairs the interpreter restores before resuming there.
-pub type OsrExitRecord = (u32, Vec<(u32, Value)>);
-
-thread_local! {
-    static OSR_EXIT: std::cell::RefCell<Option<OsrExitRecord>> = const { std::cell::RefCell::new(None) };
-}
-
 /// A loop entry stub about to call its body: `frame` points at the
 /// live-ins, with the entry index in the word before them. The frame
 /// is kept for this thread; `pending` is the body's count of posted
@@ -1354,31 +1369,23 @@ pub unsafe extern "C" fn wren_osr_take(pending: *mut u64) -> u64 {
     frame
 }
 
-/// Compiled code leaving a cold loop: `buf` holds `n` (register, value)
-/// pairs of the header's live-ins. Returns the internal undefined
-/// sentinel the OSR caller checks for.
-///
-/// # Safety
-/// `buf` must point at `2 * n` readable u64s; compiled code passes its
-/// own stack buffer.
+/// A loop the top tier compiled before it ran has now run a few
+/// hundred iterations through generic calls, filling their caches:
+/// compile the function again from them.
+#[cfg(feature = "host")]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub unsafe extern "C" fn wren_osr_exit(header: u64, buf: *const u64, n: u64) -> u64 {
-    let vals: Vec<(u32, Value)> = (0..n as usize)
-        .map(|i| unsafe {
-            (
-                *buf.add(2 * i) as u32,
-                Value::from_bits(*buf.add(2 * i + 1)),
-            )
-        })
-        .collect();
-    OSR_EXIT.with(|e| *e.borrow_mut() = Some((header as u32, vals)));
-    Value::UNDEFINED.to_bits()
+pub extern "C" fn wren_cold_loop_hot(func_id: u64) -> u64 {
+    if let Some(vm) = unsafe { vm_ref() } {
+        vm.cold_loop_hot(crate::runtime::engine::FuncId(func_id as u32));
+    }
+    0
 }
 
-/// Take the pending OSR exit record, if a compiled body just left one.
-pub fn take_osr_exit() -> Option<OsrExitRecord> {
-    OSR_EXIT.with(|e| e.borrow_mut().take())
-}
+/// What a baseline body's re-tier poll gets back when the top tier
+/// has no entry for it yet: the loop goes on in the baseline. Any
+/// other value, the internal undefined sentinel included, is the
+/// body's result to return.
+pub const RETIER_DECLINED: u64 = crate::runtime::value::TAG_UNDEFINED ^ (1 << 32);
 
 /// Baseline code whose tier countdown reached zero: proposes the top
 /// tier when the engine's policy says so and reloads the countdown.
@@ -1409,7 +1416,7 @@ pub extern "C" fn wren_tier_tick(func_id: u64) -> u64 {
 #[cfg(feature = "host")]
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64, n: u64) -> u64 {
-    let decline = Value::UNDEFINED.to_bits();
+    let decline = RETIER_DECLINED;
     let vm = read_jit_ctx().vm as *mut crate::runtime::vm::VM;
     if vm.is_null() {
         return decline;
@@ -2279,7 +2286,7 @@ fn dispatch_call_rooted(
     {
         return result;
     }
-    let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, j, idx));
+    let ic_ptr = ic_idx.and_then(|(idx, func)| current_jit_callsite_ic(vm, j, idx, func));
 
     if let Some(ic_ptr) = ic_ptr {
         vm.engine
@@ -5022,23 +5029,10 @@ pub fn deopt_words(r: &crate::mir::DeoptReg) -> usize {
     1 + deopt_consts(r).len() + r.source.operands().len()
 }
 
-/// A mid-body speculation in `func_id` failed: resume the interpreter
-/// at bytecode offset `pc` with the registers described by the `n`
-/// words in `buf` and return the function's result.
-///
-/// # Safety
-/// `buf` must point at `n` readable u64s laid out as `deopt_tag` and
-/// `deopt_words` describe; compiled code passes its own stack buffer.
-#[cfg(feature = "host")]
-#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
-pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *const u64) -> u64 {
-    let vm = unsafe { vm_ref() };
-    let vm = match vm {
-        Some(v) => v,
-        None => return Value::null().to_bits(),
-    };
-    let words: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
-    let root_len_before = jit_roots_snapshot_len();
+/// The registers `words` describe, in the layout `deopt_tag` and
+/// `deopt_words` lay down: a range or an instance the compiled body
+/// kept as scalars is allocated again and rooted for the caller.
+fn decode_deopt_words(vm: &mut crate::runtime::vm::VM, words: &[u64]) -> Vec<(u32, Value)> {
     let mut regs: Vec<(u32, Value)> = Vec::new();
     let mut objects: Vec<(u32, Value)> = Vec::new();
     let mut i = 0;
@@ -5083,6 +5077,27 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
             i += 2;
         }
     }
+    regs
+}
+
+/// A mid-body speculation in `func_id` failed: resume the interpreter
+/// at bytecode offset `pc` with the registers described by the `n`
+/// words in `buf` and return the function's result.
+///
+/// # Safety
+/// `buf` must point at `n` readable u64s laid out as `deopt_tag` and
+/// `deopt_words` describe; compiled code passes its own stack buffer.
+#[cfg(feature = "host")]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *const u64) -> u64 {
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+    let words: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
+    let root_len_before = jit_roots_snapshot_len();
+    let regs = decode_deopt_words(vm, &words);
     let id = crate::runtime::engine::FuncId(func_id as u32);
     if env_flag(&TIER_TRACE, "WLIFT_TIER_TRACE") {
         eprintln!(
@@ -5648,8 +5663,9 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_closure_n" => Some(wren_make_closure_n as *const () as usize),
         // Strings
         "wren_string_concat" => Some(wren_string_concat as *const () as usize),
-        "wren_osr_exit" => Some(wren_osr_exit as *const () as usize),
         "wren_osr_post" => Some(wren_osr_post as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_cold_loop_hot" => Some(wren_cold_loop_hot as *const () as usize),
         "wren_osr_take" => Some(wren_osr_take as *const () as usize),
         #[cfg(feature = "host")]
         "wren_tier_tick" => Some(wren_tier_tick as *const () as usize),

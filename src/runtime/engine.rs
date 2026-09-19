@@ -2920,11 +2920,10 @@ impl ExecutionEngine {
             compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
         };
         let mut cold = HashMap::new();
-        // WLIFT_COLD_LOOP_RECOMPILE=1 turns on cold-loop exits and the
-        // recompile they request; safe to run with, but the recompile
-        // costs more than it returns on short loops, so it is off.
-        static ON: OnceLock<bool> = OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("WLIFT_COLD_LOOP_RECOMPILE").is_some()) {
+        // WLIFT_DISABLE_COLD_LOOP_RECOMPILE=1 leaves a loop compiled
+        // before it ran with its generic call sites; safe to run with.
+        static OFF: OnceLock<bool> = OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("WLIFT_DISABLE_COLD_LOOP_RECOMPILE").is_some()) {
             return cold;
         }
         if mir.blocks.is_empty() {
@@ -2965,9 +2964,41 @@ impl ExecutionEngine {
         cold
     }
 
+    /// The compile clone with a `ColdLoopExit` at the head of every
+    /// cold loop header.
+    fn plant_cold_loop_exits(
+        clone: Arc<MirFunction>,
+        cold: &HashMap<crate::mir::BlockId, Vec<crate::mir::ValueId>>,
+    ) -> Arc<MirFunction> {
+        use crate::mir::Instruction;
+        if cold.is_empty() {
+            return clone;
+        }
+        let mut out = (*clone).clone();
+        let mut planted = false;
+        for header in cold.keys() {
+            if !out.blocks.iter().any(|b| b.id == *header) {
+                continue;
+            }
+            let v = out.new_value();
+            let block = out
+                .blocks
+                .iter_mut()
+                .find(|b| b.id == *header)
+                .expect("checked above");
+            block
+                .instructions
+                .insert(0, (v, Instruction::ColdLoopExit { header: *header }));
+            planted = true;
+        }
+        if planted { Arc::new(out) } else { clone }
+    }
+
     /// Whether the installed OSR entry for `block` was compiled before
-    /// its loop ever ran. Every 256th probe asks for the next tier, so
-    /// a loop that is really hot gets code with its caches filled.
+    /// its loop ever ran. The interpreter keeps the loop, filling its
+    /// caches; the 256th probe retires the top tier's body and asks for
+    /// it again, so a loop that is really hot gets code with its caches
+    /// filled.
     pub fn osr_entry_is_cold(
         &mut self,
         id: FuncId,
@@ -2986,15 +3017,76 @@ impl ExecutionEngine {
         let probes = self.cold_osr_probes.entry((id.0, block.0)).or_insert(0);
         *probes += 1;
         if probes.is_multiple_of(256) {
-            self.request_tier_up(id, interner);
+            self.recompile_top_tier(id, interner);
         }
         true
     }
 
-    /// The running VM's Immix bump region, for compiles requested while
-    /// it runs; 0 when there is none to allocate from inline.
-    #[cfg(feature = "host")]
+    /// Retire the top tier's body for `id` and compile it again from
+    /// the caches as they are now; the baseline runs in the meantime
+    /// and transfers into the new body at its next poll.
+    #[cfg(feature = "cranelift")]
+    pub fn recompile_top_tier(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        let _guard = self.tier_guard();
+        let idx = id.0 as usize;
+        if idx >= self.functions.len() || self.compiling_tier[idx].is_some() {
+            return;
+        }
+        // Only when the loop's caches have something new: a site the
+        // class hierarchy resolves never fills one, and compiling the
+        // same body again would find the loop cold again.
+        let ics = self.callsite_ic_data_for_compile(id);
+        let still_cold = match (self.functions.get(idx), ics) {
+            (Some(body), Some((ics, _))) => {
+                let now = Self::cold_loop_headers(body.mir(), &ics);
+                self.cold_osr_blocks[idx]
+                    .iter()
+                    .all(|h| now.contains_key(h))
+            }
+            _ => true,
+        };
+        if still_cold {
+            self.cold_osr_blocks[idx].clear();
+            return;
+        }
+        if tier_trace_enabled() {
+            eprintln!(
+                "tier-trace: [{:.2}ms] cold loop ran FuncId({}), recompiling",
+                trace_clock_ms(),
+                id.0
+            );
+        }
+        if let Some(FuncBody::Native {
+            optimized_executable,
+            ..
+        }) = self.functions.get_mut(idx)
+            && let Some(old) = optimized_executable.take()
+        {
+            self.retired_code.push(old);
+        }
+        self.optimized_code[idx] = std::ptr::null();
+        self.optimized_osr_entries[idx].clear();
+        self.cold_osr_blocks[idx].clear();
+        self.tier_states[idx] = if self.baseline_code[idx].is_null() {
+            TierState::Interpreted
+        } else {
+            TierState::BaselineNative
+        };
+        self.sync_active_tier_cache(idx);
+        self.tier_cells[idx]
+            .retier
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.promote_retry_at[idx] = 0;
+        if let Some(tier) = self.next_compile_tier(idx) {
+            self.request_compile(id, tier, interner);
+        }
+    }
+
+    #[cfg(not(feature = "cranelift"))]
+    pub fn recompile_top_tier(&mut self, _id: FuncId, _interner: &crate::intern::Interner) {}
+
     /// The compiling program's safepoint page, for its loop headers.
+    #[cfg(feature = "host")]
     fn safepoint_page_for_compile(&self) -> usize {
         self.safepoint_page
     }
@@ -3830,11 +3922,15 @@ impl ExecutionEngine {
 
     /// The top tier's OSR entry for a loop header, once installed.
     pub fn top_tier_osr_entry(
-        &self,
+        &mut self,
         id: FuncId,
         header: crate::mir::BlockId,
     ) -> Option<NativeOsrEntry> {
         let idx = id.0 as usize;
+        // A finished compile raises the poll before it is installed.
+        if self.tier_states.get(idx).copied() != Some(TierState::OptimizedNative) {
+            self.poll_compilations();
+        }
         if self.tier_states.get(idx).copied() != Some(TierState::OptimizedNative) {
             return None;
         }
@@ -3842,12 +3938,27 @@ impl ExecutionEngine {
             .optimized_osr_entries
             .get(idx)?
             .iter()
-            .find(|e| e.target_block == header)?;
+            .find(|e| e.target_block == header);
+        let Some(entry) = entry else {
+            if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                eprintln!(
+                    "osr-trace: retier off FuncId({}) bb{}: the top tier has no entry there",
+                    id.0, header.0
+                );
+            }
+            return None;
+        };
         // Only the bytecode's own registers mean the same thing in both
         // bodies; a value the JIT pipeline created is numbered per
         // compile.
         let registers = self.functions.get(idx)?.mir().next_value;
         if entry.live_in_regs.iter().any(|r| *r >= registers) {
+            if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                eprintln!(
+                    "osr-trace: retier off FuncId({}) bb{}: live-in past the bytecode's registers {:?} (next {})",
+                    id.0, header.0, entry.live_in_regs, registers
+                );
+            }
             return None;
         }
         Some(entry.clone())
@@ -4256,6 +4367,14 @@ impl ExecutionEngine {
             .as_deref()
             .map(|ics| Self::cold_loop_headers(&mir, ics))
             .unwrap_or_default();
+        if tier_trace_enabled() && !cold.is_empty() {
+            eprintln!(
+                "tier-trace: [{:.2}ms] cold loops FuncId({}) {:?}",
+                trace_clock_ms(),
+                id.0,
+                cold.keys().collect::<Vec<_>>()
+            );
+        }
         self.pending_cold_osr
             .insert(idx, cold.keys().copied().collect());
         let speculating =
@@ -4277,6 +4396,11 @@ impl ExecutionEngine {
         let sroa_mir = if speculating {
             let out = self.speculate_call_results(id, &mir, sroa_mir, interner);
             self.promote_fields(out, callsite_ic_ptrs.as_deref())
+        } else {
+            sroa_mir
+        };
+        let sroa_mir = if tier == CompileTier::Optimized {
+            Self::plant_cold_loop_exits(sroa_mir, &cold)
         } else {
             sroa_mir
         };
@@ -4353,8 +4477,8 @@ impl ExecutionEngine {
             }
             use crate::codegen::cranelift_backend::cl;
             cl::set_jit_modvars_cell(modvars_cell);
-            cl::set_jit_cold_headers(cold.clone());
             cl::set_jit_tier_hook(tier_hook.clone());
+            cl::set_jit_retier_cell(tier_cell_addr);
             cl::set_jit_func_id(id.0);
             crate::codegen::set_jit_bump_region(bump_region);
             crate::codegen::set_jit_safepoint_page(safepoint_page);
@@ -4372,8 +4496,8 @@ impl ExecutionEngine {
                 inline_bodies.clone(),
                 cha_for_codegen.clone(),
             );
-            cl::set_jit_cold_headers(Default::default());
             cl::set_jit_tier_hook(None);
+            cl::set_jit_retier_cell(0);
             crate::codegen::set_jit_bump_region(0);
             crate::codegen::set_jit_safepoint_page(0);
             crate::codegen::set_jit_list_class(0);
@@ -4438,12 +4562,14 @@ impl ExecutionEngine {
             results_ready.store(true, std::sync::atomic::Ordering::Release);
             if tier_cell_addr != 0 {
                 // SAFETY: the cell is boxed for the engine's lifetime and
-                // only ever read through atomics on other threads; the
+                // only ever read through atomics on other threads. The
                 // compiled code's own countdown update is a plain
-                // read-modify-write, so this store can lose to it, costing
-                // one more iteration before the tick.
+                // read-modify-write that this store can lose to, so the
+                // re-tier word is raised as well: its poll installs the
+                // result and transfers in one step.
                 let cell = unsafe { &*(tier_cell_addr as *const TierCell) };
                 cell.tick_after(1);
+                cell.retier.store(1, std::sync::atomic::Ordering::Release);
             }
             beadie::OsrCompileResult {
                 entry: native_ptr,

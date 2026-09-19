@@ -488,10 +488,6 @@ enum OsrTransfer {
     NotEntered,
     ContinueFiberLoop,
     Return(Value),
-    /// The compiled body left a cold loop; the frame's registers hold
-    /// that loop header's live-ins and interpretation resumes at this
-    /// bytecode offset.
-    ContinueAt(u32),
 }
 
 #[allow(clippy::too_many_arguments)] // OSR transfer needs every piece of the live frame context.
@@ -719,49 +715,6 @@ fn try_enter_loop_osr(
         .unwrap_or(std::ptr::null_mut());
     crate::codegen::runtime_fns::jit_roots_restore_len(saved_ctx_root_idx);
     crate::codegen::runtime_fns::set_jit_context(restored_ctx);
-
-    // A cold-loop exit: the body stopped at a loop header it was compiled
-    // for without inline-cache data. Put the header's live-ins back into
-    // the frame's registers and interpret from that header.
-    if result_bits == Value::UNDEFINED.to_bits()
-        && !vm.has_error
-        && let Some((header, live)) = crate::codegen::runtime_fns::take_osr_exit()
-    {
-        let header = crate::mir::BlockId(header);
-        let Some(offset) = bc
-            .osr_points
-            .iter()
-            .find(|p| p.target_block == header)
-            .map(|p| p.target_offset)
-        else {
-            return Err(RuntimeError::Error(format!(
-                "OSR exit at bb{} has no bytecode loop header",
-                header.0
-            )));
-        };
-        unsafe {
-            if let Some(frame) = (*live_fiber).mir_frames.last_mut() {
-                *values = std::mem::take(&mut frame.values);
-            }
-        }
-        for (reg, v) in &live {
-            let i = *reg as usize;
-            if i >= values.len() {
-                values.resize(i + 1, UNDEF);
-            }
-            values[i] = *v;
-        }
-        if env_osr_trace() {
-            eprintln!(
-                "osr-trace: [{:.2}ms] exit FuncId({}) bb{} live={}",
-                crate::runtime::engine::trace_clock_ms(),
-                func_id.0,
-                header.0,
-                live.len()
-            );
-        }
-        return Ok(OsrTransfer::ContinueAt(offset));
-    }
 
     if vm.has_error {
         vm.has_error = false;
@@ -4214,10 +4167,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 OsrTransfer::NotEntered => {}
                                 OsrTransfer::ContinueFiberLoop => continue 'fiber_loop,
                                 OsrTransfer::Return(value) => return Ok(value),
-                                OsrTransfer::ContinueAt(offset) => {
-                                    pc = offset;
-                                    continue;
-                                }
                             }
                         }
                     }
@@ -4357,10 +4306,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 OsrTransfer::NotEntered => {}
                                 OsrTransfer::ContinueFiberLoop => continue 'fiber_loop,
                                 OsrTransfer::Return(value) => return Ok(value),
-                                OsrTransfer::ContinueAt(offset) => {
-                                    pc = offset;
-                                    continue;
-                                }
                             }
                         }
                     }

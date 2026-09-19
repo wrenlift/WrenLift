@@ -67,10 +67,27 @@ impl MirPass for ConstFold {
     fn run(&self, func: &mut MirFunction) -> bool {
         let mut constants: HashMap<ValueId, ConstVal> = HashMap::new();
         let mut changed = false;
+        // The operand of every `Not`, for collapsing a chain of them:
+        // three negations are one.
+        let mut negated: HashMap<ValueId, ValueId> = HashMap::new();
 
         for block_idx in 0..func.blocks.len() {
             for inst_idx in 0..func.blocks[block_idx].instructions.len() {
                 let (val_id, ref inst) = func.blocks[block_idx].instructions[inst_idx];
+
+                if let Instruction::Not(a) = inst {
+                    let a = *a;
+                    if let Some(&b) = negated.get(&a)
+                        && let Some(&c) = negated.get(&b)
+                    {
+                        func.blocks[block_idx].instructions[inst_idx] =
+                            (val_id, Instruction::Not(c));
+                        negated.insert(val_id, c);
+                        changed = true;
+                        continue;
+                    }
+                    negated.insert(val_id, a);
+                }
 
                 if let Some(cv) = extract_constant(inst) {
                     constants.insert(val_id, cv);

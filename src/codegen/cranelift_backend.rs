@@ -1335,24 +1335,6 @@ pub mod cl {
     }
 
     thread_local! {
-        /// Loop headers of the compiling function whose call sites had no
-        /// inline-cache data; OSR-entered code leaves such a loop after a
-        /// few hundred iterations so the interpreter can warm it up.
-        static JIT_COLD_HEADERS: std::cell::RefCell<HashMap<BlockId, Vec<ValueId>>> =
-            std::cell::RefCell::new(HashMap::new());
-    }
-
-    /// Set the cold loop headers for this thread's next compile, each with
-    /// the registers the interpreter needs to resume at it.
-    pub fn set_jit_cold_headers(headers: HashMap<BlockId, Vec<ValueId>>) {
-        JIT_COLD_HEADERS.with(|c| *c.borrow_mut() = headers);
-    }
-
-    fn jit_cold_headers() -> HashMap<BlockId, Vec<ValueId>> {
-        JIT_COLD_HEADERS.with(|c| c.borrow().clone())
-    }
-
-    thread_local! {
         /// The receiver of a body being spliced behind its class check,
         /// with that class.
         static INLINE_CLASS: std::cell::Cell<Option<(Value, usize)>> =
@@ -1392,6 +1374,20 @@ pub mod cl {
     /// Set the tier hook for this thread's next compile; `None` clears it.
     pub fn set_jit_tier_hook(hook: Option<TierHook>) {
         JIT_TIER_HOOK.with(|c| *c.borrow_mut() = hook);
+    }
+
+    thread_local! {
+        /// The function's tier cell for this thread's next top-tier
+        /// compile: a cold loop polls its re-tier word.
+        static JIT_RETIER_CELL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub fn set_jit_retier_cell(cell: usize) {
+        JIT_RETIER_CELL.with(|c| c.set(cell));
+    }
+
+    fn jit_retier_cell() -> usize {
+        JIT_RETIER_CELL.with(|c| c.get())
     }
 
     thread_local! {
@@ -2477,7 +2473,6 @@ pub mod cl {
             "wren_bit_shr",
             "wren_alloc_simd4f",
             "wren_alloc_simd4i",
-            "wren_osr_exit",
             "wren_osr_post",
             "wren_osr_take",
             "wren_tier_tick",
@@ -2837,42 +2832,26 @@ pub mod cl {
         // Cold loop headers get an iteration counter and a buffer for
         // their live-ins; only OSR-entered code can hand a loop back to
         // the interpreter, because only then does a frame exist to resume.
-        let mut cold_exits: HashMap<
-            BlockId,
-            (
-                cranelift_codegen::ir::StackSlot,
-                cranelift_codegen::ir::StackSlot,
-                Vec<ValueId>,
-            ),
-        > = HashMap::new();
-        if entries.is_some() {
-            for (header, live) in jit_cold_headers() {
-                if header.0 as usize >= mir.blocks.len() {
-                    continue;
-                }
-                // A split parameter lives in the interpreter as an object
-                // field; leave such loops alone.
-                if live
+        // Counters for the loops the body leaves once they prove hot,
+        // one per `ColdLoopExit`, zeroed at every entry.
+        let cold_counters: HashMap<BlockId, cranelift_codegen::ir::StackSlot> = mir
+            .blocks
+            .iter()
+            .filter(|b| {
+                b.instructions
                     .iter()
-                    .any(|v| mir.scalar_param_sources.contains_key(v))
-                {
-                    continue;
-                }
+                    .any(|(_, i)| matches!(i, Instruction::ColdLoopExit { .. }))
+            })
+            .map(|b| {
                 let counter =
                     builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                         8,
                         3,
                     ));
-                let buf =
-                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        (live.len().max(1) * 16) as u32,
-                        3,
-                    ));
-                cold_exits.insert(header, (counter, buf, live));
-            }
-        }
+                (b.id, counter)
+            })
+            .collect();
         // Re-tier polls at outermost loop headers, JIT bodies only.
         let tier_hook = if aot_config.is_none() && f64_self_id.is_none() {
             jit_tier_hook()
@@ -2908,7 +2887,7 @@ pub mod cl {
                 retier_polls.insert(*header, (buf, live));
             }
         }
-        let exit_value_types = if cold_exits.is_empty() && retier_polls.is_empty() {
+        let exit_value_types = if cold_counters.is_empty() && retier_polls.is_empty() {
             Vec::new()
         } else {
             infer_osr_value_types(mir)
@@ -2918,7 +2897,6 @@ pub mod cl {
         // or, when a loop entry stub posted a frame for this thread, to
         // that loop's header with the interpreter's frame loaded.
         let mut entry_params: Option<Vec<Value>> = None;
-        let mut entry_kind: Option<cranelift_frontend::Variable> = None;
         if let Some(entries) = entries {
             let dispatch = builder.create_block();
             builder.switch_to_block(dispatch);
@@ -2926,7 +2904,7 @@ pub mod cl {
                 builder.append_block_param(dispatch, types::I64);
             }
             let params = builder.block_params(dispatch).to_vec();
-            for (counter, _, _) in cold_exits.values() {
+            for counter in cold_counters.values() {
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().stack_store(types::I64, zero, *counter, 0);
             }
@@ -2940,9 +2918,6 @@ pub mod cl {
             // The pending count is the only word threads share; a
             // thread that finds it set but has no frame of its own
             // takes the normal entry.
-            let kind_var = builder.declare_var(types::I64);
-            let zero = builder.ins().iconst(types::I64, 0);
-            builder.def_var(kind_var, zero);
             let gv = module.declare_data_in_func(entries.request, builder.func);
             let request = builder.ins().symbol_value(types::I64, gv);
             let pending = builder
@@ -2966,7 +2941,6 @@ pub mod cl {
             let kind = builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), args_ptr, -VALUE_SIZE);
-            builder.def_var(kind_var, kind);
             let prologues: Vec<cranelift_codegen::ir::Block> = entries
                 .layouts
                 .iter()
@@ -3030,7 +3004,6 @@ pub mod cl {
                 builder.ins().jump(block_map[&layout.target_block], &args);
             }
             entry_params = Some(params);
-            entry_kind = Some(kind_var);
         }
 
         // Receiver (entry_params[0]) saved for CallStaticSelf
@@ -3207,48 +3180,6 @@ pub mod cl {
                 val_map.insert(*vid, v);
             }
 
-            // Cold loop: count iterations and hand the loop back to the
-            // interpreter once it proves hot, with the header's live-ins.
-            // Every register the interpreter needs must still exist in the
-            // compiled code; a header that lost one gets no exit.
-            if let Some((counter, buf, live)) = cold_exits
-                .get(&bid)
-                .filter(|(_, _, live)| live.iter().all(|v| val_map.contains_key(v)))
-            {
-                let c = builder
-                    .ins()
-                    .stack_load(types::I64, types::I64, *counter, 0);
-                let one = builder.ins().iconst(types::I64, 1);
-                let c1 = builder.ins().iadd(c, one);
-                builder.ins().stack_store(types::I64, c1, *counter, 0);
-                let limit = builder.ins().iconst(types::I64, COLD_LOOP_EXIT_AFTER);
-                let hot = builder.ins().icmp(IntCC::SignedGreaterThan, c1, limit);
-                // Only an activation the interpreter entered has a
-                // frame to hand the loop back to.
-                let hot = match entry_kind {
-                    Some(kind) => {
-                        let k = builder.use_var(kind);
-                        let entered = builder.ins().icmp_imm_s(IntCC::NotEqual, k, 0);
-                        builder.ins().band(hot, entered)
-                    }
-                    None => hot,
-                };
-                let exit_block = builder.create_block();
-                let cont_block = builder.create_block();
-                builder.set_cold_block(exit_block);
-                builder.ins().brif(hot, exit_block, &[], cont_block, &[]);
-                builder.switch_to_block(exit_block);
-                emit_live_snapshot(builder, live, &val_map, &raw_bools, &exit_value_types, *buf)?;
-                let buf_ptr = builder.ins().stack_addr(types::I64, *buf, 0);
-                let header_id = builder.ins().iconst(types::I64, bid.0 as i64);
-                let n = builder.ins().iconst(types::I64, live.len() as i64);
-                let exit_fn = get_runtime_fn(module, builder, "wren_osr_exit", 3)?;
-                let call = builder.ins().call(exit_fn, &[header_id, buf_ptr, n]);
-                let sentinel = builder.inst_results(call)[0];
-                builder.ins().return_(&[sentinel]);
-                builder.switch_to_block(cont_block);
-            }
-
             if let Some((_, live)) = retier_polls.get(&bid)
                 && std::env::var_os("WLIFT_OSR_TRACE").is_some()
             {
@@ -3296,11 +3227,11 @@ pub mod cl {
                 let retier_fn = get_runtime_fn(module, builder, "wren_retier", 4)?;
                 let call = builder.ins().call(retier_fn, &[fid, header_id, buf_ptr, n]);
                 let result = builder.inst_results(call)[0];
-                let undefined = builder.ins().iconst(
+                let declined_bits = builder.ins().iconst(
                     types::I64,
-                    crate::runtime::value::Value::UNDEFINED.to_bits() as i64,
+                    crate::codegen::runtime_fns::RETIER_DECLINED as i64,
                 );
-                let declined = builder.ins().icmp(IntCC::Equal, result, undefined);
+                let declined = builder.ins().icmp(IntCC::Equal, result, declined_bits);
                 let ret_block = builder.create_block();
                 builder
                     .ins()
@@ -3503,6 +3434,89 @@ pub mod cl {
                 if pre_defined.contains(&vid) {
                     continue;
                 }
+                // A loop compiled cold: its generic calls fill their
+                // caches as it runs; the 256th iteration asks for the
+                // function to be compiled again from them, and every
+                // iteration polls for that body to transfer into.
+                if let (Instruction::ColdLoopExit { header }, None) = (inst, aot_config) {
+                    let live: Vec<ValueId> = osr_external_live_values(mir, *header)
+                        .into_iter()
+                        .chain(mir.blocks[header.0 as usize].params.iter().map(|(p, _)| *p))
+                        .collect();
+                    let cell_addr = jit_retier_cell();
+                    if let Some(counter) = cold_counters.get(header)
+                        && cell_addr != 0
+                        && live.iter().all(|v| val_map.contains_key(v))
+                        && !live
+                            .iter()
+                            .any(|v| mir.scalar_param_sources.contains_key(v))
+                    {
+                        let c = builder
+                            .ins()
+                            .stack_load(types::I64, types::I64, *counter, 0);
+                        let c1 = builder.ins().iadd_imm_s(c, 1);
+                        builder.ins().stack_store(types::I64, c1, *counter, 0);
+                        let hot = builder
+                            .ins()
+                            .icmp_imm_s(IntCC::Equal, c1, COLD_LOOP_EXIT_AFTER);
+                        let ask_block = builder.create_block();
+                        let poll_block = builder.create_block();
+                        builder.set_cold_block(ask_block);
+                        builder.ins().brif(hot, ask_block, &[], poll_block, &[]);
+                        builder.switch_to_block(ask_block);
+                        let fid = builder.ins().iconst(types::I64, jit_func_id() as i64);
+                        let f = get_runtime_fn(module, builder, "wren_cold_loop_hot", 1)?;
+                        builder.ins().call(f, &[fid]);
+                        builder.ins().jump(poll_block, &[]);
+                        builder.switch_to_block(poll_block);
+                        let cell = builder.ins().iconst(types::I64, cell_addr as i64);
+                        let word =
+                            builder
+                                .ins()
+                                .uload32(MemFlags::trusted(), cell, TIER_CELL_RETIER);
+                        let exit_block = builder.create_block();
+                        let cont_block = builder.create_block();
+                        builder.set_cold_block(exit_block);
+                        builder.ins().brif(word, exit_block, &[], cont_block, &[]);
+                        builder.switch_to_block(exit_block);
+                        let buf = builder.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (live.len().max(1) * 16) as u32,
+                                3,
+                            ),
+                        );
+                        emit_live_snapshot(
+                            builder,
+                            &live,
+                            &val_map,
+                            &raw_bools,
+                            &exit_value_types,
+                            buf,
+                        )?;
+                        let buf_ptr = builder.ins().stack_addr(types::I64, buf, 0);
+                        let header_id = builder.ins().iconst(types::I64, header.0 as i64);
+                        let n = builder.ins().iconst(types::I64, live.len() as i64);
+                        let retier_fn = get_runtime_fn(module, builder, "wren_retier", 4)?;
+                        let call = builder.ins().call(retier_fn, &[fid, header_id, buf_ptr, n]);
+                        let result = builder.inst_results(call)[0];
+                        let declined_bits = builder.ins().iconst(
+                            types::I64,
+                            crate::codegen::runtime_fns::RETIER_DECLINED as i64,
+                        );
+                        let declined = builder.ins().icmp(IntCC::Equal, result, declined_bits);
+                        let ret_block = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(declined, cont_block, &[], ret_block, &[]);
+                        builder.switch_to_block(ret_block);
+                        builder.ins().return_(&[result]);
+                        builder.switch_to_block(cont_block);
+                    } else if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                        eprintln!("osr-trace: cold loop poll skipped at bb{}", header.0);
+                    }
+                    continue;
+                }
                 // In a block that ends unreachable, an exit is the
                 // block: the guard that led here has already failed.
                 if let (true, Instruction::SlowPathExit { pc, live }, None) = (
@@ -3687,7 +3701,7 @@ pub mod cl {
     }
 
     /// Store `live` into `buf` as `(register, boxed value)` pairs, the
-    /// layout `wren_osr_exit` and `wren_retier` read.
+    /// layout `wren_retier` reads.
     fn emit_live_snapshot(
         builder: &mut FunctionBuilder,
         live: &[ValueId],
@@ -3778,26 +3792,15 @@ pub mod cl {
         Ok(())
     }
 
-    /// Leave the function from the current block: store the `live`
-    /// registers in the word layout `wren_deopt_at` reads, hand the
-    /// function to it and return its result.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn emit_deopt_at(
+    /// Store the `live` registers in the word layout `wren_deopt_at`
+    /// reads, in a fresh stack slot: its address and word count.
+    fn emit_deopt_words(
         builder: &mut FunctionBuilder,
-        module: &mut dyn Module,
-        get_runtime_fn: &mut dyn FnMut(
-            &mut dyn Module,
-            &mut FunctionBuilder,
-            &str,
-            usize,
-        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
-        func_id: u32,
-        pc: u32,
         live: &[DeoptReg],
         val_map: &HashMap<ValueId, Value>,
         raw_bools: &HashSet<ValueId>,
         value_types: &[MirType],
-    ) -> Result<(), String> {
+    ) -> Result<(Value, usize), String> {
         let words = live
             .iter()
             .map(crate::codegen::runtime_fns::deopt_words)
@@ -3829,6 +3832,30 @@ pub mod cl {
             }
         }
         let buf = builder.ins().stack_addr(types::I64, slot, 0);
+        Ok((buf, words))
+    }
+
+    /// Leave the function from the current block: store the `live`
+    /// registers in the word layout `wren_deopt_at` reads, hand the
+    /// function to it and return its result.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn emit_deopt_at(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        func_id: u32,
+        pc: u32,
+        live: &[DeoptReg],
+        val_map: &HashMap<ValueId, Value>,
+        raw_bools: &HashSet<ValueId>,
+        value_types: &[MirType],
+    ) -> Result<(), String> {
+        let (buf, words) = emit_deopt_words(builder, live, val_map, raw_bools, value_types)?;
         let fid = builder.ins().iconst(types::I64, func_id as i64);
         let pc = builder.ins().iconst(types::I64, pc as i64);
         let n = builder.ins().iconst(types::I64, words as i64);
@@ -4833,8 +4860,16 @@ pub mod cl {
                 // fast path while extending coverage to call sites
                 // that see multiple receiver classes (where the IC
                 // alone keeps thrashing).
+                // A site whose cache was empty at this compile makes
+                // the generic call, which fills the cache for the next
+                // compile to inline from; the class hierarchy would
+                // dispatch it without ever recording what it sees.
+                let cold_site = ic_site
+                    .and_then(|i| callsite_ic_ptrs.and_then(|ics| ics.get(i)))
+                    .is_some_and(|ic| ic.kind == 0);
                 if let Some(cha) = cha_by_method
                     && args.len() <= 4
+                    && !cold_site
                 {
                     let impls: Vec<crate::runtime::engine::ChaImpl> =
                         cha.get(method).cloned().unwrap_or_default();
@@ -5174,10 +5209,12 @@ pub mod cl {
 
                         // Slow path: full dispatch via wren_call_N
                         builder.switch_to_block(slow_block);
-                        let mut method_bits = method.index() as u64;
-                        if let Some(i) = ic_site.filter(|_| env_jit_callsite_ic()) {
-                            method_bits |= ((i as u64) + 1) << 32;
-                        }
+                        let method_bits = crate::codegen::runtime_fns::pack_method_word(
+                            method.index(),
+                            ic_site
+                                .filter(|_| env_jit_callsite_ic())
+                                .map(|i| (i, jit_func_id())),
+                        );
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                         let arg_vals: Vec<_> = args.iter().map(&get).collect();
                         let slow_result = emit_wren_call(
@@ -5220,10 +5257,12 @@ pub mod cl {
                         .ins()
                         .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
                 } else {
-                    let mut method_bits = method.index() as u64;
-                    if let Some(i) = ic_site.filter(|_| env_jit_callsite_ic()) {
-                        method_bits |= ((i as u64) + 1) << 32;
-                    }
+                    let method_bits = crate::codegen::runtime_fns::pack_method_word(
+                        method.index(),
+                        ic_site
+                            .filter(|_| env_jit_callsite_ic() || cold_site)
+                            .map(|i| (i, jit_func_id())),
+                    );
                     builder.ins().iconst(types::I64, method_bits as i64)
                 };
                 // Route arity > 8 through wren_call_dynamic to
@@ -6881,7 +6920,7 @@ pub mod cl {
                 Ok(Some(v))
             }
             // The Cranelift top tier keeps its slow paths.
-            Instruction::SlowPathExit { .. } => Ok(None),
+            Instruction::SlowPathExit { .. } | Instruction::ColdLoopExit { .. } => Ok(None),
             Instruction::GuardNumAt {
                 value, pc, live, ..
             } => {

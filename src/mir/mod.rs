@@ -461,6 +461,15 @@ pub enum Instruction {
         pc: u32,
         live: Vec<DeoptReg>,
     },
+    /// The head of a loop compiled before the loop ever ran, whose
+    /// call sites fill their caches as the generic calls run: after a
+    /// few hundred iterations the body asks for its function to be
+    /// compiled again from those caches, and polls for the new body
+    /// to transfer into. Planted by the engine; JIT compile clones
+    /// only.
+    ColdLoopExit {
+        header: BlockId,
+    },
     /// The instruction just before has an inline fast path: where it
     /// would otherwise call a helper, it may resume the interpreter at
     /// bytecode offset `pc`, the instruction itself, with `live` in
@@ -545,6 +554,7 @@ impl Instruction {
                 | Instruction::GuardNum(..)
                 | Instruction::GuardNumAt { .. }
                 | Instruction::GuardClassAt { .. }
+                | Instruction::ColdLoopExit { .. }
                 | Instruction::SlowPathExit { .. }
                 | Instruction::GuardBool(..)
                 | Instruction::GuardClass(..)
@@ -666,6 +676,7 @@ impl Instruction {
             Instruction::SlowPathExit { live, .. } => {
                 live.iter().flat_map(|r| r.source.operands()).collect()
             }
+            Instruction::ColdLoopExit { .. } => vec![],
             Instruction::AddI64(a, b)
             | Instruction::SubI64(a, b)
             | Instruction::MulI64(a, b)
@@ -1595,6 +1606,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::SlowPathExit { pc, live } => {
             format!("slow.exit pc={} live={}", pc, live.len())
         }
+        Instruction::ColdLoopExit { header } => format!("cold.loop bb{}", header.0),
         Instruction::GuardClassAt {
             value,
             class,
@@ -1786,7 +1798,9 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 Instruction::I64ToF64(_) => MirType::F64,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
                 Instruction::GuardClassAt { .. } => MirType::Value,
-                Instruction::SlowPathExit { .. } => MirType::Void,
+                Instruction::SlowPathExit { .. } | Instruction::ColdLoopExit { .. } => {
+                    MirType::Void
+                }
                 Instruction::NewInstance { .. } => MirType::Value,
                 Instruction::GuardNum(src)
                 | Instruction::GuardBool(src)

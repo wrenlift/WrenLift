@@ -163,6 +163,7 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
                 r.source.map(f);
             }
         }
+        ColdLoopExit { .. } => {}
         AddI64(a, b)
         | SubI64(a, b)
         | MulI64(a, b)

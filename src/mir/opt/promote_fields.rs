@@ -548,6 +548,9 @@ pub fn promote_fields(func: &mut MirFunction, classes: &Classes) -> bool {
                     }
                     out.push((vid, Instruction::SlowPathExit { pc, live }));
                 }
+                Instruction::ColdLoopExit { header } => {
+                    out.push((vid, Instruction::ColdLoopExit { header }));
+                }
                 Instruction::GuardClassAt {
                     value,
                     class,
