@@ -1,12 +1,14 @@
 name: Install LLVM 21
 description: |
-  The LLVM 21 toolchain the top tier builds against, on any runner.
+  The LLVM 21 toolchain the top tier builds against, on any runner:
+  apt.llvm.org on Linux, Homebrew on macOS, micromamba on Windows.
   Windows is why this is an action rather than three copied blocks: it
   installs through micromamba, aliases a renamed zstd import library, and
   checks every library llvm-config will name before the linker does. Two
   workflows matching that by inspection would drift.
 
-  A job that RUNS the built binary needs llvm21-runtime-dlls afterwards.
+  The binary links LLVM statically. A job that RUNS a Windows build needs
+  llvm21-runtime-dlls afterwards for the DLLs LLVM imports.
 runs:
   using: composite
   steps:
@@ -100,3 +102,19 @@ runs:
       sudo /tmp/llvm.sh 21 all
       echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
       echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> "$GITHUB_ENV"
+  - name: Install LLVM 21 (macOS)
+    if: runner.os == 'macOS'
+    shell: bash
+    run: |
+      # The versioned formula when Homebrew has it; the unversioned one
+      # tracks Homebrew's current LLVM, which is 21 today.
+      if brew install llvm@21 && [ -x "$(brew --prefix llvm@21)/bin/llvm-config" ]; then
+        PREFIX="$(brew --prefix llvm@21)"
+      else
+        brew install llvm
+        PREFIX="$(brew --prefix llvm)"
+      fi
+      "$PREFIX/bin/llvm-config" --version | grep -q '^21\.' \
+        || { echo "::error::no LLVM 21 available from Homebrew"; exit 1; }
+      echo "LLVM_SYS_211_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+      echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"

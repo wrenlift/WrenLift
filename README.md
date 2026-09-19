@@ -54,6 +54,10 @@ cargo build --release
 # binaries land in target/release/{wlift, hatch}
 ```
 
+That build runs hot code on the Cranelift tier. The prebuilt binaries
+carry an LLVM tier above it; to build that, install LLVM 21 and run
+`LLVM_SYS_211_PREFIX=<llvm prefix> cargo build --release --features llvm`.
+
 ## Getting started
 
 Try it without installing → [wrenlift.com/playground](https://wrenlift.com/playground/web/).
@@ -79,7 +83,7 @@ wlift --target=wasm script.wren -o output.wasm
 ### Execution modes
 
 ```sh
-wlift --mode=tiered script.wren        # default — interpret then Cranelift JIT with OSR
+wlift --mode=tiered script.wren        # default — interpret, then Cranelift, then LLVM on hot code
 wlift --mode=interpreter script.wren   # MIR / bytecode / threaded interpreter only, no JIT
 wlift --mode=jit script.wren           # eagerly compile everything to native
 ```

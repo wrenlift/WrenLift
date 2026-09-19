@@ -88,6 +88,10 @@ try {
             Move-Item -Force $src (Join-Path $InstallDir $exe)
         }
     }
+    # The DLLs wlift.exe loads from beside itself.
+    foreach ($dll in Get-ChildItem -Path $staged -Filter *.dll) {
+        Move-Item -Force $dll.FullName (Join-Path $InstallDir $dll.Name)
+    }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

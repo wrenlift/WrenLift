@@ -187,6 +187,11 @@ main() {
     mv "$staged/wlift-lsp" "$INSTALL_DIR/wlift-lsp"
     chmod +x "$INSTALL_DIR/wlift-lsp"
   fi
+  # macOS builds carry the libraries wlift loads from beside itself.
+  for lib in "$staged"/*.dylib; do
+    [ -f "$lib" ] || continue
+    mv "$lib" "$INSTALL_DIR/$(basename "$lib")"
+  done
 
   printf "\n"
   printf "%sInstalled %s%s to %s%s%s\n" "$GREEN" "$BOLD" "$tag" "$BOLD" "$INSTALL_DIR" "$RESET"

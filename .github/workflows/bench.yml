@@ -27,7 +27,7 @@ jobs:
   benchmark:
     name: Run benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -56,8 +56,11 @@ jobs:
           make -C projects/make -j$(nproc)
           sudo cp bin/wren_cli /usr/local/bin/wren_cli
 
+      - uses: ./.github/actions/llvm21
+
+      # The build the release ships: the top tier is LLVM.
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --features llvm --bin wlift
 
       - name: Verify bench correctness vs standard Wren
         # Sanity gate before the timing run. For each Wren bench, run

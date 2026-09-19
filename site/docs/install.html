@@ -226,6 +226,12 @@ exec $SHELL</code></pre>
         Pin a commit with <code>--rev &lt;sha&gt;</code> for reproducible
         installs.
       </p>
+      <p>
+        That build runs hot code on the Cranelift tier. The prebuilt
+        binaries carry a second, LLVM tier above it; to build that
+        yourself, install LLVM 21 and add <code>--features llvm</code>
+        with <code>LLVM_SYS_211_PREFIX</code> pointing at it.
+      </p>
 
       <h2 id="verify">Verify</h2>
 <pre><code>wlift --version

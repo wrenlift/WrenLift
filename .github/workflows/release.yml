@@ -5,6 +5,10 @@ name: Release binaries
 # each set into a tarball (a zip on Windows) with a SHA256 checksum,
 # and attaches everything to a GitHub Release.
 #
+# `wlift` links LLVM 21 statically for its top tier, so every leg
+# builds on a runner of its own architecture with the toolchain from
+# the llvm21 action; `hatch` and `wlift-lsp` build without it.
+#
 # Consumers grab binaries via `install.sh` (curl | bash style) —
 # the script parses this release's asset list, so the artifact
 # naming below is load-bearing: changing it breaks the installer.
@@ -70,22 +74,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS: both darwin targets run on macos-14 (arm64).
-          # The Apple toolchain cross-compiles to x86_64 natively
-          # and macos-13 runners queue for minutes on free tier.
+          # Every leg builds on its own architecture: the static
+          # LLVM the top tier links comes from the runner's package
+          # manager, and there is no cross-compiled copy of it.
           - label:    macos-arm64
             os:       macos-14
             target:   aarch64-apple-darwin
           - label:    macos-x86_64
-            os:       macos-14
+            os:       macos-15-intel
             target:   x86_64-apple-darwin
           - label:    linux-x86_64
-            os:       ubuntu-latest
+            os:       ubuntu-24.04
             target:   x86_64-unknown-linux-gnu
           - label:    linux-arm64
-            os:       ubuntu-latest
+            os:       ubuntu-24.04-arm
             target:   aarch64-unknown-linux-gnu
-            use_cross: true
+    # A retired or saturated runner image must fail this leg, not
+    # stall the release behind it.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,67 +102,49 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross (linux-arm64)
-        if: matrix.use_cross == true
-        run: cargo install cross --locked
-
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: release-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
 
-      - name: Build wlift + hatch (native)
-        if: matrix.use_cross != true
-        run: cargo build --release --bin wlift --bin hatch --target ${{ matrix.target }}
+      - uses: ./.github/actions/llvm21
 
-      - name: Build wlift + hatch (cross)
-        if: matrix.use_cross == true
-        run: cross build --release --bin wlift --bin hatch --target ${{ matrix.target }}
+      - name: Build wlift
+        run: cargo build --release --features llvm --bin wlift --target ${{ matrix.target }}
+
+      # Without the llvm feature: the package tool and the language
+      # server run no top tier, and the feature would put LLVM in
+      # each of them too.
+      - name: Build hatch
+        run: cargo build --release --bin hatch --target ${{ matrix.target }}
 
       # `-p wlift_lsp` needs its own invocation: cargo's `--bin`
       # only sees bins from the package selected by `-p`, so we
       # can't combine the wren_lift bins with the wlift_lsp bin
       # in a single command.
-      - name: Build wlift-lsp (native)
-        if: matrix.use_cross != true
+      - name: Build wlift-lsp
         run: cargo build --release -p wlift_lsp --target ${{ matrix.target }}
 
-      - name: Build wlift-lsp (cross)
-        if: matrix.use_cross == true
-        run: cross build --release -p wlift_lsp --target ${{ matrix.target }}
+      - name: Smoke test the binaries
+        run: |
+          bin="target/${{ matrix.target }}/release"
+          "$bin/wlift" --version
+          "$bin/hatch" --version
+          "$bin/wlift-lsp" --version
+          "$bin/wlift" --mode tiered bench/fib.wren
+          WLIFT_TIER_TRACE=1 "$bin/wlift" bench/ash/method_call.wren 2>&1 | grep -q "llvm " \
+            || { echo "::error::the top tier did not compile with LLVM"; exit 1; }
 
       - name: Package tarball + checksum
-        shell: bash
         run: |
-          set -eu
-          tag="${{ needs.resolve.outputs.tag }}"
-          triple="${{ matrix.target }}"
-          stage="wlift-${tag}-${triple}"
-          bin_dir="target/${triple}/release"
+          tools/package_release.sh "${{ needs.resolve.outputs.tag }}" \
+            "${{ matrix.target }}" "target/${{ matrix.target }}/release"
 
-          mkdir -p "dist/${stage}"
-          cp "${bin_dir}/wlift" "dist/${stage}/"
-          cp "${bin_dir}/hatch" "dist/${stage}/"
-          cp "${bin_dir}/wlift-lsp" "dist/${stage}/"
-          # Convenience: include a minimal README next to the
-          # binaries so recipients know what they are + where to
-          # find docs. Keeps the tarball self-explanatory.
-          cat > "dist/${stage}/README.txt" <<EOF
-          wlift ${tag}     — Wren runtime (JIT + interpreter)
-          hatch ${tag}     — Package + build tool for Wren
-          wlift-lsp ${tag} — Language server (LSP) for editors
-
-          Add this dir to your PATH to use the binaries directly.
-          Docs: https://github.com/wrenlift/WrenLift
-          EOF
-
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
-          ls -la dist/
+      # The packaged binary, from a directory with nothing else in it.
+      - name: Smoke test the packaged binary
+        run: |
+          stage="wlift-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}"
+          tar xzf "dist/${stage}.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/${stage}/wlift" bench/ash/nbody.wren
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -192,11 +180,20 @@ jobs:
         with:
           shared-key: release-windows
 
-      - name: Build wlift + hatch
-        run: cargo build --release --bin wlift --bin hatch --target x86_64-pc-windows-msvc
+      - uses: ./.github/actions/llvm21
+
+      - name: Build wlift
+        run: cargo build --release --features llvm --bin wlift --target x86_64-pc-windows-msvc
+
+      - name: Build hatch
+        run: cargo build --release --bin hatch --target x86_64-pc-windows-msvc
 
       - name: Build wlift-lsp
         run: cargo build --release -p wlift_lsp --target x86_64-pc-windows-msvc
+
+      - uses: ./.github/actions/llvm21-runtime-dlls
+        with:
+          into: target\x86_64-pc-windows-msvc\release\
 
       # A binary that starts is what ships: run each one, and a
       # program through the tiers.
@@ -212,6 +209,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "wlift-lsp --version failed" }
           & "$bin\wlift.exe" --mode tiered bench\fib.wren
           if ($LASTEXITCODE -ne 0) { throw "wlift bench/fib.wren failed" }
+          $env:WLIFT_TIER_TRACE = "1"
+          $trace = & "$bin\wlift.exe" bench\ash\method_call.wren 2>&1 | Out-String
+          Remove-Item Env:WLIFT_TIER_TRACE
+          if ($trace -notmatch "llvm ") { throw "the top tier did not compile with LLVM" }
 
       - name: Package zip + checksum
         shell: pwsh
@@ -222,6 +223,8 @@ jobs:
           $bin = "target\$triple\release"
           New-Item -ItemType Directory -Force "dist\$stage" | Out-Null
           Copy-Item "$bin\wlift.exe", "$bin\hatch.exe", "$bin\wlift-lsp.exe" "dist\$stage\"
+          # The DLLs LLVM imports; wlift.exe does not start without them.
+          Copy-Item "$bin\*.dll" "dist\$stage\"
           @"
           wlift $tag     - Wren runtime (JIT + interpreter)
           hatch $tag     - Package + build tool for Wren

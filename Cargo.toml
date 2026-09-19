@@ -112,10 +112,16 @@ aot = [
     "dep:target-lexicon",
 ]
 # LLVM top tier above Cranelift. Needs LLVM 21 on the build machine
-# (llvm-config on PATH or LLVM_SYS_211_PREFIX); off by default.
+# (llvm-config on PATH or LLVM_SYS_211_PREFIX); off by default. The
+# release binaries link it statically; `llvm-shared` links the shared
+# library instead, for a machine whose LLVM has no static Polly.
 llvm = [
     "cranelift",
     "dep:inkwell",
+]
+llvm-shared = [
+    "llvm",
+    "inkwell/llvm21-1-prefer-dynamic",
 ]
 
 [dependencies]
@@ -196,7 +202,7 @@ cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", r
 target-lexicon = { version = "0.13", optional = true }
 # LLVM 21, the same pin as Ash so its lowering patterns carry over;
 # linked against the shared library where one is installed.
-inkwell = { version = "0.8.0", features = ["llvm21-1-prefer-dynamic"], optional = true }
+inkwell = { version = "0.8.0", features = ["llvm21-1"], optional = true }
 # Tier-up / promotion broker. Pinned to 0.3 — version 0.3 brought in
 # the OsrEntry / swap_compiled_with_osr APIs that `src/runtime/tier.rs`
 # relies on for OSR-aware installs. Pulls in `std::thread` so it sits
