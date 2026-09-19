@@ -250,6 +250,40 @@ pub mod cl {
         Ok(builder.block_params(merge_block)[0])
     }
 
+    /// Fold the class of `value` into the element-class word of the
+    /// list at `obj`, as `ObjList::note_element` does: unseen takes the
+    /// class, the same class keeps it, anything else is mixed.
+    fn emit_note_list_element(builder: &mut FunctionBuilder, obj: Value, value: Value) {
+        use crate::runtime::object::ELEM_CLASS_MIXED;
+        let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+        let high = builder.ins().band(value, tag_obj);
+        let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+        let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+        let masked = builder.ins().band(value, mask);
+        let null_obj = builder.ins().iconst(
+            types::I64,
+            crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as i64,
+        );
+        let ptr = builder.ins().select(is_obj, masked, null_obj);
+        let class = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), ptr, HEADER_CLASS);
+        let mixed = builder.ins().iconst(types::I64, ELEM_CLASS_MIXED as i64);
+        // The null object's class is zero: not an object, so mixed.
+        let has_class = builder.ins().icmp_imm_u(IntCC::NotEqual, class, 0);
+        let class = builder.ins().select(has_class, class, mixed);
+        let cur = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj, LIST_ELEM_CLASS);
+        let unseen = builder.ins().icmp_imm_u(IntCC::Equal, cur, 0);
+        let same = builder.ins().icmp(IntCC::Equal, cur, class);
+        let keep = builder.ins().bor(unseen, same);
+        let new = builder.ins().select(keep, class, mixed);
+        builder
+            .ins()
+            .store(MemFlags::trusted(), new, obj, LIST_ELEM_CLASS);
+    }
+
     /// Or the kind of `value` into the class's field-kind byte for
     /// field `idx` of the instance at `obj_ptr`, as
     /// `ObjInstance::note_field_kind` does; a class without the bytes
@@ -705,6 +739,7 @@ pub mod cl {
                 builder.ins().call(f, &[receiver, arg]);
                 builder.ins().jump(merge, &[BlockArg::Value(receiver)]);
                 builder.switch_to_block(store_block);
+                emit_note_list_element(builder, obj, arg);
                 let elements =
                     builder
                         .ins()

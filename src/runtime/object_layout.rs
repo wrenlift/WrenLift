@@ -43,7 +43,8 @@ pub const INSTANCE_SIZE: i32 = 40;
 pub const LIST_COUNT: i32 = 24; // u32
 pub const LIST_CAPACITY: i32 = 28; // u32
 pub const LIST_ELEMENTS: i32 = 32; // *mut Value
-pub const LIST_SIZE: i32 = 40;
+pub const LIST_ELEM_CLASS: i32 = 40; // usize
+pub const LIST_SIZE: i32 = 48;
 
 // -- ObjTypedArray (40 bytes) -----------------------------------------------
 //
@@ -167,6 +168,7 @@ mod tests {
         assert_eq!(memoffset_of!(ObjList, count), LIST_COUNT as usize);
         assert_eq!(memoffset_of!(ObjList, capacity), LIST_CAPACITY as usize);
         assert_eq!(memoffset_of!(ObjList, elements), LIST_ELEMENTS as usize);
+        assert_eq!(memoffset_of!(ObjList, elem_class), LIST_ELEM_CLASS as usize);
     }
 
     #[test]

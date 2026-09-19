@@ -280,12 +280,22 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// A growable array with JIT-friendly raw buffer layout.
 #[repr(C)]
 pub struct ObjList {
-    pub header: ObjHeader, // offset 0, 24 bytes
-    pub count: u32,        // offset 24
-    pub capacity: u32,     // offset 28
+    pub header: ObjHeader,    // offset 0, 24 bytes
+    pub count: u32,           // offset 24
+    pub capacity: u32,        // offset 28
     pub elements: *mut Value, // offset 32, heap-allocated buffer
-                           // total: 40 bytes
+    /// The class of every element ever written, kept by every write:
+    /// 0 while none has been, `ELEM_CLASS_MIXED` once elements of two
+    /// classes or a non-object have been. Equal to a class, it lets
+    /// compiled code take an element as an instance of that class
+    /// after checking this word instead of the element.
+    pub elem_class: usize, // offset 40
+                              // total: 48 bytes
 }
+
+/// `ObjList::elem_class` once the elements have not all been objects
+/// of one class. Odd, so never a class pointer.
+pub const ELEM_CLASS_MIXED: usize = 1;
 
 const LIST_INITIAL_CAPACITY: u32 = 8;
 
@@ -302,6 +312,7 @@ impl ObjList {
             count: 0,
             capacity: 0,
             elements: std::ptr::null_mut(),
+            elem_class: 0,
         }
     }
 
@@ -314,7 +325,23 @@ impl ObjList {
             count: 0,
             capacity: cap,
             elements: ptr,
+            elem_class: 0,
         }
+    }
+
+    /// Fold the class of `value` into `elem_class`.
+    #[inline]
+    pub fn note_element(&mut self, value: Value) {
+        let class = value
+            .as_object()
+            .map(|p| unsafe { (*(p as *const ObjHeader)).class } as usize)
+            .filter(|c| *c != 0)
+            .unwrap_or(ELEM_CLASS_MIXED);
+        self.elem_class = match self.elem_class {
+            0 => class,
+            cur if cur == class => cur,
+            _ => ELEM_CLASS_MIXED,
+        };
     }
 
     pub fn len(&self) -> usize {
@@ -335,6 +362,7 @@ impl ObjList {
 
     pub fn set(&mut self, index: usize, value: Value) {
         if index < self.count as usize {
+            self.note_element(value);
             unsafe {
                 self.elements.add(index).write(value);
             }
@@ -342,6 +370,7 @@ impl ObjList {
     }
 
     pub fn add(&mut self, value: Value) {
+        self.note_element(value);
         self.ensure_capacity(self.count + 1);
         unsafe {
             self.elements.add(self.count as usize).write(value);
@@ -354,6 +383,7 @@ impl ObjList {
         if index > count {
             return;
         }
+        self.note_element(value);
         self.ensure_capacity(self.count + 1);
         if index < count {
             unsafe {
@@ -391,6 +421,7 @@ impl ObjList {
 
     pub fn clear(&mut self) {
         self.count = 0;
+        self.elem_class = 0;
     }
 
     pub fn as_slice(&self) -> &[Value] {
@@ -402,6 +433,8 @@ impl ObjList {
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [Value] {
+        // Anything may be written through it.
+        self.elem_class = ELEM_CLASS_MIXED;
         if self.elements.is_null() || self.count == 0 {
             &mut []
         } else {

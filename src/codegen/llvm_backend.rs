@@ -460,6 +460,11 @@ pub mod llvm {
         kind_sets: HashMap<usize, Vec<u16>>,
         /// Values proven Num earlier in the current block.
         num_in_block: HashSet<IntValue<'ctx>>,
+        /// Subscript results a class guard follows, and the class.
+        element_guards: HashMap<ValueId, usize>,
+        /// A subscript result's guard answer: the class and whether the
+        /// element has it, decided where it was read.
+        element_class_ok: HashMap<IntValue<'ctx>, (usize, IntValue<'ctx>)>,
         /// The instruction being lowered, at inline depth zero.
         cur_vid: ValueId,
         raw_bools: HashSet<ValueId>,
@@ -504,6 +509,8 @@ pub mod llvm {
                 int_sources: HashMap::new(),
                 kind_sets: HashMap::new(),
                 num_in_block: HashSet::new(),
+                element_guards: HashMap::new(),
+                element_class_ok: HashMap::new(),
                 cur_block: 0,
                 inline_class: None,
                 field_invariant: None,
@@ -1112,6 +1119,55 @@ pub mod llvm {
                 .map_err(|e| e.to_string())
         }
 
+        /// Fold the class of each of `values` into the element-class
+        /// word of the list at `obj`, as `ObjList::note_element` does.
+        fn note_list_elements(
+            &mut self,
+            obj: IntValue<'ctx>,
+            values: &[IntValue<'ctx>],
+        ) -> Result<(), String> {
+            use crate::runtime::object::ELEM_CLASS_MIXED;
+            if values.is_empty() {
+                return Ok(());
+            }
+            let p = self.addr(obj, LIST_ELEM_CLASS as i64)?;
+            let ld = self
+                .b
+                .build_load(self.i64t(), p, "eclass")
+                .map_err(|e| e.to_string())?;
+            let tag = self.list_tag();
+            ld.as_instruction_value()
+                .ok_or("load is not an instruction")?
+                .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                .map_err(|e| e.to_string())?;
+            let mut cur = ld.into_int_value();
+            let mixed = self.c64(ELEM_CLASS_MIXED as u64);
+            for v in values {
+                let (_, _, class) = self.class_of(*v)?;
+                let has_class = self.icmp(IntPredicate::NE, class, self.c64(0))?;
+                let class = self
+                    .b
+                    .build_select(has_class, class, mixed, "eclass")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                let unseen = self.icmp(IntPredicate::EQ, cur, self.c64(0))?;
+                let same = self.icmp(IntPredicate::EQ, cur, class)?;
+                let keep = self
+                    .b
+                    .build_or(unseen, same, "keep")
+                    .map_err(|e| e.to_string())?;
+                cur = self
+                    .b
+                    .build_select(keep, class, mixed, "eclass")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+            }
+            let st = self.b.build_store(p, cur).map_err(|e| e.to_string())?;
+            st.set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
         /// A List's elements pointer, tagged.
         fn load_list_elements(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
             let p = self.addr(obj, LIST_ELEMENTS as i64)?;
@@ -1547,6 +1603,7 @@ pub mod llvm {
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
             self.move_roots = move_roots(mir);
             self.kind_sets = self.collect_kind_sets(mir);
+            self.element_guards = element_guards(mir);
             // A receiver carried around a loop stands for the value the
             // loop was entered with; the guard on it may be there.
             let mut clone = mir.clone();
@@ -2100,7 +2157,8 @@ pub mod llvm {
                     let r = self.boxed(receiver)?;
                     let idx = self.boxed(&args[0])?;
                     let int = self.int_source(&args[0])?;
-                    self.typed_array_get(r, idx, int)?.into()
+                    let want = self.element_guards.get(&vid).copied();
+                    self.typed_array_get(r, idx, int, want)?.into()
                 }
                 I::SubscriptGet { receiver, args } => {
                     let mut a = vec![self.boxed(receiver)?];
@@ -2177,12 +2235,19 @@ pub mod llvm {
                     live,
                 } => {
                     let v = self.boxed(value)?;
-                    // Branchless: the class load runs on every path, so
-                    // LLVM hoists it out of a loop the value is invariant
-                    // in and the exit with it. A non-object reads the
-                    // null object's zero class and misses.
-                    let (_, _, recv_class) = self.class_of(v)?;
-                    let hit = self.icmp(IntPredicate::EQ, recv_class, self.c64(*class as u64))?;
+                    let hit = match self.element_class_ok.get(&v) {
+                        // Answered where the element was read.
+                        Some((c, ok)) if *c == *class => *ok,
+                        _ => {
+                            // Branchless: the class load runs on every
+                            // path, so LLVM hoists it out of a loop the
+                            // value is invariant in and the exit with it.
+                            // A non-object reads the null object's zero
+                            // class and misses.
+                            let (_, _, recv_class) = self.class_of(v)?;
+                            self.icmp(IntPredicate::EQ, recv_class, self.c64(*class as u64))?
+                        }
+                    };
                     let fails = self.b.build_not(hit, "fails").map_err(|e| e.to_string())?;
                     self.guard_deopt_at(fails, *pc, live)?;
                     // From here on in this block the value has the class.
@@ -2730,16 +2795,22 @@ pub mod llvm {
             }
         }
 
+        /// With `want_class`, the guard that follows on the element is
+        /// answered here: on the List path by the list's element-class
+        /// word, which a loop over one list hoists, and elsewhere by the
+        /// element's class. The answer is recorded for the guard.
         fn typed_array_get(
             &mut self,
             r: IntValue<'ctx>,
             idx: IntValue<'ctx>,
             int: Option<IntValue<'ctx>>,
+            want_class: Option<usize>,
         ) -> Result<IntValue<'ctx>, String> {
             let exit = self.miss_exit_block()?;
             let slow = exit.unwrap_or_else(|| self.new_block("sgs"));
             let merge = self.new_block("sgm");
             let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+            let mut oks: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
             let other = self.new_block("sgo");
             let p = self.list_element(r, idx, int, other)?;
             let v = self
@@ -2747,6 +2818,25 @@ pub mod llvm {
                 .build_load(self.i64t(), p, "elem")
                 .map_err(|e| e.to_string())?
                 .into_int_value();
+            if let Some(class) = want_class {
+                let obj = self.and(r, self.c64(PTR_MASK))?;
+                let ep = self.addr(obj, LIST_ELEM_CLASS as i64)?;
+                let ld = self
+                    .b
+                    .build_load(self.i64t(), ep, "eclass")
+                    .map_err(|e| e.to_string())?;
+                let tag = self.list_tag();
+                ld.as_instruction_value()
+                    .ok_or("load is not an instruction")?
+                    .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
+                    .map_err(|e| e.to_string())?;
+                let ok = self.icmp(
+                    IntPredicate::EQ,
+                    ld.into_int_value(),
+                    self.c64(class as u64),
+                )?;
+                oks.push((ok.into(), self.b.get_insert_block().unwrap()));
+            }
             incoming.push((v.into(), self.b.get_insert_block().unwrap()));
             self.br(merge)?;
             self.b.position_at_end(other);
@@ -2804,6 +2894,13 @@ pub mod llvm {
                 };
                 let bits = self.bits(f)?;
                 incoming.push((bits.into(), self.b.get_insert_block().unwrap()));
+                if want_class.is_some() {
+                    // A number is no instance.
+                    oks.push((
+                        self.i1t().const_zero().into(),
+                        self.b.get_insert_block().unwrap(),
+                    ));
+                }
                 self.br(merge)?;
                 self.b.position_at_end(next);
             }
@@ -2812,10 +2909,20 @@ pub mod llvm {
                 self.b.position_at_end(slow);
                 let sv = self.call_helper("wren_subscript_get", &[r, idx])?;
                 incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+                if let Some(class) = want_class {
+                    let (_, _, c) = self.class_of(sv)?;
+                    let ok = self.icmp(IntPredicate::EQ, c, self.c64(class as u64))?;
+                    oks.push((ok.into(), self.b.get_insert_block().unwrap()));
+                }
                 self.br(merge)?;
             }
             self.b.position_at_end(merge);
-            Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
+            let v = self.phi(self.i64t().into(), &incoming)?.into_int_value();
+            if let Some(class) = want_class {
+                let ok = self.phi(self.i1t().into(), &oks)?.into_int_value();
+                self.element_class_ok.insert(v, (class, ok));
+            }
+            Ok(v)
         }
 
         /// `r[idx] = v` with List and f32/f64 typed-array stores inline
@@ -2832,6 +2939,8 @@ pub mod llvm {
             let merge = self.new_block("ssm");
             let other = self.new_block("sso");
             let p = self.list_element(r, idx, int, other)?;
+            let obj = self.and(r, self.c64(PTR_MASK))?;
+            self.note_list_elements(obj, &[v])?;
             self.b.build_store(p, v).map_err(|e| e.to_string())?;
             self.br(merge)?;
             self.b.position_at_end(other);
@@ -3075,6 +3184,8 @@ pub mod llvm {
                 .build_int_add(p, self.c64(LIST_SIZE as u64), "elements")
                 .map_err(|e| e.to_string())?;
             self.store64(p, LIST_ELEMENTS as i64, elements)?;
+            self.store64(p, LIST_ELEM_CLASS as i64, self.c64(0))?;
+            self.note_list_elements(p, elems)?;
             for (i, v) in elems.iter().enumerate() {
                 self.store64(elements, i as i64 * VALUE_SIZE as i64, *v)?;
             }
@@ -4025,6 +4136,7 @@ pub mod llvm {
             let grow_end = self.b.get_insert_block().unwrap();
             self.br(merge)?;
             self.b.position_at_end(store_bb);
+            self.note_list_elements(obj, &[v])?;
             let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
             let p = self.element_addr(elements, count, 8)?;
             self.b.build_store(p, v).map_err(|e| e.to_string())?;
@@ -4283,6 +4395,38 @@ pub mod llvm {
     /// For each block, the receivers a dominating `ClassIs` guard
     /// proved: the guard's true edge is the only way into a block that
     /// dominates it.
+    /// Every subscript result a class guard follows, through copies,
+    /// with the class.
+    fn element_guards(mir: &MirFunction) -> HashMap<ValueId, usize> {
+        let mut out = HashMap::new();
+        for b in &mir.blocks {
+            let insts = &b.instructions;
+            for (k, (v, inst)) in insts.iter().enumerate() {
+                if !matches!(inst, Instruction::SubscriptGet { args, .. } if args.len() == 1) {
+                    continue;
+                }
+                // Anywhere later in the block: an object's class never
+                // changes, so nothing between matters.
+                let mut aliases: HashSet<ValueId> = HashSet::from([*v]);
+                for (nv, ni) in insts.iter().skip(k + 1) {
+                    match ni {
+                        Instruction::Move(s) if aliases.contains(s) => {
+                            aliases.insert(*nv);
+                        }
+                        Instruction::GuardClassAt { value, class, .. }
+                            if aliases.contains(value) =>
+                        {
+                            out.insert(*v, *class);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Every `Box(I64ToF64(i))` value, mapped to `i`.
     fn int_sources(mir: &MirFunction) -> HashMap<ValueId, ValueId> {
         let conv: HashMap<ValueId, ValueId> = mir

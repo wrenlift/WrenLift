@@ -2637,6 +2637,24 @@ impl VM {
             .get_mir(func_id)
             .map(|m| m.next_value as usize)
             .unwrap_or(0);
+        // The module body runs without a closure; a guard in its
+        // compiled code resumes the interpreter through one, so it is
+        // bound to one like a method.
+        if self
+            .engine
+            .method_binding
+            .get(func_id.0 as usize)
+            .is_some_and(|(c, _)| c.is_null())
+        {
+            let fn_name = self.interner.intern("<module>");
+            let fn_ptr = self.gc.alloc_fn(fn_name, 0, 0, func_id.0);
+            let closure_ptr = self.gc.alloc_closure(fn_ptr);
+            unsafe {
+                (*fn_ptr).header.class = self.fn_class;
+                (*closure_ptr).header.class = self.fn_class;
+            }
+            self.engine.method_binding[func_id.0 as usize] = (closure_ptr, std::ptr::null_mut());
+        }
         unsafe {
             (*fiber).header.class = self.fiber_class;
             (*fiber).mir_frames.push(MirCallFrame {
@@ -3914,6 +3932,16 @@ impl VM {
         for &ptr in &self.closure_fns {
             if !ptr.is_null() {
                 roots.push(Value::object(ptr as *mut u8));
+            }
+        }
+        // 3b. The closure each function resumes through after a guard
+        // fails; a module body's is held by nothing else.
+        for &(closure, class) in &self.engine.method_binding {
+            if !closure.is_null() {
+                roots.push(Value::object(closure as *mut u8));
+            }
+            if !class.is_null() {
+                roots.push(Value::object(class as *mut u8));
             }
         }
 
