@@ -603,7 +603,7 @@ impl Shared {
     pub fn native_tick(&mut self, id: super::engine::FuncId) {
         self.engine.native_tick(id, &self.interner);
     }
-    #[cfg(feature = "cranelift")]
+    #[cfg(feature = "host")]
     pub fn retier_declined(
         &mut self,
         id: super::engine::FuncId,

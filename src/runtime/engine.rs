@@ -3941,6 +3941,7 @@ impl ExecutionEngine {
         // stays cold for long.
         let cold = self.cold_osr_blocks.get(idx).is_some_and(|c| !c.is_empty())
             && count < self.llvm_queue_at().saturating_mul(16);
+        #[cfg(feature = "cranelift")]
         if wanted
             && !cold
             && self.compiling_tier.get(idx).copied().flatten().is_none()
@@ -3949,6 +3950,8 @@ impl ExecutionEngine {
         {
             self.request_compile(id, CompileTier::Optimized, interner);
         }
+        #[cfg(not(feature = "cranelift"))]
+        let _ = (interner, cold);
         let Some(cell) = self.tier_cells.get(idx) else {
             return;
         };
@@ -4161,7 +4164,7 @@ impl ExecutionEngine {
     /// take; baseline code keeps polling while its calls fill the
     /// caches, and every 256th poll asks for the recompile the way an
     /// interpreter probe does. Anywhere else it stops polling.
-    #[cfg(feature = "cranelift")]
+    #[cfg(feature = "host")]
     pub fn retier_declined(
         &mut self,
         id: FuncId,
