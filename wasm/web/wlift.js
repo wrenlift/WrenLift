@@ -1523,7 +1523,6 @@ class MainWlift {
       // See `worker.js` — same-class / super / static-state /
       // type-check helpers.
       wren_set_module_var: wasm.wren_set_module_var,
-      wren_write_barrier:  wasm.wren_write_barrier,
       // Boxed values a JIT'd body keeps in wasm locals go on the
       // runtime's root store around anything that may collect.
       wren_jit_roots_snapshot_len: wasm.wren_jit_roots_snapshot_len,

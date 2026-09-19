@@ -17,6 +17,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use wasm_bindgen::prelude::*;
+use wren_lift::runtime::gc_trait::GcAllocator;
 use wren_lift::runtime::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -242,10 +243,8 @@ fn mir_needs_unsupported_helpers(
                 Instruction::MakeClosure { upvalues, .. } if upvalues.len() > 4 => return true,
                 // GetUpvalue / SetUpvalue both lower inline now —
                 // the chase walks the cdylib's `current_closure`
-                // cell + the upvalue array, the write goes
-                // through `*location`, and SetUpvalue calls
-                // `wren_write_barrier` after the store for the
-                // GC inter-generational hand-off (see
+                // cell + the upvalue array and the write goes
+                // through `*location` (see
                 // `codegen/wasm::Instruction::SetUpvalue`). No
                 // `wren_set_upvalue` boundary call on the hot
                 // path, so closure-mutating bodies tier-up at
@@ -1640,21 +1639,6 @@ pub fn wren_subscript_set_1(receiver: u64, index: u64, value: u64) -> u64 {
 // dependent crate aren't necessarily passed through by
 // `wasm-pack`).
 
-/// GC inter-generational write barrier — forwarder so the
-/// inline `SetUpvalue` / future inline `SetField` paths can
-/// `(import "wren" "wren_write_barrier")` from the JIT'd
-/// module. Identical body to the host's `runtime_fns::
-/// wren_write_barrier`; the wasm-bindgen wrapper exists only
-/// to surface the symbol through wasm-pack's JS-boundary export
-/// table (the underlying `pub extern "C"` function is no-mangle
-/// on host but mangled on wasm32 to avoid colliding with this
-/// wrapper, see commit 97092d1).
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-#[wasm_bindgen]
-pub fn wren_write_barrier(source: u64, value: u64) -> u64 {
-    wren_lift::codegen::runtime_fns::wren_write_barrier(source, value)
-}
-
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn wren_set_module_var(slot: u64, value: u64) -> u64 {
@@ -1860,14 +1844,6 @@ pub fn wren_set_upvalue(index: u64, value: u64) -> u64 {
         if idx < upvalues.len() {
             let uv = upvalues[idx];
             (*uv).set(v);
-            // Inter-generational write barrier — captured
-            // upvalues live on the closure's upvalue chain.
-            let vm_ptr = wren_lift::runtime::tier::current_vm();
-            if !vm_ptr.is_null() {
-                let vm = &mut *vm_ptr;
-                vm.gc
-                    .write_barrier(uv as *mut wren_lift::runtime::object::ObjHeader, v);
-            }
         }
     }
     value

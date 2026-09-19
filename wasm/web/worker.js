@@ -355,7 +355,6 @@ __wliftWrenImports = {
   // call sibling static helpers, walk up to a base class, or
   // probe `x is Klass` reach the JIT path on wasm.
   wren_set_module_var: wasm.wren_set_module_var,
-  wren_write_barrier:  wasm.wren_write_barrier,
   // Boxed values a JIT'd body keeps in wasm locals go on the
   // runtime's root store around anything that may collect.
   wren_jit_roots_snapshot_len: wasm.wren_jit_roots_snapshot_len,
