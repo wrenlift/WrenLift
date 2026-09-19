@@ -4111,7 +4111,27 @@ impl ExecutionEngine {
     }
 
     /// Code of generation `caller_gen` (0 for baseline) polled its
-    /// word and found no newer body to transfer into: it stops polling.
+    /// word at `header` and found no newer body to transfer into. At a
+    /// loop the optimised body compiled cold there is no entry to
+    /// take; baseline code keeps polling while its calls fill the
+    /// caches, and every 256th poll asks for the recompile the way an
+    /// interpreter probe does. Anywhere else it stops polling.
+    #[cfg(feature = "cranelift")]
+    pub fn retier_declined(
+        &mut self,
+        id: FuncId,
+        header: crate::mir::BlockId,
+        caller_gen: u32,
+        interner: &crate::intern::Interner,
+    ) {
+        if caller_gen == 0 && self.osr_entry_is_cold(id, header, interner) {
+            return;
+        }
+        self.stop_retier(id, caller_gen);
+    }
+
+    /// Code of generation `caller_gen` (0 for baseline) stops polling
+    /// for a transfer.
     pub fn stop_retier(&self, id: FuncId, caller_gen: u32) {
         if let Some(cell) = self.tier_cells.get(id.0 as usize) {
             let word = if caller_gen == 0 {

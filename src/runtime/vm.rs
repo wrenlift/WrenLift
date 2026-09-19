@@ -603,6 +603,16 @@ impl Shared {
     pub fn native_tick(&mut self, id: super::engine::FuncId) {
         self.engine.native_tick(id, &self.interner);
     }
+    #[cfg(feature = "cranelift")]
+    pub fn retier_declined(
+        &mut self,
+        id: super::engine::FuncId,
+        header: crate::mir::BlockId,
+        caller_gen: u32,
+    ) {
+        self.engine
+            .retier_declined(id, header, caller_gen, &self.interner);
+    }
     pub fn cold_loop_hot(&mut self, id: super::engine::FuncId) {
         self.engine.recompile_top_tier(id, &self.interner);
     }
