@@ -154,11 +154,13 @@ impl MirPass for UnboxParams {
         replace_uses_in_func(func, &alias);
 
         // Every other use reads a box planted next to the use, so a box
-        // only needed on a rare path costs nothing on the others.
+        // only needed on a rare path costs nothing on the others. An
+        // edge into an f64 parameter passes the f64 whether this pass
+        // retyped the parameter or an earlier one did.
         let chosen_params: Vec<Vec<bool>> = func
             .blocks
             .iter()
-            .map(|b| b.params.iter().map(|(p, _)| chosen.contains(p)).collect())
+            .map(|b| b.params.iter().map(|(_, t)| *t == MirType::F64).collect())
             .collect();
         for bi in 0..func.blocks.len() {
             let mut boxed: HashMap<ValueId, ValueId> = HashMap::new();
