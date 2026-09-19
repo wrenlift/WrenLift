@@ -5268,7 +5268,7 @@ pub mod cl {
                     // Only emit IC fast path for kind=5 (getter inline).
                     // Kind=1 uses the slow path with IC index encoding so
                     // dispatch_call_rooted can use cached method lookups.
-                    if ic.kind == 5 && ic.class != 0 && std::env::var_os("X_NO5").is_none() {
+                    if ic.kind == 5 && ic.class != 0 {
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
@@ -6841,6 +6841,25 @@ pub mod cl {
                 get(b),
             ))),
             Instruction::I64ToF64(a) => Ok(Some(builder.ins().fcvt_from_sint(types::F64, get(a)))),
+            Instruction::F64ToI64(a) => {
+                Ok(Some(builder.ins().fcvt_to_sint_sat(types::I64, get(a))))
+            }
+            // The count of a List the guard before it established.
+            Instruction::ListCount(recv) => {
+                let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                let obj = builder.ins().band(get(recv), mask);
+                let count32 = builder.ins().uload32(MemFlags::trusted(), obj, LIST_COUNT);
+                let countf = builder.ins().fcvt_from_uint(types::F64, count32);
+                if f64_self_id.is_some() {
+                    Ok(Some(countf))
+                } else {
+                    Ok(Some(builder.ins().bitcast(
+                        types::I64,
+                        MemFlags::new(),
+                        countf,
+                    )))
+                }
+            }
             Instruction::IsNum(a) => {
                 let v = get(a);
                 let qnan = builder.ins().iconst(types::I64, QNAN as i64);

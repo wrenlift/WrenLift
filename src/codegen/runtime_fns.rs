@@ -311,9 +311,38 @@ enum Frameless {
     Miss,
 }
 
+/// A List fast path answered the site: record the receiver class in
+/// the site's cache (kind 9) so a compile of the caller knows it.
+#[inline(always)]
+fn note_list_fast_path_ic(
+    vm: &mut crate::runtime::vm::VM,
+    j: *mut JitThread,
+    ic_idx: Option<(usize, Option<u32>)>,
+) {
+    let Some((idx, func)) = ic_idx else {
+        return;
+    };
+    let Some(ic_ptr) = current_jit_callsite_ic(vm, j, idx, func) else {
+        return;
+    };
+    let empty = unsafe { (*ic_ptr).snapshot() }.is_none_or(|ic| ic.kind == 0);
+    if empty {
+        unsafe {
+            (*ic_ptr).store(crate::mir::bytecode::CallSiteIC {
+                class: vm.list_class as usize,
+                jit_ptr: std::ptr::null(),
+                closure: std::ptr::null(),
+                func_id: 0,
+                kind: 9,
+            })
+        };
+    }
+}
+
 #[inline(always)]
 fn try_dispatch_call_noframe_fast(
     vm: &mut crate::runtime::vm::VM,
+    j: *mut JitThread,
     recv: Value,
     method_packed: u64,
     args: &[Value],
@@ -326,7 +355,7 @@ fn try_dispatch_call_noframe_fast(
     if vm.has_error {
         return Frameless::Done(Value::null().to_bits());
     }
-    let (method_sym, _) = decode_method_and_ic(method_packed);
+    let (method_sym, ic_idx) = decode_method_and_ic(method_packed);
     let class = vm.class_of(recv);
 
     if class == vm.list_class
@@ -336,6 +365,7 @@ fn try_dispatch_call_noframe_fast(
             s.wren_call_noframe_fastpath += 1;
             s.dispatch_call_entries += 1;
         });
+        note_list_fast_path_ic(vm, j, ic_idx);
         return Frameless::Done(result);
     }
 
@@ -2287,6 +2317,7 @@ fn dispatch_call_rooted(
     if class == vm.list_class
         && let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args)
     {
+        note_list_fast_path_ic(vm, j, ic_idx);
         return result;
     }
     let ic_ptr = ic_idx.and_then(|(idx, func)| current_jit_callsite_ic(vm, j, idx, func));
@@ -2843,7 +2874,7 @@ fn wren_call_inner<const M: usize>(
             vm.engine
                 .note_runtime_call_stats(|s| s.wren_call_entries += 1);
             let args: [Value; M] = std::array::from_fn(|i| root_at(j, root_base + i));
-            match try_dispatch_call_noframe_fast(vm, args[0], method, &args) {
+            match try_dispatch_call_noframe_fast(vm, j, args[0], method, &args) {
                 Frameless::Done(result) => result,
                 Frameless::Host(host_fn, context) => {
                     let func_id = unsafe { (*j).ctx.current_func_id } as u32;
@@ -3150,7 +3181,7 @@ fn wren_call_n_inner(receiver: u64, method: u64, args_in: &[u64]) -> u64 {
             vm.engine
                 .note_runtime_call_stats(|s| s.wren_call_entries += 1);
             let args: Vec<Value> = (0..n).map(read).collect();
-            match try_dispatch_call_noframe_fast(vm, args[0], method, &args) {
+            match try_dispatch_call_noframe_fast(vm, j, args[0], method, &args) {
                 Frameless::Done(result) => result,
                 Frameless::Host(host_fn, context) => {
                     let func_id = unsafe { (*j).ctx.current_func_id } as u32;

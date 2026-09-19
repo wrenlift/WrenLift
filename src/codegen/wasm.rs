@@ -1425,7 +1425,9 @@ impl<'a> MirWasmEmitter<'a> {
 
             // -- Guards (pass-through for now) --
             Instruction::SlowPathExit { .. } => {}
-            Instruction::GuardClassAt { .. } | Instruction::ColdLoopExit { .. } => {
+            Instruction::GuardClassAt { .. }
+            | Instruction::ColdLoopExit { .. }
+            | Instruction::ListCount(_) => {
                 return Err("planted in native compile clones only".into());
             }
             Instruction::GuardNum(a)
@@ -2146,6 +2148,7 @@ impl<'a> MirWasmEmitter<'a> {
             | Instruction::CmpGeI64(..)
             | Instruction::NegI64(_)
             | Instruction::I64ToF64(_)
+            | Instruction::F64ToI64(_)
             | Instruction::IsNum(_) => {
                 return Err("integer arithmetic is not lowered to wasm".into());
             }

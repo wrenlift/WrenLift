@@ -117,6 +117,7 @@ impl MirPass for IntSpecialize {
             .flat_map(|b| b.instructions.iter().map(|(v, i)| (*v, i.clone())))
             .collect();
         let facts = collect_facts(func);
+        let counts = list_counts(func, &defs);
         let f64_params: HashSet<ValueId> = func
             .blocks
             .iter()
@@ -205,7 +206,7 @@ impl MirPass for IntSpecialize {
                     }
                 }
                 for (v, inst) in &block.instructions {
-                    let l = transfer(inst, bid, &lat, &facts, &idom, &defs);
+                    let l = transfer(inst, bid, &lat, &facts, &idom, &defs, &counts);
                     let old = lat.get(v).copied().unwrap_or(Lat::Bottom);
                     if l != old {
                         lat.insert(*v, l);
@@ -236,6 +237,7 @@ impl MirPass for IntSpecialize {
                                 | Instruction::NegF64(_)
                                 | Instruction::ModF64(..)
                                 | Instruction::Move(_)
+                                | Instruction::Unbox(_)
                         )
                     )
                 };
@@ -261,10 +263,13 @@ impl MirPass for IntSpecialize {
                     }
                 }
             }
-            // An instruction is an integer only if its operands are.
+            // An instruction is an integer only if its operands are; a
+            // proven unbox reads a boxed value and converts.
             for block in &func.blocks {
                 for (v, inst) in &block.instructions {
-                    if int_vals.contains(v) && inst.operands().iter().any(|o| !int_vals.contains(o))
+                    if int_vals.contains(v)
+                        && !matches!(inst, Instruction::Unbox(_))
+                        && inst.operands().iter().any(|o| !int_vals.contains(o))
                     {
                         int_vals.remove(v);
                         dropped = true;
@@ -302,6 +307,11 @@ impl MirPass for IntSpecialize {
                     Instruction::MulF64(a, b) => Instruction::MulI64(a, b),
                     Instruction::NegF64(a) => Instruction::NegI64(a),
                     Instruction::Move(a) => Instruction::Move(a),
+                    Instruction::Unbox(a) => {
+                        let f = func.new_value();
+                        out.push((f, Instruction::Unbox(a)));
+                        Instruction::F64ToI64(f)
+                    }
                     Instruction::ModF64(a, b) => {
                         let c = match defs.get(&b) {
                             Some(Instruction::ConstF64(c)) => *c as i64,
@@ -403,6 +413,53 @@ impl MirPass for IntSpecialize {
         }
         true
     }
+}
+
+/// The boxed values that are the count of a List: the counts, their
+/// copies, and the parameters every incoming edge passes one to.
+fn list_counts(func: &MirFunction, defs: &HashMap<ValueId, Instruction>) -> HashSet<ValueId> {
+    let mut incoming: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for b in &func.blocks {
+        for (target, args) in edges(&b.terminator) {
+            let params = &func.blocks[target.0 as usize].params;
+            for (i, a) in args.iter().enumerate() {
+                if let Some((p, _)) = params.get(i) {
+                    incoming.entry(*p).or_default().push(*a);
+                }
+            }
+        }
+    }
+    // Optimistically every copy and parameter is a count; one whose
+    // source or any incoming argument is not drops out, to a fixed
+    // point, so a count that cycles through parameters stays in.
+    let mut counts: HashSet<ValueId> = defs
+        .iter()
+        .filter(|(_, i)| matches!(i, Instruction::ListCount(_) | Instruction::Move(_)))
+        .map(|(v, _)| *v)
+        .chain(incoming.keys().copied())
+        .collect();
+    loop {
+        let mut shrank = false;
+        for (v, inst) in defs {
+            if let Instruction::Move(a) = inst
+                && counts.contains(v)
+                && !counts.contains(a)
+            {
+                counts.remove(v);
+                shrank = true;
+            }
+        }
+        for (p, args) in &incoming {
+            if counts.contains(p) && args.iter().any(|a| !counts.contains(a)) {
+                counts.remove(p);
+                shrank = true;
+            }
+        }
+        if !shrank {
+            break;
+        }
+    }
+    counts
 }
 
 fn consumes_f64(inst: &Instruction) -> bool {
@@ -575,6 +632,7 @@ fn transfer(
     facts: &[Fact],
     idom: &[usize],
     defs: &HashMap<ValueId, Instruction>,
+    counts: &HashSet<ValueId>,
 ) -> Lat {
     let get = |v: &ValueId| refined(*v, at, lat, facts, idom);
     match inst {
@@ -594,6 +652,8 @@ fn transfer(
             }
         }
         Instruction::Move(a) => get(a),
+        // A List's count is a u32.
+        Instruction::Unbox(a) if counts.contains(a) => bounded(0, u32::MAX as i128),
         Instruction::AddF64(a, b) => combine(get(a), get(b), |x, y| {
             bounded(x.lo as i128 + y.lo as i128, x.hi as i128 + y.hi as i128)
         }),

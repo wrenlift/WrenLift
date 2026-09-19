@@ -151,6 +151,8 @@ pub enum BcConst {
 ///   4 = native method (direct fn pointer call)
 ///   5 = trivial getter (direct field load; func_id stores field index)
 ///   8 = host method (closure holds the fn, func_id its context word)
+///   9 = a List the runtime's fast path served (class only; dispatch
+///       takes the fast path before the cache)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CallSiteIC {
@@ -547,7 +549,9 @@ impl<'a> Encoder<'a> {
             Instruction::ToString(a) => self.emit_unary(Op::ToStringOp, dst, *a),
             Instruction::GuardNum(a) => self.emit_unary(Op::GuardNum, dst, *a),
             Instruction::GuardNumAt { value, .. } => self.emit_unary(Op::GuardNum, dst, *value),
-            Instruction::GuardClassAt { .. } | Instruction::ColdLoopExit { .. } => {
+            Instruction::GuardClassAt { .. }
+            | Instruction::ColdLoopExit { .. }
+            | Instruction::ListCount(_) => {
                 unreachable!("planted in JIT compile clones only")
             }
             Instruction::SlowPathExit { .. } => {}
@@ -611,6 +615,7 @@ impl<'a> Encoder<'a> {
             | Instruction::CmpGeI64(..)
             | Instruction::NegI64(_)
             | Instruction::I64ToF64(_)
+            | Instruction::F64ToI64(_)
             | Instruction::IsNum(_) => {
                 unreachable!("integer arithmetic exists only in JIT compile clones")
             }

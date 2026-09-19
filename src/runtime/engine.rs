@@ -696,6 +696,23 @@ fn tier_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
 }
 
+/// The body inlined for `count` on a List: its parameter's count.
+fn list_count_body(name: crate::intern::SymbolId) -> MirFunction {
+    use crate::mir::{Instruction, Terminator};
+    let mut f = MirFunction::new(name, 1);
+    let b = f.new_block();
+    let recv = f.new_value();
+    let count = f.new_value();
+    f.block_mut(b)
+        .instructions
+        .push((recv, Instruction::BlockParam(0)));
+    f.block_mut(b)
+        .instructions
+        .push((count, Instruction::ListCount(recv)));
+    f.block_mut(b).terminator = Terminator::Return(count);
+    f
+}
+
 /// Milliseconds since the first trace line, for ordering trace output.
 pub fn trace_clock_ms() -> f64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -2879,6 +2896,26 @@ impl ExecutionEngine {
                     );
                 }
                 if ic.class == 0 {
+                    continue;
+                }
+                // `count` on a List: a read of its count behind a class
+                // guard, in place at the top tier.
+                if ic.kind == 9
+                    && tier == CompileTier::Optimized
+                    && ic.class == Self::list_class_for_compile()
+                    && ic.class != 0
+                    && interner.resolve(method) == "count"
+                    && let Some(exit) = exits.and_then(|e| e.get(dst).cloned())
+                {
+                    sites.insert(
+                        *dst,
+                        KnownCallee {
+                            guard: CalleeGuard::Class(ic.class),
+                            body: Arc::new(list_count_body(method)),
+                            constructor: None,
+                            exit: Some(exit),
+                        },
+                    );
                     continue;
                 }
                 let callee = FuncId(ic.func_id as u32);

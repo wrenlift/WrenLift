@@ -138,7 +138,7 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
         | MathUnaryF64(_, a) => {
             *a = f(*a);
         }
-        NegI64(a) | I64ToF64(a) | IsNum(a) => {
+        NegI64(a) | I64ToF64(a) | F64ToI64(a) | IsNum(a) => {
             *a = f(*a);
         }
         GuardNumAt {
@@ -152,6 +152,7 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
                 r.source.map(f);
             }
         }
+        ListCount(a) => *a = f(*a),
         GuardClassAt { value, live, .. } => {
             *value = f(*value);
             for r in live.iter_mut() {

@@ -437,6 +437,8 @@ pub enum Instruction {
     CmpGeI64(ValueId, ValueId),
     /// Exact conversion of a proven-integral value back to f64.
     I64ToF64(ValueId),
+    /// An f64 proven integral, as an i64.
+    F64ToI64(ValueId),
     /// Whether a boxed value is a Num (raw bool). JIT compile clones only.
     IsNum(ValueId),
     /// `GuardNum` on the result of the call just before it: when it
@@ -461,6 +463,10 @@ pub enum Instruction {
         pc: u32,
         live: Vec<DeoptReg>,
     },
+    /// The element count of the List in the value, as a Num. Planted
+    /// for a `count` call a guard on the List class covers; JIT
+    /// compile clones only.
+    ListCount(ValueId),
     /// The head of a loop compiled before the loop ever ran, whose
     /// call sites fill their caches as the generic calls run: after a
     /// few hundred iterations the body asks for its function to be
@@ -644,6 +650,7 @@ impl Instruction {
             | Instruction::GuardBool(a)
             | Instruction::Unbox(a)
             | Instruction::Box(a)
+            | Instruction::ListCount(a)
             | Instruction::Move(a)
             | Instruction::ToString(a)
             | Instruction::MathUnaryF64(_, a) => vec![*a],
@@ -656,6 +663,7 @@ impl Instruction {
             | Instruction::ClosureFnIs(a, _)
             | Instruction::NegI64(a)
             | Instruction::I64ToF64(a)
+            | Instruction::F64ToI64(a)
             | Instruction::IsNum(a) => vec![*a],
             Instruction::GuardNumAt {
                 value,
@@ -1602,11 +1610,13 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CmpLeI64(a, b) => format!("icmp_i64.le {}, {}", a, b),
         Instruction::CmpGeI64(a, b) => format!("icmp_i64.ge {}, {}", a, b),
         Instruction::I64ToF64(a) => format!("i64_to_f64 {}", a),
+        Instruction::F64ToI64(a) => format!("f64_to_i64 {}", a),
         Instruction::IsNum(a) => format!("is_num {}", a),
         Instruction::SlowPathExit { pc, live } => {
             format!("slow.exit pc={} live={}", pc, live.len())
         }
         Instruction::ColdLoopExit { header } => format!("cold.loop bb{}", header.0),
+        Instruction::ListCount(a) => format!("list.count {}", a),
         Instruction::GuardClassAt {
             value,
             class,
@@ -1796,8 +1806,9 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 | Instruction::BandI64(..)
                 | Instruction::NegI64(_) => MirType::I64,
                 Instruction::I64ToF64(_) => MirType::F64,
+                Instruction::F64ToI64(_) => MirType::I64,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
-                Instruction::GuardClassAt { .. } => MirType::Value,
+                Instruction::GuardClassAt { .. } | Instruction::ListCount(_) => MirType::Value,
                 Instruction::SlowPathExit { .. } | Instruction::ColdLoopExit { .. } => {
                     MirType::Void
                 }

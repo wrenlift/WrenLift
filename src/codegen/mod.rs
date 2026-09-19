@@ -1612,9 +1612,10 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::BandI64(..)
                 | Instruction::NegI64(_) => MirType::I64,
                 Instruction::I64ToF64(_) => MirType::F64,
+                Instruction::F64ToI64(_) => MirType::I64,
                 Instruction::IsNum(_) => MirType::Bool,
                 Instruction::GuardNumAt { value, .. } => value_types[value.0 as usize],
-                Instruction::GuardClassAt { .. } => MirType::Value,
+                Instruction::GuardClassAt { .. } | Instruction::ListCount(_) => MirType::Value,
                 Instruction::SlowPathExit { .. } | Instruction::ColdLoopExit { .. } => {
                     MirType::Void
                 }
@@ -4560,9 +4561,11 @@ impl<'a> LowerCtx<'a> {
             | Instruction::CmpGeI64(..)
             | Instruction::NegI64(_)
             | Instruction::I64ToF64(_)
+            | Instruction::F64ToI64(_)
             | Instruction::IsNum(_)
             | Instruction::GuardNumAt { .. }
             | Instruction::GuardClassAt { .. }
+            | Instruction::ListCount(_)
             | Instruction::ColdLoopExit { .. }
             | Instruction::SlowPathExit { .. } => {
                 panic!("integer arithmetic is lowered by the Cranelift backend only")

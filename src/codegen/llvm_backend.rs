@@ -433,6 +433,9 @@ pub mod llvm {
         /// The value each copy was made from, followed to the original:
         /// a class fact about a copy holds for every copy.
         move_roots: HashMap<ValueId, ValueId>,
+        /// Boxed values that are an i64 converted to f64: an index
+        /// read as the integer skips the integrality test.
+        int_sources: HashMap<ValueId, ValueId>,
         cur_block: usize,
         /// The receiver of a body spliced behind its class check.
         inline_class: Option<(IntValue<'ctx>, usize)>,
@@ -484,6 +487,7 @@ pub mod llvm {
                 fresh: HashMap::new(),
                 class_facts: HashMap::new(),
                 move_roots: HashMap::new(),
+                int_sources: HashMap::new(),
                 cur_block: 0,
                 inline_class: None,
                 field_invariant: None,
@@ -1386,6 +1390,7 @@ pub mod llvm {
             let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
             self.move_roots = move_roots(mir);
+            self.int_sources = int_sources(mir);
             self.class_facts = class_facts(mir, &self.move_roots);
             let loop_headers: HashSet<usize> = mir
                 .blocks
@@ -1928,7 +1933,8 @@ pub mod llvm {
                 I::SubscriptGet { receiver, args } if args.len() == 1 => {
                     let r = self.boxed(receiver)?;
                     let idx = self.boxed(&args[0])?;
-                    self.typed_array_get(r, idx)?.into()
+                    let int = self.int_source(&args[0])?;
+                    self.typed_array_get(r, idx, int)?.into()
                 }
                 I::SubscriptGet { receiver, args } => {
                     let mut a = vec![self.boxed(receiver)?];
@@ -1945,7 +1951,8 @@ pub mod llvm {
                     let r = self.boxed(receiver)?;
                     let idx = self.boxed(&args[0])?;
                     let v = self.boxed(value)?;
-                    self.typed_array_set(r, idx, v)?.into()
+                    let int = self.int_source(&args[0])?;
+                    self.typed_array_set(r, idx, int, v)?.into()
                 }
                 I::SubscriptSet {
                     receiver,
@@ -2106,6 +2113,28 @@ pub mod llvm {
                     .build_signed_int_to_float(self.geti(a)?, self.f64t(), "i2f")
                     .map_err(|e| e.to_string())?
                     .into(),
+                I::F64ToI64(a) => {
+                    let f = self.getf(a)?;
+                    self.b
+                        .build_float_to_signed_int(f, self.i64t(), "f2i")
+                        .map_err(|e| e.to_string())?
+                        .into()
+                }
+                I::ListCount(recv) => {
+                    let r = self.boxed(recv)?;
+                    let obj = self.and(r, self.c64(PTR_MASK))?;
+                    let p = self.addr(obj, LIST_COUNT as i64)?;
+                    let count32 = self
+                        .b
+                        .build_load(self.sh.ctx.i32_type(), p, "count")
+                        .map_err(|e| e.to_string())?
+                        .into_int_value();
+                    let f = self
+                        .b
+                        .build_unsigned_int_to_float(count32, self.f64t(), "countf")
+                        .map_err(|e| e.to_string())?;
+                    self.bits(f)?.into()
+                }
                 I::IsNum(a) => {
                     let v = self.boxed(a)?;
                     let boxed = self.is_nan_boxed(v)?;
@@ -2387,6 +2416,31 @@ pub mod llvm {
 
         /// `idx` as an i64 when it is an integral Num below the u32
         /// count at `obj + count_off`; otherwise branch to `slow`.
+        /// An i64 index checked against the count at `count_off`.
+        fn bounded_index(
+            &mut self,
+            idx_i: IntValue<'ctx>,
+            obj: IntValue<'ctx>,
+            count_off: i64,
+            slow: BasicBlock<'ctx>,
+        ) -> Result<IntValue<'ctx>, String> {
+            let count_p = self.addr(obj, count_off)?;
+            let count32 = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), count_p, "count")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let count = self
+                .b
+                .build_int_z_extend(count32, self.i64t(), "count64")
+                .map_err(|e| e.to_string())?;
+            let in_range = self.icmp(IntPredicate::ULT, idx_i, count)?;
+            let ok_bb = self.new_block("ixr");
+            self.cbr(in_range, ok_bb, slow)?;
+            self.b.position_at_end(ok_bb);
+            Ok(idx_i)
+        }
+
         fn int_index(
             &mut self,
             idx: IntValue<'ctx>,
@@ -2437,6 +2491,7 @@ pub mod llvm {
             &mut self,
             r: IntValue<'ctx>,
             idx: IntValue<'ctx>,
+            int: Option<IntValue<'ctx>>,
             other: BasicBlock<'ctx>,
         ) -> Result<PointerValue<'ctx>, String> {
             let high = self
@@ -2457,7 +2512,10 @@ pub mod llvm {
             let list_bb = self.new_block("lel");
             self.cbr(is_list, list_bb, other)?;
             self.b.position_at_end(list_bb);
-            let i = self.int_index(idx, obj, LIST_COUNT as i64, other)?;
+            let i = match int {
+                Some(i) => self.bounded_index(i, obj, LIST_COUNT as i64, other)?,
+                None => self.int_index(idx, obj, LIST_COUNT as i64, other)?,
+            };
             let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
             self.element_addr(elements, i, VALUE_SIZE as u64)
         }
@@ -2483,17 +2541,26 @@ pub mod llvm {
 
         /// `r[idx]` with List elements and the typed-array element kinds
         /// inline and everything else through the helper.
+        /// The i64 a boxed index was converted from, when it was.
+        fn int_source(&self, idx: &ValueId) -> Result<Option<IntValue<'ctx>>, String> {
+            match self.int_sources.get(idx) {
+                Some(i) => Ok(Some(self.geti(i)?)),
+                None => Ok(None),
+            }
+        }
+
         fn typed_array_get(
             &mut self,
             r: IntValue<'ctx>,
             idx: IntValue<'ctx>,
+            int: Option<IntValue<'ctx>>,
         ) -> Result<IntValue<'ctx>, String> {
             let exit = self.miss_exit_block()?;
             let slow = exit.unwrap_or_else(|| self.new_block("sgs"));
             let merge = self.new_block("sgm");
             let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
             let other = self.new_block("sgo");
-            let p = self.list_element(r, idx, other)?;
+            let p = self.list_element(r, idx, int, other)?;
             let v = self
                 .b
                 .build_load(self.i64t(), p, "elem")
@@ -2576,13 +2643,14 @@ pub mod llvm {
             &mut self,
             r: IntValue<'ctx>,
             idx: IntValue<'ctx>,
+            int: Option<IntValue<'ctx>>,
             v: IntValue<'ctx>,
         ) -> Result<IntValue<'ctx>, String> {
             let exit = self.miss_exit_block()?;
             let slow = exit.unwrap_or_else(|| self.new_block("sss"));
             let merge = self.new_block("ssm");
             let other = self.new_block("sso");
-            let p = self.list_element(r, idx, other)?;
+            let p = self.list_element(r, idx, int, other)?;
             self.b.build_store(p, v).map_err(|e| e.to_string())?;
             self.br(merge)?;
             self.b.position_at_end(other);
@@ -4034,6 +4102,27 @@ pub mod llvm {
     /// For each block, the receivers a dominating `ClassIs` guard
     /// proved: the guard's true edge is the only way into a block that
     /// dominates it.
+    /// Every `Box(I64ToF64(i))` value, mapped to `i`.
+    fn int_sources(mir: &MirFunction) -> HashMap<ValueId, ValueId> {
+        let conv: HashMap<ValueId, ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::I64ToF64(i) => Some((*v, *i)),
+                _ => None,
+            })
+            .collect();
+        mir.blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|(v, inst)| match inst {
+                Instruction::Box(f) => conv.get(f).map(|i| (*v, *i)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every copy's original value, through chains of copies.
     fn move_roots(mir: &MirFunction) -> HashMap<ValueId, ValueId> {
         let mut roots: HashMap<ValueId, ValueId> = HashMap::new();

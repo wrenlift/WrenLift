@@ -116,6 +116,18 @@ impl MirPass for TypeSpecialize {
                 .any(|(_, inst)| matches!(inst, Instruction::GuardNum(_)))
         });
         let self_call_returns_num = has_num_guard;
+        // A constant or a box is a Num wherever it is read, and a
+        // block may read one a later block defines.
+        for b in &func.blocks {
+            for (v, inst) in &b.instructions {
+                if matches!(
+                    inst,
+                    Instruction::ConstNum(_) | Instruction::Box(_) | Instruction::ListCount(_)
+                ) {
+                    known_nums.insert(*v);
+                }
+            }
+        }
 
         for block_idx in 0..func.blocks.len() {
             let old_instructions = std::mem::take(&mut func.blocks[block_idx].instructions);
@@ -123,7 +135,7 @@ impl MirPass for TypeSpecialize {
 
             for (val_id, inst) in &old_instructions {
                 match inst {
-                    Instruction::ConstNum(_) | Instruction::Box(_) => {
+                    Instruction::ConstNum(_) | Instruction::Box(_) | Instruction::ListCount(_) => {
                         known_nums.insert(*val_id);
                         new_instructions.push((*val_id, inst.clone()));
                     }

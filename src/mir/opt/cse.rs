@@ -245,7 +245,10 @@ fn resolve(v: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
 fn inst_reads_memory(inst: &Instruction) -> bool {
     matches!(
         inst,
-        Instruction::SubscriptGet { .. } | Instruction::GetField(..) | Instruction::GetModuleVar(_)
+        Instruction::SubscriptGet { .. }
+            | Instruction::GetField(..)
+            | Instruction::GetModuleVar(_)
+            | Instruction::ListCount(_)
     )
 }
 
@@ -416,6 +419,8 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         I64ToF64(..) => 79,
         IsNum(..) => 80,
         GuardNumAt { .. } | GuardClassAt { .. } | SlowPathExit { .. } | ColdLoopExit { .. } => 35,
+        ListCount(..) => 82,
+        F64ToI64(..) => 83,
         NewInstance { .. } => 81,
     }
 }

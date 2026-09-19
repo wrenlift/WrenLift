@@ -275,6 +275,7 @@ pub fn eval_pure_instruction(
         // -- Guards (lenient: accepts both boxed and unboxed forms) --
         Instruction::SlowPathExit { .. } => Ok(InterpValue::Boxed(Value::null())),
         Instruction::GuardClassAt { .. } => Err(InterpError::Unsupported("GuardClassAt".into())),
+        Instruction::ListCount(_) => Err(InterpError::Unsupported("ListCount".into())),
         Instruction::ColdLoopExit { .. } => Err(InterpError::Unsupported("ColdLoopExit".into())),
         Instruction::NewInstance { .. } => Err(InterpError::Unsupported("NewInstance".into())),
         Instruction::GuardNumAt { value: a, .. } | Instruction::GuardNum(a) => {
@@ -347,6 +348,7 @@ pub fn eval_pure_instruction(
         | Instruction::CmpGeI64(..)
         | Instruction::NegI64(_)
         | Instruction::I64ToF64(_)
+        | Instruction::F64ToI64(_)
         | Instruction::IsNum(_) => Err(InterpError::Unsupported("integer arithmetic".into())),
         Instruction::SubscriptGet { .. } => Err(InterpError::Unsupported("SubscriptGet".into())),
         Instruction::SubscriptSet { .. } => Err(InterpError::Unsupported("SubscriptSet".into())),
