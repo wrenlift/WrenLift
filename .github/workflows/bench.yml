@@ -66,17 +66,30 @@ jobs:
         # the protection against a silent miscompile that would
         # otherwise post as a speedup.
         #
+        # mandelbrot's checksum counts escape iterations, which move
+        # when compiled code fuses a multiply and an add, so it is
+        # compared within a band rather than exactly.
+        #
         # stderr is captured separately (wlift may print JIT compile-
         # diagnostic noise there) and shown alongside the diff when we
         # fail, but doesn't participate in the comparison.
         run: |
           WLIFT="./target/release/wlift"
-          BENCHMARKS="fib method_call binary_trees delta_blue"
+          BENCHMARKS="fib method_call binary_trees delta_blue nbody mandelbrot"
           fail=0
           for bench in $BENCHMARKS; do
             echo "::group::$bench correctness"
             wl=$(timeout 60 "$WLIFT" "bench/${bench}.wren" 2>/tmp/wl.err | grep -v '^elapsed:' || true)
             wr=$(timeout 60 wren_cli "bench/${bench}.wren" 2>/tmp/wr.err | grep -v '^elapsed:' || true)
+            if [ "$bench" = "mandelbrot" ] && [ -n "$wl" ] && [ -n "$wr" ]; then
+              a=$(echo "$wl" | sed -n 's/^checksum: //p')
+              b=$(echo "$wr" | sed -n 's/^checksum: //p')
+              if [ -n "$a" ] && [ -n "$b" ] && [ "$(echo "($a - $b) * 200 < $b && ($b - $a) * 200 < $b" | bc -l)" = "1" ]; then
+                echo "$bench: checksums $a and $b within band"
+                echo "::endgroup::"
+                continue
+              fi
+            fi
             if [ "$wl" != "$wr" ]; then
               echo "::error title=$bench::wrenlift output differs from wren_cli"
               echo "--- wrenlift stdout ---"
@@ -115,7 +128,7 @@ jobs:
 
           # Helper: run a command N times, extract best "elapsed: X" time.
           # Failures are silent — `delta_blue` has no .py/.rb/.lua port,
-          # so the cross-language attempts naturally no-op. The wrenlift
+          # so its cross-language attempts naturally no-op. The wrenlift
           # / wren paths fail loudly via the surrounding "FAILED for $bench"
           # gate when their .wren source is missing.
           best_of() {
@@ -134,7 +147,7 @@ jobs:
             echo "$best"
           }
 
-          BENCHMARKS="fib method_call binary_trees delta_blue"
+          BENCHMARKS="fib method_call binary_trees delta_blue nbody mandelbrot"
           RESULTS="{}"
 
           for bench in $BENCHMARKS; do

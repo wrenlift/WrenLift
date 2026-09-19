@@ -55,7 +55,7 @@ else
   printf "${YELLOW}Showing WrenLift AOT results only.${RESET}\n\n"
 fi
 
-BENCHMARKS=(fib method_call binary_trees delta_blue)
+BENCHMARKS=(fib method_call binary_trees delta_blue nbody mandelbrot)
 if [[ $# -gt 0 ]]; then
   BENCHMARKS=("$1")
 fi
