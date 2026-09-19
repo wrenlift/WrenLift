@@ -4607,14 +4607,10 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
         match obj_type {
             ObjType::List => {
                 let list = ptr as *const ObjList;
-                if let Some(n) = idx.as_num() {
-                    let i = n as usize;
-                    let count = unsafe { (*list).count as usize };
-                    if i < count
-                        && let Some(val) = unsafe { (*list).get(i) }
-                    {
-                        return val.to_bits();
-                    }
+                if let Some(i) = fast_list_index(idx, unsafe { (*list).count as usize })
+                    && let Some(val) = unsafe { (*list).get(i) }
+                {
+                    return val.to_bits();
                 }
             }
             ObjType::Map => {
@@ -4765,15 +4761,11 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
         match obj_type {
             ObjType::List => {
                 let list = ptr as *mut ObjList;
-                if let Some(n) = idx.as_num() {
-                    let i = n as usize;
-                    let count = unsafe { (*list).count as usize };
-                    if i < count {
-                        unsafe {
-                            (*list).set(i, value);
-                        }
-                        return value.to_bits();
+                if let Some(i) = fast_list_index(idx, unsafe { (*list).count as usize }) {
+                    unsafe {
+                        (*list).set(i, value);
                     }
+                    return value.to_bits();
                 }
             }
             ObjType::Map => {
