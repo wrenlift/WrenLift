@@ -4476,11 +4476,8 @@ pub mod cl {
                 // Extract obj pointer: recv & PTR_MASK
                 let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(recv_val, mask);
-                // Load fields pointer: obj_ptr + INSTANCE_FIELDS
-                let fields_ptr =
-                    builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), obj_ptr, INSTANCE_FIELDS);
+                // The fields follow the header.
+                let fields_ptr = builder.ins().iadd_imm_u(obj_ptr, INSTANCE_SIZE as i64);
                 // Load field value: fields_ptr + idx * VALUE_SIZE
                 let offset = (*idx as i32) * VALUE_SIZE;
                 let field_val =
@@ -4495,11 +4492,7 @@ pub mod cl {
                 // Extract obj pointer
                 let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(recv_val, mask);
-                // Load fields pointer
-                let fields_ptr =
-                    builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), obj_ptr, INSTANCE_FIELDS);
+                let fields_ptr = builder.ins().iadd_imm_u(obj_ptr, INSTANCE_SIZE as i64);
                 // Store field value
                 let offset = (*idx as i32) * VALUE_SIZE;
                 builder
@@ -4819,12 +4812,8 @@ pub mod cl {
                             let fast_result = if let Some(field_idx) = impl_.trivial_getter_field {
                                 // Inline trivial getter: load
                                 // recv.fields[field_idx].
-                                let fields_ptr = builder.ins().load(
-                                    types::I64,
-                                    MemFlags::trusted(),
-                                    recv_obj,
-                                    INSTANCE_FIELDS,
-                                );
+                                let fields_ptr =
+                                    builder.ins().iadd_imm_u(recv_obj, INSTANCE_SIZE as i64);
                                 builder.ins().load(
                                     types::I64,
                                     MemFlags::trusted(),
@@ -5302,12 +5291,7 @@ pub mod cl {
                         // Fast path: inline field load (kind=5 only)
                         builder.switch_to_block(fast_block);
                         let field_idx = ic.func_id as i32;
-                        let fields_ptr = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            obj_ptr,
-                            INSTANCE_FIELDS,
-                        );
+                        let fields_ptr = builder.ins().iadd_imm_u(obj_ptr, INSTANCE_SIZE as i64);
                         let offset = field_idx * VALUE_SIZE;
                         let fast_result =
                             builder
@@ -5720,12 +5704,7 @@ pub mod cl {
 
                     // Fast path: load fields_ptr then indexed field.
                     builder.switch_to_block(fast_block);
-                    let fields_ptr = builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        obj_ptr,
-                        INSTANCE_FIELDS,
-                    );
+                    let fields_ptr = builder.ins().iadd_imm_u(obj_ptr, INSTANCE_SIZE as i64);
                     let offset = (*field_idx as i32) * VALUE_SIZE;
                     let field_val =
                         builder

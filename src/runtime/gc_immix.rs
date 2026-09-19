@@ -492,9 +492,8 @@ impl GcAllocator for ImmixGc {
         };
         let header_size = std::mem::size_of::<ObjInstance>();
         let total = header_size + num_fields * std::mem::size_of::<Value>();
-        if total > MAX_ALLOC {
-            return self.alloc(ObjInstance::new(class));
-        }
+        // Compiled code addresses the fields after the header.
+        debug_assert!(total <= MAX_ALLOC);
         self.count_allocation();
         ACTIVE_HEAP.set(self.heap);
         let p = unsafe { rt::alloc_plain(self.heap, total) } as *mut ObjInstance;

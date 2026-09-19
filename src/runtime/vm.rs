@@ -2386,6 +2386,12 @@ impl VM {
             } else {
                 0
             };
+            if class_mir.num_fields as u32 + inherited_fields as u32
+                > crate::runtime::object::MAX_FIELDS as u32
+            {
+                self.report_error("A class can only have 255 fields, including inherited ones.");
+                return InterpretResult::CompileError;
+            }
             unsafe {
                 (*class_ptr).header.class = self.class_class;
                 // Total fields = own fields + inherited fields from superclass chain

@@ -1775,14 +1775,23 @@ impl fmt::Debug for ObjClass {
 // ---------------------------------------------------------------------------
 
 /// A class instance with a fixed number of fields.
+///
+/// The fields follow the header in the same allocation, so compiled
+/// code reads field `i` at `INSTANCE_SIZE + 8 * i` from the object
+/// without a load through `fields`, which points there for the
+/// interpreter and the collector. A class has at most 255 fields, so
+/// every instance fits one heap allocation.
 #[repr(C)]
 pub struct ObjInstance {
     pub header: ObjHeader,  // offset 0, 24 bytes
     pub num_fields: u32,    // offset 24
     pub fields_owned: bool, // offset 28 (in padding before *mut)
-    pub fields: *mut Value, // offset 32, heap-allocated or nursery-bump-allocated
+    pub fields: *mut Value, // offset 32
                             // total: 40 bytes
 }
+
+/// Fields a class may have, its superclasses' included.
+pub const MAX_FIELDS: u16 = 255;
 
 impl ObjInstance {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]

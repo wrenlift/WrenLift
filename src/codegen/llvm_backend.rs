@@ -430,6 +430,9 @@ pub mod llvm {
         /// Receivers whose class a dominating `ClassIs` guard proved,
         /// per block.
         class_facts: HashMap<usize, Vec<(ValueId, usize)>>,
+        /// The value each copy was made from, followed to the original:
+        /// a class fact about a copy holds for every copy.
+        move_roots: HashMap<ValueId, ValueId>,
         cur_block: usize,
         /// The receiver of a body spliced behind its class check.
         inline_class: Option<(IntValue<'ctx>, usize)>,
@@ -437,7 +440,9 @@ pub mod llvm {
         /// A guarded getter whose class keeps its field as Nums: the
         /// guard that follows checks the class's field-kind byte at
         /// this address instead of the value.
-        field_invariant: Option<(ValueId, inkwell::values::GlobalValue<'ctx>, u16)>,
+        /// The value, the class's field-kind bytes with their count,
+        /// and the field: the guard that consumes it reads the byte.
+        field_invariant: Option<(ValueId, *mut u8, usize, u16)>,
         /// The instruction being lowered, at inline depth zero.
         cur_vid: ValueId,
         raw_bools: HashSet<ValueId>,
@@ -478,6 +483,7 @@ pub mod llvm {
                 num_values: HashSet::new(),
                 fresh: HashMap::new(),
                 class_facts: HashMap::new(),
+                move_roots: HashMap::new(),
                 cur_block: 0,
                 inline_class: None,
                 field_invariant: None,
@@ -752,11 +758,16 @@ pub mod llvm {
 
         /// The class a guard proved for `recv` in the current block.
         fn known_class(&self, recv: ValueId) -> Option<usize> {
+            let recv = self.root(recv);
             self.class_facts
                 .get(&self.cur_block)?
                 .iter()
                 .find(|(v, _)| *v == recv)
                 .map(|(_, c)| *c)
+        }
+
+        fn root(&self, v: ValueId) -> ValueId {
+            self.move_roots.get(&v).copied().unwrap_or(v)
         }
 
         /// Store `seen | bit` at `p` when that changes the byte.
@@ -784,20 +795,12 @@ pub mod llvm {
             Ok(())
         }
 
-        /// The fields array of the instance `obj` (unmasked `r`): right
-        /// after the header for an instance this body allocated.
-        fn instance_fields(
-            &mut self,
-            r: IntValue<'ctx>,
-            obj: IntValue<'ctx>,
-        ) -> Result<IntValue<'ctx>, String> {
-            if self.fresh.contains_key(&r) {
-                self.b
-                    .build_int_add(obj, self.c64(INSTANCE_SIZE as u64), "fields")
-                    .map_err(|e| e.to_string())
-            } else {
-                self.load64_stable(obj, INSTANCE_FIELDS as i64)
-            }
+        /// The fields array of the instance `obj`: right after the
+        /// header.
+        fn instance_fields(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            self.b
+                .build_int_add(obj, self.c64(INSTANCE_SIZE as u64), "fields")
+                .map_err(|e| e.to_string())
         }
 
         /// `note_field_kind` for an instance of a class known at compile
@@ -864,11 +867,20 @@ pub mod llvm {
             if seen != crate::runtime::object::FIELD_NUM {
                 return;
             }
-            // The bytes are read through a global of the array's size
-            // rather than a bare address, which lets LLVM hoist the
-            // checks out of loops; the engine maps it to the array.
+            self.field_invariant = Some((dst, kinds, len, idx));
+        }
+
+        /// The class's field-kind bytes as a global of the array's size
+        /// rather than a bare address, which lets LLVM hoist the checks
+        /// out of loops; the engine maps it to the array. Made only when
+        /// a guard reads it, so the module never declares one unused.
+        fn kinds_global(
+            &mut self,
+            kinds: *mut u8,
+            len: usize,
+        ) -> inkwell::values::GlobalValue<'ctx> {
             let name = format!("wren_field_kinds_{:x}", kinds as usize);
-            let global = match self.sh.module.get_global(&name) {
+            match self.sh.module.get_global(&name) {
                 Some(g) => g,
                 None => {
                     let ty = self.sh.ctx.i8_type().array_type(len as u32);
@@ -878,8 +890,7 @@ pub mod llvm {
                     self.sh.globals.borrow_mut().push((g, kinds as u64));
                     g
                 }
-            };
-            self.field_invariant = Some((dst, global, idx));
+            }
         }
 
         /// The TBAA tag of field-kind bytes: disjoint from field data,
@@ -1222,7 +1233,10 @@ pub mod llvm {
                 .build_select(hit, ptr, null_obj, "iptr")
                 .map_err(|e| e.to_string())?
                 .into_int_value();
-            let fields = self.load64_stable(safe, INSTANCE_FIELDS as i64)?;
+            let fields = self
+                .b
+                .build_int_add(safe, self.c64(INSTANCE_SIZE as u64), "fields")
+                .map_err(|e| e.to_string())?;
             Ok((hit, fields))
         }
 
@@ -1371,7 +1385,8 @@ pub mod llvm {
 
             let rpo = crate::codegen::cranelift_backend::cl::compute_rpo(mir);
             let reachable: HashSet<usize> = osr_reachable_blocks(mir, BlockId(0));
-            self.class_facts = class_facts(mir);
+            self.move_roots = move_roots(mir);
+            self.class_facts = class_facts(mir, &self.move_roots);
             let loop_headers: HashSet<usize> = mir
                 .blocks
                 .iter()
@@ -1483,6 +1498,9 @@ pub mod llvm {
                 if !matches!(
                     block.instructions.get(i + 1),
                     Some((_, Instruction::GuardNumAt { value, .. })) if *value == vid
+                ) && !matches!(
+                    block.instructions.get(i + 1),
+                    Some((_, Instruction::Move(s))) if *s == vid
                 ) {
                     self.field_invariant = None;
                 }
@@ -1597,7 +1615,7 @@ pub mod llvm {
 
         fn lower_instruction(
             &mut self,
-            _dst: ValueId,
+            vid: ValueId,
             inst: &Instruction,
         ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
             use Instruction as I;
@@ -1620,7 +1638,16 @@ pub mod llvm {
                         None => return Ok(None),
                     }
                 }
-                I::Move(s) => self.get(s)?,
+                I::Move(s) => {
+                    // A copy carries a pending field invariant of its
+                    // source.
+                    if let Some((guarded, kinds, len, idx)) = self.field_invariant
+                        && guarded == *s
+                    {
+                        self.field_invariant = Some((vid, kinds, len, idx));
+                    }
+                    self.get(s)?
+                }
 
                 I::Add(a, b) => self.boxed_binop(a, b, BinOp::Add, "wren_num_add")?.into(),
                 I::Sub(a, b) => self.boxed_binop(a, b, BinOp::Sub, "wren_num_sub")?.into(),
@@ -1681,14 +1708,17 @@ pub mod llvm {
                 I::GetField(recv, idx) => {
                     let r = self.boxed(recv)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let fields = self.instance_fields(r, obj)?;
+                    let fields = self.instance_fields(obj)?;
+                    if let Some(class) = self.known_class(*recv) {
+                        self.note_field_invariant(class, *idx, vid);
+                    }
                     self.field_load(fields, *idx)?.into()
                 }
                 I::SetField(recv, idx, val) => {
                     let r = self.boxed(recv)?;
                     let v = self.boxed(val)?;
                     let obj = self.and(r, self.c64(PTR_MASK))?;
-                    let fields = self.instance_fields(r, obj)?;
+                    let fields = self.instance_fields(obj)?;
                     self.field_store(fields, *idx, v)?;
                     let known = self
                         .fresh
@@ -1990,6 +2020,12 @@ pub mod llvm {
                         .into_int_value();
                     let fails = self.b.build_not(hit, "fails").map_err(|e| e.to_string())?;
                     self.guard_deopt_at(fails, *pc, live)?;
+                    // From here on in this block the value has the class.
+                    let root = self.root(*value);
+                    self.class_facts
+                        .entry(self.cur_block)
+                        .or_default()
+                        .push((root, *class));
                     v.into()
                 }
                 I::NewInstance { class, assigned } => {
@@ -2209,7 +2245,8 @@ pub mod llvm {
                 } => {
                     let v = self.boxed(value)?;
                     let fails = match self.field_invariant.take() {
-                        Some((guarded, global, idx)) if guarded == *value => {
+                        Some((guarded, kinds, len, idx)) if guarded == *value => {
+                            let global = self.kinds_global(kinds, len);
                             let p = unsafe {
                                 self.b
                                     .build_in_bounds_gep(
@@ -4005,7 +4042,24 @@ pub mod llvm {
     /// For each block, the receivers a dominating `ClassIs` guard
     /// proved: the guard's true edge is the only way into a block that
     /// dominates it.
-    fn class_facts(mir: &MirFunction) -> HashMap<usize, Vec<(ValueId, usize)>> {
+    /// Every copy's original value, through chains of copies.
+    fn move_roots(mir: &MirFunction) -> HashMap<ValueId, ValueId> {
+        let mut roots: HashMap<ValueId, ValueId> = HashMap::new();
+        for b in &mir.blocks {
+            for (v, inst) in &b.instructions {
+                if let Instruction::Move(s) = inst {
+                    let root = roots.get(s).copied().unwrap_or(*s);
+                    roots.insert(*v, root);
+                }
+            }
+        }
+        roots
+    }
+
+    fn class_facts(
+        mir: &MirFunction,
+        roots: &HashMap<ValueId, ValueId>,
+    ) -> HashMap<usize, Vec<(ValueId, usize)>> {
         use crate::mir::opt::licm::{compute_dominators, compute_rpo};
         let n = mir.blocks.len();
         let mut preds = vec![0usize; n];
@@ -4039,8 +4093,27 @@ pub mod llvm {
                 _ => None,
             })
             .collect();
+        // An in-place guard holds for the rest of its block, which the
+        // lowering adds as it passes it, and for every block the guard's
+        // block dominates.
+        let in_place: Vec<(usize, ValueId, usize)> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.instructions
+                    .iter()
+                    .filter_map(move |(_, inst)| match inst {
+                        Instruction::GuardClassAt { value, class, .. } => Some((
+                            b.id.0 as usize,
+                            roots.get(value).copied().unwrap_or(*value),
+                            *class,
+                        )),
+                        _ => None,
+                    })
+            })
+            .collect();
         let mut facts: HashMap<usize, Vec<(ValueId, usize)>> = HashMap::new();
-        if guards.is_empty() {
+        if guards.is_empty() && in_place.is_empty() {
             return facts;
         }
         let rpo = compute_rpo(mir);
@@ -4051,6 +4124,13 @@ pub mod llvm {
                 for &(t, r, c) in &guards {
                     if t == d {
                         facts.entry(bi).or_default().push((r, c));
+                    }
+                }
+                if d != bi {
+                    for &(t, r, c) in &in_place {
+                        if t == d {
+                            facts.entry(bi).or_default().push((r, c));
+                        }
                     }
                 }
                 let up = idom.get(d).copied().unwrap_or(usize::MAX);
