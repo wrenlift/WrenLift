@@ -1430,7 +1430,7 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
         .engine
         .top_tier_osr_entry(id, crate::mir::BlockId(header), caller_gen)
     else {
-        vm.retier_declined(id, caller_gen);
+        vm.engine.stop_retier(id, caller_gen);
         return decline;
     };
     let pairs: Vec<(u32, Value)> = (0..n as usize)
@@ -1470,7 +1470,7 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
                         func_id, header, reg
                     );
                 }
-                vm.retier_declined(id, caller_gen);
+                vm.engine.stop_retier(id, caller_gen);
                 return decline;
             }
         }

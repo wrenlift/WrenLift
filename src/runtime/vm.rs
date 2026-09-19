@@ -603,10 +603,6 @@ impl Shared {
     pub fn native_tick(&mut self, id: super::engine::FuncId) {
         self.engine.native_tick(id, &self.interner);
     }
-    #[cfg(feature = "host")]
-    pub fn retier_declined(&mut self, id: super::engine::FuncId, caller_gen: u32) {
-        self.engine.retier_declined(id, caller_gen, &self.interner);
-    }
     pub fn cold_loop_hot(&mut self, id: super::engine::FuncId) {
         self.engine.recompile_top_tier(id, &self.interner);
     }

@@ -40,90 +40,6 @@ pub struct ChaImpl {
     pub direct: bool,
 }
 
-/// The LLVM tier's start signal. Optimised bodies of the Cranelift
-/// tier register their cells here until the timer fires, when every
-/// registered cell's `retier_top` word is raised so each body still
-/// running reports in for an LLVM compile; bodies installed after
-/// that are raised at install. The engine's drop stops the timer
-/// from touching cells it no longer owns.
-#[cfg(feature = "host")]
-struct LlvmWave {
-    cells: std::sync::Mutex<Vec<usize>>,
-    due: std::sync::atomic::AtomicBool,
-    stopped: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(feature = "host")]
-impl LlvmWave {
-    /// Milliseconds after the engine starts before the LLVM tier
-    /// compiles anything: a shorter program ends before the compile
-    /// does. `WLIFT_LLVM_AFTER_MS=<ms>` overrides it; safe to set.
-    fn after_ms() -> f64 {
-        static AFTER_MS: OnceLock<f64> = OnceLock::new();
-        *AFTER_MS.get_or_init(|| {
-            std::env::var("WLIFT_LLVM_AFTER_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(250.0)
-        })
-    }
-
-    fn start() -> Arc<Self> {
-        let wave = Arc::new(Self {
-            cells: std::sync::Mutex::new(Vec::new()),
-            due: std::sync::atomic::AtomicBool::new(false),
-            stopped: std::sync::atomic::AtomicBool::new(false),
-        });
-        let timer = Arc::clone(&wave);
-        let wait = (Self::after_ms() - trace_clock_ms()).max(0.0);
-        let _ = std::thread::Builder::new()
-            .name("wlift-llvm-wave".into())
-            .spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs_f64(wait / 1e3));
-                timer.fire();
-            });
-        wave
-    }
-
-    fn fire(&self) {
-        use std::sync::atomic::Ordering;
-        let Ok(mut cells) = self.cells.lock() else {
-            return;
-        };
-        if self.stopped.load(Ordering::Acquire) {
-            return;
-        }
-        self.due.store(true, Ordering::Release);
-        for addr in cells.drain(..) {
-            // SAFETY: the engine registered the cell and has not been
-            // dropped (its drop sets `stopped` under this lock).
-            let cell = unsafe { &*(addr as *const TierCell) };
-            cell.retier_top.store(1, Ordering::Release);
-        }
-    }
-
-    /// Raise `cell`'s word now if the wave is due, else when it fires.
-    fn register(&self, cell: &TierCell) {
-        use std::sync::atomic::Ordering;
-        let Ok(mut cells) = self.cells.lock() else {
-            return;
-        };
-        if self.due.load(Ordering::Acquire) {
-            cell.retier_top.store(1, Ordering::Release);
-        } else {
-            cells.push(cell as *const TierCell as usize);
-        }
-    }
-
-    fn stop(&self) {
-        if let Ok(mut cells) = self.cells.lock() {
-            self.stopped
-                .store(true, std::sync::atomic::Ordering::Release);
-            cells.clear();
-        }
-    }
-}
-
 /// Counters baseline code keeps for the tier above it. `countdown` is
 /// decremented on every entry and outermost-loop iteration and calls
 /// `wren_tier_tick` when it reaches zero; the helper reloads it with
@@ -165,6 +81,23 @@ impl TierCell {
     }
 }
 
+/// Lower the calling thread's scheduling priority below the program's.
+#[cfg(feature = "host")]
+fn lower_thread_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain libc calls on the calling thread; a thread's nice
+    // value is set through its kernel thread id.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: sets the calling thread's own QoS class.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}
+
 /// Threads sharing one bounded queue for top-tier compiles, the shape
 /// of beadie's promotion broker: a full queue rejects the proposal and
 /// the function is re-proposed later. With more than one thread a
@@ -185,6 +118,17 @@ impl Promoter {
     }
 
     fn start_threads(threads: usize) -> Self {
+        Self::start_named("wlift-promoter", threads, false)
+    }
+
+    /// One thread for the LLVM tier's compiles, which are the long
+    /// ones: at most one runs at a time, and it yields the processor
+    /// to the program on a machine with few cores.
+    fn start_llvm() -> Self {
+        Self::start_named("wlift-llvm", 1, true)
+    }
+
+    fn start_named(name: &str, threads: usize, low_priority: bool) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(256);
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -193,8 +137,11 @@ impl Promoter {
                 let stopped = Arc::clone(&stop);
                 let rx = Arc::clone(&rx);
                 std::thread::Builder::new()
-                    .name("wlift-promoter".into())
+                    .name(name.into())
                     .spawn(move || {
+                        if low_priority {
+                            lower_thread_priority();
+                        }
                         loop {
                             let job = match rx.lock() {
                                 Ok(rx) => rx.recv(),
@@ -525,6 +472,7 @@ pub struct CompiledModule {
 enum CompilationResult {
     Compiled {
         id: FuncId,
+        serial: u32,
         tier: CompileTier,
         executable: ExecutableFunction,
         native_meta: Option<Arc<NativeFrameMetadata>>,
@@ -532,6 +480,7 @@ enum CompilationResult {
     },
     Failed {
         id: FuncId,
+        serial: u32,
     },
 }
 
@@ -747,8 +696,7 @@ fn tier_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
 }
 
-/// Milliseconds since the first engine was created, for ordering trace
-/// output and the LLVM tier's wait.
+/// Milliseconds since the first trace line, for ordering trace output.
 pub fn trace_clock_ms() -> f64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     START
@@ -1075,15 +1023,12 @@ pub struct ExecutionEngine {
     optimized_gen: Vec<u32>,
     /// Whether the installed optimised body is the LLVM tier's.
     optimized_llvm: Vec<bool>,
-    #[cfg(feature = "host")]
-    llvm_wave: Option<Arc<LlvmWave>>,
     /// Functions a speculative guard failed in; their compiles carry
     /// no speculation from then on.
     speculation_failed: Vec<bool>,
-    /// Whether the compile in flight for each function speculates; a
-    /// result that does after the function's speculation failed is
-    /// stale and is not installed.
-    compile_speculates: Vec<bool>,
+    /// Bumped by every compile request and by a speculation failure;
+    /// a result carrying an older number is stale and is dropped.
+    compile_serial: Vec<u32>,
     /// The closure and defining class each method was bound with, so
     /// a failed mid-body guard can resume the method in the
     /// interpreter. Null for functions that are not class methods.
@@ -1099,6 +1044,9 @@ pub struct ExecutionEngine {
     /// The thread top-tier compiles run on, started on first use.
     #[cfg(feature = "host")]
     promoter: Option<Promoter>,
+    /// The LLVM tier's compile thread, started on first use.
+    #[cfg(feature = "host")]
+    llvm_worker: Option<Promoter>,
     /// Bytecode pointers indexed by FuncId. O(1) lookup for bytecode dispatch.
     /// null entries mean bytecode not yet compiled for this function.
     pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
@@ -1323,8 +1271,6 @@ impl ExecutionEngine {
     /// Create a new engine with the given mode.
     pub fn new(mode: ExecutionMode) -> Self {
         let (tx, rx) = mpsc::channel();
-        // The clock the LLVM tier's wait reads runs from here.
-        let _ = trace_clock_ms();
         Self {
             mode,
             #[cfg(feature = "host")]
@@ -1376,15 +1322,15 @@ impl ExecutionEngine {
             promote_refused: Vec::new(),
             optimized_gen: Vec::new(),
             optimized_llvm: Vec::new(),
-            #[cfg(feature = "host")]
-            llvm_wave: None,
             speculation_failed: Vec::new(),
-            compile_speculates: Vec::new(),
+            compile_serial: Vec::new(),
             method_binding: Vec::new(),
             deopt_exits: 0,
             retired_code: Vec::new(),
             #[cfg(feature = "host")]
             promoter: None,
+            #[cfg(feature = "host")]
+            llvm_worker: None,
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
@@ -1454,7 +1400,7 @@ impl ExecutionEngine {
         self.optimized_gen.push(0);
         self.optimized_llvm.push(false);
         self.speculation_failed.push(false);
-        self.compile_speculates.push(false);
+        self.compile_serial.push(0);
         self.method_binding
             .push((std::ptr::null_mut(), std::ptr::null_mut()));
         self.bc_cache.push(std::ptr::null());
@@ -2557,9 +2503,11 @@ impl ExecutionEngine {
             .retier_top
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.promote_retry_at[idx] = 0;
-        if self.compiling_tier[idx].is_none() {
-            self.request_compile(id, CompileTier::Baseline, interner);
-        }
+        // A compile in flight speculates the same way; its result is
+        // stale from here and the baseline compile goes out now.
+        self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1);
+        self.compiling_tier[idx] = None;
+        self.request_compile(id, CompileTier::Baseline, interner);
     }
 
     pub fn note_ic_hit(&mut self, id: FuncId) {
@@ -3142,7 +3090,7 @@ impl ExecutionEngine {
     pub fn recompile_top_tier(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         let _guard = self.tier_guard();
         let idx = id.0 as usize;
-        if idx >= self.functions.len() || self.compiling_tier[idx].is_some() {
+        if idx >= self.functions.len() {
             return;
         }
         // Only when the loop's caches have something new: a site the
@@ -3194,6 +3142,9 @@ impl ExecutionEngine {
             .retier_top
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.promote_retry_at[idx] = 0;
+        // A compile in flight was made from the same empty caches.
+        self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1);
+        self.compiling_tier[idx] = None;
         if let Some(tier) = self.next_compile_tier(idx) {
             self.request_compile(id, tier, interner);
         }
@@ -3764,11 +3715,9 @@ impl ExecutionEngine {
                             .store(1, std::sync::atomic::Ordering::Release);
                     }
                 }
-                #[cfg(feature = "host")]
                 if !llvm && crate::codegen::top_tier_is_llvm() {
-                    self.llvm_wave
-                        .get_or_insert_with(LlvmWave::start)
-                        .register(cell);
+                    let total = cell.total.load(std::sync::atomic::Ordering::Relaxed);
+                    cell.tick_after(self.llvm_queue_at().saturating_sub(total).max(1));
                 }
                 // Swap both pointer and OSR table atomically to
                 // optimized tier. Beadie bumps the bead's generation
@@ -3918,29 +3867,55 @@ impl ExecutionEngine {
             .max(1)
     }
 
-    /// An optimised body reporting in: propose the LLVM tier for it
-    /// when its body is the Cranelift tier's, nothing is in flight and
-    /// the wave is due, then lower its word until the next signal.
+    /// Entries and outermost-loop iterations at which the LLVM tier is
+    /// proposed for an optimised body. `WLIFT_LLVM_AT=<n>` overrides
+    /// it; safe to set.
+    pub fn llvm_queue_at(&self) -> u32 {
+        static AT: OnceLock<Option<u32>> = OnceLock::new();
+        AT.get_or_init(|| {
+            std::env::var("WLIFT_LLVM_AT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(self.opt_threshold.saturating_mul(4))
+    }
+
+    /// The Cranelift tier's body of `id` crossed a sampling point:
+    /// propose the LLVM tier once the count is reached, and set the
+    /// next point.
     #[cfg(feature = "host")]
-    fn llvm_report(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+    fn llvm_tick(&mut self, id: FuncId, count: u32, interner: &crate::intern::Interner) {
         let idx = id.0 as usize;
         self.poll_compilations();
-        let due = self
-            .llvm_wave
-            .as_ref()
-            .is_some_and(|w| w.due.load(std::sync::atomic::Ordering::Acquire));
-        if due
-            && crate::codegen::top_tier_is_llvm()
+        let wanted = crate::codegen::top_tier_is_llvm()
             && self.tier_states.get(idx).copied() == Some(TierState::OptimizedNative)
             && !self.optimized_llvm.get(idx).copied().unwrap_or(true)
-            && !self.promote_refused.get(idx).copied().unwrap_or(true)
+            && !self.promote_refused.get(idx).copied().unwrap_or(true);
+        // A loop compiled cold recompiles the body from its caches once
+        // it runs; the LLVM tier waits for that body, unless the loop
+        // stays cold for long.
+        let cold = self.cold_osr_blocks.get(idx).is_some_and(|c| !c.is_empty())
+            && count < self.llvm_queue_at().saturating_mul(16);
+        if wanted
+            && !cold
             && self.compiling_tier.get(idx).copied().flatten().is_none()
+            && count >= self.llvm_queue_at()
+            && count >= self.promote_retry_at[idx]
         {
             self.request_compile(id, CompileTier::Optimized, interner);
         }
-        if let Some(cell) = self.tier_cells.get(idx) {
-            cell.retier_top
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+        let Some(cell) = self.tier_cells.get(idx) else {
+            return;
+        };
+        if !wanted {
+            cell.tick_after(u32::MAX);
+        } else if self.compiling_tier[idx].is_some() {
+            cell.tick_after(1 << 20);
+        } else {
+            let at = self.promote_retry_at[idx]
+                .max(self.llvm_queue_at())
+                .max(count.saturating_add(64));
+            cell.tick_after(at - count);
         }
     }
 
@@ -4040,13 +4015,10 @@ impl ExecutionEngine {
             return;
         }
         let _guard = self.tier_guard();
-        if self.tier_states.get(id.0 as usize).copied() == Some(TierState::OptimizedNative) {
-            self.llvm_report(id, interner);
-            return;
-        }
         let Some(count) = self.tier_cells.get(id.0 as usize).map(|c| c.tick()) else {
             return;
         };
+
         if tier_trace_enabled() {
             eprintln!(
                 "tier-trace: [{:.2}ms] tick FuncId({}) count={}",
@@ -4059,15 +4031,20 @@ impl ExecutionEngine {
         // Native code is a safepoint for installs too; nothing running
         // is dropped, the lower tier's code stays owned by the function.
         self.poll_compilations();
+        // The poll may have installed the optimised body; from there
+        // the count is the LLVM tier's.
+        if self.tier_states.get(idx).copied() == Some(TierState::OptimizedNative) {
+            self.llvm_tick(id, count, interner);
+            return;
+        }
         if self.propose_top_tier(idx, count) {
             self.request_tier_up(id, interner);
         }
         let Some(cell) = self.tier_cells.get(idx) else {
             return;
         };
-        let settled = self.promote_refused[idx]
-            || self.tier_states[idx] == TierState::OptimizedNative
-            || crate::codegen::top_tier() == crate::codegen::TopTier::Off;
+        let settled =
+            self.promote_refused[idx] || crate::codegen::top_tier() == crate::codegen::TopTier::Off;
         if settled {
             cell.tick_after(u32::MAX);
         } else if self.compiling_tier[idx].is_some() {
@@ -4134,19 +4111,15 @@ impl ExecutionEngine {
     }
 
     /// Code of generation `caller_gen` (0 for baseline) polled its
-    /// word and found no newer body to transfer into: baseline code
-    /// stops polling; an optimised body was reporting in.
-    #[cfg(feature = "host")]
-    pub fn retier_declined(
-        &mut self,
-        id: FuncId,
-        caller_gen: u32,
-        interner: &crate::intern::Interner,
-    ) {
-        if caller_gen > 0 {
-            self.llvm_report(id, interner);
-        } else if let Some(cell) = self.tier_cells.get(id.0 as usize) {
-            cell.retier.store(0, std::sync::atomic::Ordering::Relaxed);
+    /// word and found no newer body to transfer into: it stops polling.
+    pub fn stop_retier(&self, id: FuncId, caller_gen: u32) {
+        if let Some(cell) = self.tier_cells.get(id.0 as usize) {
+            let word = if caller_gen == 0 {
+                &cell.retier
+            } else {
+                &cell.retier_top
+            };
+            word.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -4515,7 +4488,7 @@ impl ExecutionEngine {
                 cell: self.tier_cells[idx].as_ref() as *const TierCell as usize,
                 generation,
                 retier_headers: Self::retier_headers(&mir),
-                tick_headers: std::collections::HashSet::new(),
+                tick_headers: Self::loop_headers(&mir),
                 result_kinds: 0,
                 result_kinds_len: 0,
             })
@@ -4526,7 +4499,8 @@ impl ExecutionEngine {
         Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
         let profile = self.get_type_profile(id).cloned();
         let speculate = !self.speculation_failed[idx];
-        self.compile_speculates[idx] = speculate;
+        self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1);
+        let serial = self.compile_serial[idx];
         let trace_name = self
             .functions
             .get(idx)
@@ -4616,7 +4590,7 @@ impl ExecutionEngine {
             0
         };
         let raise_top = tier == CompileTier::Optimized && generation > 1;
-        let note_field_kinds = tier == CompileTier::Baseline && crate::codegen::top_tier_is_llvm();
+        let note_field_kinds = crate::codegen::top_tier_is_llvm();
         let modvars_cell = self.modvars_cell_addr(id);
         let callee_purity = self.compute_callee_purity_map();
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
@@ -4732,6 +4706,7 @@ impl ExecutionEngine {
                         .ok()
                         .map(|executable| CompilationResult::Compiled {
                             id,
+                            serial,
                             tier,
                             executable,
                             native_meta,
@@ -4764,7 +4739,7 @@ impl ExecutionEngine {
                 }
                 _ => (std::ptr::null_mut(), Vec::new()),
             };
-            let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
+            let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id, serial }));
             results_ready.store(true, std::sync::atomic::Ordering::Release);
             if tier_cell_addr != 0 {
                 // SAFETY: the cell is boxed for the engine's lifetime and
@@ -4808,6 +4783,8 @@ impl ExecutionEngine {
         if tier == CompileTier::Optimized || !bead_interpreted || spread {
             let worker = if spread {
                 self.baseline_worker.get_or_insert_with(Promoter::start)
+            } else if use_llvm {
+                self.llvm_worker.get_or_insert_with(Promoter::start_llvm)
             } else {
                 self.promoter
                     .get_or_insert_with(|| Promoter::start_threads(TOP_TIER_THREADS))
@@ -4881,6 +4858,23 @@ impl ExecutionEngine {
                     id.0 as usize
                 }
             };
+            let serial = match &result {
+                CompilationResult::Compiled { serial, .. }
+                | CompilationResult::Failed { serial, .. } => *serial,
+            };
+            // Requested before a newer compile or a speculation failure:
+            // the newer request owns the function's slot.
+            if self.compile_serial.get(idx).copied() != Some(serial) {
+                if tier_trace_enabled() {
+                    eprintln!(
+                        "tier-trace: [{:.2}ms] drop stale compile FuncId({})",
+                        trace_clock_ms(),
+                        idx
+                    );
+                }
+                self.pending_count = self.pending_count.saturating_sub(1);
+                continue;
+            }
             if tier_trace_enabled() {
                 match &result {
                     CompilationResult::Compiled { id, tier, .. } => {
@@ -4891,7 +4885,7 @@ impl ExecutionEngine {
                             id.0
                         );
                     }
-                    CompilationResult::Failed { id } => {
+                    CompilationResult::Failed { id, .. } => {
                         eprintln!(
                             "tier-trace: [{:.2}ms] install failed FuncId({})",
                             trace_clock_ms(),
@@ -4916,28 +4910,6 @@ impl ExecutionEngine {
                     ..
                 } = result
                 {
-                    if tier == CompileTier::Optimized
-                        && self.compile_speculates[idx]
-                        && self.speculation_failed[idx]
-                    {
-                        // Its guards failed in the body it was to
-                        // replace; the next drain compiles the function
-                        // again without them.
-                        if tier_trace_enabled() {
-                            eprintln!(
-                                "tier-trace: [{:.2}ms] drop stale Optimized FuncId({})",
-                                trace_clock_ms(),
-                                idx
-                            );
-                        }
-                        drop(executable);
-                        self.pending_callee_precompile.push(FuncId(idx as u32));
-                        if idx < self.compiling_tier.len() {
-                            self.compiling_tier[idx] = None;
-                        }
-                        self.pending_count = self.pending_count.saturating_sub(1);
-                        continue;
-                    }
                     self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
                     // Stash callees for predictive pre-compile. The
                     // actual submits happen later in `drain_compile_queue`
@@ -5035,6 +5007,7 @@ impl ExecutionEngine {
         #[cfg(feature = "host")]
         {
             drop(self.promoter.take());
+            drop(self.llvm_worker.take());
             drop(self.baseline_worker.take());
         }
     }
@@ -5053,10 +5026,6 @@ impl ExecutionEngine {
 
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
-        #[cfg(feature = "host")]
-        if let Some(wave) = self.llvm_wave.take() {
-            wave.stop();
-        }
         self.stop_promoter();
         // Beadie's broker owns the worker thread now; its Drop impl sends
         // a shutdown signal and joins when TierManager drops. Any in-flight
