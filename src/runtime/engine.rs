@@ -4379,6 +4379,9 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let modvars_cell = self.modvars_cell_addr(id);
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
+        crate::codegen::cranelift_backend::cl::set_jit_frame_head_cell(
+            crate::codegen::runtime_fns::jit_frame_head_cell(),
+        );
         crate::codegen::set_jit_bump_region(Self::bump_region_for_compile());
         crate::codegen::set_jit_safepoint_page(self.safepoint_page_for_compile());
         crate::codegen::set_jit_list_class(Self::list_class_for_compile());
@@ -4397,6 +4400,7 @@ impl ExecutionEngine {
                 cha_for_codegen,
             );
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
+        crate::codegen::cranelift_backend::cl::set_jit_frame_head_cell(0);
         crate::codegen::set_jit_bump_region(0);
         crate::codegen::set_jit_safepoint_page(0);
         crate::codegen::set_jit_list_class(0);
@@ -4661,6 +4665,7 @@ impl ExecutionEngine {
         let defining_class = self.method_binding[idx].1 as usize;
         let note_field_kinds = crate::codegen::top_tier_is_llvm();
         let modvars_cell = self.modvars_cell_addr(id);
+        let frame_head_cell = crate::codegen::runtime_fns::jit_frame_head_cell();
         let callee_purity = self.compute_callee_purity_map();
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
             Some(self.compute_inline_bodies())
@@ -4722,6 +4727,7 @@ impl ExecutionEngine {
             }
             use crate::codegen::cranelift_backend::cl;
             cl::set_jit_modvars_cell(modvars_cell);
+            cl::set_jit_frame_head_cell(frame_head_cell);
             cl::set_jit_tier_hook(tier_hook.clone());
             cl::set_jit_retier_cell(tier_cell_addr, generation);
             cl::set_jit_func_id(id.0);
@@ -4753,6 +4759,7 @@ impl ExecutionEngine {
             crate::codegen::set_jit_safepoint_page(0);
             crate::codegen::set_jit_list_class(0);
             cl::set_jit_modvars_cell(0);
+            cl::set_jit_frame_head_cell(0);
             let result = result
                 .map_err(|e| {
                     if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {

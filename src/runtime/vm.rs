@@ -86,6 +86,14 @@ fn file_mtime_secs(_path: &str) -> Option<f64> {
 }
 
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
+
+/// Where an error was raised: the innermost known source position and
+/// the stack as trace lines, innermost first.
+#[derive(Clone, Debug)]
+pub struct ErrorSite {
+    pub loc: Option<super::vm_interp::SourceLoc>,
+    pub trace: Vec<String>,
+}
 use super::gc_trait::{GcAllocator, GcImpl};
 use super::object::*;
 use super::value::Value;
@@ -542,6 +550,9 @@ pub struct VM {
 
     // -- Post-mortem error fiber (saved before restoring prev_fiber) --
     pub error_fiber: *mut ObjFiber,
+    /// The stack and source position noted when the pending error was
+    /// raised, before its frames unwound; taken by the report.
+    pub error_site: Option<ErrorSite>,
 
     /// Last error message from runtime_error (for Fiber.try to retrieve).
     pub last_error: Option<String>,
@@ -687,6 +698,7 @@ impl VM {
             has_error: false,
             pending_fiber_action: None,
             error_fiber: ptr::null_mut(),
+            error_site: None,
             last_error: None,
             sync_entry_fiber: ptr::null_mut(),
             gc_requested: false,
@@ -848,6 +860,7 @@ impl VM {
             has_error: false,
             pending_fiber_action: None,
             error_fiber: ptr::null_mut(),
+            error_site: None,
             last_error: None,
             sync_entry_fiber: std::ptr::null_mut(),
             gc_requested: false,
@@ -2674,6 +2687,7 @@ impl VM {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
+                native_mark: crate::codegen::runtime_fns::frame_head(),
             });
         }
 
@@ -2709,14 +2723,20 @@ impl VM {
         };
         let interpret_result = match result {
             Ok(_) => {
+                self.error_site = None;
                 self.fiber = prev_fiber;
                 InterpretResult::Success
             }
             Err(e) => {
                 // Save the error fiber for post-mortem inspection before restoring
                 self.error_fiber = fiber;
-                let loc = unsafe { self.extract_error_location(fiber) };
-                self.report_runtime_error(&e, loc.as_ref(), fiber);
+                // Noted when the error was raised, or, for one the run
+                // loop unwound to here, still on the fiber.
+                let site = self
+                    .error_site
+                    .take()
+                    .unwrap_or_else(|| self.site_of(fiber));
+                self.report_runtime_error(&e, &site);
                 self.fiber = prev_fiber;
                 InterpretResult::RuntimeError
             }
@@ -2796,6 +2816,135 @@ impl VM {
         })
     }
 
+    /// The span of a bytecode offset in `func_id`: the instruction the
+    /// offset lies in, which for a saved return offset is the call.
+    fn span_at_pc(&self, func_id: super::engine::FuncId, pc: u32) -> Option<crate::ast::Span> {
+        let bc = self.engine.peek_bytecode(func_id)?;
+        bc.lookup_span(pc.saturating_sub(1)).cloned()
+    }
+
+    /// The span of a compiled frame's site word: the widest expression
+    /// starting at that source offset, which is the call itself.
+    fn span_at_site(&self, func_id: super::engine::FuncId, site: u32) -> Option<crate::ast::Span> {
+        if site == 0 || site == crate::codegen::runtime_fns::FRAME_SITE_SHADOWED {
+            return None;
+        }
+        let start = (site - 1) as usize;
+        let mir = self.engine.get_mir(func_id)?;
+        mir.span_map
+            .values()
+            .filter(|sp| sp.start == start)
+            .max_by_key(|sp| sp.end)
+            .cloned()
+            .or(Some(start..start + 1))
+    }
+
+    /// A fiber's stack for a trace, innermost first: the interpreter's
+    /// frames with the compiled frames between them, each with the
+    /// span of what it is running. Compiled frames are known for the
+    /// running fiber only; a suspended one's chain went with its stack.
+    fn stack_entries(
+        &self,
+        fiber: *mut ObjFiber,
+    ) -> Vec<(super::engine::FuncId, Arc<String>, Option<crate::ast::Span>)> {
+        use crate::codegen::runtime_fns::{FRAME_SITE_SHADOWED, frame_head, frames_between};
+        let mut out = Vec::new();
+        if fiber.is_null() {
+            return out;
+        }
+        let frames = unsafe { &(*fiber).mir_frames };
+        let native = fiber == self.fiber;
+        let mut head = frame_head();
+        for frame in frames.iter().rev() {
+            if native {
+                let stop = frame.native_mark & !1;
+                for (fid, site) in frames_between(head, stop) {
+                    if std::env::var_os("WLIFT_FRAME_TRACE").is_some() {
+                        eprintln!("frame-trace: native fid={fid} site={site}");
+                    }
+                    if site == FRAME_SITE_SHADOWED {
+                        continue;
+                    }
+                    let id = super::engine::FuncId(fid);
+                    let module = self
+                        .engine
+                        .func_module(id)
+                        .cloned()
+                        .unwrap_or_else(|| frame.module_name.clone());
+                    out.push((id, module, self.span_at_site(id, site)));
+                }
+                head = stop;
+            }
+            if std::env::var_os("WLIFT_FRAME_TRACE").is_some() {
+                eprintln!(
+                    "frame-trace: interp fid={} pc={} mark={:#x}",
+                    frame.func_id.0, frame.pc, frame.native_mark
+                );
+            }
+            if frame.native_mark & 1 == 0 {
+                out.push((
+                    frame.func_id,
+                    frame.module_name.clone(),
+                    self.span_at_pc(frame.func_id, frame.pc),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Where the fiber is now: the innermost entry's span, for the
+    /// report's label, and the whole stack as trace lines.
+    fn site_of(&self, fiber: *mut ObjFiber) -> ErrorSite {
+        let entries = self.stack_entries(fiber);
+        let loc = entries.iter().find_map(|(_, module, span)| {
+            span.as_ref().map(|span| super::vm_interp::SourceLoc {
+                span: span.clone(),
+                module: module.clone(),
+            })
+        });
+        let mut trace: Vec<String> = entries
+            .iter()
+            .map(|(id, module, span)| {
+                let func_name = self
+                    .engine
+                    .get_mir(*id)
+                    .map(|mir| self.interner.resolve(mir.name).to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                StackFrame {
+                    func_name,
+                    module: (**module).clone(),
+                    line: span
+                        .as_ref()
+                        .and_then(|sp| self.line_from_span(module, sp.start)),
+                }
+                .to_string()
+            })
+            .collect();
+        if self.config.fiber_stack_traces && !fiber.is_null() {
+            let mut current = unsafe { (*fiber).caller };
+            while !current.is_null() {
+                trace.push("  --- in calling fiber ---".to_string());
+                trace.extend(self.build_stack_trace(current));
+                current = unsafe { (*current).caller };
+            }
+            if let Some(frames) = unsafe { &(*fiber).spawn_trace }
+                && !frames.is_empty()
+            {
+                trace.push("  --- spawned at ---".to_string());
+                trace.extend(frames.iter().map(|f| f.to_string()));
+            }
+        }
+        ErrorSite { loc, trace }
+    }
+
+    /// Note where the error being raised comes from, once per error:
+    /// the frames unwind before it is reported.
+    pub fn note_raise(&mut self) {
+        if self.error_site.is_none() {
+            self.error_site = Some(self.site_of(self.fiber));
+        }
+    }
+
     /// Extract a StackFrame from a MirCallFrame.
     fn frame_to_stack_frame(&self, frame: &MirCallFrame) -> StackFrame {
         let func_name = self
@@ -2803,13 +2952,9 @@ impl VM {
             .get_mir(frame.func_id)
             .map(|mir| self.interner.resolve(mir.name).to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let line = self.engine.get_mir(frame.func_id).and_then(|mir| {
-            let block = mir.blocks.get(frame.current_block.0 as usize)?;
-            let idx = if frame.ip > 0 { frame.ip - 1 } else { 0 };
-            let (vid, _) = block.instructions.get(idx)?;
-            let span = mir.span_map.get(vid)?;
-            self.line_from_span(&frame.module_name, span.start)
-        });
+        let line = self
+            .span_at_pc(frame.func_id, frame.pc)
+            .and_then(|span| self.line_from_span(&frame.module_name, span.start));
         StackFrame {
             func_name,
             module: (*frame.module_name).clone(),
@@ -2841,41 +2986,6 @@ impl VM {
             .rev()
             .map(|frame| self.frame_to_stack_frame(frame))
             .collect()
-    }
-
-    /// Build a full cross-fiber stack trace, walking the caller chain.
-    /// Each fiber boundary is annotated. Includes spawn traces when available.
-    fn build_full_fiber_trace(&self, fiber: *mut ObjFiber) -> Vec<String> {
-        if fiber.is_null() {
-            return Vec::new();
-        }
-
-        let mut trace = self.build_stack_trace(fiber);
-
-        if !self.config.fiber_stack_traces {
-            return trace;
-        }
-
-        // Walk the caller chain
-        let mut current = unsafe { (*fiber).caller };
-        while !current.is_null() {
-            trace.push("  --- in calling fiber ---".to_string());
-            trace.extend(self.build_stack_trace(current));
-            current = unsafe { (*current).caller };
-        }
-
-        // Append spawn trace if present
-        let spawn_trace = unsafe { &(*fiber).spawn_trace };
-        if let Some(frames) = spawn_trace
-            && !frames.is_empty()
-        {
-            trace.push("  --- spawned at ---".to_string());
-            for frame in frames {
-                trace.push(frame.to_string());
-            }
-        }
-
-        trace
     }
 
     /// Generate a contextual help note for a runtime error.
@@ -2910,13 +3020,9 @@ impl VM {
 
     /// Report a runtime error with full ariadne diagnostics, source snippets,
     /// contextual help, and a stack trace.
-    pub fn report_runtime_error(
-        &self,
-        error: &super::vm_interp::RuntimeError,
-        loc: Option<&super::vm_interp::SourceLoc>,
-        fiber: *mut ObjFiber,
-    ) {
-        if let Some(loc) = loc
+    pub fn report_runtime_error(&self, error: &super::vm_interp::RuntimeError, site: &ErrorSite) {
+        let trace = &site.trace;
+        if let Some(loc) = site.loc.as_ref()
             && let Some(source) = self.module_sources.get(loc.module.as_str())
         {
             let mut diag = crate::diagnostics::Diagnostic::error(error.to_string())
@@ -2928,7 +3034,6 @@ impl VM {
             }
 
             // Add stack trace as a note (uses full cross-fiber trace when enabled)
-            let trace = self.build_full_fiber_trace(fiber);
             if trace.len() > 1 {
                 let trace_str = format!("stack trace:\n{}", trace.join("\n"));
                 diag = diag.with_note(trace_str);
@@ -2953,7 +3058,6 @@ impl VM {
         if let Some(help) = Self::error_help(error) {
             diag = diag.with_note(help);
         }
-        let trace = self.build_full_fiber_trace(fiber);
         if !trace.is_empty() {
             let trace_str = format!("stack trace:\n{}", trace.join("\n"));
             diag = diag.with_note(trace_str);
@@ -3477,6 +3581,7 @@ impl VM {
             Err(e) => {
                 self.has_error = true;
                 crate::codegen::runtime_fns::note_error_pending();
+                self.note_raise();
                 self.last_error = Some(e.to_string());
                 Some(Value::null())
             }
@@ -4232,6 +4337,7 @@ impl NativeContext for VM {
         }
         self.has_error = true;
         crate::codegen::runtime_fns::note_error_pending();
+        self.note_raise();
         self.last_error = Some(msg);
     }
 
@@ -4336,7 +4442,7 @@ impl NativeContext for VM {
     }
 
     fn get_stack_trace_string(&self, fiber: *mut ObjFiber) -> String {
-        let trace = self.build_full_fiber_trace(fiber);
+        let trace = self.site_of(fiber).trace;
         if trace.is_empty() {
             "<no stack trace>".to_string()
         } else {
@@ -4761,6 +4867,7 @@ impl VM {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
+                native_mark: crate::codegen::runtime_fns::frame_head(),
             });
         }
 
@@ -5096,6 +5203,7 @@ impl VM {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 self.has_error = true;
                 crate::codegen::runtime_fns::note_error_pending();
+                self.note_raise();
                 self.last_error = Some(format!(
                     "method dispatch hit AOT stub with no body (func_id={})",
                     func_id.0
@@ -5155,6 +5263,7 @@ impl VM {
                     closure: Some(live_closure),
                     defining_class: live_defining_class,
                     bc_ptr: std::ptr::null(),
+                    native_mark: crate::codegen::runtime_fns::frame_head(),
                 });
             }
 
@@ -5226,6 +5335,7 @@ impl VM {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 self.has_error = true;
                 crate::codegen::runtime_fns::note_error_pending();
+                self.note_raise();
                 self.last_error = Some(format!(
                     "constructor dispatch hit AOT stub with no body (func_id={})",
                     func_id.0
@@ -5285,6 +5395,7 @@ impl VM {
                 closure: Some(live_closure),
                 defining_class: live_defining_class,
                 bc_ptr: std::ptr::null(),
+                native_mark: crate::codegen::runtime_fns::frame_head(),
             });
         }
 
@@ -5386,6 +5497,7 @@ impl VM {
             closure: Some(live_closure),
             defining_class: live_defining_class,
             bc_ptr: std::ptr::null(),
+            native_mark: crate::codegen::runtime_fns::frame_head(),
         };
 
         let current_fiber = self.fiber;
@@ -5603,6 +5715,7 @@ impl VM {
                     closure: Some(closure_ptr),
                     defining_class: Some(class_ptr),
                     bc_ptr: std::ptr::null(),
+                    native_mark: crate::codegen::runtime_fns::frame_head(),
                 });
             }
 
@@ -5686,6 +5799,7 @@ impl VM {
                 closure: Some(closure_ptr),
                 defining_class: Some(class_ptr),
                 bc_ptr: std::ptr::null(),
+                native_mark: crate::codegen::runtime_fns::frame_head(),
             });
         }
 

@@ -280,6 +280,8 @@ fn inline_in_place(func: &mut MirFunction, dst: ValueId, sites: &HashMap<ValueId
             },
         ));
     }
+    // The body's instructions are the call's, for a trace.
+    let site_span = func.span_map.get(&dst).cloned();
     let mut vmap: HashMap<ValueId, ValueId> = HashMap::new();
     for (v, inst) in &body.instructions {
         if let Instruction::BlockParam(idx) = inst {
@@ -288,6 +290,9 @@ fn inline_in_place(func: &mut MirFunction, dst: ValueId, sites: &HashMap<ValueId
         }
         let nv = func.new_value();
         vmap.insert(*v, nv);
+        if let Some(span) = site_span.clone() {
+            func.span_map.insert(nv, span);
+        }
         let mut inst = inst.clone();
         remap_inst(&mut inst, &vmap);
         out.push((nv, inst));
@@ -656,7 +661,8 @@ fn inline_site(
         operands.push(receiver);
     }
     operands.extend_from_slice(&args);
-    let entry = splice_body(func, &callee.body, post, constructor, &operands);
+    let site_span = func.span_map.get(&dst).cloned();
+    let entry = splice_body(func, &callee.body, post, constructor, &operands, site_span);
 
     if let Some((pc, live)) = callee.exit.clone() {
         let exit_block = func.new_block();
@@ -734,12 +740,15 @@ fn slow_continuation(func: &mut MirFunction, copy: &mut SlowCopy, slow_dst: Valu
 /// the receiver is instead that allocation, made first in the entry
 /// block and absent from `operands`, and every return hands it to
 /// `post`.
+/// `site_span` is the call's, given to every value of the body so a
+/// trace places them at the call.
 fn splice_body(
     func: &mut MirFunction,
     body: &MirFunction,
     post: BlockId,
     constructor: Option<Instruction>,
     operands: &[ValueId],
+    site_span: Option<crate::ast::Span>,
 ) -> BlockId {
     let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
     for b in &body.blocks {
@@ -748,7 +757,11 @@ fn splice_body(
     let mut vmap: HashMap<ValueId, ValueId> = HashMap::new();
     for b in &body.blocks {
         for v in b.defined_values() {
-            vmap.insert(v, func.new_value());
+            let nv = func.new_value();
+            vmap.insert(v, nv);
+            if let Some(span) = site_span.clone() {
+                func.span_map.insert(nv, span);
+            }
         }
     }
     let entry = block_map[&body.blocks[0].id];

@@ -1169,6 +1169,10 @@ pub struct MirCallFrame {
     pub defining_class: Option<*mut ObjClass>,
     /// Cached bytecode pointer — avoids ensure_bytecode lookup on return.
     pub bc_ptr: *const crate::mir::bytecode::BytecodeFunction,
+    /// The compiled frame record head when this frame was pushed, so
+    /// a trace can place the compiled frames between interpreter ones;
+    /// bit 0 set while a loop entry runs this activation natively.
+    pub native_mark: u64,
 }
 
 impl fmt::Debug for MirCallFrame {

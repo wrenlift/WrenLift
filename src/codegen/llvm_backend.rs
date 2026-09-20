@@ -35,8 +35,8 @@ pub mod llvm {
     use crate::codegen::cranelift_backend::cl::{
         OsrEntryLayout, PTR_MASK, QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
         collect_osr_targets, const_f64_of, direct_calls_enabled, env_jit_callsite_ic,
-        infer_osr_value_types, is_positive_power_of_two, jit_func_id, jit_modvar_in_range,
-        jit_modvars_cell, osr_entry_layout, should_compile_osr_entries,
+        infer_osr_value_types, is_positive_power_of_two, jit_frame_head_cell, jit_func_id,
+        jit_modvar_in_range, jit_modvars_cell, osr_entry_layout, should_compile_osr_entries,
     };
     use crate::intern::Interner;
     use crate::mir::{
@@ -467,6 +467,15 @@ pub mod llvm {
         element_class_ok: HashMap<IntValue<'ctx>, (usize, IntValue<'ctx>)>,
         /// The instruction being lowered, at inline depth zero.
         cur_vid: ValueId,
+        /// Its site word: source offset plus one, 0 when it has none.
+        cur_site: u32,
+        /// The body's frame record and the head it displaced (see
+        /// `runtime_fns::FrameRecord`).
+        frame_rec: Option<(PointerValue<'ctx>, IntValue<'ctx>)>,
+        /// The slot a body without a record of its own links one from
+        /// around each call that can raise, all of which are on slow
+        /// paths.
+        lazy_rec: Option<PointerValue<'ctx>>,
         raw_bools: HashSet<ValueId>,
         value_types: Vec<MirType>,
 
@@ -515,6 +524,9 @@ pub mod llvm {
                 inline_class: None,
                 field_invariant: None,
                 cur_vid: ValueId(u32::MAX),
+                cur_site: 0,
+                frame_rec: None,
+                lazy_rec: None,
                 raw_bools: HashSet::new(),
                 value_types: infer_osr_value_types(mir),
 
@@ -565,6 +577,10 @@ pub mod llvm {
                 bail!("unknown runtime helper {name}");
             };
             let ty = self.helper_type(args.len());
+            let raises = crate::codegen::runtime_fns::helper_can_raise(name);
+            if raises {
+                self.site_enter()?;
+            }
             let v = self
                 .call_addr(
                     ty,
@@ -573,7 +589,8 @@ pub mod llvm {
                     name,
                 )?
                 .into_int_value();
-            if crate::codegen::runtime_fns::helper_can_raise(name) {
+            if raises {
+                self.site_leave()?;
                 self.error_poll()?;
             }
             Ok(v)
@@ -1341,6 +1358,124 @@ pub mod llvm {
             self.icmp(IntPredicate::EQ, m, self.c64(QNAN))
         }
 
+        /// Link a record for this body in its frame, holding the
+        /// displaced head; a trace reads the chain. Its key is written
+        /// by the first site, which every reader of the record comes
+        /// through. A body that cannot raise keeps none.
+        fn frame_push(&mut self) -> Result<(), String> {
+            use crate::codegen::cranelift_backend::cl::{body_calls, body_can_raise};
+            let cell = jit_frame_head_cell();
+            if cell == 0 || !body_can_raise(self.sh.mir) {
+                return Ok(());
+            }
+            let rec = self
+                .b
+                .build_alloca(self.i64t().array_type(2), "frec")
+                .map_err(|e| e.to_string())?;
+            if !body_calls(self.sh.mir) {
+                self.lazy_rec = Some(rec);
+                return Ok(());
+            }
+            let cellp = self
+                .b
+                .build_int_to_ptr(self.c64(cell as u64), self.ptrt(), "fhead")
+                .map_err(|e| e.to_string())?;
+            let head = self
+                .b
+                .build_load(self.i64t(), cellp, "head")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            self.b.build_store(rec, head).map_err(|e| e.to_string())?;
+            let reca = self
+                .b
+                .build_ptr_to_int(rec, self.i64t(), "freca")
+                .map_err(|e| e.to_string())?;
+            self.b.build_store(cellp, reca).map_err(|e| e.to_string())?;
+            self.frame_rec = Some((rec, head));
+            Ok(())
+        }
+
+        /// Before a call that can raise: the record's key names the
+        /// site. A body without a record links one here, for the call's
+        /// duration.
+        fn site_enter(&mut self) -> Result<(), String> {
+            let key = jit_func_id() as u64 | ((self.cur_site as u64) << 32);
+            let rec = match (self.frame_rec, self.lazy_rec) {
+                (Some((rec, _)), _) => rec,
+                (None, Some(rec)) => {
+                    let cellp = self.head_cell()?;
+                    let head = self
+                        .b
+                        .build_load(self.i64t(), cellp, "head")
+                        .map_err(|e| e.to_string())?;
+                    self.b.build_store(rec, head).map_err(|e| e.to_string())?;
+                    let reca = self
+                        .b
+                        .build_ptr_to_int(rec, self.i64t(), "freca")
+                        .map_err(|e| e.to_string())?;
+                    self.b.build_store(cellp, reca).map_err(|e| e.to_string())?;
+                    rec
+                }
+                (None, None) => return Ok(()),
+            };
+            let keyp = unsafe {
+                self.b
+                    .build_in_bounds_gep(self.i64t(), rec, &[self.c64(1)], "fkey")
+            }
+            .map_err(|e| e.to_string())?;
+            self.b
+                .build_store(keyp, self.c64(key))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// After such a call: a record linked for it is unlinked.
+        fn site_leave(&mut self) -> Result<(), String> {
+            if self.frame_rec.is_some() {
+                return Ok(());
+            }
+            let Some(rec) = self.lazy_rec else {
+                return Ok(());
+            };
+            let head = self
+                .b
+                .build_load(self.i64t(), rec, "prev")
+                .map_err(|e| e.to_string())?;
+            let cellp = self.head_cell()?;
+            self.b.build_store(cellp, head).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        fn head_cell(&self) -> Result<PointerValue<'ctx>, String> {
+            self.b
+                .build_int_to_ptr(self.c64(jit_frame_head_cell() as u64), self.ptrt(), "fhead")
+                .map_err(|e| e.to_string())
+        }
+
+        /// A deopt helper's function id argument, with bit 32 set when
+        /// the body has a record of its own for the helper to unlink.
+        fn deopt_fid(&self) -> IntValue<'ctx> {
+            let bit = if self.frame_rec.is_some() {
+                crate::codegen::runtime_fns::DEOPT_HAS_RECORD
+            } else {
+                0
+            };
+            self.c64(jit_func_id() as u64 | bit)
+        }
+
+        /// Before a return: the head is the displaced record again.
+        fn frame_pop(&mut self) -> Result<(), String> {
+            let Some((_, head)) = self.frame_rec else {
+                return Ok(());
+            };
+            let cellp = self
+                .b
+                .build_int_to_ptr(self.c64(jit_frame_head_cell() as u64), self.ptrt(), "fhead")
+                .map_err(|e| e.to_string())?;
+            self.b.build_store(cellp, head).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
         /// Leave the function with null when an error is pending, as
         /// the interpreter would have unwound, instead of running on
         /// and raising another over it. Emitted after every call that
@@ -1397,6 +1532,7 @@ pub mod llvm {
             let raised = self.icmp(IntPredicate::NE, err, self.c64(0))?;
             self.cbr(raised, leave, cont)?;
             self.b.position_at_end(leave);
+            self.frame_pop()?;
             self.b
                 .build_return(Some(&self.c64(TAG_NULL)))
                 .map_err(|e| e.to_string())?;
@@ -1572,6 +1708,8 @@ pub mod llvm {
                     self.osr_vars.insert(vid);
                 }
             }
+
+            self.frame_push()?;
 
             if self.entries.is_empty() {
                 let entry = &mir.blocks[0];
@@ -1787,6 +1925,11 @@ pub mod llvm {
                     _ => None,
                 };
                 self.cur_vid = vid;
+                self.cur_site = mir
+                    .span_map
+                    .get(&vid)
+                    .map(|sp| sp.start as u32 + 1)
+                    .unwrap_or(0);
                 let v = self.lower_instruction(vid, inst)?;
                 self.miss_exit = None;
                 if !matches!(
@@ -1860,10 +2003,12 @@ pub mod llvm {
             match term {
                 Terminator::Return(v) => {
                     let r = self.boxed(v)?;
+                    self.frame_pop()?;
                     self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
                 }
                 Terminator::ReturnNull => {
                     let r = self.c64(TAG_NULL);
+                    self.frame_pop()?;
                     self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
                 }
                 Terminator::Branch { target, args } => {
@@ -2156,11 +2301,13 @@ pub mod llvm {
                     for a in args {
                         call_args.push(self.boxed(a)?.into());
                     }
+                    self.site_enter()?;
                     let call = self
                         .b
                         .build_call(self.sh.main_fn, &call_args, "self")
                         .map_err(|e| e.to_string())?;
                     let v = call.try_as_basic_value().basic().unwrap();
+                    self.site_leave()?;
                     self.error_poll()?;
                     v
                 }
@@ -3089,9 +3236,10 @@ pub mod llvm {
             for (i, p) in params.iter().enumerate() {
                 self.store64(buf, (i * 8) as i64, *p)?;
             }
-            let fid = self.c64(jit_func_id() as u64);
+            let fid = self.deopt_fid();
             let n = self.c64(params.len() as u64);
             let result = self.call_helper("wren_deopt_n", &[fid, n, buf])?;
+            self.frame_pop()?;
             self.b
                 .build_return(Some(&result))
                 .map_err(|e| e.to_string())?;
@@ -3146,10 +3294,11 @@ pub mod llvm {
                     at += 1;
                 }
             }
-            let fid = self.c64(jit_func_id() as u64);
+            let fid = self.deopt_fid();
             let pcv = self.c64(pc as u64);
             let n = self.c64(words as u64);
             let result = self.call_helper("wren_deopt_at", &[fid, pcv, n, buf])?;
+            self.frame_pop()?;
             self.b
                 .build_return(Some(&result))
                 .map_err(|e| e.to_string())?;
@@ -3758,6 +3907,7 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?;
             let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
             a.extend(args.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+            self.site_enter()?;
             let call = match jit_ptr {
                 Some(jit_ptr) => {
                     let ty = self.helper_type(1 + args.len());
@@ -3778,6 +3928,7 @@ pub mod llvm {
             self.b
                 .build_store(depth_p, depth)
                 .map_err(|e| e.to_string())?;
+            self.site_leave()?;
             self.error_poll()?;
             Ok(Some((fv, self.b.get_insert_block().unwrap())))
         }
@@ -4012,12 +4163,14 @@ pub mod llvm {
                                 .map_err(|e| e.to_string())?;
                             let mut a: Vec<BasicMetadataValueEnum> = vec![inst.into()];
                             a.extend(arg_vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+                            self.site_enter()?;
                             self.b
                                 .build_indirect_call(ty, ptr, &a, "init")
                                 .map_err(|e| e.to_string())?;
                             self.b
                                 .build_store(depth_p, depth)
                                 .map_err(|e| e.to_string())?;
+                            self.site_leave()?;
                             self.error_poll()?;
                             incoming.push((inst.into(), self.b.get_insert_block().unwrap()));
                             self.br(merge)?;

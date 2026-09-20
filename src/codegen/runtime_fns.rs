@@ -1329,6 +1329,82 @@ pub struct JitThread {
     /// The frame a loop entry stub posted for the body it is about to
     /// call; 0 between stubs.
     pub osr_frame: u64,
+    /// The innermost compiled frame's record (see [`FrameRecord`]), 0
+    /// when none is running.
+    pub frame_head: u64,
+}
+
+/// What a compiled body keeps in its own stack frame and links from
+/// [`JitThread::frame_head`] while it runs: the record it displaced,
+/// and a key of its function id in the low word and, in the high
+/// word, the source offset plus one of the call it is inside (0 in
+/// its prologue, [`FRAME_SITE_SHADOWED`] once a loop entry into a
+/// higher tier has taken over its activation). The interpreter notes
+/// the head in each frame it pushes, so a trace can interleave the
+/// two stacks.
+#[repr(C)]
+pub struct FrameRecord {
+    pub prev: u64,
+    pub key: u64,
+}
+
+/// Site word of a record whose activation continues in a higher
+/// tier's loop entry; traces leave it out.
+pub const FRAME_SITE_SHADOWED: u32 = u32::MAX;
+
+/// Address of this thread's record head, for a body compiled on any
+/// thread to run on this one.
+pub fn jit_frame_head_cell() -> usize {
+    unsafe { std::ptr::addr_of_mut!((*jit_state()).frame_head) as usize }
+}
+
+#[inline(always)]
+pub fn frame_head() -> u64 {
+    unsafe { (*jit_state()).frame_head }
+}
+
+#[inline(always)]
+pub fn set_frame_head(head: u64) {
+    unsafe { (*jit_state()).frame_head = head };
+}
+
+/// The compiled frames from `from` down to, excluding, `stop`,
+/// innermost first, as (function id, site word). `WLIFT_FRAME_TRACE=1`
+/// prints the walk; safe to run with.
+pub fn frames_between(from: u64, stop: u64) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut p = from;
+    while p != 0 && p != stop && out.len() < 100_000 {
+        if std::env::var_os("WLIFT_FRAME_TRACE").is_some() {
+            eprintln!("frame-trace: rec {p:#x} stop {stop:#x}");
+        }
+        let rec = unsafe { &*(p as *const FrameRecord) };
+        out.push((rec.key as u32, (rec.key >> 32) as u32));
+        p = rec.prev;
+    }
+    out
+}
+
+/// Unlink the head record, the calling activation's: it goes on in
+/// the interpreter, which pushes its own frame for it, and the body's
+/// epilogue stores the same predecessor again.
+pub fn pop_frame() {
+    let p = frame_head();
+    if p != 0 {
+        let rec = unsafe { &*(p as *const FrameRecord) };
+        set_frame_head(rec.prev);
+    }
+}
+
+/// Mark the head record, `func_id`'s activation's, shadowed while it
+/// runs in a higher tier's loop entry; a site store by the body clears
+/// it.
+pub fn shadow_frame(func_id: u32) {
+    let p = frame_head();
+    if p != 0 {
+        let rec = unsafe { &mut *(p as *mut FrameRecord) };
+        rec.key = func_id as u64 | ((FRAME_SITE_SHADOWED as u64) << 32);
+    }
 }
 
 thread_local! {
@@ -1350,6 +1426,7 @@ thread_local! {
         depth: 0,
         disabled: false,
         osr_frame: 0,
+        frame_head: 0,
     }) };
 
     /// Flat shadow root stack — zero-alloc push/pop after warmup.
@@ -1451,6 +1528,8 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     if vm.is_null() {
         return decline;
     }
+    let has_record = func_id & DEOPT_HAS_RECORD != 0;
+    let func_id = func_id as u32 as u64;
     let vm = unsafe { &mut *vm };
     let id = crate::runtime::engine::FuncId(func_id as u32);
     // The caller's generation rides above the header id.
@@ -1523,6 +1602,9 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     unsafe { (*jit_state()).ctx.current_func_id = func_id };
     set_jit_depth(depth + 1);
     let f: extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(entry.ptr) };
+    if has_record {
+        shadow_frame(func_id as u32);
+    }
     let result = f(args[1..].as_ptr() as *const u64);
     set_jit_depth(depth);
     unsafe { (*jit_state()).ctx.current_func_id = saved_func_id };
@@ -2622,6 +2704,7 @@ fn handle_jit_fiber_action(
                     // Propagate the runtime error from the child fiber.
                     vm.has_error = true;
                     note_error_pending();
+                    vm.note_raise();
                     vm.last_error = Some(e.to_string());
                     Value::null().to_bits()
                 }
@@ -5257,6 +5340,10 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
         Some(v) => v,
         None => return Value::null().to_bits(),
     };
+    if func_id & DEOPT_HAS_RECORD != 0 {
+        pop_frame();
+    }
+    let func_id = func_id as u32 as u64;
     let words: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
     let root_len_before = jit_roots_snapshot_len();
     let regs = decode_deopt_words(vm, &words);
@@ -5290,6 +5377,7 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
             _ => {
                 vm.has_error = true;
                 note_error_pending();
+                vm.note_raise();
                 vm.last_error = Some(format!(
                     "deoptimisation of FuncId({}) found no closure to resume",
                     func_id
@@ -5315,8 +5403,16 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_deopt_n(func_id: u64, n: u64, buf: *const u64) -> u64 {
     let args: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
+    if func_id & DEOPT_HAS_RECORD != 0 {
+        pop_frame();
+    }
     deopt_impl(func_id as u32, &args)
 }
+
+/// Bit of a deopt or retier helper's function id argument: the head
+/// record is the calling activation's, to unlink or shadow before
+/// another takes it over.
+pub const DEOPT_HAS_RECORD: u64 = 1 << 32;
 
 // ---------------------------------------------------------------------------
 // Boxed NaN-boxed arithmetic runtime functions

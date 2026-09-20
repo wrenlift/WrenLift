@@ -6344,3 +6344,70 @@ System.print(total)
     assert!(matches!(result, InterpretResult::Success), "{output}");
     assert_eq!(output.trim(), "a3,a6,a9, b3,b6,\n7400");
 }
+
+/// An error raised inside compiled code reports the raising line and
+/// every frame, compiled or not, with its line — not the interpreter
+/// frame that entered the compiled code.
+#[test]
+fn e2e_trace_through_compiled_frames() {
+    let src = r#"
+class Mesh {
+  construct new() { _n = 0 }
+  // comment before boom
+  boom(i) {
+    if (i == 3000000) Fiber.abort("boom at %(i)")
+    return i
+  }
+}
+
+class Scene {
+  construct new() { _mesh = Mesh.new() }
+  // a comment line
+  render(i) {
+    // another comment
+    var x = _mesh.boom(i)
+    return x + i
+  }
+  run() {
+    var t = 0
+    for (i in 0..4000000) t = t + render(i)
+    return t
+  }
+}
+
+Scene.new().run()
+"#;
+    use std::sync::Arc;
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = errors.clone();
+    let config = VMConfig {
+        error_fn: Some(Box::new(move |_, _, _, msg| {
+            sink.lock().unwrap().push(msg.to_string());
+        })),
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    };
+    let (result, _, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::RuntimeError));
+    let errors = errors.lock().unwrap().clone();
+    // Without the colour sequences.
+    let mut text = String::new();
+    let mut esc = false;
+    for c in errors.join("\n").chars() {
+        if esc {
+            esc = !c.is_ascii_alphabetic();
+        } else if c == '\x1b' {
+            esc = true;
+        } else {
+            text.push(c);
+        }
+    }
+    // The label sits on the abort, not on the loop that entered the
+    // compiled body.
+    assert!(text.contains(":6:23 ]"), "{text}");
+    assert!(text.contains("at boom(_) (main:6)"), "{text}");
+    assert!(text.contains("at run() (main:21)"), "{text}");
+    assert!(text.contains("at <module> (main:26)"), "{text}");
+}

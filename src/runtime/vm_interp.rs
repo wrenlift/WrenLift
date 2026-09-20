@@ -311,6 +311,7 @@ fn call_foreign_dynamic_with_frame_sync(
             let msg = panic_message(&panic);
             vm.has_error = true;
             crate::codegen::runtime_fns::note_error_pending();
+            vm.note_raise();
             vm.last_error = Some(format!("foreign panic: {}", msg));
             Value::null()
         }
@@ -349,6 +350,7 @@ fn call_foreign_c_with_frame_sync(
             let msg = panic_message(&panic);
             vm.has_error = true;
             crate::codegen::runtime_fns::note_error_pending();
+            vm.note_raise();
             vm.last_error = Some(format!("foreign panic: {}", msg));
             Value::null()
         }
@@ -447,7 +449,9 @@ fn try_run_root_frame_native(
         eprintln!("native-entry: root FuncId({}) {}", func_id.0, name);
     }
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+    unsafe { set_top_frame_native(fiber, true) };
     let result_bits = unsafe { call_jit_fn(native_fn_ptr, &[]) };
+    unsafe { set_top_frame_native(fiber, false) };
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
     let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
@@ -696,7 +700,9 @@ fn try_enter_loop_osr(
     vm.engine.note_native_entry(func_id);
     vm.engine.note_osr_entry(func_id);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+    unsafe { set_top_frame_native(fiber, true) };
     let result_bits = unsafe { call_osr_entry(entry.ptr, &osr_args[1..]) };
+    unsafe { set_top_frame_native(fiber, false) };
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
     let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
@@ -955,6 +961,22 @@ fn take_native_error(vm: &mut VM, fiber: *mut ObjFiber) -> Option<NativeError> {
     } else {
         NativeError::Finished(err_val)
     })
+}
+
+/// Flag the fiber's top frame as running in compiled code — a root or
+/// loop entry took the activation over — so a trace shows the compiled
+/// record in its place.
+///
+/// # Safety
+/// `fiber` must point to a live `ObjFiber`.
+unsafe fn set_top_frame_native(fiber: *mut ObjFiber, on: bool) {
+    if let Some(frame) = unsafe { (*fiber).mir_frames.last_mut() } {
+        frame.native_mark = if on {
+            frame.native_mark | 1
+        } else {
+            frame.native_mark & !1
+        };
+    }
 }
 
 /// Consume an error raised inside compiled code the interpreter called.
@@ -3164,6 +3186,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     closure: Some(closure_ptr),
                                     defining_class,
                                     bc_ptr: target_bc_ptr,
+                                    native_mark: crate::codegen::runtime_fns::frame_head(),
                                 });
                             }
 
@@ -3301,6 +3324,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     closure: Some(closure_ptr),
                                     defining_class,
                                     bc_ptr: target_bc_ptr,
+                                    native_mark: crate::codegen::runtime_fns::frame_head(),
                                 });
                             }
 
@@ -4369,6 +4393,7 @@ pub fn eval_in_vm(
             closure: None,
             defining_class: None,
             bc_ptr: std::ptr::null(),
+            native_mark: crate::codegen::runtime_fns::frame_head(),
         });
     }
 
@@ -4947,6 +4972,7 @@ fn dispatch_closure_bc_inner(
             closure: Some(closure_ptr),
             defining_class,
             bc_ptr: target_bc_ptr,
+            native_mark: crate::codegen::runtime_fns::frame_head(),
         });
     }
 
@@ -5300,6 +5326,8 @@ pub unsafe fn route_method_error_through_fiber_try(
             (*cur).caller = std::ptr::null_mut();
             if (*cur).is_try {
                 (*cur).is_try = false;
+                // Caught: nothing to report.
+                vm.error_site = None;
                 if !caller.is_null() {
                     resume_caller(vm, caller, err_val);
                 }
@@ -6149,6 +6177,7 @@ mod tests {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
+                native_mark: crate::codegen::runtime_fns::frame_head(),
             });
         }
         vm.fiber = fiber;
@@ -6183,6 +6212,7 @@ mod tests {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
+                native_mark: crate::codegen::runtime_fns::frame_head(),
             });
         }
         vm.fiber = fiber;

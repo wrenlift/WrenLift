@@ -528,9 +528,11 @@ pub mod cl {
                     .store(MemFlags::trusted(), arg, buf_ptr, (i as i32) * 8);
             }
             let count = builder.ins().iconst(types::I64, args.len() as i64);
+            emit_site_enter(builder);
             let call = builder
                 .ins()
                 .call(f, &[receiver, method_val, count, buf_ptr]);
+            emit_site_leave(builder);
             emit_error_poll(builder, module, get_runtime_fn)?;
             return Ok(builder.inst_results(call)[0]);
         }
@@ -548,7 +550,9 @@ pub mod cl {
         let f = get_runtime_fn(module, builder, call_name, 2 + args.len())?;
         let mut call_args = vec![receiver, method_val];
         call_args.extend_from_slice(args);
+        emit_site_enter(builder);
         let call = builder.ins().call(f, &call_args);
+        emit_site_leave(builder);
         emit_error_poll(builder, module, get_runtime_fn)?;
         Ok(builder.inst_results(call)[0])
     }
@@ -1691,10 +1695,196 @@ pub mod cl {
         let err = builder.inst_results(call)[0];
         builder.ins().brif(err, leave, &[], cont, &[]);
         builder.switch_to_block(leave);
+        emit_frame_pop(builder);
+        let return_ty = builder.func.signature.returns[0].value_type;
         let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+        let null = if return_ty == types::F64 {
+            builder.ins().bitcast(types::F64, MemFlags::new(), null)
+        } else {
+            null
+        };
         builder.ins().return_(&[null]);
         builder.switch_to_block(cont);
         Ok(())
+    }
+
+    thread_local! {
+        /// Address of the record head (`JitThread::frame_head`) of the
+        /// thread the compiling body will run on, set by the engine
+        /// around each JIT compile; 0 leaves the body without records.
+        static JIT_FRAME_HEAD_CELL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The body's frame record: its address and, for the body that
+        /// pushed it rather than one writing into its wrapper's, the
+        /// head it displaced.
+        static FRAME_REC: std::cell::Cell<Option<(Value, Option<Value>)>> = const { std::cell::Cell::new(None) };
+        /// Site word of the instruction being lowered: its source
+        /// offset plus one, 0 when it has none.
+        static FRAME_SITE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// The slot a body without a record of its own links one from
+        /// around each call that can raise, all of which are on slow
+        /// paths.
+        static LAZY_SLOT: std::cell::Cell<Option<cranelift_codegen::ir::StackSlot>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Set the record head cell JIT lowering bakes for this thread's
+    /// next compile; pass 0 to clear.
+    pub fn set_jit_frame_head_cell(addr: usize) {
+        JIT_FRAME_HEAD_CELL.with(|c| c.set(addr));
+    }
+
+    /// Whether a body calls out on some path that is not a slow path:
+    /// a method call, a string conversion. Such a body links its frame
+    /// record in its prologue; one whose calls are all slow paths links
+    /// one around each of them instead, so its fast paths pay nothing.
+    pub(crate) fn body_calls(mir: &MirFunction) -> bool {
+        mir.blocks.iter().any(|b| {
+            b.instructions.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    Instruction::Call { .. }
+                        | Instruction::CallKnownFunc { .. }
+                        | Instruction::CallStaticSelf { .. }
+                        | Instruction::SuperCall { .. }
+                        | Instruction::StringConcat(_)
+                        | Instruction::ToString(_)
+                )
+            })
+        })
+    }
+
+    /// Whether a body may leave a frame on the stack when an error is
+    /// raised: it calls, dispatches an operator, or resumes in the
+    /// interpreter. A body of loads, stores and typed arithmetic does
+    /// none of that and keeps no record.
+    pub(crate) fn body_can_raise(mir: &MirFunction) -> bool {
+        mir.blocks.iter().any(|b| {
+            b.instructions.iter().any(|(_, inst)| {
+                !matches!(
+                    inst,
+                    Instruction::BlockParam(_)
+                        | Instruction::Move(_)
+                        | Instruction::ConstNum(_)
+                        | Instruction::ConstBool(_)
+                        | Instruction::ConstNull
+                        | Instruction::ConstString(_)
+                        | Instruction::ConstF64(_)
+                        | Instruction::ConstI64(_)
+                        | Instruction::MathUnaryF64(..)
+                        | Instruction::MathBinaryF64(..)
+                        | Instruction::AddF64(..)
+                        | Instruction::SubF64(..)
+                        | Instruction::MulF64(..)
+                        | Instruction::DivF64(..)
+                        | Instruction::ModF64(..)
+                        | Instruction::NegF64(_)
+                        | Instruction::CmpLtF64(..)
+                        | Instruction::CmpGtF64(..)
+                        | Instruction::CmpLeF64(..)
+                        | Instruction::CmpGeF64(..)
+                        | Instruction::Not(_)
+                        | Instruction::Unbox(_)
+                        | Instruction::Box(_)
+                        | Instruction::GetField(..)
+                        | Instruction::SetField(..)
+                        | Instruction::GetStaticField(_)
+                        | Instruction::SetStaticField(..)
+                        | Instruction::GetModuleVar(_)
+                        | Instruction::SetModuleVar(..)
+                        | Instruction::MakeClosure { .. }
+                        | Instruction::GetUpvalue(_)
+                        | Instruction::SetUpvalue(..)
+                        | Instruction::MakeList(_)
+                        | Instruction::MakeRange(..)
+                        | Instruction::IsType(..)
+                        | Instruction::ListCount(_)
+                        | Instruction::F64ToI64(_)
+                )
+            })
+        })
+    }
+
+    /// Link a record for this body in its frame, holding the displaced
+    /// head; a trace reads the chain. Its key is written by the first
+    /// site, which every reader of the record comes through. The inner
+    /// f64 body writes into its wrapper's record instead.
+    fn emit_frame_push(builder: &mut FunctionBuilder, own: bool) {
+        FRAME_REC.set(None);
+        LAZY_SLOT.set(None);
+        let cell = JIT_FRAME_HEAD_CELL.with(|c| c.get());
+        if cell == 0 {
+            return;
+        }
+        let cellv = builder.ins().iconst(types::I64, cell as i64);
+        let head = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), cellv, 0);
+        if !own {
+            FRAME_REC.set(Some((head, None)));
+            return;
+        }
+        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            16,
+            3,
+        ));
+        let rec = builder.ins().stack_addr(types::I64, slot, 0);
+        builder.ins().store(MemFlags::trusted(), head, rec, 0);
+        builder.ins().store(MemFlags::trusted(), rec, cellv, 0);
+        FRAME_REC.set(Some((rec, Some(head))));
+    }
+
+    /// Before a call that can raise: the record's key names the site.
+    /// A body without a record links one here, for the call's duration.
+    fn emit_site_enter(builder: &mut FunctionBuilder) {
+        let key = jit_func_id() as i64 | ((FRAME_SITE.get() as i64) << 32);
+        if let Some((rec, _)) = FRAME_REC.get() {
+            let key = builder.ins().iconst(types::I64, key);
+            builder.ins().store(MemFlags::trusted(), key, rec, 8);
+        } else if let Some(slot) = LAZY_SLOT.get() {
+            let cell = JIT_FRAME_HEAD_CELL.with(|c| c.get());
+            let cellv = builder.ins().iconst(types::I64, cell as i64);
+            let head = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), cellv, 0);
+            let rec = builder.ins().stack_addr(types::I64, slot, 0);
+            builder.ins().store(MemFlags::trusted(), head, rec, 0);
+            let key = builder.ins().iconst(types::I64, key);
+            builder.ins().store(MemFlags::trusted(), key, rec, 8);
+            builder.ins().store(MemFlags::trusted(), rec, cellv, 0);
+        }
+    }
+
+    /// After such a call: a record linked for it is unlinked.
+    fn emit_site_leave(builder: &mut FunctionBuilder) {
+        if FRAME_REC.get().is_none()
+            && let Some(slot) = LAZY_SLOT.get()
+        {
+            let cell = JIT_FRAME_HEAD_CELL.with(|c| c.get());
+            let cellv = builder.ins().iconst(types::I64, cell as i64);
+            let rec = builder.ins().stack_addr(types::I64, slot, 0);
+            let head = builder.ins().load(types::I64, MemFlags::trusted(), rec, 0);
+            builder.ins().store(MemFlags::trusted(), head, cellv, 0);
+        }
+    }
+
+    /// A deopt helper's function id argument, with bit 32 set when the
+    /// head record is this activation's for the helper to unlink.
+    fn deopt_fid(func_id: u32) -> i64 {
+        func_id as i64
+            | if FRAME_REC.get().is_some() {
+                1 << 32
+            } else {
+                0
+            }
+    }
+
+    /// Before a return: the head is the displaced record again.
+    fn emit_frame_pop(builder: &mut FunctionBuilder) {
+        if let Some((_, Some(head))) = FRAME_REC.get() {
+            let cell = JIT_FRAME_HEAD_CELL.with(|c| c.get());
+            let cellv = builder.ins().iconst(types::I64, cell as i64);
+            builder.ins().store(MemFlags::trusted(), head, cellv, 0);
+        }
     }
 
     /// Iterations an optimised body's outermost loop runs between
@@ -1757,6 +1947,12 @@ pub mod cl {
 
     pub(crate) fn jit_modvars_cell() -> usize {
         JIT_MODVARS_CELL.with(|c| c.get())
+    }
+
+    /// The record head cell baked into this thread's next compile.
+    #[cfg(feature = "llvm")]
+    pub(crate) fn jit_frame_head_cell() -> usize {
+        JIT_FRAME_HEAD_CELL.with(|c| c.get())
     }
 
     /// Whether slot `idx` of the compiling function's module is within
@@ -2048,6 +2244,12 @@ pub mod cl {
                     builder.append_block_param(entry, types::I64);
                 }
                 let entry_params = builder.block_params(entry).to_vec();
+                if body_calls(mir) {
+                    emit_frame_push(&mut builder, true);
+                } else {
+                    FRAME_REC.set(None);
+                    LAZY_SLOT.set(None);
+                }
                 // Collect the BlockParam indices used by the MIR, then
                 // unbox only those params to pass to the inner f64 function.
                 let used_indices: Vec<usize> = mir.blocks[0]
@@ -2134,6 +2336,7 @@ pub mod cl {
                 let i64_result = builder
                     .ins()
                     .bitcast(types::I64, MemFlags::new(), f64_result);
+                emit_frame_pop(&mut builder);
                 builder.ins().return_(&[i64_result]);
                 builder.seal_all_blocks();
                 builder.finalize(module.target_config());
@@ -3026,9 +3229,26 @@ pub mod cl {
         // A splice that failed to lower may have left its receiver here.
         INLINE_CLASS.set(None);
         // A JIT body polls for a pending error after each helper that
-        // can raise; AOT polls at block entries, and the inner f64 body
-        // makes no such calls.
-        ERROR_POLL.set(aot_config.is_none() && f64_self_id.is_none());
+        // can raise; AOT polls at block entries.
+        ERROR_POLL.set(aot_config.is_none());
+        FRAME_REC.set(None);
+        LAZY_SLOT.set(None);
+        FRAME_SITE.set(0);
+        let frame_record = aot_config.is_none() && body_calls(mir);
+        if aot_config.is_none()
+            && f64_self_id.is_none()
+            && !frame_record
+            && body_can_raise(mir)
+            && JIT_FRAME_HEAD_CELL.with(|c| c.get()) != 0
+        {
+            LAZY_SLOT.set(Some(builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    16,
+                    3,
+                ),
+            )));
+        }
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
         for (i, _) in mir.blocks.iter().enumerate() {
@@ -3208,6 +3428,9 @@ pub mod cl {
                 builder.append_block_param(dispatch, types::I64);
             }
             let params = builder.block_params(dispatch).to_vec();
+            if frame_record {
+                emit_frame_push(builder, f64_self_id.is_none());
+            }
             for counter in cold_counters.values() {
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().stack_store(types::I64, zero, *counter, 0);
@@ -3533,7 +3756,7 @@ pub mod cl {
                 builder.switch_to_block(exit_block);
                 emit_live_snapshot(builder, live, &val_map, &raw_bools, &exit_value_types, *buf)?;
                 let buf_ptr = builder.ins().stack_addr(types::I64, *buf, 0);
-                let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
+                let fid = builder.ins().iconst(types::I64, deopt_fid(hook.func_id));
                 let header_id = builder
                     .ins()
                     .iconst(types::I64, retier_header_word(bid, hook.generation));
@@ -3551,6 +3774,7 @@ pub mod cl {
                     .ins()
                     .brif(declined, cont_block, &[], ret_block, &[]);
                 builder.switch_to_block(ret_block);
+                emit_frame_pop(builder);
                 builder.ins().return_(&[result]);
                 builder.switch_to_block(cont_block);
             }
@@ -3573,6 +3797,9 @@ pub mod cl {
                         builder.append_block_param(cl_block, types::F64);
                     }
                     let entry_params = builder.block_params(cl_block).to_vec();
+                    if frame_record {
+                        emit_frame_push(builder, false);
+                    }
                     let mut param_idx = 0usize;
                     for &(vid, ref inst) in &block.instructions {
                         if matches!(inst, Instruction::BlockParam(_)) {
@@ -3593,7 +3820,11 @@ pub mod cl {
                             for _ in 0..arity {
                                 builder.append_block_param(cl_block, types::I64);
                             }
-                            builder.block_params(cl_block).to_vec()
+                            let params = builder.block_params(cl_block).to_vec();
+                            if frame_record {
+                                emit_frame_push(builder, true);
+                            }
+                            params
                         }
                     };
                     if !entry_params.is_empty() {
@@ -3817,6 +4048,7 @@ pub mod cl {
                             .iconst(types::I64, retier_header_word(*header, generation));
                         let n = builder.ins().iconst(types::I64, live.len() as i64);
                         let retier_fn = get_runtime_fn(module, builder, "wren_retier", 4)?;
+                        let fid = builder.ins().iconst(types::I64, deopt_fid(jit_func_id()));
                         let call = builder.ins().call(retier_fn, &[fid, header_id, buf_ptr, n]);
                         let result = builder.inst_results(call)[0];
                         let declined_bits = builder.ins().iconst(
@@ -3829,6 +4061,7 @@ pub mod cl {
                             .ins()
                             .brif(declined, cont_block, &[], ret_block, &[]);
                         builder.switch_to_block(ret_block);
+                        emit_frame_pop(builder);
                         builder.ins().return_(&[result]);
                         builder.switch_to_block(cont_block);
                     } else if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
@@ -3873,6 +4106,12 @@ pub mod cl {
                         | Instruction::CmpLeI64(..)
                         | Instruction::CmpGeI64(..)
                         | Instruction::IsNum(..)
+                );
+                FRAME_SITE.set(
+                    mir.span_map
+                        .get(&vid)
+                        .map(|sp| sp.start as u32 + 1)
+                        .unwrap_or(0),
                 );
                 let result = lower_instruction(
                     inst,
@@ -4009,11 +4248,12 @@ pub mod cl {
                 .stack_store(types::I64, *p, slot, (i * 8) as i32);
         }
         let buf = builder.ins().stack_addr(types::I64, slot, 0);
-        let fid = builder.ins().iconst(types::I64, func_id as i64);
+        let fid = builder.ins().iconst(types::I64, deopt_fid(func_id));
         let n = builder.ins().iconst(types::I64, params.len() as i64);
         let f = get_runtime_fn(module, builder, "wren_deopt_n", 3)?;
         let call = builder.ins().call(f, &[fid, n, buf]);
         let result = builder.inst_results(call)[0];
+        emit_frame_pop(builder);
         builder.ins().return_(&[result]);
         builder.switch_to_block(cont_block);
         Ok(())
@@ -4175,12 +4415,13 @@ pub mod cl {
         value_types: &[MirType],
     ) -> Result<(), String> {
         let (buf, words) = emit_deopt_words(builder, live, val_map, raw_bools, value_types)?;
-        let fid = builder.ins().iconst(types::I64, func_id as i64);
+        let fid = builder.ins().iconst(types::I64, deopt_fid(func_id));
         let pc = builder.ins().iconst(types::I64, pc as i64);
         let n = builder.ins().iconst(types::I64, words as i64);
         let f = get_runtime_fn(module, builder, "wren_deopt_at", 4)?;
         let call = builder.ins().call(f, &[fid, pc, n, buf]);
         let result = builder.inst_results(call)[0];
+        emit_frame_pop(builder);
         builder.ins().return_(&[result]);
         Ok(())
     }
@@ -4364,8 +4605,10 @@ pub mod cl {
             builder.switch_to_block(call_block);
         }
         let f = get_runtime_fn(module, builder, slow_fn, 2)?;
+        emit_site_enter(builder);
         let call = builder.ins().call(f, &[la, lb]);
         let slow_result = builder.inst_results(call)[0];
+        emit_site_leave(builder);
         emit_error_poll(builder, module, get_runtime_fn)?;
         builder
             .ins()
@@ -4574,8 +4817,10 @@ pub mod cl {
 
                 builder.switch_to_block(slow_block);
                 let f = get_runtime_fn(module, builder, "wren_num_neg", 1)?;
+                emit_site_enter(builder);
                 let call = builder.ins().call(f, &[la]);
                 let slow_result = builder.inst_results(call)[0];
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 builder
                     .ins()
@@ -4896,7 +5141,9 @@ pub mod cl {
                     let buf = builder.ins().stack_addr(types::I64, stack_slot, 0);
                     let count = builder.ins().iconst(types::I64, args.len() as i64);
                     let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
+                    emit_site_enter(builder);
                     let call = builder.ins().call(f, &[r, method_val, count, buf]);
+                    emit_site_leave(builder);
                     emit_error_poll(builder, module, get_runtime_fn)?;
                     return Ok(Some(builder.inst_results(call)[0]));
                 }
@@ -5073,7 +5320,9 @@ pub mod cl {
                                     let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
                                     call_args.push(null);
                                 }
+                                emit_site_enter(builder);
                                 let call = builder.ins().call(fn_ref, &call_args);
+                                emit_site_leave(builder);
                                 emit_error_poll(builder, module, get_runtime_fn)?;
                                 builder.inst_results(call)[0]
                             };
@@ -5132,7 +5381,9 @@ pub mod cl {
                                 );
                             }
                             let count = builder.ins().iconst(types::I64, args.len() as i64);
+                            emit_site_enter(builder);
                             let call = builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                            emit_site_leave(builder);
                             emit_error_poll(builder, module, get_runtime_fn)?;
                             builder.inst_results(call)[0]
                         } else {
@@ -5152,7 +5403,9 @@ pub mod cl {
                             for a in args.iter() {
                                 slow_args.push(get(a));
                             }
+                            emit_site_enter(builder);
                             let slow_call = builder.ins().call(f, &slow_args);
+                            emit_site_leave(builder);
                             emit_error_poll(builder, module, get_runtime_fn)?;
                             builder.inst_results(slow_call)[0]
                         };
@@ -5313,7 +5566,9 @@ pub mod cl {
                                     for a in args.iter() {
                                         fast_args.push(get(a));
                                     }
+                                    emit_site_enter(builder);
                                     let fast_call = builder.ins().call(fast_f, &fast_args);
+                                    emit_site_leave(builder);
                                     emit_error_poll(builder, module, get_runtime_fn)?;
                                     let fast_result = builder.inst_results(fast_call)[0];
                                     builder
@@ -5463,7 +5718,9 @@ pub mod cl {
                         let f = get_runtime_fn(module, builder, name, 2 + args.len())?;
                         let mut call_args = vec![packed_val, r];
                         call_args.extend(arg_vals.iter().copied());
+                        emit_site_enter(builder);
                         let call = builder.ins().call(f, &call_args);
+                        emit_site_leave(builder);
                         emit_error_poll(builder, module, get_runtime_fn)?;
                         let fast_result = builder.inst_results(call)[0];
                         builder
@@ -5598,7 +5855,9 @@ pub mod cl {
                             .store(MemFlags::trusted(), get(a), buf_ptr, (i as i32) * 8);
                     }
                     let count = builder.ins().iconst(types::I64, args.len() as i64);
+                    emit_site_enter(builder);
                     let call = builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                    emit_site_leave(builder);
                     emit_error_poll(builder, module, get_runtime_fn)?;
                     builder.inst_results(call)[0]
                 } else {
@@ -5618,7 +5877,9 @@ pub mod cl {
                     for a in args.iter() {
                         call_args.push(get(a));
                     }
+                    emit_site_enter(builder);
                     let result = builder.ins().call(f, &call_args);
+                    emit_site_leave(builder);
                     emit_error_poll(builder, module, get_runtime_fn)?;
                     builder.inst_results(result)[0]
                 };
@@ -5882,7 +6143,9 @@ pub mod cl {
                     for a in args {
                         call_args.push(get(a));
                     }
+                    emit_site_enter(builder);
                     let call = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
+                    emit_site_leave(builder);
                     emit_error_poll(builder, module, get_runtime_fn)?;
                     let fast_result = builder.inst_results(call)[0];
                     builder
@@ -6006,7 +6269,9 @@ pub mod cl {
                     for a in args.iter() {
                         fast_args.push(get(a));
                     }
+                    emit_site_enter(builder);
                     let fast_call = builder.ins().call(fast_f, &fast_args);
+                    emit_site_leave(builder);
                     emit_error_poll(builder, module, get_runtime_fn)?;
                     let fast_result = builder.inst_results(fast_call)[0];
                     builder
@@ -6050,7 +6315,9 @@ pub mod cl {
                     for a in args.iter() {
                         call_args.push(get(a));
                     }
+                    emit_site_enter(builder);
                     let result = builder.ins().call(f, &call_args);
+                    emit_site_leave(builder);
                     emit_error_poll(builder, module, get_runtime_fn)?;
                     Ok(Some(builder.inst_results(result)[0]))
                 } else {
@@ -6117,7 +6384,9 @@ pub mod cl {
                     call_args.push(get(a));
                 }
                 let f = get_runtime_fn(module, builder, call_name, call_args.len())?;
+                emit_site_enter(builder);
                 let result = builder.ins().call(f, &call_args);
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
@@ -6221,7 +6490,9 @@ pub mod cl {
             }
             Instruction::ToString(a) => {
                 let f = get_runtime_fn(module, builder, "wren_to_string", 1)?;
+                emit_site_enter(builder);
                 let result = builder.ins().call(f, &[get(a)]);
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
@@ -6795,8 +7066,10 @@ pub mod cl {
                 // 7. Slow path: existing runtime dispatch.
                 builder.switch_to_block(slow_block);
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_get", 2)?;
+                emit_site_enter(builder);
                 let slow_call = builder.ins().call(slow_fn, &[r, idx]);
                 let slow_result = builder.inst_results(slow_call)[0];
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 builder
                     .ins()
@@ -6812,7 +7085,9 @@ pub mod cl {
                 for a in args {
                     call_args.push(get(a));
                 }
+                emit_site_enter(builder);
                 let result = builder.ins().call(f, &call_args);
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
@@ -6950,8 +7225,10 @@ pub mod cl {
                 //    validation + anything non-TypedArray.
                 builder.switch_to_block(slow_block);
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_set", 3)?;
+                emit_site_enter(builder);
                 let slow_call = builder.ins().call(slow_fn, &[r, idx, val]);
                 let slow_result = builder.inst_results(slow_call)[0];
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 builder
                     .ins()
@@ -6971,7 +7248,9 @@ pub mod cl {
                     call_args.push(get(a));
                 }
                 call_args.push(get(value));
+                emit_site_enter(builder);
                 let result = builder.ins().call(f, &call_args);
+                emit_site_leave(builder);
                 emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
@@ -7560,10 +7839,12 @@ pub mod cl {
                 } else {
                     v
                 };
+                emit_frame_pop(builder);
                 builder.ins().return_(&[v]);
             }
             Terminator::ReturnNull => {
                 let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                emit_frame_pop(builder);
                 builder.ins().return_(&[null]);
             }
             Terminator::Branch { target, args } => {

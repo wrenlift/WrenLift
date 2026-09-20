@@ -58,6 +58,7 @@ unsafe fn setup_fiber_from_closure(
             closure: Some(closure),
             defining_class: (*closure).defining_class_opt(),
             bc_ptr: std::ptr::null(),
+            native_mark: crate::codegen::runtime_fns::frame_head(),
         });
         (*fiber).state = FiberState::New;
     }
@@ -530,9 +531,11 @@ fn try_krio_yield(value: Value) -> Option<Value> {
     // while it is suspended leaves their own behind.
     let jit_ctx = crate::codegen::runtime_fns::read_jit_ctx();
     let jit_depth = crate::codegen::runtime_fns::jit_depth();
+    let frame_head = crate::codegen::runtime_fns::frame_head();
     let received: Option<u64> = krio_fiber::yield_u64(value.to_bits());
     crate::codegen::runtime_fns::set_jit_context(jit_ctx);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+    crate::codegen::runtime_fns::set_frame_head(frame_head);
 
     // Back on the fiber stack — host has reinstalled this fiber's
     // saved roots into JIT_ROOTS_STORE before resuming us.
@@ -747,12 +750,14 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // own when it resumes and leaves it behind when it yields.
     let jit_ctx = crate::codegen::runtime_fns::read_jit_ctx();
     let jit_depth = crate::codegen::runtime_fns::jit_depth();
+    let frame_head = crate::codegen::runtime_fns::frame_head();
     // `resume_with_u64` is the alloc-free counterpart of the
     // generic `resume_with::<u64>` — see the matching comment on
     // `krio_fiber::yield_u64` in `try_krio_yield`.
     let step = unsafe { (*krio_ptr).resume_with_u64(input.to_bits()) };
     crate::codegen::runtime_fns::set_jit_context(jit_ctx);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+    crate::codegen::runtime_fns::set_frame_head(frame_head);
     unsafe {
         crate::runtime::rt::stack_switch(target_id, outgoing);
         crate::runtime::rt::stack_suspended(target_id, (*krio_ptr).saved_sp() as usize);
@@ -853,6 +858,10 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
                 (*target).krio_return_value = Value::null();
                 (*target).is_try = false;
             }
+            // Caught by `try`: nothing to report.
+            if !err.is_null() && was_try && !vm_ptr.is_null() {
+                unsafe { (*vm_ptr).error_site = None };
+            }
             // An error `try` did not ask for aborts the caller too, as
             // Wren does: raised here, on the caller's own run.
             if !err.is_null() && !was_try && !vm_ptr.is_null() {
@@ -933,6 +942,11 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
         (*target_ptr).stack.clear();
         (*target_ptr).stack.push(initial_val);
         (*target_ptr).state = FiberState::Running;
+        // The frame was set up when the fiber was made; the compiled
+        // frames under it are the ones running now.
+        if let Some(frame) = (*target_ptr).mir_frames.first_mut() {
+            frame.native_mark = crate::codegen::runtime_fns::frame_head();
+        }
 
         // Swap the VM's active fiber to `target_ptr` so the
         // interpreter loop runs the right body. The previous
