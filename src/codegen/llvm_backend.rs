@@ -612,6 +612,22 @@ pub mod llvm {
             });
         }
         let sites = code_sites_of(&sections.lock().unwrap());
+        if std::env::var_os("WLIFT_TIER_TRACE").is_some() {
+            let log = sections.lock().unwrap();
+            eprintln!(
+                "tier-trace: llvm {} sections code={:x?} stackmaps={:x?} marks={:?}",
+                safe_name,
+                log.code,
+                log.stackmaps,
+                sites
+                    .iter()
+                    .map(|s| match &s.sites {
+                        crate::codegen::SiteTable::Marks(m) => m.len(),
+                        _ => 0,
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
         Ok(LlvmCompiledCode {
             fn_ptr,
             osr_entries,

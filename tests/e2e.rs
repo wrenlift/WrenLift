@@ -6389,7 +6389,15 @@ Scene.new().run()
         opt_threshold: 4,
         ..VMConfig::default()
     };
+    unsafe {
+        std::env::set_var("WLIFT_FRAME_TRACE", "1");
+        std::env::set_var("WLIFT_TIER_TRACE", "1");
+    }
     let (result, _, _) = run_with_config(src, config);
+    unsafe {
+        std::env::remove_var("WLIFT_FRAME_TRACE");
+        std::env::remove_var("WLIFT_TIER_TRACE");
+    }
     assert!(matches!(result, InterpretResult::RuntimeError));
     let errors = errors.lock().unwrap().clone();
     // Without the colour sequences.
@@ -6592,7 +6600,17 @@ Scene.new().run()
         opt_threshold: 4,
         ..VMConfig::default()
     };
+    // The walk and the tier decisions behind it, shown when the
+    // assertion fails.
+    unsafe {
+        std::env::set_var("WLIFT_FRAME_TRACE", "1");
+        std::env::set_var("WLIFT_TIER_TRACE", "1");
+    }
     let (result, _, _) = run_with_config(src, config);
+    unsafe {
+        std::env::remove_var("WLIFT_FRAME_TRACE");
+        std::env::remove_var("WLIFT_TIER_TRACE");
+    }
     assert!(matches!(result, InterpretResult::RuntimeError));
     let errors = errors.lock().unwrap().clone();
     let mut text = String::new();
