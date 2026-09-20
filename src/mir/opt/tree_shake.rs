@@ -99,8 +99,8 @@ fn collect_class_method_roots(v: crate::runtime::value::Value, worklist: &mut Ve
     };
     // SAFETY: the module var holds a GC-rooted object. We only read
     // immutable header fields plus the methods table; we never follow
-    // freed pointers because the VM keeps live module vars in the
-    // nursery/old gen until shutdown.
+    // freed pointers because the VM keeps live module vars alive
+    // until shutdown.
     unsafe {
         let header = ptr as *const ObjHeader;
         if (*header).obj_type != ObjType::Class {

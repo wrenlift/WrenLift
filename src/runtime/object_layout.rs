@@ -7,55 +7,54 @@
 #[cfg(test)]
 use {super::object::*, super::value::Value, crate::codegen::runtime_fns::JitContext};
 
-// -- ObjHeader (24 bytes on 64-bit) -----------------------------------------
+// -- ObjHeader (16 bytes on 64-bit) -----------------------------------------
 
 pub const HEADER_OBJ_TYPE: i32 = 0; // u8
 pub const HEADER_GC_MARK: i32 = 1; // u8
-pub const HEADER_GENERATION: i32 = 2; // u8
+pub const HEADER_FLAGS: i32 = 2; // u8
 // 5 bytes padding
-pub const HEADER_NEXT: i32 = 8; // *mut ObjHeader
-pub const HEADER_CLASS: i32 = 16; // *mut ObjClass
-pub const HEADER_SIZE: i32 = 24;
+pub const HEADER_CLASS: i32 = 8; // *mut ObjClass
+pub const HEADER_SIZE: i32 = 16;
 
 // -- ObjClass ------------------------------------------------------------------
 
 /// `*mut u8`: one `FIELD_*` byte per instance field, or null.
-pub const CLASS_FIELD_KINDS: i32 = 24;
+pub const CLASS_FIELD_KINDS: i32 = 16;
 /// u8 of `CLASS_FLAG_*` bits.
-pub const CLASS_FLAGS: i32 = 32;
+pub const CLASS_FLAGS: i32 = 24;
 /// u16: instance field count.
-pub const CLASS_NUM_FIELDS: i32 = 72;
+pub const CLASS_NUM_FIELDS: i32 = 64;
 /// `ObjType::Instance` as the header's type byte.
 pub const OBJ_TYPE_INSTANCE: u8 = 9;
 /// The class or an ancestor other than Object defines `==` or `!=`, so
 /// equality on its instances is not identity.
 pub const CLASS_FLAG_EQ: u8 = 1;
 
-// -- ObjInstance (40 bytes) --------------------------------------------------
+// -- ObjInstance (32 bytes) --------------------------------------------------
 
-pub const INSTANCE_NUM_FIELDS: i32 = 24; // u32
+pub const INSTANCE_NUM_FIELDS: i32 = 16; // u32
 // 4 bytes padding
-pub const INSTANCE_FIELDS: i32 = 32; // *mut Value
-pub const INSTANCE_SIZE: i32 = 40;
+pub const INSTANCE_FIELDS: i32 = 24; // *mut Value
+pub const INSTANCE_SIZE: i32 = 32;
 
 // -- ObjList (40 bytes) -----------------------------------------------------
 
-pub const LIST_COUNT: i32 = 24; // u32
-pub const LIST_CAPACITY: i32 = 28; // u32
-pub const LIST_ELEMENTS: i32 = 32; // *mut Value
-pub const LIST_ELEM_CLASS: i32 = 40; // usize
-pub const LIST_SIZE: i32 = 48;
+pub const LIST_COUNT: i32 = 16; // u32
+pub const LIST_CAPACITY: i32 = 20; // u32
+pub const LIST_ELEMENTS: i32 = 24; // *mut Value
+pub const LIST_ELEM_CLASS: i32 = 32; // usize
+pub const LIST_SIZE: i32 = 40;
 
-// -- ObjTypedArray (40 bytes) -----------------------------------------------
+// -- ObjTypedArray (32 bytes) -----------------------------------------------
 //
 // Shared backing storage for ByteArray / Int32Array / Float32Array / Float64Array.
 // The `kind` byte (0=U8, 1=F32, 2=F64, 3=I32) drives element size + load/store
 // width.
 
-pub const TYPED_ARRAY_COUNT: i32 = 24; // u32 — element count
-pub const TYPED_ARRAY_KIND: i32 = 28; // u8 — TypedArrayKind tag
-pub const TYPED_ARRAY_DATA: i32 = 32; // *mut u8 — raw backing buffer
-pub const TYPED_ARRAY_SIZE: i32 = 40;
+pub const TYPED_ARRAY_COUNT: i32 = 16; // u32 — element count
+pub const TYPED_ARRAY_KIND: i32 = 20; // u8 — TypedArrayKind tag
+pub const TYPED_ARRAY_DATA: i32 = 24; // *mut u8 — raw backing buffer
+pub const TYPED_ARRAY_SIZE: i32 = 32;
 
 // ObjType discriminant for TypedArray. Must match the
 // `ObjType::TypedArray` variant position (13th, 0-indexed = 12).
@@ -68,11 +67,11 @@ pub const TA_KIND_F32: u8 = 1;
 pub const TA_KIND_F64: u8 = 2;
 pub const TA_KIND_I32: u8 = 3;
 
-// -- ObjSimd (48 bytes) ----------------------------------------------------
+// -- ObjSimd (40 bytes) ----------------------------------------------------
 
-pub const SIMD_KIND: i32 = 24; // u8 — SimdKind tag
-pub const SIMD_LANES: i32 = 32; // [u32; 4] raw lane payload
-pub const SIMD_SIZE: i32 = 48;
+pub const SIMD_KIND: i32 = 16; // u8 — SimdKind tag
+pub const SIMD_LANES: i32 = 24; // [u32; 4] raw lane payload
+pub const SIMD_SIZE: i32 = 40;
 
 // ObjType discriminant for ObjSimd.
 pub const OBJ_TYPE_SIMD: u8 = 13;
@@ -86,21 +85,21 @@ pub const SIMD_KIND_I32X4: u8 = 1;
 // `upvalues` is a `Vec<*mut ObjUpvalue>` whose internal layout is
 // `(cap, ptr, len)` on current stable Rust — `Vec::as_ptr()`
 // returns the value at offset 8 inside the Vec. The closure's
-// `upvalues` field starts at byte 32, so the data-pointer field
-// lives at byte 40. The `verify_closure_data_ptr_offset` test
+// `upvalues` field starts at byte 24, so the data-pointer field
+// lives at byte 32. The `verify_closure_data_ptr_offset` test
 // pins this against `Vec::as_ptr()` so a future Rust layout
 // change fails loudly instead of silently miscompiling — JIT
 // inlining walks raw memory through this offset and a stale
 // constant points at `cap` instead of `ptr`, returning bogus
 // addresses on every upvalue access.
 
-pub const CLOSURE_FUNCTION: i32 = 24; // *mut ObjFn
-pub const CLOSURE_UPVALUES_DATA: i32 = 40; // *mut *mut ObjUpvalue (Vec data ptr)
+pub const CLOSURE_FUNCTION: i32 = 16; // *mut ObjFn
+pub const CLOSURE_UPVALUES_DATA: i32 = 32; // *mut *mut ObjUpvalue (Vec data ptr)
 
 // -- ObjUpvalue --------------------------------------------------------------
 
-pub const UPVALUE_LOCATION: i32 = 24; // *mut Value (open) or &closed (closed)
-pub const UPVALUE_CLOSED: i32 = 32; // Value (closed-over storage)
+pub const UPVALUE_LOCATION: i32 = 16; // *mut Value (open) or &closed (closed)
+pub const UPVALUE_CLOSED: i32 = 24; // Value (closed-over storage)
 
 // -- JitContext --------------------------------------------------------------
 //
@@ -130,11 +129,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<ObjHeader>(), HEADER_SIZE as usize);
         assert_eq!(memoffset_of!(ObjHeader, obj_type), HEADER_OBJ_TYPE as usize);
         assert_eq!(memoffset_of!(ObjHeader, gc_mark), HEADER_GC_MARK as usize);
-        assert_eq!(
-            memoffset_of!(ObjHeader, generation),
-            HEADER_GENERATION as usize
-        );
-        assert_eq!(memoffset_of!(ObjHeader, next), HEADER_NEXT as usize);
+        assert_eq!(memoffset_of!(ObjHeader, flags), HEADER_FLAGS as usize);
         assert_eq!(memoffset_of!(ObjHeader, class), HEADER_CLASS as usize);
     }
 

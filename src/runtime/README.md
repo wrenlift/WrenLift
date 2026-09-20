@@ -27,8 +27,7 @@ Every heap-allocated object begins with an `ObjHeader` containing:
 
 - `obj_type: ObjType` -- `#[repr(u8)]` discriminant for runtime type dispatch
 - `gc_mark: u8` -- tri-color marking (0=white, 1=gray, 2=black)
-- `generation: u8` -- 0=young (nursery), 1=old
-- `next: *mut ObjHeader` -- intrusive linked list for GC sweep
+- `flags: u8` -- per-object flag bits (`FLAG_*` in `object.rs`)
 - `class: *mut ObjClass` -- class pointer for method dispatch
 
 All `Obj*` structs are `#[repr(C)]` with `ObjHeader` as the first field, enabling safe casting between `*mut ObjHeader` and concrete object types via `downcast_ref`/`downcast_mut`.
@@ -54,7 +53,7 @@ Method dispatch is O(1) via `HashMap<SymbolId, Method>` lookup, where `SymbolId`
 
 ## Garbage Collector
 
-The default collector (`gc_immix.rs`, `--gc immix`, `WLIFT_GC=immix`) is a
+The collector (`gc_immix.rs`) is a
 non-moving mark-sweep whose memory comes through the runtime seam
 (`rt.rs`): a versioned `#[repr(C)]` table of function-pointer slots for
 allocation, address resolution, the per-cycle liveness claim, the stack
@@ -75,57 +74,10 @@ behind the header. Free blocks beyond a small float are returned to the
 OS after a quiet collection. Knobs: `WLIFT_GC_HEAP_MB`,
 `WLIFT_GC_TRIGGER_MB`, `WLIFT_GC_GROWTH`, `WLIFT_GC_STRESS`.
 
-The generational collector below remains selectable with
-`--gc generational`.
-
-## Generational Garbage Collector
-
-Two-generation collector with bump-allocated nursery and mark-sweep old generation.
-
-### Nursery (young generation)
-
-A contiguous `Vec<u8>` arena with bump-pointer allocation. Allocation is O(1): align the bump pointer, write the object, advance. Default size is 256 KB. When the nursery is full, new allocations overflow directly to the old generation.
-
-### Old generation
-
-Box-allocated objects linked via the `ObjHeader::next` intrusive list. Mark-sweep collection: unreachable objects are freed by reconstructing the `Box` and dropping it.
-
-### Minor GC
-
-1. Mark from roots using a gray stack (tri-color marking).
-2. Mark from the remembered set (old-to-young references).
-3. Process the gray stack (mark gray objects black, trace their references).
-4. Walk nursery objects: promote live (marked) objects to old gen via `ptr::read` into a new `Box`; drop dead objects in place.
-5. Build a forwarding table (old nursery address to new old-gen address) and update all roots, old-gen internal pointers, and the intern table.
-6. Reset the nursery bump pointer to 0.
-7. Reset marks on old-gen objects.
-
-Special handling for `ObjUpvalue`: when a closed upvalue is promoted, its self-referential `location` pointer (pointing to its own `closed` field in the nursery) is fixed up to point to the new location.
-
-### Major GC
-
-Same as minor GC, followed by a sweep of dead old-gen objects. Triggered every N minor collections (default 8, configurable via `major_gc_interval`).
-
-### Write barrier
-
-When an old-gen object receives a reference to a young-gen object, the old-gen object is added to the remembered set. This ensures minor GC can find young objects reachable only through old-gen references. The barrier is a no-op for young-to-young or old-to-old writes.
-
-### String interning
-
-Hash-based deduplication via `HashMap<u64, Vec<*mut ObjString>>` keyed by FNV-1a hash. Interned strings are collected when unreachable (no pinning). The intern table is updated during pointer forwarding after promotion.
-
-### Adaptive threshold
-
-After each collection, the old-gen threshold is recalculated as `max(live_count * heap_grow_factor, initial_threshold)`. Default grow factor is 2.0, default initial threshold is 256 objects. Collection is triggered when the nursery exceeds 75% usage or old-gen object count exceeds the threshold.
-
-### Configuration (`GcConfig`)
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `nursery_size` | 256 KB | Arena size in bytes |
-| `initial_threshold` | 256 | Minimum old-gen object count before GC triggers |
-| `heap_grow_factor` | 2.0 | Multiplier for adaptive threshold |
-| `major_gc_interval` | 8 | Minor collections between each major collection |
+The collector is the only one; `--gc-stats` prints its counters and the
+pause split (stop / mark / sweep). String interning deduplicates through
+a hash table keyed by FNV-1a hash; interned strings are collected when
+unreachable.
 
 ## Fiber Runtime
 

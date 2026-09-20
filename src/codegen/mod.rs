@@ -25,7 +25,6 @@ pub mod cfg;
 pub mod cranelift_backend;
 #[cfg(feature = "llvm")]
 pub mod llvm_backend;
-pub mod native_meta;
 pub mod regalloc;
 // `runtime_fns` is mostly small TLS / context shims that the BC
 // interpreter calls into too; the JIT-only entry points (naked
@@ -38,7 +37,6 @@ pub mod wasm;
 pub mod x86_64;
 
 use std::fmt;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Virtual Registers
@@ -1925,12 +1923,8 @@ pub enum CompiledFunction {
 }
 
 /// Full compilation artifact for native targets.
-///
-/// The metadata is not consumed by the runtime yet, but preserving it now
-/// gives tiered execution a place to hang precise native-frame rooting data.
 pub struct CompiledArtifact {
     pub code: CompiledFunction,
-    pub native_meta: Option<Arc<native_meta::NativeFrameMetadata>>,
     /// True if the compiled code has shadow stores and needs a shadow frame
     /// pushed before execution. Determined by `needs_native_shadow_stack`.
     pub needs_shadow_frame: bool,
@@ -2384,7 +2378,6 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             let module = wasm::emit_mir(mir)?;
             Ok(CompiledArtifact {
                 code: CompiledFunction::Wasm(module),
-                native_meta: None,
                 needs_shadow_frame: false,
             })
         }
@@ -2430,11 +2423,10 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 )?;
                 return Ok(CompiledArtifact {
                     code: CompiledFunction::LlvmOwned(compiled),
-                    native_meta: None,
                     needs_shadow_frame: false,
                 });
             }
-            let mut compiled = cranelift_backend::cl::compile_mir(
+            let compiled = cranelift_backend::cl::compile_mir(
                 mir_ref,
                 interner,
                 callsite_ic_ptrs.as_deref(),
@@ -2443,20 +2435,9 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 inline_bodies.clone(),
                 cha_by_method.clone(),
             )?;
-            // Pull the GC root metadata out before we move `compiled`
-            // into the `CompiledFunction` wrapper. Cranelift's
-            // user-stack-map output, translated by
-            // `native_meta_from_cranelift`, gives the GC scanner the
-            // same per-safepoint live-spill view the in-tree backend
-            // already produces — without it, every Cranelift-compiled
-            // frame is invisible to the GC and any Wren `Value` held
-            // in a register or spill slot across a runtime-helper
-            // call goes stale on a collection.
-            let native_meta = compiled.native_meta.take().map(Arc::new);
             let code = CompiledFunction::CraneliftOwned(compiled);
             Ok(CompiledArtifact {
                 code,
-                native_meta,
                 needs_shadow_frame: false,
             })
         }
@@ -2509,9 +2490,6 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 Target::Wasm => unreachable!(),
             };
             let alloc = regalloc::allocate_registers_result(&mach, &target_regs);
-            let mut native_meta = Some(Arc::new(native_meta::build_native_frame_metadata(
-                &mach, &alloc,
-            )));
             regalloc::apply_allocation(&mut mach, &alloc, target_regs.frame_reserved);
             fixup_sentinels(&mut mach, target);
             // Resolve any remaining parallel copies after register allocation.
@@ -2521,12 +2499,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             // Mov sequence. The postalloc resolver detects these and inserts
             // scratch-register temporaries to break cycles.
             resolve_parallel_copies_postalloc(&mut mach, target);
-            runtime_fns::link_runtime_calls(
-                &mut mach,
-                target,
-                &alloc.assignments,
-                native_meta.as_deref(),
-            );
+            runtime_fns::link_runtime_calls(&mut mach, target, &alloc.assignments);
             insert_callee_saves(&mut mach, target);
 
             // JIT frame registration for GC stack walking. Non-leaf functions
@@ -2552,33 +2525,11 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             let code = match target {
                 Target::X86_64 => {
                     let emitted = x86_64::emit(&mach)?;
-                    // Patch safepoint code offsets from emitted call positions.
-                    if let Some(ref mut meta) = native_meta {
-                        let meta = Arc::make_mut(meta);
-                        for &(inst_idx, offset) in &emitted.call_offsets {
-                            for sp in &mut meta.safepoints {
-                                if sp.inst_index == inst_idx as u32 {
-                                    sp.code_offset = offset;
-                                }
-                            }
-                        }
-                    }
                     CompiledFunction::X86_64(emitted)
                 }
                 #[cfg(target_arch = "aarch64")]
                 Target::Aarch64 => {
                     let compiled = aarch64::emit(&mach)?;
-                    // Patch safepoint code offsets from emitted call positions.
-                    if let Some(ref mut meta) = native_meta {
-                        let meta = Arc::make_mut(meta);
-                        for &(inst_idx, offset) in &compiled.call_offsets {
-                            for sp in &mut meta.safepoints {
-                                if sp.inst_index == inst_idx as u32 {
-                                    sp.code_offset = offset;
-                                }
-                            }
-                        }
-                    }
                     CompiledFunction::Aarch64(compiled)
                 }
                 #[cfg(not(target_arch = "aarch64"))]
@@ -2590,7 +2541,6 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
 
             Ok(CompiledArtifact {
                 code,
-                native_meta,
                 needs_shadow_frame: has_shadow_stores,
             })
         }

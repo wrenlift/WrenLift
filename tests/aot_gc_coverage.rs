@@ -1,27 +1,13 @@
-//! Phase 4 — per-pattern AOT GC stress tests.
+//! Per-pattern AOT GC stress tests.
 //!
 //! Each test compiles a tiny Wren program that exercises a
 //! specific MIR-instruction class (allocators, mutators,
 //! call chains, fibers, …) in a tight loop, then runs the
-//! resulting binary under:
-//!
-//! - `WLIFT_AOT_GC=1` — opt into the AOT GC path.
-//! - `WLIFT_GC_STRESS=1` — force collection at every
-//!   `finish_alloc` so any stale-reference bug surfaces
-//!   immediately.
-//! - `WLIFT_VALIDATE_BARRIERS=1` — pre-collect remembered-set
-//!   check in both directions (missed barriers + stale sources).
-//!
-//! A clean exit means every alloc-site survives a GC fired at
-//! that exact instruction's safepoint, with full barrier
-//! coverage. Any panic / segfault / non-zero exit identifies the
+//! resulting binary under `WLIFT_GC_STRESS=1`, which collects at
+//! every allocation so a stale reference surfaces at once. A clean
+//! exit means every allocation site survives a collection fired
+//! there; any panic, segfault or non-zero exit identifies the
 //! offending lowering or runtime helper.
-//!
-//! These tests target the latent bug exposed by the larger
-//! nursery in `b4f6775` (sustained mix died on
-//! `trace_object+1112` after a few requests). Stress mode
-//! ensures the bug surfaces in <1 s of test time instead of
-//! after ~100 site requests.
 //!
 //! Skipped on Windows (different linker driver) and on builds
 //! without the `aot` feature.
@@ -64,9 +50,7 @@ fn run_under_stress(source: &str) -> (i32, String, String) {
     link_executable(&obj, &staticlib(), &exe).expect("link_executable");
 
     let output = Command::new(&exe)
-        .env("WLIFT_AOT_GC", "1")
         .env("WLIFT_GC_STRESS", "1")
-        .env("WLIFT_VALIDATE_BARRIERS", "1")
         .output()
         .expect("execute aot binary");
 
@@ -83,14 +67,7 @@ fn assert_clean(label: &str, exit: i32, stderr: &str) {
         exit, 0,
         "{label}: non-zero exit ({exit}). stderr:\n{stderr}"
     );
-    for bad in [
-        "WRITE BARRIER BUG",
-        "STALE-SOURCE",
-        "ALIAS-DETECT",
-        "STACKMAP COVERAGE GAP",
-        "fatal runtime error",
-        "panicked at",
-    ] {
+    for bad in ["fatal runtime error", "panicked at"] {
         assert!(
             !stderr.contains(bad),
             "{label}: stderr contains `{bad}`. full stderr:\n{stderr}"

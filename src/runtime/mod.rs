@@ -4,7 +4,6 @@ pub mod fiber;
 pub mod gc;
 pub mod gc_immix;
 pub mod gc_immix_heap;
-pub mod gc_ringbuf;
 pub mod gc_trait;
 #[cfg(feature = "host")]
 pub mod isolate;

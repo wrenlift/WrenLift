@@ -505,7 +505,7 @@ pub unsafe extern "C" fn wlift_aot_alloc_const_string(
 /// shape the JIT uses when one helper recurses into another.
 ///
 /// The runtime helpers that survived the AOT lowering rewrite
-/// (`wren_call_*`, `wren_make_*`, `wren_write_barrier`, etc.)
+/// (`wren_call_*`, `wren_make_*`, etc.)
 /// consult this context via `with_context` — without setting it
 /// up first, they'd see a null `vm` and short-circuit to a no-op
 /// or null return, manifesting as silent failures inside AOT'd
@@ -708,12 +708,6 @@ pub unsafe extern "C" fn wlift_aot_install_class(
                 cls.methods[idx] = Some(method);
                 cls.note_bound_signature(sig);
             }
-            // The class is pinned in old gen (`alloc_class`)
-            // and the closure was just allocated — possibly in
-            // nursery. Without the barrier the next minor GC
-            // doesn't trace closure through class.methods and
-            // the slot dangles. Validator direction-1 surfaces
-            // this as `class.method[N]`.
         }
     }
 
@@ -788,122 +782,6 @@ unsafe fn aot_intern_name(
         Ok(s) => vm.interner.intern(s),
         Err(_) => vm.interner.intern(default_name),
     }
-}
-
-/// Per-safepoint descriptor for `wlift_aot_register_code_range`.
-/// The bootstrap emits one of these per Cranelift user stack map
-/// captured during AOT lowering. `roots_start` + `roots_count`
-/// index into the per-function flat root-offsets array.
-#[cfg(feature = "aot")]
-#[repr(C)]
-pub struct WliftAotSafepointDesc {
-    /// Bytes from the function's entry to the return address
-    /// after the call instruction this safepoint covers. Matches
-    /// `(saved_lr - code_range.start)` at GC time.
-    pub code_offset: u32,
-    /// Index of the first root spill offset in the per-function
-    /// roots blob.
-    pub roots_start: u32,
-    /// Number of consecutive `i32` root spill offsets at
-    /// `roots[roots_start..roots_start+roots_count]`.
-    pub roots_count: u32,
-}
-
-/// Register an AOT-compiled function's code range + safepoint
-/// metadata with the engine so the GC stack walker can scan its
-/// frames during a collection cycle. AOT bodies are entered
-/// directly from the linker's `main()` (no per-call helper to
-/// push a `jit_frame_entry`), so without this registration the
-/// stack walker has no way to find them and any GC fired from
-/// inside an alloc helper sweeps live spill slots.
-///
-/// Symmetric to the JIT path's `register_code_range` call inside
-/// `engine::install_compiled_function`. The runtime synthesises a
-/// fresh `FuncId` (we don't need the same id as
-/// `register_aot_function` — the GC walker keys metadata off the
-/// `code_range`'s `func_id` field, which we control here).
-///
-/// # Safety
-///
-/// `fn_ptr` must point at the function's entry; `code_size` must
-/// match what Cranelift emitted (`CompiledCode::code_info().total_size`).
-/// `safepoints` and `roots` must be valid `[WliftAotSafepointDesc]`
-/// and `[i32]` arrays of the given lengths; the bootstrap satisfies
-/// these by emitting them as `Linkage::Local` `Data` blobs.
-#[unsafe(no_mangle)]
-#[cfg(feature = "aot")]
-pub unsafe extern "C" fn wlift_aot_register_code_range(
-    vm: *mut WrenVM,
-    fn_ptr: *const u8,
-    code_size: u32,
-    safepoints: *const WliftAotSafepointDesc,
-    safepoints_count: u32,
-    roots: *const i32,
-) -> c_int {
-    use crate::codegen::native_meta::{
-        LiveRootMetadata, NativeFrameMetadata, RootLocation, SafepointKind, SafepointMetadata,
-    };
-    use std::sync::Arc;
-
-    if vm.is_null() || fn_ptr.is_null() {
-        return 70;
-    }
-    let vm_ref = unsafe { &mut *vm };
-
-    let sp_slice: &[WliftAotSafepointDesc] = if safepoints.is_null() || safepoints_count == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(safepoints, safepoints_count as usize) }
-    };
-
-    let mut safepoints_meta: Vec<SafepointMetadata> = Vec::with_capacity(sp_slice.len());
-    for (ord, sp) in sp_slice.iter().enumerate() {
-        let mut live_roots: Vec<LiveRootMetadata> = Vec::with_capacity(sp.roots_count as usize);
-        if sp.roots_count > 0 && !roots.is_null() {
-            let root_slice = unsafe {
-                std::slice::from_raw_parts(
-                    roots.add(sp.roots_start as usize),
-                    sp.roots_count as usize,
-                )
-            };
-            for (slot, &offset) in root_slice.iter().enumerate() {
-                live_roots.push(LiveRootMetadata {
-                    slot: slot as u16,
-                    location: RootLocation::Spill(offset),
-                });
-            }
-        }
-        safepoints_meta.push(SafepointMetadata {
-            ordinal: ord as u32,
-            inst_index: 0,
-            code_offset: sp.code_offset,
-            kind: SafepointKind::CallRuntime,
-            live_roots,
-        });
-    }
-
-    let metadata = Arc::new(NativeFrameMetadata {
-        boxed_values: Vec::new(),
-        safepoints: safepoints_meta,
-        spill_safe_nonleaf: true,
-    });
-
-    // Synthesise a placeholder FuncId for code_range bookkeeping.
-    // The GC walker keys metadata off the code_range; the engine's
-    // `jit_metadata` slot for that FuncId needs the same Arc so
-    // `scan_native_stack_roots` finds it.
-    let name_sym = vm_ref.interner.intern("<aot-frame>");
-    let func_id = vm_ref
-        .engine
-        .register_aot_function(name_sym, 0, fn_ptr, None);
-    let start = fn_ptr as usize;
-    vm_ref
-        .engine
-        .set_aot_metadata(func_id, Arc::clone(&metadata));
-    vm_ref
-        .engine
-        .register_code_range(func_id, start, start + code_size as usize, metadata);
-    0
 }
 
 /// One foreign-method install descriptor: signature + the
@@ -1853,10 +1731,6 @@ pub extern "C" fn wrenSetListElement(
             index as usize
         };
         list.set(idx, elem);
-        // Inter-gen edge — old-gen list receiver gets a young
-        // value from a plugin write. Without this barrier the
-        // edge never enters the remembered_set and the next
-        // minor GC drops the young object behind the list.
     }
 }
 

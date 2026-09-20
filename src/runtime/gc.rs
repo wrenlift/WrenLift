@@ -14,6 +14,10 @@ pub struct GcStats {
     pub peak_objects: usize,
     /// Total time spent in GC (nanoseconds).
     pub gc_time_ns: u64,
+    /// Of which: reaching the pause, marking, and sweeping.
+    pub stop_ns: u64,
+    pub mark_ns: u64,
+    pub sweep_ns: u64,
 }
 
 // A header pointer read from a slot is followed only when it lies in

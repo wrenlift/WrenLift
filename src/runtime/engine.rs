@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
-use crate::codegen::native_meta::NativeFrameMetadata;
 use crate::codegen::{CompileTier, ExecutableFunction, NativeOsrEntry};
 use crate::intern::SymbolId;
 use crate::mir::MirFunction;
@@ -475,7 +474,6 @@ enum CompilationResult {
         serial: u32,
         tier: CompileTier,
         executable: ExecutableFunction,
-        native_meta: Option<Arc<NativeFrameMetadata>>,
         inline_safe: bool,
     },
     Failed {
@@ -847,24 +845,6 @@ fn mir_calls_any_tainted_method(
     false
 }
 
-/// Determine leaf status from compiled code metadata. A function is leaf if
-/// its only safepoints are self-calls (CallLocal or wren_call_static_self_*).
-/// This replaces MIR-level analysis which can't predict conditional CallRuntime
-/// emission (e.g., SetField with/without write barrier).
-#[allow(dead_code)]
-fn is_compiled_leaf(
-    native_meta: &Option<std::sync::Arc<crate::codegen::native_meta::NativeFrameMetadata>>,
-) -> bool {
-    native_meta
-        .as_ref()
-        .map(|meta| {
-            meta.safepoints
-                .iter()
-                .all(|sp| sp.kind == crate::codegen::native_meta::SafepointKind::CallLocal)
-        })
-        .unwrap_or(true)
-}
-
 /// Check if a MIR function can stay on the direct native fast path for the
 /// given compilation tier.
 fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
@@ -976,7 +956,6 @@ pub struct ExecutionEngine {
     /// Whether the currently active native tier can use the direct fast path.
     pub jit_leaf: Vec<bool>,
     /// Preserved native-frame metadata for compiled functions.
-    pub jit_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
     /// Active execution tier for each function.
     pub tier_states: Vec<TierState>,
     /// Per-function tier and dispatch statistics.
@@ -1023,7 +1002,6 @@ pub struct ExecutionEngine {
     /// Whether baseline-native code can use the direct fast path.
     pub baseline_leaf: Vec<bool>,
     /// Baseline native metadata indexed by FuncId.
-    pub baseline_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
     /// Optimized native code pointers indexed by FuncId.
     pub optimized_code: Vec<*const u8>,
     /// Optimized native OSR entry points indexed by FuncId.
@@ -1031,7 +1009,6 @@ pub struct ExecutionEngine {
     /// Whether optimized-native code can use the direct fast path.
     pub optimized_leaf: Vec<bool>,
     /// Optimized native metadata indexed by FuncId.
-    pub optimized_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
     /// Per function, the counters its baseline code reads and writes;
     /// boxed so the address baked into the code stays valid.
     #[allow(clippy::vec_box)]
@@ -1079,15 +1056,13 @@ pub struct ExecutionEngine {
     pub type_profiles: Vec<Option<TypeProfile>>,
     /// Code ranges for compiled functions, sorted by start address.
     /// Used by GC stack walker to map return addresses → safepoint metadata.
-    pub code_ranges: Vec<CodeRange>,
     /// AOT-binary modvars / consts data regions registered at
     /// startup. Each `(addr, count)` is a slice of `count` u64
-    /// `Value`-bits the GC scans + writes back forwarded
-    /// pointers to. `engine.modules` is empty under AOT (the
-    /// bootstrap doesn't go through `interpret`'s install loop),
-    /// so without these the const strings + closure pointers in
-    /// `wlift_modvars_<n>` and `wlift_consts_<n>` aren't roots
-    /// and a minor GC sweeps them while the AOT body still
+    /// `Value`-bits the GC scans as roots. `engine.modules` is
+    /// empty under AOT (the bootstrap doesn't go through
+    /// `interpret`'s install loop), so without these the const
+    /// strings + closure pointers in `wlift_modvars_<n>` and
+    /// `wlift_consts_<n>` would be swept while the AOT body still
     /// references them via `GetModuleVar`.
     pub aot_root_regions: Vec<(*mut u64, usize)>,
     /// Threaded-code cache indexed by FuncId. Lazily populated on first
@@ -1195,15 +1170,6 @@ fn auto_deopt_retry_tick(id: FuncId) -> bool {
         }
         false
     })
-}
-
-/// Address range of a compiled function's native code.
-#[derive(Debug, Clone)]
-pub struct CodeRange {
-    pub start: usize,
-    pub end: usize,
-    pub func_id: FuncId,
-    pub metadata: Arc<NativeFrameMetadata>,
 }
 
 /// Stable view of a module's variable storage for compiled code.
@@ -1320,7 +1286,6 @@ impl ExecutionEngine {
             wasm_jit_slots: Vec::new(),
             wasm_call_counts: Vec::new(),
             jit_leaf: Vec::new(),
-            jit_metadata: Vec::new(),
             tier_states: Vec::new(),
             tier_stats: Vec::new(),
             func_modules: Vec::new(),
@@ -1337,11 +1302,9 @@ impl ExecutionEngine {
             pending_cold_osr: HashMap::new(),
             cold_osr_probes: HashMap::new(),
             baseline_leaf: Vec::new(),
-            baseline_metadata: Vec::new(),
             optimized_code: Vec::new(),
             optimized_osr_entries: Vec::new(),
             optimized_leaf: Vec::new(),
-            optimized_metadata: Vec::new(),
             tier_cells: Vec::new(),
             promote_retry_at: Vec::new(),
             promote_refused: Vec::new(),
@@ -1358,7 +1321,6 @@ impl ExecutionEngine {
             llvm_worker: None,
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
-            code_ranges: Vec::new(),
             aot_root_regions: Vec::new(),
             #[cfg(feature = "host")]
             threaded_code: Vec::new(),
@@ -1402,7 +1364,6 @@ impl ExecutionEngine {
         self.wasm_jit_slots.push(0);
         self.wasm_call_counts.push(0);
         self.jit_leaf.push(false);
-        self.jit_metadata.push(None);
         self.tier_states.push(TierState::Interpreted);
         self.tier_stats.push(FuncTierStats::default());
         self.func_modules.push(module);
@@ -1414,11 +1375,9 @@ impl ExecutionEngine {
         self.baseline_osr_entries.push(Vec::new());
         self.cold_osr_blocks.push(std::collections::HashSet::new());
         self.baseline_leaf.push(false);
-        self.baseline_metadata.push(None);
         self.optimized_code.push(std::ptr::null());
         self.optimized_osr_entries.push(Vec::new());
         self.optimized_leaf.push(false);
-        self.optimized_metadata.push(None);
         self.tier_cells.push(Box::new(TierCell::default()));
         self.promote_retry_at.push(0);
         self.promote_refused.push(false);
@@ -1453,7 +1412,7 @@ impl ExecutionEngine {
     /// `jit_code[id]` with the native pointer so the existing JIT
     /// dispatch path drives the call without ever walking MIR. The
     /// stub `MirFunction` keeps the engine's per-function vectors
-    /// (tier_states, jit_metadata, …) in lock-step; runtime helpers
+    /// (tier_states, jit_code, …) in lock-step; runtime helpers
     /// consult the slot via fn_id but never read the empty body.
     pub fn register_aot_function(
         &mut self,
@@ -1510,54 +1469,6 @@ impl ExecutionEngine {
 pub const WASM_JIT_THRESHOLD: u32 = 50;
 
 impl ExecutionEngine {
-    /// Install per-function `NativeFrameMetadata` into the slot
-    /// the GC stack walker reads. Used by the AOT install path:
-    /// AOT functions are registered via `register_aot_function`
-    /// (which pushes a `None` at `jit_metadata[func_id]`); the
-    /// follow-up `register_code_range` call needs the metadata
-    /// slot populated for `scan_native_stack_roots` to find the
-    /// safepoint live-roots when it walks the fp chain.
-    ///
-    /// JIT functions take a different path: their metadata is
-    /// staged in `baseline_metadata` / `optimized_metadata` and
-    /// promoted to `jit_metadata` by `set_tier_state`.
-    pub fn set_aot_metadata(&mut self, func_id: FuncId, metadata: Arc<NativeFrameMetadata>) {
-        let idx = func_id.0 as usize;
-        if idx < self.jit_metadata.len() {
-            self.jit_metadata[idx] = Some(metadata);
-        }
-    }
-
-    /// Register a compiled function's code range for GC stack walking.
-    pub fn register_code_range(
-        &mut self,
-        func_id: FuncId,
-        code_start: usize,
-        code_end: usize,
-        metadata: Arc<NativeFrameMetadata>,
-    ) {
-        self.code_ranges.push(CodeRange {
-            start: code_start,
-            end: code_end,
-            func_id,
-            metadata,
-        });
-        // Keep sorted by start address for binary search.
-        self.code_ranges.sort_by_key(|r| r.start);
-    }
-
-    /// Find the compiled function containing a given return address.
-    /// Used by GC stack walker to look up safepoint metadata.
-    pub fn find_code_range(&self, addr: usize) -> Option<&CodeRange> {
-        // Binary search: find the last range whose start <= addr
-        let idx = self.code_ranges.partition_point(|r| r.start <= addr);
-        if idx == 0 {
-            return None;
-        }
-        let range = &self.code_ranges[idx - 1];
-        if addr < range.end { Some(range) } else { None }
-    }
-
     /// Get the MIR for a function by ID.
     /// Returns an Arc clone so the caller can hold it without borrowing the engine.
     pub fn get_mir(&self, id: FuncId) -> Option<Arc<MirFunction>> {
@@ -2320,14 +2231,12 @@ impl ExecutionEngine {
             TierState::Interpreted => {
                 self.jit_code[idx] = std::ptr::null();
                 self.jit_leaf[idx] = false;
-                self.jit_metadata[idx] = None;
                 // Bead's OSR table is cleared by `reload()` / `blacklist()`
                 // which the deopt path in record_bailout already drives.
             }
             TierState::BaselineNative => {
                 self.jit_code[idx] = self.baseline_code[idx];
                 self.jit_leaf[idx] = self.baseline_leaf[idx];
-                self.jit_metadata[idx] = self.baseline_metadata[idx].clone();
                 if !self.baseline_code[idx].is_null() {
                     let entries = encode_osr_entries(&self.baseline_osr_entries[idx]);
                     self.tier
@@ -2337,7 +2246,6 @@ impl ExecutionEngine {
             TierState::OptimizedNative => {
                 self.jit_code[idx] = self.optimized_code[idx];
                 self.jit_leaf[idx] = self.optimized_leaf[idx];
-                self.jit_metadata[idx] = self.optimized_metadata[idx].clone();
                 if !self.optimized_code[idx].is_null() {
                     let entries = encode_osr_entries(&self.optimized_osr_entries[idx]);
                     self.tier
@@ -3646,7 +3554,6 @@ impl ExecutionEngine {
         idx: usize,
         tier: CompileTier,
         executable: ExecutableFunction,
-        native_meta: Option<Arc<NativeFrameMetadata>>,
         inline_safe: bool,
     ) {
         let native_ptr = if executable.is_native() {
@@ -3714,7 +3621,6 @@ impl ExecutionEngine {
                 self.baseline_osr_entries[idx] = osr_entries.clone();
                 self.cold_osr_blocks[idx] = self.pending_cold_osr.remove(&idx).unwrap_or_default();
                 self.baseline_leaf[idx] = inline_safe;
-                self.baseline_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::BaselineNative;
                 // Publish code + OSR table to the bead atomically.
                 // `install_or_swap_osr` picks eager-install or swap
@@ -3748,7 +3654,6 @@ impl ExecutionEngine {
                 self.optimized_osr_entries[idx] = osr_entries.clone();
                 self.cold_osr_blocks[idx] = self.pending_cold_osr.remove(&idx).unwrap_or_default();
                 self.optimized_leaf[idx] = inline_safe;
-                self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
                 self.optimized_gen[idx] += 1;
                 self.optimized_llvm[idx] = llvm;
@@ -3808,51 +3713,6 @@ impl ExecutionEngine {
                     eprint!("{:02x}", b);
                 }
                 eprintln!();
-            }
-        }
-        // Register code range for GC stack walking.
-        if !native_ptr.is_null()
-            && let Some(meta) = self.jit_metadata.get(idx).and_then(|m| m.clone())
-        {
-            let func_id = FuncId(idx as u32);
-            let start = native_ptr as usize;
-            // Get code size from the executable stored in functions.
-            let code_size = match self.functions.get(idx) {
-                Some(FuncBody::Native {
-                    baseline_executable,
-                    optimized_executable,
-                    ..
-                }) => {
-                    if let Some(opt) = optimized_executable {
-                        opt.code_size()
-                    } else {
-                        baseline_executable.code_size()
-                    }
-                }
-                _ => 0,
-            };
-            if code_size > 0 {
-                self.code_ranges.retain(|r| r.func_id != func_id);
-                if std::env::var_os("WLIFT_TRACE_CODE_RANGE").is_some() {
-                    eprintln!(
-                        "code-range: register f{} {:#x}-{:#x} size={}",
-                        func_id.0,
-                        start,
-                        start + code_size,
-                        code_size
-                    );
-                }
-                // Dump raw machine code hex for offline disassembly.
-                if std::env::var_os("WLIFT_DUMP_HEX").is_some() {
-                    eprint!("HEX:f{}:{}:", func_id.0, code_size);
-                    let code_bytes =
-                        unsafe { std::slice::from_raw_parts(start as *const u8, code_size) };
-                    for b in code_bytes {
-                        eprint!("{:02x}", b);
-                    }
-                    eprintln!();
-                }
-                self.register_code_range(func_id, start, start + code_size, meta);
             }
         }
         // Selective IC invalidation: only clear IC entries that reference
@@ -4408,7 +4268,6 @@ impl ExecutionEngine {
             Ok(compiled) => compiled,
             Err(_) => return false,
         };
-        let native_meta = compiled.native_meta;
         // Use MIR analysis for leaf classification. Shadow frame push/pop
         // is handled by each dispatch path via metadata checks, so even if
         // a "leaf" function needs shadow stores, they'll be set up correctly.
@@ -4421,7 +4280,7 @@ impl ExecutionEngine {
             Ok(executable) => executable,
             Err(_) => return false,
         };
-        self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
+        self.install_compiled_tier(idx, tier, executable, inline_safe);
         true
     }
 
@@ -4694,7 +4553,7 @@ impl ExecutionEngine {
         // fresh compiled pointer but a stale (empty) OSR table.
         //
         // The richer install artifact (ExecutableFunction ownership,
-        // native_meta, tier) still travels back to the interpreter
+        // tier) still travels back to the interpreter
         // thread through `compilation_tx` so `poll_compilations` can
         // finish the engine-side install at a safepoint.
         let compile_fn = move || -> beadie::OsrCompileResult {
@@ -4769,7 +4628,6 @@ impl ExecutionEngine {
                 })
                 .ok()
                 .and_then(|artifact| {
-                    let native_meta = artifact.native_meta;
                     let inline_safe =
                         is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
                     artifact
@@ -4787,7 +4645,6 @@ impl ExecutionEngine {
                             serial,
                             tier,
                             executable,
-                            native_meta,
                             inline_safe,
                         })
                 });
@@ -4983,12 +4840,11 @@ impl ExecutionEngine {
                 if let CompilationResult::Compiled {
                     tier,
                     executable,
-                    native_meta,
                     inline_safe,
                     ..
                 } = result
                 {
-                    self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
+                    self.install_compiled_tier(idx, tier, executable, inline_safe);
                     // Stash callees for predictive pre-compile. The
                     // actual submits happen later in `drain_compile_queue`
                     // where we have interner access for env-var filtering.

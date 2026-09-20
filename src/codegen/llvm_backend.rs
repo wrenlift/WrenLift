@@ -3404,12 +3404,12 @@ pub mod llvm {
             let slow = self.new_block("lls");
             let merge = self.new_block("llm");
             let p = self.bump_alloc(bump, self.c64(size), slow)?;
-            // Header: list type with the heap-buffer flag, no next, the
-            // list class; count and capacity share a word; the elements
+            // Header: list type with the heap-buffer flag, the list
+            // class; count and capacity share a word; the elements
             // follow.
-            let type_word = ObjType::List as u64 | ((FLAG_HEAP_BUFFER as u64) << 24);
+            let type_word =
+                ObjType::List as u64 | ((FLAG_HEAP_BUFFER as u64) << (HEADER_FLAGS * 8));
             self.store64(p, 0, self.c64(type_word))?;
-            self.store64(p, HEADER_NEXT as i64, self.c64(0))?;
             self.store64(p, HEADER_CLASS as i64, self.c64(list_class as u64))?;
             self.store64(
                 p,
@@ -3514,11 +3514,10 @@ pub mod llvm {
                 }
             };
             let p = self.bump_alloc(bump, size, slow)?;
-            // Header: type byte, clear mark/generation/flags, no next,
-            // the class, the field count, no owned fields, the fields
-            // right after the header.
+            // Header: type byte, clear mark and flags, the class, the
+            // field count, no owned fields, the fields right after the
+            // header.
             self.store64(p, 0, self.c64(OBJ_TYPE_INSTANCE as u64))?;
-            self.store64(p, HEADER_NEXT as i64, self.c64(0))?;
             self.store64(p, HEADER_CLASS as i64, class)?;
             self.store64(p, INSTANCE_NUM_FIELDS as i64, nf)?;
             let fields = self

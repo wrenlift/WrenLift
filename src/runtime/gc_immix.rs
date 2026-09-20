@@ -231,6 +231,8 @@ impl ImmixGc {
         let start = Instant::now();
         ACTIVE_HEAP.set(self.heap);
         unsafe { rt::collect_begin(self.heap) };
+        let marking = Instant::now();
+        self.stats.stop_ns += (marking - start).as_nanos() as u64;
         let mut gray = Gray {
             heap: self.heap,
             builtin: rt::heap_is_builtin(),
@@ -251,6 +253,7 @@ impl ImmixGc {
             }
         }
         gray.drain();
+        self.stats.mark_ns += marking.elapsed().as_nanos() as u64;
         self.finish_collection(start);
     }
 
@@ -260,7 +263,9 @@ impl ImmixGc {
         let this: *mut ImmixGc = self;
         let heap = self.heap;
         let prev = CLOSING.replace(this);
+        let sweeping = Instant::now();
         unsafe { rt::collect_end(heap) };
+        self.stats.sweep_ns += sweeping.elapsed().as_nanos() as u64;
         CLOSING.set(prev);
         let m = unsafe { rt::stats(heap) };
         self.stats.objects_allocated += self.threaded_allocs.swap(0, Ordering::Relaxed);

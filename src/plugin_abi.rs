@@ -284,13 +284,10 @@ pub unsafe extern "C" fn wlift_plugin_typed_array_bytes(
 //
 // Plugins doing multi-allocation foreign methods (parse-event-list,
 // build-frame-info-map, etc.) need a way to keep already-allocated
-// receivers alive across subsequent allocator calls that may trigger
-// nursery GC. Without rooting, a stale local `Value` held in Rust
-// after a forwarding GC decodes to the from-space pointer; a later
-// `map_set` / `list_add` then mutates a zombie cell and corrupts the
-// successor object's header (smearing NaN-tagged bits into
-// `ObjHeader.class`, surfacing as a `trace_object` SIGSEGV on the
-// next GC). The pattern's documented in `wlift_gpu`'s `buffer_read_bytes`
+// receivers alive across subsequent allocator calls that may collect.
+// Without rooting, a local `Value` held only in Rust is invisible to
+// the collector, and a later `map_set` / `list_add` then writes
+// through a freed object. The pattern's documented in `wlift_gpu`'s `buffer_read_bytes`
 // (re-reads `slot(0)` after each alloc); these primitives extend that
 // discipline to plugins that need MORE than slot(0)'s single root.
 //
@@ -319,9 +316,7 @@ pub unsafe extern "C" fn wlift_plugin_push_root(_vm: *mut (), value: u64) -> u32
     idx as u32
 }
 
-/// Re-read a rooted value at the given absolute slot index. Always
-/// returns the live (post-forwarding) bits — GC updates the slot
-/// in place when nursery objects promote.
+/// Re-read a rooted value at the given absolute slot index.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_plugin_jit_root_at(_vm: *mut (), idx: u32) -> u64 {
     crate::codegen::runtime_fns::jit_root_at(idx as usize).to_bits()

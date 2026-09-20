@@ -13,7 +13,7 @@
 //! Beadie doesn't model WrenLift-specific compile-time context:
 //! inline-cache snapshots, back-edge counts for OSR, on-stack-
 //! replacement safepoints, the rich post-compile install that
-//! touches `jit_code`/`tier_states`/`code_ranges`. All of that lives
+//! touches `jit_code`/`tier_states`. All of that lives
 //! engine-side; the compile closure captures what it needs and
 //! returns the raw native pointer for beadie's state machine, while
 //! the richer `ExecutableFunction` travels back to the main thread

@@ -1516,9 +1516,9 @@ impl<'a> MirWasmEmitter<'a> {
                     // Inline path. ObjInstance layout (#[repr(C)]):
                     //   header   : ObjHeader  // offset 0, with
                     //                          // obj_type: u8 at byte 0
-                    //   num_fields : u32        // offset 24
-                    //   fields_owned : bool     // offset 28
-                    //   fields   : *mut Value   // offset 32
+                    //   num_fields : u32        // offset 16
+                    //   fields_owned : bool     // offset 20
+                    //   fields   : *mut Value   // offset 24
                     //
                     // Wasm pseudocode:
                     //
@@ -1530,7 +1530,7 @@ impl<'a> MirWasmEmitter<'a> {
                     //   if (result i64)
                     //     local.get $recv
                     //     i32.wrap_i64
-                    //     i32.load  offset=32   ;; fields data ptr
+                    //     i32.load  offset=24   ;; fields data ptr
                     //     i64.load  offset=idx*8;; field value
                     //   else
                     //     local.get $recv
@@ -1548,9 +1548,9 @@ impl<'a> MirWasmEmitter<'a> {
                     //
                     // `mem::offset_of!(ObjInstance, fields)`
                     // resolves to the layout for the target arch
-                    // the codegen is being COMPILED for: 32 on
+                    // the codegen is being COMPILED for: 24 on
                     // host x86_64 (8-byte pointers, host tests),
-                    // ~20 on wasm32 (4-byte pointers, runtime
+                    // ~16 on wasm32 (4-byte pointers, runtime
                     // tier-up via wlift_wasm cdylib). Same idea
                     // for `header.obj_type` — at offset 0 on both
                     // arches but stating it explicitly avoids a

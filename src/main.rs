@@ -571,18 +571,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
     }
 
     if cli.gc_stats {
-        let stats = vm.gc.stats();
-        eprintln!("--- GC Stats ---");
-        eprintln!("  collections:        {}", stats.collections);
-        eprintln!("  objects allocated:  {}", stats.objects_allocated);
-        eprintln!("  objects freed:      {}", stats.objects_freed);
-        eprintln!("  peak objects:       {}", stats.peak_objects);
-        eprintln!("  total allocated:    {} KB", stats.total_allocated / 1024);
-        eprintln!("  total freed:        {} KB", stats.total_freed / 1024);
-        eprintln!(
-            "  gc time:            {:.3}s",
-            stats.gc_time_ns as f64 / 1e9
-        );
+        print_gc_stats(&vm);
     }
     // The VM is never dropped below, so its exit-time report runs here.
     if std::env::var_os("WLIFT_TIER_STATS").is_some() {
@@ -1268,9 +1257,7 @@ fn run_hatch(bytes: &[u8], cli: &Cli) {
         InterpretResult::RuntimeError => process::exit(70),
     }
     if cli.gc_stats {
-        let stats = vm.gc.stats();
-        eprintln!("--- GC Stats ---");
-        eprintln!("  collections:        {}", stats.collections);
+        print_gc_stats(&vm);
     }
 }
 
@@ -1299,10 +1286,30 @@ fn run_bytecode(bytes: &[u8], filename: &str, cli: &Cli) {
         InterpretResult::RuntimeError => process::exit(70),
     }
     if cli.gc_stats {
-        let stats = vm.gc.stats();
-        eprintln!("--- GC Stats ---");
-        eprintln!("  collections:        {}", stats.collections);
+        print_gc_stats(&vm);
     }
+}
+
+/// Print the collector's counters and pause split for `--gc-stats`.
+fn print_gc_stats(vm: &VM) {
+    let stats = vm.gc.stats();
+    eprintln!("--- GC Stats ---");
+    eprintln!("  collections:        {}", stats.collections);
+    eprintln!("  objects allocated:  {}", stats.objects_allocated);
+    eprintln!("  objects freed:      {}", stats.objects_freed);
+    eprintln!("  peak objects:       {}", stats.peak_objects);
+    eprintln!("  total allocated:    {} KB", stats.total_allocated / 1024);
+    eprintln!("  total freed:        {} KB", stats.total_freed / 1024);
+    eprintln!(
+        "  gc time:            {:.3}s",
+        stats.gc_time_ns as f64 / 1e9
+    );
+    eprintln!(
+        "    stop / mark / sweep: {:.3}s / {:.3}s / {:.3}s",
+        stats.stop_ns as f64 / 1e9,
+        stats.mark_ns as f64 / 1e9,
+        stats.sweep_ns as f64 / 1e9
+    );
 }
 
 fn main() {

@@ -133,8 +133,6 @@ pub struct ObjHeader {
     pub obj_type: ObjType, // offset 0, u8
     /// GC mark bit / tri-color byte. 0 = white, 1 = gray, 2 = black.
     pub gc_mark: u8, // offset 1
-    /// GC generation. 0 = young (nursery), 1 = old.
-    pub generation: u8, // offset 2
     /// Misc per-object flags. Bit 0 = `ARENA_ALLOCATED`: set when
     /// this object's storage was bump-allocated into a fiber's
     /// `wlift_region::Region` rather than the GC heap, so the
@@ -142,13 +140,11 @@ pub struct ObjHeader {
     /// foreign-method return, cross-fiber field write) know to
     /// deep-copy to the GC heap before the source fiber's region
     /// can drop. Bits 1-7 reserved.
-    pub flags: u8, // offset 3
-    // 4 bytes padding (implicit)
-    /// Intrusive linked list of all heap objects (for GC sweep).
-    pub next: *mut ObjHeader, // offset 8
+    pub flags: u8, // offset 2
+    // 5 bytes padding (implicit)
     /// The class of this object (for method dispatch). Null for meta-objects.
-    pub class: *mut ObjClass, // offset 16
-                              // total: 24 bytes
+    pub class: *mut ObjClass, // offset 8
+                              // total: 16 bytes
 }
 
 /// Per-object header-flag bits. See [`ObjHeader::flags`].
@@ -163,9 +159,7 @@ impl ObjHeader {
         Self {
             obj_type,
             gc_mark: 0,
-            generation: 0,
             flags: 0,
-            next: std::ptr::null_mut(),
             class: std::ptr::null_mut(),
         }
     }
@@ -280,10 +274,10 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// A growable array with JIT-friendly raw buffer layout.
 #[repr(C)]
 pub struct ObjList {
-    pub header: ObjHeader,    // offset 0, 24 bytes
-    pub count: u32,           // offset 24
-    pub capacity: u32,        // offset 28
-    pub elements: *mut Value, // offset 32, heap-allocated buffer
+    pub header: ObjHeader,    // offset 0, 16 bytes
+    pub count: u32,           // offset 16
+    pub capacity: u32,        // offset 20
+    pub elements: *mut Value, // offset 24, heap-allocated buffer
     /// The class of every element ever written, kept by every write:
     /// 0 while none has been, `ELEM_CLASS_MIXED` once elements of two
     /// classes or a non-object have been. Equal to a class, it lets
@@ -575,12 +569,12 @@ impl fmt::Debug for ObjList {
 /// (no allocation). The buffer is freed in `Drop`.
 #[repr(C)]
 pub struct ObjTypedArray {
-    pub header: ObjHeader, // offset 0, 24 bytes
-    pub count: u32,        // offset 24: element count (not byte count)
-    pub kind: u8,          // offset 28: TypedArrayKind encoded as u8
-    _pad: [u8; 3],         // offset 29..32
-    pub data: *mut u8,     // offset 32: raw byte buffer
-                           // total: 40 bytes (matches ObjList)
+    pub header: ObjHeader, // offset 0, 16 bytes
+    pub count: u32,        // offset 16: element count (not byte count)
+    pub kind: u8,          // offset 20: TypedArrayKind encoded as u8
+    _pad: [u8; 3],         // offset 21..24
+    pub data: *mut u8,     // offset 24: raw byte buffer
+                           // total: 32 bytes
 }
 
 impl ObjTypedArray {
@@ -724,11 +718,11 @@ impl fmt::Debug for ObjTypedArray {
 /// underlying bytes.
 #[repr(C)]
 pub struct ObjSimd {
-    pub header: ObjHeader, // offset 0, 24 bytes
-    pub kind: u8,          // offset 24: SimdKind encoded as u8
-    _pad: [u8; 7],         // offset 25..32
-    pub lanes: [u32; 4],   // offset 32: raw lane bits
-                           // total: 48 bytes
+    pub header: ObjHeader, // offset 0, 16 bytes
+    pub kind: u8,          // offset 16: SimdKind encoded as u8
+    _pad: [u8; 7],         // offset 17..24
+    pub lanes: [u32; 4],   // offset 24: raw lane bits
+                           // total: 40 bytes
 }
 
 impl ObjSimd {
@@ -1534,8 +1528,8 @@ pub trait NativeContext {
     /// Allocate a string through the intern table: if an ObjString with
     /// the same bytes already exists, returns the existing pointer
     /// instead of allocating a fresh one. Used by parsers (JSON, etc.)
-    /// where keys repeat heavily; saves both nursery pressure and
-    /// later hashmap-key churn on the consumer side.
+    /// where keys repeat heavily; saves both allocation and later
+    /// hashmap-key churn on the consumer side.
     fn intern_string(&mut self, s: String) -> Value;
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value;
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value;
@@ -1566,9 +1560,8 @@ pub trait NativeContext {
     // -- Fiber operations --
     fn alloc_fiber(&mut self) -> *mut ObjFiber;
     /// Charge off-heap bytes (e.g. a krio fiber's mmap stack) against
-    /// the GC's collection-trigger pressure. The Wren heap arena is
-    /// tiny relative to a 1 MiB krio stack, so `should_collect`'s
-    /// nursery accounting misses them entirely without this hook.
+    /// the GC's collection-trigger pressure, which counts heap bytes
+    /// only and would never see a 1 MiB krio stack otherwise.
     fn track_external_alloc(&mut self, bytes: usize);
     /// Foreign-method-side safepoint: if the GC's `should_collect`
     /// trips, run a collection now. Useful for idle-prone foreign
@@ -1820,11 +1813,11 @@ impl fmt::Debug for ObjClass {
 /// every instance fits one heap allocation.
 #[repr(C)]
 pub struct ObjInstance {
-    pub header: ObjHeader,  // offset 0, 24 bytes
-    pub num_fields: u32,    // offset 24
-    pub fields_owned: bool, // offset 28 (in padding before *mut)
-    pub fields: *mut Value, // offset 32
-                            // total: 40 bytes
+    pub header: ObjHeader,  // offset 0, 16 bytes
+    pub num_fields: u32,    // offset 16
+    pub fields_owned: bool, // offset 20 (in padding before *mut)
+    pub fields: *mut Value, // offset 24
+                            // total: 32 bytes
 }
 
 /// Fields a class may have, its superclasses' included.
@@ -1862,7 +1855,7 @@ impl ObjInstance {
         instance
     }
 
-    /// Create an instance with an externally-managed fields pointer (e.g. nursery bump-allocated).
+    /// Create an instance with an externally-managed fields pointer.
     /// The fields pointer will NOT be freed on drop.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new_with_fields(class: *mut ObjClass, num_fields: u32, fields: *mut Value) -> Self {

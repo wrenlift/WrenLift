@@ -2628,10 +2628,8 @@ fn handle_jit_fiber_action(
                 Vec::new()
             };
             // Root target / caller across run_fiber the same way the
-            // SM-poll branch above does — run_fiber drives the BC
-            // interpreter which can fire GC, and any nursery-
-            // promoted fiber pointer held only as a Rust local
-            // here would go stale post-promotion.
+            // SM-poll branch above does: run_fiber drives the BC
+            // interpreter, which can collect.
             let target_root_idx = jit_roots_snapshot_len();
             push_jit_root(Value::object(target as *mut u8));
             let caller_root_idx = if !caller.is_null() {
@@ -4366,14 +4364,6 @@ fn make_list_impl(elements: &[u64]) -> u64 {
 }
 
 /// Add a single element to an existing list.
-///
-/// Routes through `gc.write_barrier` after the add so the
-/// remembered set captures any old→young edge created by the
-/// insert. Without this, a minor GC fired between this call and
-/// a later traversal would sweep the young element and leave the
-/// list's `elements[i]` dangling — surfaces later as the
-/// `WRITE BARRIER BUG: old List → young raw, desc: list[N]`
-/// validator panic.
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_list_add(list_val: u64, elem: u64) {
     let list = Value::from_bits(list_val);
@@ -4412,14 +4402,6 @@ pub extern "C" fn wren_make_list_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// Set a key-value pair on a map object.
-///
-/// Routes through `gc.write_barrier` for both the key and the value
-/// after the insert so that old→young edges land in the remembered
-/// set. Without these, a minor GC fired between this insert and a
-/// later traversal of the map would treat the young key/value as
-/// unreachable and sweep it, leaving the map's entries dangling
-/// (surfaces later as a SIGSEGV in `update_old_gen_pointers_inline`
-/// when the hasher dereferences the stale string).
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_map_set(map_val: u64, key: u64, value: u64) {
     let map = Value::from_bits(map_val);
@@ -4491,16 +4473,8 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     // Root the closure before upvalue allocations.
     push_jit_root(Value::object(closure_ptr as *mut u8));
 
-    // Populate upvalues with captured values (pre-closed).
-    // CRITICAL: `alloc_upvalue` can trigger a minor GC that
-    // promotes the closure to old-gen. If we then write through
-    // the stale `closure_ptr`, we mutate a freed nursery slot and
-    // the live (forwarded) closure ends up with garbage upvalues.
-    // Refresh the closure pointer from JIT_ROOTS_STORE every
-    // iteration — the GC forwards the slot in place, so reading
-    // it back always yields the current address. Then enroll the
-    // old(closure) -> young(upvalue) edge in remembered_set so a
-    // subsequent minor GC traces through the new upvalue.
+    // Populate upvalues with captured values (pre-closed); the
+    // closure is read back through its root each iteration.
     let closure_root_idx = jit_roots_len() - 1;
     for (i, &uv_bits) in upvalue_vals.iter().enumerate() {
         let captured_val = Value::from_bits(uv_bits);
@@ -4518,12 +4492,8 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     }
 
     // The closure (and its function object) were pushed as
-    // intermediate roots during the upvalue allocation loop; the
-    // upvalue allocs may have triggered a minor GC that
-    // forwarded the closure pointer in place inside
-    // `JIT_ROOTS_STORE`. Read the forwarded value back out
-    // before popping so `finish_alloc` sees the live closure
-    // pointer, not the stale local `closure_ptr`.
+    // intermediate roots during the upvalue allocation loop; read
+    // the rooted value back before popping.
     let closure_val = pop_jit_root().expect("closure root vanished");
     unsafe { finish_alloc(vm, closure_val) }
 }
@@ -4702,138 +4672,6 @@ pub extern "C" fn wren_is_type(val: u64, class_sym: u64) -> u64 {
     Value::bool(false).to_bits()
 }
 
-#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
-unsafe fn dladdr_symbol_runtime(addr: *const ()) -> Option<String> {
-    unsafe {
-        let mut info: libc::Dl_info = std::mem::zeroed();
-        if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
-            return None;
-        }
-        let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
-        cstr.to_str().ok().map(|s| s.to_string())
-    }
-}
-#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
-unsafe fn dladdr_symbol_runtime(_addr: *const ()) -> Option<String> {
-    None
-}
-
-/// Diagnostic: receiver is a FORWARDED nursery object. Walk the
-/// native frame chain, resolve each AOT return address via dladdr,
-/// and print "<symbol>+<offset>" for every AOT frame on the stack.
-/// This pinpoints which AOT call site is holding the stale pointer
-/// so a codegen fix (adding declare_value_needs_stack_map) can be
-/// applied at the right spot. The site has to be one whose stack
-/// map didn't cover the list/string receiver across the call that
-/// triggered the minor GC and forwarded it.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn dump_stale_subscript_frames(obj_ptr: *const u8, recv: Value, idx: Value) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SEEN: AtomicU32 = AtomicU32::new(0);
-    // Cap reporting so a hot loop doesn't bury the terminal.
-    if SEEN.fetch_add(1, Ordering::Relaxed) >= 4 {
-        return;
-    }
-    eprintln!(
-        "[stale-subscript] recv={:#018x} obj_ptr={:p} idx={:#018x} — \
-         FORWARDED receiver detected; AOT frame chain below:",
-        recv.to_bits(),
-        obj_ptr,
-        idx.to_bits()
-    );
-    let mut fp: usize;
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack));
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack));
-    }
-    let mut walked = 0;
-    let max_frames = 64;
-    while fp != 0 && walked < max_frames {
-        walked += 1;
-        if fp & 7 != 0 {
-            break;
-        }
-        let saved_fp = unsafe { *(fp as *const usize) };
-        let saved_ret = unsafe { *((fp + 8) as *const usize) };
-        if saved_ret == 0 {
-            break;
-        }
-        // Find the smallest registered code range that contains saved_ret.
-        let vm = unsafe { vm_ref() };
-        let range = vm.and_then(|vm| {
-            vm.engine
-                .code_ranges
-                .iter()
-                .find(|r| saved_ret >= r.start && saved_ret < r.end)
-                .map(|r| (r.start, r.end, r.func_id.0))
-        });
-        if let Some((cr_start, _cr_end, func_id)) = range {
-            let offset = saved_ret.wrapping_sub(cr_start);
-            let sym = unsafe { dladdr_symbol_runtime(cr_start as *const ()) };
-            eprintln!(
-                "  #{walked:02} ret={saved_ret:#x} +{offset} func_id={func_id} sym={}",
-                sym.unwrap_or_else(|| "<unknown>".to_string())
-            );
-            // For the FIRST (topmost) AOT frame — the immediate caller of
-            // wren_subscript_get — also dump that frame's safepoint
-            // live_roots and the actual slot values, so we can see whether
-            // the receiver slot was tracked by the stack map.
-            if walked == 1 {
-                let vm = unsafe { vm_ref() };
-                if let Some(vm) = vm
-                    && let Some(meta) = vm
-                        .engine
-                        .jit_metadata
-                        .get(func_id as usize)
-                        .and_then(|m| m.as_ref())
-                {
-                    let sp = meta
-                        .safepoints
-                        .iter()
-                        .find(|sp| sp.code_offset == offset as u32);
-                    if let Some(sp) = sp {
-                        eprintln!(
-                            "    safepoint at +{offset} has {} live root(s):",
-                            sp.live_roots.len()
-                        );
-                        for (i, root) in sp.live_roots.iter().enumerate() {
-                            use crate::codegen::native_meta::RootLocation;
-                            let slot_str = match root.location {
-                                RootLocation::Spill(off) => {
-                                    let addr = (saved_fp as isize + off as isize) as *const u64;
-                                    let bits = unsafe { *addr };
-                                    format!(
-                                        "fp+{} = {:#018x}{}",
-                                        off,
-                                        bits,
-                                        if bits == recv.to_bits() {
-                                            " *** matches recv ***"
-                                        } else {
-                                            ""
-                                        }
-                                    )
-                                }
-                                _ => format!("{:?}", root.location),
-                            };
-                            eprintln!("      [{i}] {slot_str}");
-                        }
-                    } else {
-                        eprintln!("    no safepoint at +{offset} (GAP)");
-                    }
-                }
-            }
-        }
-        fp = saved_fp;
-    }
-}
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn dump_stale_subscript_frames(_obj_ptr: *const u8, _recv: Value, _idx: Value) {}
-
 /// Subscript get (`list[idx]` or `map[key]`).
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
@@ -4843,17 +4681,6 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
     if recv.is_object() {
         let ptr = recv.as_object().unwrap();
         let header = ptr as *const ObjHeader;
-        // Diagnostic: if the receiver is a FORWARDED nursery object, the caller
-        // is holding a stale pointer past a minor GC. Dump the AOT frame chain
-        // (resolved via dladdr) so the responsible call site is identifiable
-        // from a single failing request. Gated on WLIFT_TRACE_STALE_SUBSCRIPT=1.
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if env_flag(&ON, "WLIFT_TRACE_STALE_SUBSCRIPT") {
-            const FORWARDED: u8 = 3;
-            if unsafe { (*header).gc_mark } == FORWARDED {
-                dump_stale_subscript_frames(ptr, recv, idx);
-            }
-        }
         let obj_type = unsafe { (*header).obj_type };
 
         match obj_type {
@@ -6752,7 +6579,6 @@ pub fn link_runtime_calls(
     mf: &mut MachFunc,
     target: super::Target,
     assignments: &std::collections::HashMap<VReg, crate::codegen::regalloc::Location>,
-    native_meta: Option<&crate::codegen::native_meta::NativeFrameMetadata>,
 ) {
     let (abi_args, abi_ret, call_scratch, copy_scratch) = abi_regs(target);
     if abi_args.is_empty() {
@@ -6765,57 +6591,19 @@ pub fn link_runtime_calls(
     };
 
     enum PendingCall {
-        Runtime(
-            usize,
-            &'static str,
-            Vec<VReg>,
-            Option<VReg>,
-            Option<Vec<crate::codegen::native_meta::LiveRootMetadata>>,
-        ),
-        Local(
-            usize,
-            Label,
-            Vec<VReg>,
-            Option<VReg>,
-            Option<Vec<crate::codegen::native_meta::LiveRootMetadata>>,
-        ),
+        Runtime(usize, &'static str, Vec<VReg>, Option<VReg>),
+        Local(usize, Label, Vec<VReg>, Option<VReg>),
         Indirect(usize, VReg, Vec<VReg>, Option<VReg>),
     }
 
     let mut call_sites: Vec<PendingCall> = Vec::new();
-    let mut safepoint_iter = native_meta
-        .map(|meta| meta.safepoints.iter())
-        .into_iter()
-        .flatten();
     for (orig_i, inst) in mf.insts.iter().enumerate() {
         match inst {
             MachInst::CallRuntime { name, args, ret } => {
-                let live_roots = if *name != "wren_shadow_store"
-                    && *name != "wren_shadow_load"
-                    && *name != "wren_enter_shadow_frame"
-                    && *name != "wren_exit_shadow_frame"
-                {
-                    safepoint_iter.next().map(|sp| sp.live_roots.clone())
-                } else {
-                    None
-                };
-                call_sites.push(PendingCall::Runtime(
-                    orig_i,
-                    name,
-                    args.clone(),
-                    *ret,
-                    live_roots,
-                ));
+                call_sites.push(PendingCall::Runtime(orig_i, name, args.clone(), *ret));
             }
             MachInst::CallLocal { target, args, ret } => {
-                let live_roots = safepoint_iter.next().map(|sp| sp.live_roots.clone());
-                call_sites.push(PendingCall::Local(
-                    orig_i,
-                    *target,
-                    args.clone(),
-                    *ret,
-                    live_roots,
-                ));
+                call_sites.push(PendingCall::Local(orig_i, *target, args.clone(), *ret));
             }
             MachInst::CallIndirectAbi { target, args, ret } => {
                 call_sites.push(PendingCall::Indirect(orig_i, *target, args.clone(), *ret));
@@ -6826,7 +6614,7 @@ pub fn link_runtime_calls(
 
     for call_site in call_sites.into_iter().rev() {
         let (orig_i, new_insts) = match call_site {
-            PendingCall::Runtime(orig_i, name, args, ret, live_roots) => {
+            PendingCall::Runtime(orig_i, name, args, ret) => {
                 let Some(addr) = resolve(name) else {
                     continue;
                 };
@@ -6840,11 +6628,10 @@ pub fn link_runtime_calls(
                     frame_ptr,
                     assignments,
                     LinkedCallTarget::Runtime(addr as u64),
-                    live_roots.as_deref(),
                 );
                 (orig_i, new_insts)
             }
-            PendingCall::Local(orig_i, label, args, ret, live_roots) => {
+            PendingCall::Local(orig_i, label, args, ret) => {
                 let new_insts = lower_linked_call(
                     &args,
                     ret,
@@ -6855,7 +6642,6 @@ pub fn link_runtime_calls(
                     frame_ptr,
                     assignments,
                     LinkedCallTarget::Local(label),
-                    live_roots.as_deref(),
                 );
                 (orig_i, new_insts)
             }
@@ -6870,7 +6656,6 @@ pub fn link_runtime_calls(
                     frame_ptr,
                     assignments,
                     LinkedCallTarget::Indirect(target_vreg),
-                    None,
                 );
                 (orig_i, new_insts)
             }
@@ -6898,7 +6683,6 @@ fn lower_linked_call(
     frame_ptr: VReg,
     assignments: &std::collections::HashMap<VReg, crate::codegen::regalloc::Location>,
     target: LinkedCallTarget,
-    live_roots: Option<&[crate::codegen::native_meta::LiveRootMetadata]>,
 ) -> Vec<MachInst> {
     let mut reg_moves: Vec<(u32, u32)> = Vec::new();
     let mut spill_loads: Vec<(i32, u32)> = Vec::new();
@@ -6998,7 +6782,6 @@ fn lower_linked_call(
     // Shadow reloads removed — GC writes forwarded pointers directly to
     // spill slots via stack map write-back. JIT frame is registered by
     // #[naked] wren_call_N wrappers.
-    let _ = live_roots;
 
     new_insts
 }
@@ -7007,42 +6790,6 @@ fn lower_linked_call(
 #[cfg(feature = "host")]
 fn target_data_addr(name: &'static str) -> u64 {
     resolve(name).unwrap_or(0) as u64
-}
-
-#[allow(dead_code)]
-fn append_shadow_reloads(
-    new_insts: &mut Vec<MachInst>,
-    shadow_roots_ptr_addr: u64,
-    call_scratch: u32,
-    copy_scratch: u32,
-    frame_ptr: VReg,
-    live_roots: &[crate::codegen::native_meta::LiveRootMetadata],
-) {
-    if shadow_roots_ptr_addr == 0 {
-        return;
-    }
-
-    for root in live_roots {
-        let crate::codegen::native_meta::RootLocation::Spill(offset) = root.location else {
-            continue;
-        };
-        new_insts.push(MachInst::LoadImm {
-            dst: VReg::gp(call_scratch),
-            bits: shadow_roots_ptr_addr,
-        });
-        new_insts.push(MachInst::Ldr {
-            dst: VReg::gp(copy_scratch),
-            mem: Mem::new(VReg::gp(call_scratch), 0),
-        });
-        new_insts.push(MachInst::Ldr {
-            dst: VReg::gp(call_scratch),
-            mem: Mem::new(VReg::gp(copy_scratch), (root.slot as i32) * 8),
-        });
-        new_insts.push(MachInst::Str {
-            src: VReg::gp(call_scratch),
-            mem: Mem::new(frame_ptr, offset),
-        });
-    }
 }
 
 /// Resolve a set of parallel register moves so no source is clobbered before
@@ -7307,7 +7054,7 @@ mod tests {
             (arg1, Location::Reg(PhysReg::gp(5))),
             (ret, Location::Reg(PhysReg::gp(3))),
         ]);
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, None);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
 
         // CallRuntime replaced: 2 arg movs + LoadImm + CallInd + ret mov = 5 new
         assert_eq!(mf.insts.len(), before_len + 4);
@@ -7339,7 +7086,7 @@ mod tests {
             (arg0, Location::Reg(PhysReg::gp(3))),
             (arg1, Location::Reg(PhysReg::gp(4))),
         ]);
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, None);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
 
         let has_call_scratch = mf
             .insts
@@ -7361,59 +7108,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shadow_reloads_do_not_use_abi_return_as_scratch() {
-        let ret = VReg::gp(12);
-        let mut mf = MachFunc::new("test".into());
-        mf.emit(MachInst::CallRuntime {
-            name: "wren_not",
-            args: vec![VReg::gp(10)],
-            ret: Some(ret),
-        });
-        mf.emit(MachInst::Ret);
-
-        let assignments = std::collections::HashMap::from([
-            (VReg::gp(10), Location::Reg(PhysReg::gp(3))),
-            (ret, Location::Reg(PhysReg::gp(0))),
-            (VReg::gp(20), Location::Spill(-8)),
-        ]);
-        let native_meta = crate::codegen::native_meta::NativeFrameMetadata {
-            boxed_values: vec![VReg::gp(20)],
-            safepoints: vec![crate::codegen::native_meta::SafepointMetadata {
-                ordinal: 0,
-                inst_index: 0,
-                code_offset: 0,
-                kind: crate::codegen::native_meta::SafepointKind::CallRuntime,
-                live_roots: vec![crate::codegen::native_meta::LiveRootMetadata {
-                    slot: 0,
-                    location: crate::codegen::native_meta::RootLocation::Spill(-8),
-                }],
-            }],
-            spill_safe_nonleaf: true,
-        };
-
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, Some(&native_meta));
-
-        let call_idx = mf
-            .insts
-            .iter()
-            .position(|inst| matches!(inst, MachInst::CallInd { .. }))
-            .expect("linked call should contain CallInd");
-        let clobbers_ret = mf.insts[call_idx + 1..].iter().any(|inst| {
-            matches!(
-                inst,
-                MachInst::Ldr {
-                    dst,
-                    mem: Mem { base, offset: 0 }
-                } if *dst == VReg::gp(0) && *base == VReg::gp(17)
-            )
-        });
-        assert!(
-            !clobbers_ret,
-            "shadow reloads must not reuse the ABI return register as a scratch"
-        );
-    }
-
-    #[test]
     fn test_runtime_call_parallel_copy_resolves_with_abi_overlap() {
         let mut mf = MachFunc::new("test".into());
         let recv = VReg::gp(10);
@@ -7431,7 +7125,7 @@ mod tests {
             (method, Location::Reg(PhysReg::gp(0))),
             (arg, Location::Reg(PhysReg::gp(1))),
         ]);
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, None);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
 
         let mut regs = std::collections::HashMap::<u32, &'static str>::from([
             (0, "method"),

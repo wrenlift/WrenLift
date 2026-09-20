@@ -165,8 +165,8 @@ impl MethodCache {
         });
     }
 
-    /// Invalidate all cache entries. Must be called after GC since
-    /// nursery promotion can relocate ObjClass/ObjClosure pointers.
+    /// Invalidate all cache entries, after a collection that may have
+    /// freed a class or closure an entry names.
     pub fn invalidate(&mut self) {
         for entry in &mut self.entries {
             *entry = None;

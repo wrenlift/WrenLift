@@ -734,7 +734,6 @@ impl VM {
             crate::codegen::runtime_fns::JitContext::default(),
         );
         crate::codegen::runtime_fns::clear_jit_roots();
-        crate::runtime::gc_ringbuf::init_if_enabled();
 
         #[cfg_attr(not(feature = "host"), allow(unused_mut))]
         let mut shared = Shared {
