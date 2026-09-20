@@ -1383,6 +1383,10 @@ pub struct EntryLink {
 /// the interpreter after a deopt, and that frame stands for it.
 pub const KEY_SHADOWED: u64 = 1 << 63;
 
+/// Bit of a key's site word for a frame handed out as a record rather
+/// than a frame pointer (see `llvm_backend::frame_records`).
+pub const KEY_RECORD: u64 = 1 << 62;
+
 impl EntryLink {
     pub const fn new() -> Self {
         EntryLink {

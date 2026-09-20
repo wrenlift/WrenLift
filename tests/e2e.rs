@@ -6394,10 +6394,6 @@ Scene.new().run()
         std::env::set_var("WLIFT_TIER_TRACE", "1");
     }
     let (result, _, _) = run_with_config(src, config);
-    unsafe {
-        std::env::remove_var("WLIFT_FRAME_TRACE");
-        std::env::remove_var("WLIFT_TIER_TRACE");
-    }
     assert!(matches!(result, InterpretResult::RuntimeError));
     let errors = errors.lock().unwrap().clone();
     // Without the colour sequences.
@@ -6601,16 +6597,12 @@ Scene.new().run()
         ..VMConfig::default()
     };
     // The walk and the tier decisions behind it, shown when the
-    // assertion fails.
+    // assertion fails. Left set: another test may be reading them.
     unsafe {
         std::env::set_var("WLIFT_FRAME_TRACE", "1");
         std::env::set_var("WLIFT_TIER_TRACE", "1");
     }
     let (result, _, _) = run_with_config(src, config);
-    unsafe {
-        std::env::remove_var("WLIFT_FRAME_TRACE");
-        std::env::remove_var("WLIFT_TIER_TRACE");
-    }
     assert!(matches!(result, InterpretResult::RuntimeError));
     let errors = errors.lock().unwrap().clone();
     let mut text = String::new();
@@ -6628,17 +6620,29 @@ Scene.new().run()
         .lines()
         .filter_map(|l| l.trim_start_matches(['│', ' ']).strip_prefix("at "))
         .collect();
-    assert_eq!(
-        lines,
-        [
-            "boom(_) (main:5)",
-            "deep(_,_) (main:9)",
-            "deep(_,_) (main:10)",
-            "deep(_,_) (main:10)",
-            "deep(_,_) (main:10)",
-            "run() (main:22)",
-            "<module> (main:27)",
-        ],
+    // The compiler may inline a level of the recursion and `render`
+    // into `run`; what remains must be these frames in this order.
+    let expected = [
+        "boom(_) (main:5)",
+        "deep(_,_) (main:9)",
+        "deep(_,_) (main:10)",
+        "deep(_,_) (main:10)",
+        "deep(_,_) (main:10)",
+        "render(_) (main:17)",
+        "run() (main:22)",
+        "<module> (main:27)",
+    ];
+    let mut at = 0;
+    for line in &lines {
+        let Some(i) = expected[at..].iter().position(|e| e == line) else {
+            panic!("unexpected frame {line}\n{text}");
+        };
+        at += i + 1;
+    }
+    assert!(
+        lines.len() >= 5 && lines[0] == expected[0] && lines[1] == expected[1],
         "{text}"
     );
+    assert_eq!(lines.last(), Some(&expected[7]), "{text}");
+    assert_eq!(lines[lines.len() - 2], expected[6], "{text}");
 }

@@ -53,6 +53,9 @@ pub mod llvm {
         /// The code sections and, from the stack maps, the site of each
         /// direct call's return address, for traces.
         pub sites: Vec<crate::codegen::CodeSites>,
+        /// Where the body writes its frame record's distance from the
+        /// frame pointer; the site table names it.
+        _record_cell: Box<u64>,
         _engine: ExecutionEngine<'static>,
         _context: Box<Context>,
     }
@@ -237,7 +240,10 @@ pub mod llvm {
     /// The site tables of the code sections in `log`, from the stack
     /// map section (format version 3): each record is a mark planted
     /// after a direct call, its id the site.
-    fn code_sites_of(log: &SectionLog) -> Vec<crate::codegen::CodeSites> {
+    fn code_sites_of(
+        log: &SectionLog,
+        record: Option<(usize, usize)>,
+    ) -> Vec<crate::codegen::CodeSites> {
         let mut marks: Vec<Vec<(u32, u32)>> = vec![Vec::new(); log.code.len()];
         if let Some((base, len)) = log.stackmaps
             && len >= 16
@@ -289,11 +295,15 @@ pub mod llvm {
             .zip(marks)
             .map(|(&(start, end), mut marks)| {
                 marks.sort_unstable();
+                let records = record
+                    .filter(|(addr, _)| *addr >= start && *addr < end)
+                    .map(|(addr, cell)| vec![((addr - start) as u32, cell)])
+                    .unwrap_or_default();
                 crate::codegen::CodeSites {
                     start,
                     end,
                     func_id: 0,
-                    sites: crate::codegen::SiteTable::Marks(marks),
+                    sites: crate::codegen::SiteTable::Marks { marks, records },
                 }
             })
             .collect()
@@ -408,6 +418,7 @@ pub mod llvm {
         let main_ty = i64t.fn_type(&params, false);
         let main_fn = module.add_function(&safe_name, main_ty, None);
         stamp_function(ctx, &machine, main_fn);
+        let record_cell: Box<u64> = Box::new(0);
 
         // Every OSR header that qualifies; the body is lowered once with
         // an entry switch over the main entry and these.
@@ -435,6 +446,11 @@ pub mod llvm {
             iter_value_sym: interner.lookup("iteratorValue(_)"),
             add_sym: interner.lookup("add(_)"),
             globals: std::cell::RefCell::new(Vec::new()),
+            record_cell: if frame_records() {
+                record_cell.as_ref() as *const u64 as usize
+            } else {
+                0
+            },
         };
 
         let mut osr_defs: Vec<OsrDef> = Vec::new();
@@ -611,7 +627,22 @@ pub mod llvm {
                 live_in_modvar: modvar,
             });
         }
-        let sites = code_sites_of(&sections.lock().unwrap());
+        // The function lowered with a record: the body behind the
+        // trampolines when there are loop entries, else the main one.
+        let lowered = if layouts.is_empty() {
+            safe_name.clone()
+        } else {
+            format!("{}_body", safe_name)
+        };
+        let record = if frame_records() {
+            engine
+                .get_function_address(&lowered)
+                .ok()
+                .map(|addr| (addr, record_cell.as_ref() as *const u64 as usize))
+        } else {
+            None
+        };
+        let sites = code_sites_of(&sections.lock().unwrap(), record);
         if std::env::var_os("WLIFT_TIER_TRACE").is_some() {
             let log = sections.lock().unwrap();
             eprintln!(
@@ -622,7 +653,7 @@ pub mod llvm {
                 sites
                     .iter()
                     .map(|s| match &s.sites {
-                        crate::codegen::SiteTable::Marks(m) => m.len(),
+                        crate::codegen::SiteTable::Marks { marks, .. } => marks.len(),
                         _ => 0,
                     })
                     .collect::<Vec<_>>()
@@ -632,6 +663,7 @@ pub mod llvm {
             fn_ptr,
             osr_entries,
             sites,
+            _record_cell: record_cell,
             _engine: engine,
             _context: context,
         })
@@ -680,6 +712,20 @@ pub mod llvm {
         /// so LLVM may hoist their loads: `(global, address)`, mapped
         /// into the execution engine before the code is finalised.
         globals: std::cell::RefCell<Vec<(inkwell::values::GlobalValue<'ctx>, u64)>>,
+        /// The cell the lowered body writes its record's distance from
+        /// the frame pointer to (see [`frame_records`]); 0 without.
+        record_cell: usize,
+    }
+
+    /// Whether LLVM bodies keep a frame record a trace reads instead
+    /// of the frame pointer chain: on Windows x64 the frame pointer
+    /// LLVM keeps points into the frame, not at the saved pair, so a
+    /// body stores `{caller's handle, own return address}` in its frame
+    /// and hands that out as its frame. `WLIFT_FRAME_RECORDS=1` turns
+    /// it on elsewhere, for exercising it; safe to run with.
+    pub fn frame_records() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| cfg!(windows) || std::env::var_os("WLIFT_FRAME_RECORDS").is_some())
     }
 
     /// Lowering state for one LLVM function (the body or an OSR entry).
@@ -744,6 +790,8 @@ pub mod llvm {
         cur_vid: ValueId,
         /// Its site word: source offset plus one, 0 when it has none.
         cur_site: u32,
+        /// The body's frame record, under [`frame_records`].
+        rec: Option<PointerValue<'ctx>>,
         raw_bools: HashSet<ValueId>,
         value_types: Vec<MirType>,
 
@@ -793,6 +841,7 @@ pub mod llvm {
                 field_invariant: None,
                 cur_vid: ValueId(u32::MAX),
                 cur_site: 0,
+                rec: None,
                 raw_bools: HashSet::new(),
                 value_types: infer_osr_value_types(mir),
 
@@ -1632,12 +1681,20 @@ pub mod llvm {
             if cell == 0 {
                 return Ok(());
             }
-            let key = jit_func_id() as u64 | ((self.cur_site as u64) << 32);
+            let mut key = jit_func_id() as u64 | ((self.cur_site as u64) << 32);
             let cellp = self
                 .b
                 .build_int_to_ptr(self.c64(cell as u64), self.ptrt(), "fcur")
                 .map_err(|e| e.to_string())?;
-            let fp = self.frame_address()?;
+            let fp = match self.rec {
+                Some(rec) => {
+                    key |= crate::codegen::runtime_fns::KEY_RECORD;
+                    self.b
+                        .build_ptr_to_int(rec, self.i64t(), "recw")
+                        .map_err(|e| e.to_string())?
+                }
+                None => self.frame_address()?,
+            };
             self.b.build_store(cellp, fp).map_err(|e| e.to_string())?;
             let keyp = unsafe {
                 self.b
@@ -1648,6 +1705,88 @@ pub mod llvm {
                 .build_store(keyp, self.c64(key))
                 .map_err(|e| e.to_string())?;
             Ok(())
+        }
+
+        /// Under [`frame_records`]: the record in this frame, filled at
+        /// entry with the handle the caller stored and this frame's
+        /// return address, and the cell told how far the record sits
+        /// below the frame pointer, for a callee's saved frame pointer
+        /// to be turned into the record.
+        fn plant_record(&mut self) -> Result<(), String> {
+            let cell = self.sh.record_cell;
+            if cell == 0 || jit_cur_cell() == 0 {
+                return Ok(());
+            }
+            let rec = self
+                .b
+                .build_alloca(self.i64t().array_type(2), "frec")
+                .map_err(|e| e.to_string())?;
+            let curp = self
+                .b
+                .build_int_to_ptr(self.c64(jit_cur_cell() as u64), self.ptrt(), "fcur")
+                .map_err(|e| e.to_string())?;
+            let prev = self
+                .b
+                .build_load(self.i64t(), curp, "prev")
+                .map_err(|e| e.to_string())?;
+            self.b.build_store(rec, prev).map_err(|e| e.to_string())?;
+            let ra = self.return_address()?;
+            let rap = unsafe {
+                self.b
+                    .build_in_bounds_gep(self.i64t(), rec, &[self.c64(1)], "fra")
+            }
+            .map_err(|e| e.to_string())?;
+            self.b.build_store(rap, ra).map_err(|e| e.to_string())?;
+            let fp = self.frame_address()?;
+            let recw = self
+                .b
+                .build_ptr_to_int(rec, self.i64t(), "recw")
+                .map_err(|e| e.to_string())?;
+            let delta = self
+                .b
+                .build_int_sub(fp, recw, "recdelta")
+                .map_err(|e| e.to_string())?;
+            let cellp = self
+                .b
+                .build_int_to_ptr(self.c64(cell as u64), self.ptrt(), "reccell")
+                .map_err(|e| e.to_string())?;
+            self.b
+                .build_store(cellp, delta)
+                .map_err(|e| e.to_string())?;
+            self.rec = Some(rec);
+            Ok(())
+        }
+
+        /// Before a direct call under [`frame_records`]: the callee
+        /// reads this frame's handle from the cell.
+        fn before_direct_call(&mut self) -> Result<(), String> {
+            if self.rec.is_some() {
+                self.cur_frame()?;
+            }
+            Ok(())
+        }
+
+        /// This frame's return address, as a word.
+        fn return_address(&mut self) -> Result<IntValue<'ctx>, String> {
+            let f = match self.sh.module.get_function("llvm.returnaddress") {
+                Some(f) => f,
+                None => {
+                    let ty = self.ptrt().fn_type(&[self.sh.ctx.i32_type().into()], false);
+                    self.sh.module.add_function("llvm.returnaddress", ty, None)
+                }
+            };
+            let call = self
+                .b
+                .build_call(f, &[self.sh.ctx.i32_type().const_zero().into()], "ra")
+                .map_err(|e| e.to_string())?;
+            let p = call
+                .try_as_basic_value()
+                .basic()
+                .ok_or("returnaddress")?
+                .into_pointer_value();
+            self.b
+                .build_ptr_to_int(p, self.i64t(), "raw")
+                .map_err(|e| e.to_string())
         }
 
         /// This frame's pointer, as a word.
@@ -1944,6 +2083,7 @@ pub mod llvm {
                     self.osr_vars.insert(vid);
                 }
             }
+            self.plant_record()?;
 
             if self.entries.is_empty() {
                 let entry = &mir.blocks[0];
@@ -2536,6 +2676,7 @@ pub mod llvm {
                     for a in args {
                         call_args.push(self.boxed(a)?.into());
                     }
+                    self.before_direct_call()?;
                     let call = self
                         .b
                         .build_call(self.sh.main_fn, &call_args, "self")
@@ -4138,6 +4279,7 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?;
             let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
             a.extend(args.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+            self.before_direct_call()?;
             let call = match jit_ptr {
                 Some(jit_ptr) => {
                     let ty = self.helper_type(1 + args.len());
@@ -4393,6 +4535,7 @@ pub mod llvm {
                                 .map_err(|e| e.to_string())?;
                             let mut a: Vec<BasicMetadataValueEnum> = vec![inst.into()];
                             a.extend(arg_vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
+                            self.before_direct_call()?;
                             self.b
                                 .build_indirect_call(ty, ptr, &a, "init")
                                 .map_err(|e| e.to_string())?;

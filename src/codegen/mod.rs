@@ -1949,8 +1949,14 @@ pub enum SiteTable {
     Ranges(Vec<(u32, u32, u32)>),
     /// Marks planted right after each call, ascending: a return
     /// address's site is the first mark at or past it (LLVM's stack
-    /// maps).
-    Marks(Vec<(u32, u32)>),
+    /// maps). `records` names, by function offset, the cell holding
+    /// how far below its frame pointer a function keeps its frame
+    /// record (see `llvm_backend::frame_records`); empty when frames
+    /// are read by frame pointer.
+    Marks {
+        marks: Vec<(u32, u32)>,
+        records: Vec<(u32, usize)>,
+    },
 }
 
 /// Site word of a return address the trace leaves out: a call the
@@ -1975,11 +1981,29 @@ impl CodeSites {
                     _ => SITE_NONE,
                 }
             }
-            SiteTable::Marks(marks) => {
+            SiteTable::Marks { marks, .. } => {
                 let i = marks.partition_point(|(m, _)| *m < off);
                 marks.get(i).map(|(_, site)| *site).unwrap_or(SITE_NONE)
             }
         })
+    }
+
+    /// Whether the frame returning to `ra` is read by frame pointer;
+    /// false when it keeps a record instead.
+    pub fn classic_frame(&self, ra: usize) -> bool {
+        self.record_delta(ra).is_none()
+    }
+
+    /// How far below its frame pointer the function containing `ra`
+    /// keeps its frame record, when it keeps one.
+    pub fn record_delta(&self, ra: usize) -> Option<u64> {
+        let SiteTable::Marks { records, .. } = &self.sites else {
+            return None;
+        };
+        let off = ra.checked_sub(self.start)? as u32;
+        let i = records.partition_point(|(f, _)| *f <= off);
+        let (_, cell) = records.get(i.checked_sub(1)?)?;
+        Some(unsafe { std::ptr::read_volatile(*cell as *const u64) })
     }
 }
 

@@ -5339,6 +5339,9 @@ pub mod cl {
                             let sig_ref = builder.import_signature(sig);
                             let mut call_args = vec![inst];
                             call_args.extend(arg_vals.iter().copied());
+                            // A callee keeping a frame record reads this
+                            // frame from the cell.
+                            emit_cur_frame(builder);
                             let _ = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
                             builder
                                 .ins()

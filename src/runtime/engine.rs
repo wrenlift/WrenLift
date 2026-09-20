@@ -1420,10 +1420,10 @@ impl ExecutionEngine {
 
     /// The compiled body a return address is inside and the site of the
     /// call returning there.
-    fn site_at(&self, ra: usize) -> Option<(u32, u32)> {
+    fn site_at(&self, ra: usize) -> Option<(&crate::codegen::CodeSites, u32)> {
         let i = self.code_sites.partition_point(|c| c.start < ra);
         let c = self.code_sites.get(i.checked_sub(1)?)?;
-        c.site_at(ra).map(|site| (c.func_id, site))
+        c.site_at(ra).map(|site| (c, site))
     }
 
     /// The compiled frames of one segment, innermost first, as
@@ -1432,42 +1432,58 @@ impl ExecutionEngine {
     /// are in compiled code. `WLIFT_FRAME_TRACE=1` prints the walk;
     /// safe to run with.
     pub fn native_frames(&self, fp: u64, key: u64) -> Vec<(u32, u32)> {
-        use crate::codegen::runtime_fns::KEY_SHADOWED;
+        use crate::codegen::runtime_fns::{KEY_RECORD, KEY_SHADOWED};
         let trace = std::env::var_os("WLIFT_FRAME_TRACE").is_some();
         let mut out = Vec::new();
+        if trace {
+            eprintln!("frame-trace: segment from {fp:#x} key {key:#x}");
+        }
         if fp == 0 {
             return out;
         }
         if key & KEY_SHADOWED == 0 {
-            out.push((key as u32, (key >> 32) as u32));
+            out.push((key as u32, (key >> 32) as u32 & !(KEY_RECORD >> 32) as u32));
         } else if trace {
             eprintln!("frame-trace: shadowed fid={} at {fp:#x}", key as u32);
         }
-        let mut fp = fp as usize;
+        // A handle is a frame pointer at `{saved frame pointer, return
+        // address}`, or a record of the same shape a body keeps when
+        // its frame pointer does not point there. Only a frame read by
+        // frame pointer hands out its caller's raw frame pointer, which
+        // must become the record when the caller keeps one.
+        let mut handle = fp as usize;
+        let mut classic = key & KEY_RECORD == 0;
         while out.len() < 100_000 {
-            // Frame pointers of compiled frames are aligned and above
-            // the frame they are read from.
-            if !fp.is_multiple_of(8) {
+            if handle == 0 || !handle.is_multiple_of(8) {
                 break;
             }
-            let ra = unsafe { *((fp + 8) as *const usize) };
-            let Some((fid, site)) = self.site_at(ra) else {
+            let ra = unsafe { *((handle + 8) as *const usize) };
+            let Some((body, site)) = self.site_at(ra) else {
                 if trace {
                     eprintln!("frame-trace: {ra:#x} not compiled; segment ends");
                 }
                 break;
             };
             if trace {
-                eprintln!("frame-trace: {ra:#x} fid={fid} site={site}");
+                eprintln!("frame-trace: {ra:#x} fid={} site={site}", body.func_id);
             }
             if site != crate::codegen::SITE_NONE {
-                out.push((fid, site));
+                out.push((body.func_id, site));
             }
-            let up = unsafe { *(fp as *const usize) };
-            if up <= fp {
+            let mut up = unsafe { *(handle as *const usize) };
+            if classic && let Some(delta) = body.record_delta(ra) {
+                up = up.wrapping_sub(delta as usize);
+            }
+            if up <= handle {
+                if trace {
+                    eprintln!(
+                        "frame-trace: caller handle {up:#x} not above {handle:#x}; segment ends"
+                    );
+                }
                 break;
             }
-            fp = up;
+            handle = up;
+            classic = body.classic_frame(ra);
         }
         out
     }
