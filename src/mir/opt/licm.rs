@@ -11,12 +11,33 @@ use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 
 pub struct Licm;
 
+/// Hoists only module variable reads: what is left to move once the
+/// loop's numbers are known, without moving typed conversions out to
+/// where a loop entry could not rebuild them.
+pub struct LicmModuleVars;
+
+impl MirPass for LicmModuleVars {
+    fn name(&self) -> &str {
+        "licm-module-vars"
+    }
+
+    fn run(&self, func: &mut MirFunction) -> bool {
+        run_licm(func, true)
+    }
+}
+
 impl MirPass for Licm {
     fn name(&self) -> &str {
         "licm"
     }
 
     fn run(&self, func: &mut MirFunction) -> bool {
+        run_licm(func, false)
+    }
+}
+
+fn run_licm(func: &mut MirFunction, module_vars_only: bool) -> bool {
+    {
         func.compute_predecessors();
         let rpo = compute_rpo(func);
         let idom = compute_dominators(func, &rpo);
@@ -40,7 +61,7 @@ impl MirPass for Licm {
             let body_set: HashSet<BlockId> = lp.body.iter().copied().collect();
 
             // Find loop-invariant instructions (fixpoint).
-            let invariants = find_invariants(func, &body_set, &def_block);
+            let invariants = find_invariants(func, &body_set, &def_block, module_vars_only);
             if invariants.is_empty() {
                 continue;
             }
@@ -292,6 +313,7 @@ fn find_invariants(
     func: &MirFunction,
     body: &HashSet<BlockId>,
     def_block: &HashMap<ValueId, BlockId>,
+    module_vars_only: bool,
 ) -> HashSet<ValueId> {
     let mut invariants: HashSet<ValueId> = HashSet::new();
 
@@ -301,6 +323,24 @@ fn find_invariants(
             None => true, // unknown (e.g. function params) = outside
         }
     };
+
+    // A module variable the loop never writes, in a loop that runs no
+    // code of the program's own, reads the same on every iteration. A
+    // boxed operator on a Num receiver is native: it can raise, never
+    // dispatch.
+    let nums = crate::mir::known_num_values(func);
+    let runs_code = body
+        .iter()
+        .flat_map(|b| func.block(*b).instructions.iter())
+        .any(|(_, inst)| inst.may_run_code(&|v| nums.contains(&v)));
+    let written: HashSet<u16> = body
+        .iter()
+        .flat_map(|b| func.block(*b).instructions.iter())
+        .filter_map(|(_, inst)| match inst {
+            Instruction::SetModuleVar(slot, _) => Some(*slot),
+            _ => None,
+        })
+        .collect();
 
     let mut changed = true;
     while changed {
@@ -333,14 +373,21 @@ fn find_invariants(
                 ) {
                     continue;
                 }
-                // Skip module var, upvalue and static field reads
-                // (may change between iterations).
+                // Skip upvalue and static field reads (may change
+                // between iterations), and module variable reads
+                // unless the loop leaves the variable alone.
                 if matches!(
                     inst,
-                    Instruction::GetModuleVar(_)
-                        | Instruction::GetUpvalue(_)
-                        | Instruction::GetStaticField(_)
+                    Instruction::GetUpvalue(_) | Instruction::GetStaticField(_)
                 ) {
+                    continue;
+                }
+                if let Instruction::GetModuleVar(slot) = inst
+                    && (runs_code || written.contains(slot))
+                {
+                    continue;
+                }
+                if module_vars_only && !matches!(inst, Instruction::GetModuleVar(_)) {
                     continue;
                 }
 

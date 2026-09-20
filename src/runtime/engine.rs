@@ -622,6 +622,9 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
         if std::env::var_os("WLIFT_DISABLE_INT_SPEC").is_none() {
             crate::mir::opt::int_loop::IntSpecialize.run(mir);
         }
+        // With the loop's numbers known, a module variable read a loop
+        // never writes can leave it.
+        crate::mir::opt::licm::LicmModuleVars.run(mir);
     }
 }
 

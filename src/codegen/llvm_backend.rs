@@ -1786,6 +1786,9 @@ pub mod llvm {
                     }
                     for (vid, inst) in osr_rematerializable_defs(mir, layout.target_block) {
                         let v: BasicValueEnum = match inst {
+                            Instruction::GetModuleVar(_) => self
+                                .lower_instruction(vid, &inst)?
+                                .ok_or("a module variable read yields a value")?,
                             Instruction::ConstNum(n) => self.c64(n.to_bits()).into(),
                             Instruction::ConstBool(b) => {
                                 self.c64(if b { TAG_TRUE } else { TAG_FALSE }).into()

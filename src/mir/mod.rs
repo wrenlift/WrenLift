@@ -552,6 +552,43 @@ impl DeoptSource {
 impl Instruction {
     /// Does this instruction have side effects?
     /// Pure instructions can be eliminated by DCE if unused.
+    /// Whether the instruction can run code of the program's own:
+    /// a call, a conversion or concatenation that calls `toString`,
+    /// a subscript, or a boxed operator whose receiver `is_num` cannot
+    /// vouch for, since an object's operator is a method. Anything else
+    /// leaves module variables as they are.
+    pub fn may_run_code(&self, is_num: &dyn Fn(ValueId) -> bool) -> bool {
+        match self {
+            Instruction::Call { .. }
+            | Instruction::CallKnownFunc { .. }
+            | Instruction::CallStaticSelf { .. }
+            | Instruction::SuperCall { .. }
+            | Instruction::StringConcat(..)
+            | Instruction::ToString(..)
+            | Instruction::SubscriptGet { .. }
+            | Instruction::SubscriptSet { .. } => true,
+            Instruction::Add(a, _)
+            | Instruction::Sub(a, _)
+            | Instruction::Mul(a, _)
+            | Instruction::Div(a, _)
+            | Instruction::Mod(a, _)
+            | Instruction::Neg(a)
+            | Instruction::CmpLt(a, _)
+            | Instruction::CmpGt(a, _)
+            | Instruction::CmpLe(a, _)
+            | Instruction::CmpGe(a, _)
+            | Instruction::CmpEq(a, _)
+            | Instruction::CmpNe(a, _)
+            | Instruction::BitAnd(a, _)
+            | Instruction::BitOr(a, _)
+            | Instruction::BitXor(a, _)
+            | Instruction::BitNot(a)
+            | Instruction::Shl(a, _)
+            | Instruction::Shr(a, _) => !is_num(*a),
+            _ => false,
+        }
+    }
+
     pub fn has_side_effects(&self) -> bool {
         matches!(
             self,
@@ -1279,8 +1316,28 @@ pub fn is_osr_rematerializable(inst: &Instruction) -> bool {
     )
 }
 
-/// Constants defined outside `target`'s reachable region that can be rebuilt
-/// in a native OSR entry instead of being passed from the interpreter.
+/// Values the function defines as Nums outright: constants, boxes of
+/// raw numbers, list counts and guarded values. A boxed operator on
+/// one of these as receiver is native.
+pub fn known_num_values(func: &MirFunction) -> HashSet<ValueId> {
+    func.blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|(v, inst)| match inst {
+            Instruction::ConstNum(_)
+            | Instruction::Box(_)
+            | Instruction::ListCount(_)
+            | Instruction::GuardNum(_) => Some(*v),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Values defined outside `target`'s reachable region that a native
+/// OSR entry can rebuild instead of being passed from the interpreter:
+/// constants anywhere, and a module variable read in the loop's
+/// preheader that neither the rest of the preheader nor the loop can
+/// write, so the read gives the same value at any entry.
 pub fn osr_rematerializable_defs(
     func: &MirFunction,
     target: BlockId,
@@ -1295,6 +1352,59 @@ pub fn osr_rematerializable_defs(
             if is_osr_rematerializable(inst) {
                 defs.insert(vid, inst.clone());
             }
+        }
+    }
+    // The preheader: the one predecessor of the header outside the
+    // loop, ending in an unconditional jump to it.
+    let pre = func.blocks.iter().find(|b| {
+        !reachable.contains(&(b.id.0 as usize))
+            && matches!(&b.terminator, Terminator::Branch { target: t, .. } if *t == target)
+    });
+    let Some(pre) = pre else {
+        return defs;
+    };
+    // The loop: what the header reaches that reaches it back.
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &b in &reachable {
+        for succ in func.blocks[b].terminator.successors() {
+            preds.entry(succ.0 as usize).or_default().push(b);
+        }
+    }
+    let mut back: HashSet<usize> = HashSet::new();
+    let mut work = vec![target.0 as usize];
+    while let Some(b) = work.pop() {
+        if !back.insert(b) {
+            continue;
+        }
+        if let Some(ps) = preds.get(&b) {
+            work.extend(ps.iter().copied());
+        }
+    }
+    let loop_insts = || {
+        back.iter()
+            .flat_map(|&b| func.blocks[b].instructions.iter().map(|(_, i)| i))
+    };
+    let nums = known_num_values(func);
+    if loop_insts().any(|i| i.may_run_code(&|v| nums.contains(&v))) {
+        return defs;
+    }
+    let written: HashSet<u16> = loop_insts()
+        .filter_map(|i| match i {
+            Instruction::SetModuleVar(s, _) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    for (k, &(vid, ref inst)) in pre.instructions.iter().enumerate() {
+        let Instruction::GetModuleVar(slot) = inst else {
+            continue;
+        };
+        let stable = !written.contains(slot)
+            && pre.instructions[k + 1..].iter().all(|(_, later)| {
+                !later.may_run_code(&|_| false)
+                    && !matches!(later, Instruction::SetModuleVar(s, _) if s == slot)
+            });
+        if stable {
+            defs.insert(vid, inst.clone());
         }
     }
     defs

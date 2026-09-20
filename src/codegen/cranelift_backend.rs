@@ -2706,15 +2706,92 @@ pub mod cl {
         crate::mir::infer_value_types(mir)
     }
 
-    /// The constants a loop entry rebuilds rather than loads.
+    /// A module variable read: through the module's data in an AOT
+    /// body, the module's cell in a JIT body.
+    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
+    fn emit_get_module_var(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        idx: u16,
+        aot_config: Option<&AotLoweringConfig>,
+    ) -> Result<Value, String> {
+        if let Some(cfg) = aot_config {
+            let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
+            let base = builder.ins().symbol_value(types::I64, gv);
+            let result =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), base, (idx as i32) * 8);
+            Ok(result)
+        } else if jit_modvar_in_range(idx) {
+            let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
+            let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+            Ok(builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), base, (idx as i32) * 8))
+        } else if jit_modvars_cell() != 0 {
+            // Three loads through the module's stable cell; an
+            // index past the current length reads null, as the
+            // helper does.
+            let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
+            let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+            let len = builder.ins().load(types::I64, MemFlags::trusted(), cell, 8);
+            let idx_val = builder.ins().iconst(types::I64, idx as i64);
+            let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, idx_val, len);
+            let hit = builder.create_block();
+            let miss = builder.create_block();
+            let merge = builder.create_block();
+            builder.append_block_param(merge, types::I64);
+            builder.ins().brif(in_range, hit, &[], miss, &[]);
+            builder.switch_to_block(hit);
+            builder.seal_block(hit);
+            let v = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), base, (idx as i32) * 8);
+            builder.ins().jump(merge, &[BlockArg::Value(v)]);
+            builder.switch_to_block(miss);
+            builder.seal_block(miss);
+            let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+            builder.ins().jump(merge, &[BlockArg::Value(null)]);
+            builder.switch_to_block(merge);
+            builder.seal_block(merge);
+            Ok(builder.block_params(merge)[0])
+        } else {
+            let f = get_runtime_fn(module, builder, "wren_get_module_var", 1)?;
+            let idx_val = builder.ins().iconst(types::I64, idx as i64);
+            let result = builder.ins().call(f, &[idx_val]);
+            Ok(builder.inst_results(result)[0])
+        }
+    }
+
+    /// The values a loop entry rebuilds rather than loads: constants,
+    /// and module variables read just before the loop.
+    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
     fn emit_osr_external_constants(
         mir: &MirFunction,
         target: BlockId,
         builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        aot_config: Option<&AotLoweringConfig>,
     ) -> Result<Vec<(ValueId, Value)>, String> {
         let mut out = Vec::new();
         for (vid, inst) in osr_rematerializable_defs(mir, target) {
             let value = match inst {
+                Instruction::GetModuleVar(idx) => {
+                    emit_get_module_var(builder, module, get_runtime_fn, idx, aot_config)?
+                }
                 Instruction::ConstNum(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
                 Instruction::ConstBool(b) => {
                     let bits = if b { TAG_TRUE } else { TAG_FALSE } as i64;
@@ -3171,7 +3248,14 @@ pub mod cl {
                 builder.ins().stack_store(types::I64, zero, *counter, 0);
             }
             for layout in &entries.layouts {
-                for (vid, v) in emit_osr_external_constants(mir, layout.target_block, builder)? {
+                for (vid, v) in emit_osr_external_constants(
+                    mir,
+                    layout.target_block,
+                    builder,
+                    module,
+                    &mut |m, b, name, n| declare_runtime_fn(m, b, name, n),
+                    aot_config,
+                )? {
                     if pre_defined.insert(vid) {
                         val_map.insert(vid, v);
                     }
@@ -4680,63 +4764,13 @@ pub mod cl {
             // JIT mode keeps the `wren_get/set_module_var` dispatch
             // — those helpers consult the TLS `JitContext` which
             // is patched per-frame by the install path.
-            Instruction::GetModuleVar(idx) => {
-                if let Some(cfg) = aot_config {
-                    let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
-                    let base = builder.ins().symbol_value(types::I64, gv);
-                    let result = builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        base,
-                        (*idx as i32) * 8,
-                    );
-                    Ok(Some(result))
-                } else if jit_modvar_in_range(*idx) {
-                    let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
-                    let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
-                    Ok(Some(builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        base,
-                        (*idx as i32) * 8,
-                    )))
-                } else if jit_modvars_cell() != 0 {
-                    // Three loads through the module's stable cell; an
-                    // index past the current length reads null, as the
-                    // helper does.
-                    let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
-                    let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
-                    let len = builder.ins().load(types::I64, MemFlags::trusted(), cell, 8);
-                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
-                    let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, idx_val, len);
-                    let hit = builder.create_block();
-                    let miss = builder.create_block();
-                    let merge = builder.create_block();
-                    builder.append_block_param(merge, types::I64);
-                    builder.ins().brif(in_range, hit, &[], miss, &[]);
-                    builder.switch_to_block(hit);
-                    builder.seal_block(hit);
-                    let v = builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        base,
-                        (*idx as i32) * 8,
-                    );
-                    builder.ins().jump(merge, &[BlockArg::Value(v)]);
-                    builder.switch_to_block(miss);
-                    builder.seal_block(miss);
-                    let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
-                    builder.ins().jump(merge, &[BlockArg::Value(null)]);
-                    builder.switch_to_block(merge);
-                    builder.seal_block(merge);
-                    Ok(Some(builder.block_params(merge)[0]))
-                } else {
-                    let f = get_runtime_fn(module, builder, "wren_get_module_var", 1)?;
-                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
-                    let result = builder.ins().call(f, &[idx_val]);
-                    Ok(Some(builder.inst_results(result)[0]))
-                }
-            }
+            Instruction::GetModuleVar(idx) => Ok(Some(emit_get_module_var(
+                builder,
+                module,
+                get_runtime_fn,
+                *idx,
+                aot_config,
+            )?)),
             Instruction::SetModuleVar(idx, val) => {
                 if let Some(cfg) = aot_config {
                     let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
