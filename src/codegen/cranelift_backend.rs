@@ -1564,6 +1564,86 @@ pub mod cl {
         }
     }
 
+    /// Whether every block parameter typed Value only ever receives a
+    /// Num the inner f64 body carries raw: an entry parameter, a box, a
+    /// constant, a recursive result, or such a parameter. Optimistic
+    /// over the parameters, to a fixed point.
+    fn value_params_carry_nums(mir: &MirFunction) -> bool {
+        use crate::mir::Terminator;
+        let defs: HashMap<ValueId, &Instruction> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter().map(|(v, i)| (*v, i)))
+            .collect();
+        let mut nums: HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .skip(1)
+            .flat_map(|b| b.params.iter())
+            .filter(|(_, t)| *t == MirType::Value)
+            .map(|(p, _)| *p)
+            .collect();
+        let carries = |v: ValueId, nums: &HashSet<ValueId>| -> bool {
+            let mut v = v;
+            for _ in 0..64 {
+                if nums.contains(&v) {
+                    return true;
+                }
+                match defs.get(&v) {
+                    Some(Instruction::Move(a)) => v = *a,
+                    Some(
+                        Instruction::BlockParam(_)
+                        | Instruction::Box(_)
+                        | Instruction::ConstNum(_)
+                        | Instruction::CallStaticSelf { .. },
+                    ) => return true,
+                    _ => return false,
+                }
+            }
+            false
+        };
+        loop {
+            let mut dropped = false;
+            for b in &mir.blocks {
+                let edges: Vec<(BlockId, &[ValueId])> = match &b.terminator {
+                    Terminator::Branch { target, args } => vec![(*target, args.as_slice())],
+                    Terminator::CondBranch {
+                        true_target,
+                        true_args,
+                        false_target,
+                        false_args,
+                        ..
+                    } => vec![
+                        (*true_target, true_args.as_slice()),
+                        (*false_target, false_args.as_slice()),
+                    ],
+                    _ => Vec::new(),
+                };
+                for (target, args) in edges {
+                    let params = &mir.blocks[target.0 as usize].params;
+                    for (i, a) in args.iter().enumerate() {
+                        let Some((p, _)) = params.get(i) else {
+                            continue;
+                        };
+                        if nums.contains(p) && !carries(*a, &nums) {
+                            nums.remove(p);
+                            dropped = true;
+                        }
+                    }
+                }
+            }
+            if !dropped {
+                break;
+            }
+        }
+        mir.blocks
+            .iter()
+            .skip(1)
+            .flat_map(|b| b.params.iter())
+            .filter(|(_, t)| *t == MirType::Value)
+            .all(|(p, _)| nums.contains(p))
+    }
+
     /// Iterations an optimised body's outermost loop runs between
     /// debits of its cell.
     const LOOP_TICK: i64 = 256;
@@ -1797,11 +1877,15 @@ pub mod cl {
                 )
             })
         });
+        // The inner body carries every Num raw, so a block parameter
+        // typed Value must only ever receive one: a parameter, a box, a
+        // constant, a recursive result, or such a parameter again.
         let use_f64_inner = has_num_guards
             && has_self_calls
             && param_count > 0
             && !has_mid_body_guards
-            && !has_other_calls;
+            && !has_other_calls
+            && value_params_carry_nums(mir);
 
         let mut sig = module.make_signature();
         for _ in 0..param_count {
@@ -3318,6 +3402,8 @@ pub mod cl {
             for (vid, ty) in &block.params {
                 let cl_type = match ty {
                     MirType::F64 => types::F64,
+                    // Every Num is raw in the inner f64 body.
+                    MirType::Value if f64_self_id.is_some() => types::F64,
                     _ => types::I64,
                 };
                 let param = builder.append_block_param(cl_block, cl_type);
@@ -4298,6 +4384,9 @@ pub mod cl {
         let result = match inst {
             // === Constants ===
             Instruction::ConstNum(n) => {
+                if f64_self_id.is_some() {
+                    return Ok(Some(builder.ins().f64const(*n)));
+                }
                 let bits = n.to_bits() as i64;
                 Ok(Some(builder.ins().iconst(types::I64, bits)))
             }
