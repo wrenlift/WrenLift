@@ -196,6 +196,13 @@ impl Default for CallSiteIC {
 /// reader can tell a fill that happened under it.
 const KIND_MASK: u64 = 0xFF;
 
+/// Bit of a kind set once the site has seen a second receiver class.
+/// The entry still names the latest class and method, but no fast
+/// path or compile takes it for one class: the compiler dispatches
+/// such a site over the class hierarchy instead of inlining one class
+/// behind a guard that the next class would fail.
+pub const IC_POLYMORPHIC: u64 = 0x80;
+
 impl CallSiteIC {
     /// A consistent copy of the entry, or `None` while another thread
     /// is filling it. The entry is a seqlock: `kind` goes to 0 before
@@ -262,6 +269,20 @@ impl CallSiteIC {
         kind_cell.store(next | (new.kind & KIND_MASK), Ordering::Release);
     }
 
+    /// Fill the entry with `new` for the receiver class it names,
+    /// keeping the note that the site is polymorphic once a different
+    /// class has been seen here.
+    #[inline]
+    pub fn store_seen(&self, mut new: CallSiteIC) {
+        let kind = self.kind();
+        let class = unsafe { AtomicUsize::from_ptr(&self.class as *const usize as *mut usize) }
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if kind & IC_POLYMORPHIC != 0 || (kind != 0 && class != 0 && class != new.class) {
+            new.kind |= IC_POLYMORPHIC;
+        }
+        self.store(new);
+    }
+
     /// Empty the entry.
     #[inline]
     pub fn clear(&self) {
@@ -269,7 +290,7 @@ impl CallSiteIC {
     }
 }
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 // SAFETY: IC entries are only accessed from a single interpreter thread.
 // The UnsafeCell is needed for interior mutability through Arc.

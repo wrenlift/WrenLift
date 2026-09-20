@@ -965,7 +965,7 @@ fn populate_callsite_ic(
         },
     };
 
-    unsafe { (*ic_ptr).store(entry) };
+    unsafe { (*ic_ptr).store_seen(entry) };
     trace_jit_ic(|| {
         format!(
             "jit-ic: populate kind={} ic_ptr=0x{:x}",
@@ -1022,7 +1022,7 @@ fn maybe_upgrade_closure_ic_to_leaf(
     }
 
     unsafe {
-        (*ic_ptr).store(crate::mir::bytecode::CallSiteIC {
+        (*ic_ptr).store_seen(crate::mir::bytecode::CallSiteIC {
             class: cache_key_class as usize,
             jit_ptr,
             closure: closure_ptr as *const u8,

@@ -2922,12 +2922,15 @@ impl ExecutionEngine {
 
     /// Loop headers whose body has call sites but no inline-cache data
     /// yet: the loop has not run, so compiling it now bakes in generic
-    /// dispatch.
+    /// dispatch. A site for the list protocol (`iterate`,
+    /// `iteratorValue`, `add`) is lowered inline whatever its cache
+    /// says, so it is no evidence either way.
     /// Each cold header maps to the registers the interpreter needs to
     /// resume there: the header's live-ins in the bytecode's own terms.
     fn cold_loop_headers(
         mir: &MirFunction,
         ics: &[CallSiteIC],
+        interner: &crate::intern::Interner,
     ) -> HashMap<crate::mir::BlockId, Vec<crate::mir::ValueId>> {
         use crate::mir::Instruction;
         use crate::mir::opt::licm::{
@@ -2948,7 +2951,17 @@ impl ExecutionEngine {
         let mut site_kinds: Vec<Vec<u64>> = vec![Vec::new(); mir.blocks.len()];
         for (bi, block) in mir.blocks.iter().enumerate() {
             for (dst, inst) in &block.instructions {
-                if let (Instruction::Call { .. }, Some(i)) = (inst, numbering.get(dst)) {
+                if let (Instruction::Call { method, args, .. }, Some(i)) =
+                    (inst, numbering.get(dst))
+                {
+                    if args.len() == 1
+                        && matches!(
+                            interner.resolve(*method),
+                            "iterate(_)" | "iteratorValue(_)" | "add(_)"
+                        )
+                    {
+                        continue;
+                    }
                     site_kinds[bi].push(ics.get(*i as usize).map(|ic| ic.kind).unwrap_or(0));
                 }
             }
@@ -3052,7 +3065,7 @@ impl ExecutionEngine {
         let ics = self.callsite_ic_data_for_compile(id);
         let still_cold = match (self.functions.get(idx), ics) {
             (Some(body), Some((ics, _))) => {
-                let now = Self::cold_loop_headers(body.mir(), &ics);
+                let now = Self::cold_loop_headers(body.mir(), &ics, interner);
                 self.cold_osr_blocks[idx]
                     .iter()
                     .all(|h| now.contains_key(h))
@@ -4469,7 +4482,7 @@ impl ExecutionEngine {
             .map(|ics| self.compute_devirt_hints(id, ics));
         let cold = callsite_ic_ptrs
             .as_deref()
-            .map(|ics| Self::cold_loop_headers(&mir, ics))
+            .map(|ics| Self::cold_loop_headers(&mir, ics, interner))
             .unwrap_or_default();
         if tier_trace_enabled() && !cold.is_empty() {
             eprintln!(

@@ -2696,7 +2696,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     }) {
                                         let fn_idx =
                                             unsafe { (*(*closure_ptr).function).fn_id } as usize;
-                                        ic.store(crate::mir::bytecode::CallSiteIC {
+                                        ic.store_seen(crate::mir::bytecode::CallSiteIC {
                                             class: cache_key_class as usize,
                                             jit_ptr: std::ptr::null(),
                                             closure: closure_ptr as *const u8,
@@ -2738,13 +2738,15 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     // Populate IC for this call site
                                     let ic_table = unsafe { &*bc.ic_table.get() };
                                     if ic_idx < ic_table.len() {
-                                        ic_table[ic_idx].store(crate::mir::bytecode::CallSiteIC {
-                                            class: cache_key_class as usize,
-                                            jit_ptr,
-                                            closure: closure_ptr as *const u8,
-                                            func_id: fn_idx as u64,
-                                            kind: 1, // JIT leaf
-                                        });
+                                        ic_table[ic_idx].store_seen(
+                                            crate::mir::bytecode::CallSiteIC {
+                                                class: cache_key_class as usize,
+                                                jit_ptr,
+                                                closure: closure_ptr as *const u8,
+                                                func_id: fn_idx as u64,
+                                                kind: 1, // JIT leaf
+                                            },
+                                        );
                                     }
                                     // Swap in the callee's module context.
                                     // Cross-module calls (e.g. a hot-loop in
