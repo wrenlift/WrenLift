@@ -76,8 +76,13 @@ impl InferredType {
 pub struct TypeEnv {
     /// Variable types (keyed by declaration span start).
     vars: HashMap<usize, InferredType>,
-    /// Expression types (keyed by expression span start).
+    /// Expression types (keyed by expression span start): the
+    /// outermost expression starting there, since an operand and the
+    /// operation on it start at the same offset.
     exprs: HashMap<usize, InferredType>,
+    /// Expression types keyed by the whole span, for the operand
+    /// itself.
+    exprs_exact: HashMap<(usize, usize), InferredType>,
     /// Field types per class: class_name → field_name → InferredType.
     field_types: HashMap<SymbolId, HashMap<SymbolId, InferredType>>,
     /// Method return types: (class_name, method_name) → InferredType.
@@ -89,6 +94,7 @@ impl TypeEnv {
         Self {
             vars: HashMap::new(),
             exprs: HashMap::new(),
+            exprs_exact: HashMap::new(),
             field_types: HashMap::new(),
             method_return_types: HashMap::new(),
         }
@@ -102,12 +108,21 @@ impl TypeEnv {
         self.vars.get(&span_start).unwrap_or(&InferredType::Any)
     }
 
-    pub fn set_expr_type(&mut self, span_start: usize, ty: InferredType) {
-        self.exprs.insert(span_start, ty);
+    pub fn set_expr_type(&mut self, span: &Span, ty: InferredType) {
+        self.exprs_exact.insert((span.start, span.end), ty.clone());
+        self.exprs.insert(span.start, ty);
     }
 
+    /// The type of the outermost expression starting at `span_start`.
     pub fn get_expr_type(&self, span_start: usize) -> &InferredType {
         self.exprs.get(&span_start).unwrap_or(&InferredType::Any)
+    }
+
+    /// The type of exactly the expression at `span`.
+    pub fn get_expr_type_at(&self, span: &Span) -> &InferredType {
+        self.exprs_exact
+            .get(&(span.start, span.end))
+            .unwrap_or(&InferredType::Any)
     }
 
     /// Widen a variable type (join with new type on reassignment).
@@ -159,6 +174,7 @@ impl TypeEnv {
     fn clear_ephemeral(&mut self) {
         self.vars.clear();
         self.exprs.clear();
+        self.exprs_exact.clear();
     }
 
     pub fn var_types(&self) -> &HashMap<usize, InferredType> {
@@ -363,7 +379,7 @@ impl TypeInferrer {
 
     fn infer_expr(&mut self, expr: &Spanned<Expr>) -> InferredType {
         let ty = self.infer_expr_inner(expr);
-        self.env.set_expr_type(expr.1.start, ty.clone());
+        self.env.set_expr_type(&expr.1, ty.clone());
         ty
     }
 
@@ -587,46 +603,32 @@ impl TypeInferrer {
         left: &InferredType,
         right: &InferredType,
     ) -> InferredType {
-        // True when an operand could plausibly be a `Num` —
-        // either we proved it (`is_num()`) or sema couldn't pin
-        // a type at all (`Any`). Arithmetic ops only make
-        // sense on Nums in Wren; if either operand has a known
-        // *non*-Num concrete type the result stays `Any`, but
-        // an unknown side shouldn't poison an otherwise
-        // arithmetic expression.
-        let could_be_num = |t: &InferredType| matches!(t, InferredType::Num | InferredType::Any);
+        // An operand is a Num only when proven: the compiler unboxes
+        // on the strength of this, and an operator on an unknown
+        // operand may be the program's own.
+        let both_num = left.is_num() && right.is_num();
 
         match op {
-            // Arithmetic ops: Num × Num → Num. `+` doubles as
-            // string concatenation: keep the `String` rule for
-            // it but otherwise fall back to the could-be-num
-            // gate so `Num × Any` and `Any × Any` (the common
-            // shape when one operand is a method call sema
-            // hasn't typed yet) infer as `Num`.
+            // `+` doubles as string concatenation.
             BinaryOp::Add => {
                 if *left == InferredType::String || *right == InferredType::String {
                     InferredType::String
-                } else if could_be_num(left) && could_be_num(right) {
+                } else if both_num {
                     InferredType::Num
                 } else {
                     InferredType::Any
                 }
             }
-            BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                if could_be_num(left) && could_be_num(right) {
-                    InferredType::Num
-                } else {
-                    InferredType::Any
-                }
-            }
-
-            // Bitwise ops: Num × Num → Num
-            BinaryOp::BitAnd
+            BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
             | BinaryOp::BitOr
             | BinaryOp::BitXor
             | BinaryOp::Shl
             | BinaryOp::Shr => {
-                if could_be_num(left) && could_be_num(right) {
+                if both_num {
                     InferredType::Num
                 } else {
                     InferredType::Any

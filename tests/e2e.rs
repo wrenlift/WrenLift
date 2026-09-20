@@ -6472,6 +6472,30 @@ System.print(w)
     assert_eq!(output.trim(), "hi\n7");
 }
 
+/// An operator is a method of its receiver's class: a Num literal on
+/// the other side proves nothing about the receiver.
+#[test]
+fn e2e_operator_on_unknown_receiver_with_num_literal() {
+    let (result, output, _) = run(r#"
+class V {
+  construct new(x) { _x = x }
+  +(o) { V.new(_x + o) }
+  *(o) { V.new(_x * o) }
+  x { _x }
+}
+var a = V.new(1)
+var b = a + 1
+System.print(b.x)
+var c = b * 3
+System.print(c.x)
+var f = Fiber.new { 2 + b }
+f.try()
+System.print(f.error)
+"#);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "2\n6\nRight operand must be a number.");
+}
+
 /// A module-level loop carries the module variables it writes as
 /// values; a deopt inside it and each exit write them back.
 #[test]

@@ -1495,19 +1495,18 @@ class Slicer {
     }
 
     #[test]
-    fn arithmetic_with_unknown_operand_is_num() {
-        // `var n = some.getter * 22`. Sema can't pin the
-        // method-return type for `some.getter` (that needs the
-        // primitive method-return table that hasn't landed
-        // yet), but the multiplication should still infer
-        // `Num` — Wren's arithmetic ops only accept Num
-        // operands, so the well-typed result is Num regardless.
+    fn arithmetic_with_unknown_operand_is_untyped() {
+        // `var n = some.getter * 22`: an operator is a method of its
+        // receiver's class, so with the receiver's type unknown the
+        // product is unknown too, not Num.
         let src = "var n = 1.cos * 22\n";
         let a = Analysis::run(src).expect("parse + sema");
         let name_at = src.find("n =").unwrap();
-        let ty = a.var_type_at_span(name_at).expect("var typed");
-        assert_eq!(
-            inferred_to_class_name(&ty, &a.interner).as_deref(),
+        let ty = a.var_type_at_span(name_at);
+        assert_ne!(
+            ty.as_ref()
+                .and_then(|t| inferred_to_class_name(t, &a.interner))
+                .as_deref(),
             Some("Num")
         );
     }

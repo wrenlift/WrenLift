@@ -1035,9 +1035,10 @@ impl<'a> MirBuilder<'a> {
             Expr::BinaryOp { op, left, right } => {
                 let lhs = self.lower_expr(left);
                 let rhs = self.lower_expr(right);
-                // Check if both operands are known-Num. Use AST structure for
-                // literals (immune to span-key collisions in TypeEnv), TypeEnv
-                // for variables/fields/calls.
+                // Both operands proven Num: literals by structure, the
+                // rest by the type sema recorded for exactly that
+                // operand, not for the operation that starts where it
+                // does.
                 let is_num_expr = |e: &Spanned<Expr>, env: &crate::sema::types::TypeEnv| -> bool {
                     match &e.0 {
                         Expr::Num(_) => true,
@@ -1045,7 +1046,7 @@ impl<'a> MirBuilder<'a> {
                             op: UnaryOp::Neg,
                             operand,
                         } => matches!(operand.0, Expr::Num(_)),
-                        _ => env.get_expr_type(e.1.start).is_num(),
+                        _ => env.get_expr_type_at(&e.1).is_num(),
                     }
                 };
                 let both_num = self
