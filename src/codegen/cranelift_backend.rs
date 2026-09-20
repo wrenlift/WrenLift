@@ -2867,114 +2867,13 @@ pub mod cl {
         pub request: cranelift_module::DataId,
     }
 
-    /// Collect all runtime function name→address pairs for Cranelift symbol resolution.
+    /// Every runtime function name with its address, for the JIT
+    /// module's symbol table.
     fn runtime_symbols() -> Vec<(&'static str, usize)> {
-        let mut syms = Vec::new();
-        // Iterate through all known runtime function names
-        let names = [
-            "wren_call_0",
-            "wren_call_1",
-            "wren_call_2",
-            "wren_call_3",
-            "wren_call_4",
-            "wren_call_5",
-            "wren_call_6",
-            "wren_call_7",
-            "wren_call_8",
-            "wren_call_dynamic",
-            "wren_load_jit_ptr",
-            "wren_load_jit_closure",
-            "wren_jit_roots_snapshot",
-            "wren_jit_roots_restore",
-            "wren_known_call_0",
-            "wren_known_call_1",
-            "wren_known_call_2",
-            "wren_known_call_3",
-            "wren_known_call_0_nocheck",
-            "wren_known_call_1_nocheck",
-            "wren_known_call_2_nocheck",
-            "wren_known_call_3_nocheck",
-            "wren_construct_0",
-            "wren_construct_1",
-            "wren_construct_2",
-            "wren_construct_3",
-            "wren_alloc_instance",
-            "wren_ic_call_0",
-            "wren_ic_call_1",
-            "wren_ic_call_2",
-            "wren_ic_call_3",
-            "wren_super_call_0",
-            "wren_super_call_1",
-            "wren_super_call_2",
-            "wren_super_call_3",
-            "wren_super_call_4",
-            "wren_make_list",
-            "wren_make_list_1",
-            "wren_make_list_2",
-            "wren_make_list_3",
-            "wren_make_list_4",
-            "wren_list_add",
-            "wren_make_map",
-            "wren_map_set",
-            "wren_make_range",
-            "wren_make_closure_0",
-            "wren_make_closure_1",
-            "wren_make_closure_2",
-            "wren_make_closure_3",
-            "wren_make_closure_4",
-            "wren_make_closure_5",
-            "wren_make_closure_6",
-            "wren_make_closure_7",
-            "wren_make_closure_8",
-            "wren_make_closure_n",
-            "wren_get_module_var",
-            "wren_const_string",
-            "wren_set_module_var",
-            "wren_get_upvalue",
-            "wren_set_upvalue",
-            "wren_get_static_field",
-            "wren_set_static_field",
-            "wren_num_add",
-            "wren_num_sub",
-            "wren_num_mul",
-            "wren_num_div",
-            "wren_num_mod",
-            "wren_num_neg",
-            "wren_cmp_lt",
-            "wren_cmp_gt",
-            "wren_cmp_le",
-            "wren_cmp_ge",
-            "wren_cmp_eq",
-            "wren_cmp_ne",
-            "wren_not",
-            "wren_is_truthy",
-            "wren_string_concat",
-            "wren_to_string",
-            "wren_is_type",
-            "wren_subscript_get",
-            "wren_subscript_set",
-            "wren_bit_and",
-            "wren_bit_or",
-            "wren_bit_xor",
-            "wren_bit_not",
-            "wren_bit_shl",
-            "wren_bit_shr",
-            "wren_alloc_simd4f",
-            "wren_alloc_simd4i",
-            "wren_osr_post",
-            "wren_osr_take",
-            "wren_tier_tick",
-            "wren_retier",
-            "wren_deopt_n",
-            "wren_deopt_at",
-        ];
-
-        for name in &names {
-            if let Some(addr) = crate::codegen::runtime_fns::resolve(name) {
-                syms.push((*name, addr));
-            }
-        }
-        syms
+        crate::codegen::runtime_fns::RUNTIME_FN_NAMES
+            .iter()
+            .filter_map(|name| crate::codegen::runtime_fns::resolve(name).map(|a| (*name, a)))
+            .collect()
     }
 
     /// Declare a runtime function in the Cranelift module and return its FuncRef.

@@ -2123,8 +2123,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                     // aborted: …")` was a flat one-liner that
                     // looked like a green log line in the page,
                     // not an error.
-                    let loc = unsafe { vm.extract_error_location(entry.fiber) };
-                    vm.report_runtime_error(&e, loc.as_ref(), entry.fiber);
+                    vm.report_runtime_error_on(&e, entry.fiber);
                     // Mark the run as failed so the page paints the
                     // console pane red and the runtime pill flips
                     // to "error" — the initial interpret() returned

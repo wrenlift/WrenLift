@@ -2730,13 +2730,7 @@ impl VM {
             Err(e) => {
                 // Save the error fiber for post-mortem inspection before restoring
                 self.error_fiber = fiber;
-                // Noted when the error was raised, or, for one the run
-                // loop unwound to here, still on the fiber.
-                let site = self
-                    .error_site
-                    .take()
-                    .unwrap_or_else(|| self.site_of(fiber));
-                self.report_runtime_error(&e, &site);
+                self.report_runtime_error_on(&e, fiber);
                 self.fiber = prev_fiber;
                 InterpretResult::RuntimeError
             }
@@ -3016,6 +3010,21 @@ impl VM {
             }
             _ => None,
         }
+    }
+
+    /// Report an error that unwound out of `fiber`'s run loop, from
+    /// the site noted when it was raised or, for one the loop carried
+    /// out itself, the fiber's stack as it still stands.
+    pub fn report_runtime_error_on(
+        &mut self,
+        error: &super::vm_interp::RuntimeError,
+        fiber: *mut ObjFiber,
+    ) {
+        let site = self
+            .error_site
+            .take()
+            .unwrap_or_else(|| self.site_of(fiber));
+        self.report_runtime_error(error, &site);
     }
 
     /// Report a runtime error with full ariadne diagnostics, source snippets,
