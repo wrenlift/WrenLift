@@ -500,6 +500,16 @@ pub unsafe fn call_jit_at(j: *mut JitThread, fn_ptr: *const u8, args: &[Value]) 
 
 #[inline(always)]
 unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
+    let j = jit_state();
+    let mut link = EntryLink::new();
+    unsafe { enter_link(j, &mut link) };
+    let result = unsafe { call_jit_cached_inner(ctx, fn_ptr, args) };
+    unsafe { leave_link(j, &link) };
+    result
+}
+
+#[inline(always)]
+unsafe fn call_jit_cached_inner(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
     unsafe {
         #[cfg(not(target_arch = "aarch64"))]
         let _ = ctx;
@@ -1329,81 +1339,137 @@ pub struct JitThread {
     /// The frame a loop entry stub posted for the body it is about to
     /// call; 0 between stubs.
     pub osr_frame: u64,
-    /// The innermost compiled frame's record (see [`FrameRecord`]), 0
-    /// when none is running.
-    pub frame_head: u64,
+    /// Where compiled code is, for a trace (see [`EntryLink`]): the
+    /// frame pointer and site key of the compiled frame that last
+    /// called a helper that can raise, and the innermost link of the
+    /// entries into compiled code. Compiled code stores the pair
+    /// through one address ([`jit_cur_cell`]), so they sit together.
+    pub cur: CurFrame,
+    pub entry_top: u64,
 }
 
-/// What a compiled body keeps in its own stack frame and links from
-/// [`JitThread::frame_head`] while it runs: the record it displaced,
-/// and a key of its function id in the low word and, in the high
-/// word, the source offset plus one of the call it is inside (0 in
-/// its prologue, [`FRAME_SITE_SHADOWED`] once a loop entry into a
-/// higher tier has taken over its activation). The interpreter notes
-/// the head in each frame it pushes, so a trace can interleave the
-/// two stacks.
+/// The compiled frame a raise would be inside: its frame pointer and
+/// key (function id in the low word, site in the high word). Written
+/// by compiled code before each call into the runtime that can raise
+/// or run code, read by a trace, 0 when no compiled frame has.
 #[repr(C)]
-pub struct FrameRecord {
-    pub prev: u64,
+#[derive(Clone, Copy, Default)]
+pub struct CurFrame {
+    pub fp: u64,
     pub key: u64,
 }
 
-/// Site word of a record whose activation continues in a higher
-/// tier's loop entry; traces leave it out.
-pub const FRAME_SITE_SHADOWED: u32 = u32::MAX;
-
-/// Address of this thread's record head, for a body compiled on any
-/// thread to run on this one.
-pub fn jit_frame_head_cell() -> usize {
-    unsafe { std::ptr::addr_of_mut!((*jit_state()).frame_head) as usize }
+/// What a trace needs of compiled frames, and what it costs them:
+/// nothing on entry, return or a direct call. Compiled bodies keep
+/// frame pointers, so from a frame every caller's frame and return
+/// address follow, and a return address inside compiled code names its
+/// site through the code's own table. Only where compiled code calls
+/// the runtime is that chain unreadable (runtime frames keep no frame
+/// pointer), so such a call stores its frame and site first
+/// ([`CurFrame`]), and each entry from the runtime into compiled code
+/// links the pair it displaces here, on the entering frame's stack, for
+/// the walk to continue below the entry. The interpreter notes the
+/// innermost link in each frame it pushes, so a trace can interleave
+/// the two stacks.
+#[repr(C)]
+pub struct EntryLink {
+    pub prev: u64,
+    pub fp: u64,
+    pub key: u64,
 }
 
-#[inline(always)]
-pub fn frame_head() -> u64 {
-    unsafe { (*jit_state()).frame_head }
-}
+/// Bit of a key's site word for a frame the trace leaves out: the
+/// activation went on elsewhere, in a higher tier's loop entry or in
+/// the interpreter after a deopt, and that frame stands for it.
+pub const KEY_SHADOWED: u64 = 1 << 63;
 
-#[inline(always)]
-pub fn set_frame_head(head: u64) {
-    unsafe { (*jit_state()).frame_head = head };
-}
-
-/// The compiled frames from `from` down to, excluding, `stop`,
-/// innermost first, as (function id, site word). `WLIFT_FRAME_TRACE=1`
-/// prints the walk; safe to run with.
-pub fn frames_between(from: u64, stop: u64) -> Vec<(u32, u32)> {
-    let mut out = Vec::new();
-    let mut p = from;
-    while p != 0 && p != stop && out.len() < 100_000 {
-        if std::env::var_os("WLIFT_FRAME_TRACE").is_some() {
-            eprintln!("frame-trace: rec {p:#x} stop {stop:#x}");
+impl EntryLink {
+    pub const fn new() -> Self {
+        EntryLink {
+            prev: 0,
+            fp: 0,
+            key: 0,
         }
-        let rec = unsafe { &*(p as *const FrameRecord) };
-        out.push((rec.key as u32, (rec.key >> 32) as u32));
-        p = rec.prev;
-    }
-    out
-}
-
-/// Unlink the head record, the calling activation's: it goes on in
-/// the interpreter, which pushes its own frame for it, and the body's
-/// epilogue stores the same predecessor again.
-pub fn pop_frame() {
-    let p = frame_head();
-    if p != 0 {
-        let rec = unsafe { &*(p as *const FrameRecord) };
-        set_frame_head(rec.prev);
     }
 }
 
-/// Mark the head record, `func_id`'s activation's, shadowed while it
-/// runs in a higher tier's loop entry; a site store by the body clears
-/// it.
-pub fn shadow_frame(func_id: u32) {
-    let p = frame_head();
-    if p != 0 {
-        let rec = unsafe { &mut *(p as *mut FrameRecord) };
-        rec.key = func_id as u64 | ((FRAME_SITE_SHADOWED as u64) << 32);
+impl Default for EntryLink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Entering compiled code from the runtime: the link takes the current
+/// frame pair, and a fresh segment starts.
+///
+/// # Safety
+/// `j` is this thread's state; `link` outlives the call and is passed
+/// to [`leave_link`] after it.
+#[inline(always)]
+pub unsafe fn enter_link(j: *mut JitThread, link: &mut EntryLink) {
+    unsafe {
+        let j = &mut *j;
+        link.prev = j.entry_top;
+        link.fp = j.cur.fp;
+        link.key = j.cur.key;
+        j.entry_top = link as *mut EntryLink as u64;
+        j.cur.fp = 0;
+    }
+}
+
+/// Back from compiled code: the pair the link held is current again.
+///
+/// # Safety
+/// As [`enter_link`], with the same link.
+#[inline(always)]
+pub unsafe fn leave_link(j: *mut JitThread, link: &EntryLink) {
+    unsafe {
+        let j = &mut *j;
+        j.cur.fp = link.fp;
+        j.cur.key = link.key;
+        j.entry_top = link.prev;
+    }
+}
+
+/// The innermost entry link, for an interpreter frame to note.
+#[inline(always)]
+pub fn entry_top() -> u64 {
+    unsafe { (*jit_state()).entry_top }
+}
+
+/// The frame pair and entry link of this thread, for a fiber switch to
+/// carry with the stack they describe.
+pub fn native_frames_state() -> (CurFrame, u64) {
+    let j = unsafe { &*jit_state() };
+    (j.cur, j.entry_top)
+}
+
+pub fn set_native_frames_state(state: (CurFrame, u64)) {
+    let j = unsafe { &mut *jit_state() };
+    j.cur = state.0;
+    j.entry_top = state.1;
+}
+
+/// Address of this thread's current frame pair, for a body compiled on
+/// any thread to run on this one.
+pub fn jit_cur_cell() -> usize {
+    unsafe { std::ptr::addr_of_mut!((*jit_state()).cur) as usize }
+}
+
+/// The current compiled frame's activation goes on in the interpreter
+/// (a deopt): a trace leaves the frame out and continues from it.
+pub fn shadow_current() {
+    unsafe { (*jit_state()).cur.key |= KEY_SHADOWED };
+}
+
+/// The activation the innermost entry displaced goes on in the body
+/// entered (a loop entry into a higher tier): a trace leaves its frame
+/// out and continues from it.
+pub fn shadow_entry() {
+    let j = unsafe { &mut *jit_state() };
+    if j.entry_top != 0 {
+        let link = unsafe { &mut *(j.entry_top as *mut EntryLink) };
+        link.key |= KEY_SHADOWED;
     }
 }
 
@@ -1426,7 +1492,8 @@ thread_local! {
         depth: 0,
         disabled: false,
         osr_frame: 0,
-        frame_head: 0,
+        cur: CurFrame { fp: 0, key: 0 },
+        entry_top: 0,
     }) };
 
     /// Flat shadow root stack — zero-alloc push/pop after warmup.
@@ -1528,7 +1595,6 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     if vm.is_null() {
         return decline;
     }
-    let has_record = func_id & DEOPT_HAS_RECORD != 0;
     let func_id = func_id as u32 as u64;
     let vm = unsafe { &mut *vm };
     let id = crate::runtime::engine::FuncId(func_id as u32);
@@ -1607,10 +1673,13 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
     unsafe { (*jit_state()).ctx.current_func_id = func_id };
     set_jit_depth(depth + 1);
     let f: extern "C" fn(*const u64) -> u64 = unsafe { std::mem::transmute(entry.ptr) };
-    if has_record {
-        shadow_frame(func_id as u32);
-    }
+    // The caller's activation goes on in the body entered.
+    let j = jit_state();
+    let mut link = EntryLink::new();
+    unsafe { enter_link(j, &mut link) };
+    shadow_entry();
     let result = f(args[1..].as_ptr() as *const u64);
+    unsafe { leave_link(j, &link) };
     set_jit_depth(depth);
     unsafe { (*jit_state()).ctx.current_func_id = saved_func_id };
     result
@@ -3948,6 +4017,16 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
 /// Raw call into JIT code without VM reference (for IC dispatch).
 #[inline(always)]
 unsafe fn call_jit_with_shadow_raw(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    let j = jit_state();
+    let mut link = EntryLink::new();
+    unsafe { enter_link(j, &mut link) };
+    let result = unsafe { call_jit_with_shadow_raw_inner(fn_ptr, args) };
+    unsafe { leave_link(j, &link) };
+    result
+}
+
+#[inline(always)]
+unsafe fn call_jit_with_shadow_raw_inner(fn_ptr: *const u8, args: &[Value]) -> u64 {
     unsafe {
         match args.len() {
             0 => {
@@ -5172,9 +5251,8 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
         Some(v) => v,
         None => return Value::null().to_bits(),
     };
-    if func_id & DEOPT_HAS_RECORD != 0 {
-        pop_frame();
-    }
+    // The frame goes on in the interpreter; a trace leaves it out.
+    shadow_current();
     let func_id = func_id as u32 as u64;
     let words: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
     let root_len_before = jit_roots_snapshot_len();
@@ -5235,16 +5313,9 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
 #[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
 pub unsafe extern "C" fn wren_deopt_n(func_id: u64, n: u64, buf: *const u64) -> u64 {
     let args: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
-    if func_id & DEOPT_HAS_RECORD != 0 {
-        pop_frame();
-    }
+    shadow_current();
     deopt_impl(func_id as u32, &args)
 }
-
-/// Bit of a deopt or retier helper's function id argument: the head
-/// record is the calling activation's, to unlink or shadow before
-/// another takes it over.
-pub const DEOPT_HAS_RECORD: u64 = 1 << 32;
 
 // ---------------------------------------------------------------------------
 // Boxed NaN-boxed arithmetic runtime functions

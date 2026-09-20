@@ -2708,7 +2708,7 @@ impl VM {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
-                native_mark: crate::codegen::runtime_fns::frame_head(),
+                native_mark: crate::codegen::runtime_fns::entry_top(),
             });
         }
 
@@ -2841,7 +2841,7 @@ impl VM {
     /// The span of a compiled frame's site word: the widest expression
     /// starting at that source offset, which is the call itself.
     fn span_at_site(&self, func_id: super::engine::FuncId, site: u32) -> Option<crate::ast::Span> {
-        if site == 0 || site == crate::codegen::runtime_fns::FRAME_SITE_SHADOWED {
+        if site == 0 || site == crate::codegen::SITE_NONE {
             return None;
         }
         let start = (site - 1) as usize;
@@ -2862,35 +2862,48 @@ impl VM {
         &self,
         fiber: *mut ObjFiber,
     ) -> Vec<(super::engine::FuncId, Arc<String>, Option<crate::ast::Span>)> {
-        use crate::codegen::runtime_fns::{FRAME_SITE_SHADOWED, frame_head, frames_between};
+        use crate::codegen::runtime_fns::{EntryLink, entry_top, jit_state};
         let mut out = Vec::new();
         if fiber.is_null() {
             return out;
         }
         let frames = unsafe { &(*fiber).mir_frames };
         let native = fiber == self.fiber;
-        let mut head = frame_head();
+        let trace = std::env::var_os("WLIFT_FRAME_TRACE").is_some();
+        // Compiled frames come in segments, each between two entries
+        // from the runtime: the innermost from the current frame pair,
+        // every older one from the pair its entry link holds.
+        let cur = unsafe { (*jit_state()).cur };
+        let mut seg = (cur.fp, cur.key);
+        let mut link = entry_top();
+        let push_segment = |seg: (u64, u64), out: &mut Vec<_>, frame: &MirCallFrame| {
+            for (fid, site) in self.engine.native_frames(seg.0, seg.1) {
+                if trace {
+                    eprintln!("frame-trace: native fid={fid} site={site}");
+                }
+                let id = super::engine::FuncId(fid);
+                let module = self
+                    .engine
+                    .func_module(id)
+                    .cloned()
+                    .unwrap_or_else(|| frame.module_name.clone());
+                out.push((id, module, self.span_at_site(id, site)));
+            }
+        };
+        let older = |link: u64| {
+            let l = unsafe { &*(link as *const EntryLink) };
+            ((l.fp, l.key), l.prev)
+        };
         for frame in frames.iter().rev() {
             if native {
+                // Segments entered after this frame was pushed sit above it.
                 let stop = frame.native_mark & !1;
-                for (fid, site) in frames_between(head, stop) {
-                    if std::env::var_os("WLIFT_FRAME_TRACE").is_some() {
-                        eprintln!("frame-trace: native fid={fid} site={site}");
-                    }
-                    if site == FRAME_SITE_SHADOWED {
-                        continue;
-                    }
-                    let id = super::engine::FuncId(fid);
-                    let module = self
-                        .engine
-                        .func_module(id)
-                        .cloned()
-                        .unwrap_or_else(|| frame.module_name.clone());
-                    out.push((id, module, self.span_at_site(id, site)));
+                while link != stop && link != 0 {
+                    push_segment(seg, &mut out, frame);
+                    (seg, link) = older(link);
                 }
-                head = stop;
             }
-            if std::env::var_os("WLIFT_FRAME_TRACE").is_some() {
+            if trace {
                 eprintln!(
                     "frame-trace: interp fid={} pc={} mark={:#x}",
                     frame.func_id.0, frame.pc, frame.native_mark
@@ -2902,6 +2915,15 @@ impl VM {
                     frame.module_name.clone(),
                     self.span_at_pc(frame.func_id, frame.pc),
                 ));
+            }
+        }
+        if native && let Some(frame) = frames.first() {
+            loop {
+                push_segment(seg, &mut out, frame);
+                if link == 0 {
+                    break;
+                }
+                (seg, link) = older(link);
             }
         }
         out
@@ -4897,7 +4919,7 @@ impl VM {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
-                native_mark: crate::codegen::runtime_fns::frame_head(),
+                native_mark: crate::codegen::runtime_fns::entry_top(),
             });
         }
 
@@ -5293,7 +5315,7 @@ impl VM {
                     closure: Some(live_closure),
                     defining_class: live_defining_class,
                     bc_ptr: std::ptr::null(),
-                    native_mark: crate::codegen::runtime_fns::frame_head(),
+                    native_mark: crate::codegen::runtime_fns::entry_top(),
                 });
             }
 
@@ -5425,7 +5447,7 @@ impl VM {
                 closure: Some(live_closure),
                 defining_class: live_defining_class,
                 bc_ptr: std::ptr::null(),
-                native_mark: crate::codegen::runtime_fns::frame_head(),
+                native_mark: crate::codegen::runtime_fns::entry_top(),
             });
         }
 
@@ -5534,7 +5556,7 @@ impl VM {
             closure: Some(live_closure),
             defining_class: live_defining_class,
             bc_ptr: std::ptr::null(),
-            native_mark: crate::codegen::runtime_fns::frame_head(),
+            native_mark: crate::codegen::runtime_fns::entry_top(),
         };
 
         let current_fiber = self.fiber;
@@ -5752,7 +5774,7 @@ impl VM {
                     closure: Some(closure_ptr),
                     defining_class: Some(class_ptr),
                     bc_ptr: std::ptr::null(),
-                    native_mark: crate::codegen::runtime_fns::frame_head(),
+                    native_mark: crate::codegen::runtime_fns::entry_top(),
                 });
             }
 
@@ -5836,7 +5858,7 @@ impl VM {
                 closure: Some(closure_ptr),
                 defining_class: Some(class_ptr),
                 bc_ptr: std::ptr::null(),
-                native_mark: crate::codegen::runtime_fns::frame_head(),
+                native_mark: crate::codegen::runtime_fns::entry_top(),
             });
         }
 

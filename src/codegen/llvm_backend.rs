@@ -35,7 +35,7 @@ pub mod llvm {
     use crate::codegen::cranelift_backend::cl::{
         OsrEntryLayout, PTR_MASK, QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
         collect_osr_targets, const_f64_of, direct_calls_enabled, env_jit_callsite_ic,
-        infer_osr_value_types, is_positive_power_of_two, jit_frame_head_cell, jit_func_id,
+        infer_osr_value_types, is_positive_power_of_two, jit_cur_cell, jit_func_id,
         jit_modvar_in_range, jit_modvars_cell, osr_entry_layout, should_compile_osr_entries,
     };
     use crate::intern::Interner;
@@ -50,8 +50,253 @@ pub mod llvm {
     pub struct LlvmCompiledCode {
         pub fn_ptr: *const u8,
         pub osr_entries: Vec<NativeOsrEntry>,
+        /// The code sections and, from the stack maps, the site of each
+        /// direct call's return address, for traces.
+        pub sites: Vec<crate::codegen::CodeSites>,
         _engine: ExecutionEngine<'static>,
         _context: Box<Context>,
+    }
+
+    /// What the module's sections were placed at, kept by the memory
+    /// manager MCJIT loads through: the code sections, for a trace to
+    /// know a return address is compiled, and the stack map section,
+    /// which names the site of each direct call.
+    #[derive(Debug, Default)]
+    struct SectionLog {
+        code: Vec<(usize, usize)>,
+        stackmaps: Option<(usize, usize)>,
+        mappings: Vec<(usize, usize)>,
+    }
+
+    /// The memory manager: pages mapped writable for the loader, code
+    /// pages made executable when it is done, everything unmapped with
+    /// the engine.
+    #[derive(Debug)]
+    struct SectionMemory(Arc<std::sync::Mutex<SectionLog>>);
+
+    fn page_round(size: usize) -> usize {
+        let page = 4096;
+        (size.max(1) + page - 1) & !(page - 1)
+    }
+
+    #[cfg(unix)]
+    fn map_pages(size: usize) -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            std::ptr::null_mut()
+        } else {
+            p as *mut u8
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(start: usize, size: usize) -> Result<(), String> {
+        let rc = unsafe {
+            libc::mprotect(
+                start as *mut libc::c_void,
+                size,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("mprotect: {}", std::io::Error::last_os_error()));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        unsafe {
+            unsafe extern "C" {
+                fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
+            }
+            sys_icache_invalidate(start as *mut libc::c_void, size);
+        }
+        #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+        unsafe {
+            unsafe extern "C" {
+                fn __clear_cache(start: *mut libc::c_char, end: *mut libc::c_char);
+            }
+            __clear_cache(
+                start as *mut libc::c_char,
+                (start + size) as *mut libc::c_char,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn unmap_pages(start: usize, size: usize) {
+        unsafe { libc::munmap(start as *mut libc::c_void, size) };
+    }
+
+    #[cfg(windows)]
+    fn map_pages(size: usize) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ) as *mut u8
+        }
+    }
+
+    #[cfg(windows)]
+    fn make_executable(start: usize, size: usize) -> Result<(), String> {
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+        use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, VirtualProtect};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut old = 0;
+        let ok = unsafe { VirtualProtect(start as *const _, size, PAGE_EXECUTE_READ, &mut old) };
+        if ok == 0 {
+            return Err(format!(
+                "VirtualProtect: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        unsafe { FlushInstructionCache(GetCurrentProcess(), start as *const _, size) };
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn unmap_pages(start: usize, _size: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
+    }
+
+    impl inkwell::memory_manager::McjitMemoryManager for SectionMemory {
+        fn allocate_code_section(
+            &mut self,
+            size: usize,
+            _alignment: u32,
+            _section_id: u32,
+            _section_name: &str,
+        ) -> *mut u8 {
+            let len = page_round(size);
+            let p = map_pages(len);
+            if !p.is_null() {
+                let mut log = self.0.lock().unwrap();
+                log.code.push((p as usize, p as usize + size));
+                log.mappings.push((p as usize, len));
+            }
+            p
+        }
+
+        fn allocate_data_section(
+            &mut self,
+            size: usize,
+            _alignment: u32,
+            _section_id: u32,
+            section_name: &str,
+            _is_read_only: bool,
+        ) -> *mut u8 {
+            let len = page_round(size);
+            let p = map_pages(len);
+            if !p.is_null() {
+                let mut log = self.0.lock().unwrap();
+                if section_name.contains("llvm_stackmaps") {
+                    log.stackmaps = Some((p as usize, size));
+                }
+                log.mappings.push((p as usize, len));
+            }
+            p
+        }
+
+        fn finalize_memory(&mut self) -> Result<(), String> {
+            let log = self.0.lock().unwrap();
+            let code: Vec<(usize, usize)> = log
+                .mappings
+                .iter()
+                .copied()
+                .filter(|(start, _)| log.code.iter().any(|(s, _)| s == start))
+                .collect();
+            drop(log);
+            for (start, len) in code {
+                make_executable(start, len)?;
+            }
+            Ok(())
+        }
+
+        fn destroy(&mut self) {
+            let log = std::mem::take(&mut *self.0.lock().unwrap());
+            for (start, len) in log.mappings {
+                unmap_pages(start, len);
+            }
+        }
+    }
+
+    /// The site tables of the code sections in `log`, from the stack
+    /// map section (format version 3): each record is a mark planted
+    /// after a direct call, its id the site.
+    fn code_sites_of(log: &SectionLog) -> Vec<crate::codegen::CodeSites> {
+        let mut marks: Vec<Vec<(u32, u32)>> = vec![Vec::new(); log.code.len()];
+        if let Some((base, len)) = log.stackmaps
+            && len >= 16
+        {
+            let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+            let u8_at = |o: usize| bytes.get(o).copied().unwrap_or(0);
+            let u16_at = |o: usize| u16::from_le_bytes([u8_at(o), u8_at(o + 1)]);
+            let u32_at =
+                |o: usize| u32::from_le_bytes([u8_at(o), u8_at(o + 1), u8_at(o + 2), u8_at(o + 3)]);
+            let u64_at = |o: usize| (u32_at(o) as u64) | ((u32_at(o + 4) as u64) << 32);
+            if u8_at(0) == 3 {
+                let functions = u32_at(4) as usize;
+                let constants = u32_at(8) as usize;
+                let records = u32_at(12) as usize;
+                let mut fns = Vec::with_capacity(functions);
+                let mut at = 16;
+                for _ in 0..functions {
+                    fns.push((u64_at(at) as usize, u64_at(at + 16) as usize));
+                    at += 24;
+                }
+                at += constants * 8;
+                let mut fi = 0;
+                let mut left = fns.first().map(|f| f.1).unwrap_or(0);
+                for _ in 0..records {
+                    while left == 0 && fi + 1 < fns.len() {
+                        fi += 1;
+                        left = fns[fi].1;
+                    }
+                    let site = u64_at(at) as u32;
+                    let offset = u32_at(at + 8) as usize;
+                    let locations = u16_at(at + 14) as usize;
+                    at += 16 + locations * 12;
+                    at = (at + 7) & !7;
+                    let live_outs = u16_at(at + 2) as usize;
+                    at += 4 + live_outs * 4;
+                    at = (at + 7) & !7;
+                    if let Some(&(addr, _)) = fns.get(fi) {
+                        let ra = addr + offset;
+                        if let Some(i) = log.code.iter().position(|(s, e)| ra >= *s && ra < *e) {
+                            marks[i].push(((ra - log.code[i].0) as u32, site));
+                        }
+                    }
+                    left = left.saturating_sub(1);
+                }
+            }
+        }
+        log.code
+            .iter()
+            .zip(marks)
+            .map(|(&(start, end), mut marks)| {
+                marks.sort_unstable();
+                crate::codegen::CodeSites {
+                    start,
+                    end,
+                    func_id: 0,
+                    sites: crate::codegen::SiteTable::Marks(marks),
+                }
+            })
+            .collect()
     }
 
     // SAFETY: the engine's memory is self-contained; nothing else
@@ -323,8 +568,15 @@ pub mod llvm {
             eprintln!("=== end ===");
         }
 
+        let sections = Arc::new(std::sync::Mutex::new(SectionLog::default()));
         let engine = module
-            .create_jit_execution_engine(codegen_level())
+            .create_mcjit_execution_engine_with_memory_manager(
+                SectionMemory(sections.clone()),
+                codegen_level(),
+                CodeModel::JITDefault,
+                true,
+                false,
+            )
             .map_err(|e| e.to_string())?;
         for (global, addr) in shared.globals.borrow().iter() {
             engine.add_global_mapping(global, *addr as usize);
@@ -359,9 +611,11 @@ pub mod llvm {
                 live_in_modvar: modvar,
             });
         }
+        let sites = code_sites_of(&sections.lock().unwrap());
         Ok(LlvmCompiledCode {
             fn_ptr,
             osr_entries,
+            sites,
             _engine: engine,
             _context: context,
         })
@@ -474,13 +728,6 @@ pub mod llvm {
         cur_vid: ValueId,
         /// Its site word: source offset plus one, 0 when it has none.
         cur_site: u32,
-        /// The body's frame record and the head it displaced (see
-        /// `runtime_fns::FrameRecord`).
-        frame_rec: Option<(PointerValue<'ctx>, IntValue<'ctx>)>,
-        /// The slot a body without a record of its own links one from
-        /// around each call that can raise, all of which are on slow
-        /// paths.
-        lazy_rec: Option<PointerValue<'ctx>>,
         raw_bools: HashSet<ValueId>,
         value_types: Vec<MirType>,
 
@@ -530,8 +777,6 @@ pub mod llvm {
                 field_invariant: None,
                 cur_vid: ValueId(u32::MAX),
                 cur_site: 0,
-                frame_rec: None,
-                lazy_rec: None,
                 raw_bools: HashSet::new(),
                 value_types: infer_osr_value_types(mir),
 
@@ -584,7 +829,7 @@ pub mod llvm {
             let ty = self.helper_type(args.len());
             let raises = crate::codegen::runtime_fns::helper_can_raise(name);
             if raises {
-                self.site_enter()?;
+                self.cur_frame()?;
             }
             let v = self
                 .call_addr(
@@ -595,7 +840,6 @@ pub mod llvm {
                 )?
                 .into_int_value();
             if raises {
-                self.site_leave()?;
                 self.error_poll()?;
             }
             Ok(v)
@@ -1363,69 +1607,25 @@ pub mod llvm {
             self.icmp(IntPredicate::EQ, m, self.c64(QNAN))
         }
 
-        /// Link a record for this body in its frame, holding the
-        /// displaced head; a trace reads the chain. Its key is written
-        /// by the first site, which every reader of the record comes
-        /// through. A body that cannot raise keeps none.
-        fn frame_push(&mut self) -> Result<(), String> {
-            use crate::codegen::cranelift_backend::cl::{body_calls, body_can_raise};
-            let cell = jit_frame_head_cell();
-            if cell == 0 || !body_can_raise(self.sh.mir) {
+        /// Before a call into the runtime that can raise or run code:
+        /// the thread's current frame pair is this frame and the site.
+        /// A trace walks up from here; a direct call needs only the
+        /// mark after it.
+        fn cur_frame(&mut self) -> Result<(), String> {
+            let cell = jit_cur_cell();
+            if cell == 0 {
                 return Ok(());
             }
-            let rec = self
-                .b
-                .build_alloca(self.i64t().array_type(2), "frec")
-                .map_err(|e| e.to_string())?;
-            if !body_calls(self.sh.mir) {
-                self.lazy_rec = Some(rec);
-                return Ok(());
-            }
+            let key = jit_func_id() as u64 | ((self.cur_site as u64) << 32);
             let cellp = self
                 .b
-                .build_int_to_ptr(self.c64(cell as u64), self.ptrt(), "fhead")
+                .build_int_to_ptr(self.c64(cell as u64), self.ptrt(), "fcur")
                 .map_err(|e| e.to_string())?;
-            let head = self
-                .b
-                .build_load(self.i64t(), cellp, "head")
-                .map_err(|e| e.to_string())?
-                .into_int_value();
-            self.b.build_store(rec, head).map_err(|e| e.to_string())?;
-            let reca = self
-                .b
-                .build_ptr_to_int(rec, self.i64t(), "freca")
-                .map_err(|e| e.to_string())?;
-            self.b.build_store(cellp, reca).map_err(|e| e.to_string())?;
-            self.frame_rec = Some((rec, head));
-            Ok(())
-        }
-
-        /// Before a call that can raise: the record's key names the
-        /// site. A body without a record links one here, for the call's
-        /// duration.
-        fn site_enter(&mut self) -> Result<(), String> {
-            let key = jit_func_id() as u64 | ((self.cur_site as u64) << 32);
-            let rec = match (self.frame_rec, self.lazy_rec) {
-                (Some((rec, _)), _) => rec,
-                (None, Some(rec)) => {
-                    let cellp = self.head_cell()?;
-                    let head = self
-                        .b
-                        .build_load(self.i64t(), cellp, "head")
-                        .map_err(|e| e.to_string())?;
-                    self.b.build_store(rec, head).map_err(|e| e.to_string())?;
-                    let reca = self
-                        .b
-                        .build_ptr_to_int(rec, self.i64t(), "freca")
-                        .map_err(|e| e.to_string())?;
-                    self.b.build_store(cellp, reca).map_err(|e| e.to_string())?;
-                    rec
-                }
-                (None, None) => return Ok(()),
-            };
+            let fp = self.frame_address()?;
+            self.b.build_store(cellp, fp).map_err(|e| e.to_string())?;
             let keyp = unsafe {
                 self.b
-                    .build_in_bounds_gep(self.i64t(), rec, &[self.c64(1)], "fkey")
+                    .build_in_bounds_gep(self.i64t(), cellp, &[self.c64(1)], "fkey")
             }
             .map_err(|e| e.to_string())?;
             self.b
@@ -1434,51 +1634,67 @@ pub mod llvm {
             Ok(())
         }
 
-        /// After such a call: a record linked for it is unlinked.
-        fn site_leave(&mut self) -> Result<(), String> {
-            if self.frame_rec.is_some() {
-                return Ok(());
-            }
-            let Some(rec) = self.lazy_rec else {
-                return Ok(());
+        /// This frame's pointer, as a word.
+        fn frame_address(&mut self) -> Result<IntValue<'ctx>, String> {
+            let f = match self.sh.module.get_function("llvm.frameaddress.p0") {
+                Some(f) => f,
+                None => {
+                    let ty = self.ptrt().fn_type(&[self.sh.ctx.i32_type().into()], false);
+                    self.sh
+                        .module
+                        .add_function("llvm.frameaddress.p0", ty, None)
+                }
             };
-            let head = self
+            let call = self
                 .b
-                .build_load(self.i64t(), rec, "prev")
+                .build_call(f, &[self.sh.ctx.i32_type().const_zero().into()], "fp")
                 .map_err(|e| e.to_string())?;
-            let cellp = self.head_cell()?;
-            self.b.build_store(cellp, head).map_err(|e| e.to_string())?;
-            Ok(())
-        }
-
-        fn head_cell(&self) -> Result<PointerValue<'ctx>, String> {
+            let p = call
+                .try_as_basic_value()
+                .basic()
+                .ok_or("frameaddress")?
+                .into_pointer_value();
             self.b
-                .build_int_to_ptr(self.c64(jit_frame_head_cell() as u64), self.ptrt(), "fhead")
+                .build_ptr_to_int(p, self.i64t(), "fpw")
                 .map_err(|e| e.to_string())
         }
 
-        /// A deopt helper's function id argument, with bit 32 set when
-        /// the body has a record of its own for the helper to unlink.
-        fn deopt_fid(&self) -> IntValue<'ctx> {
-            let bit = if self.frame_rec.is_some() {
-                crate::codegen::runtime_fns::DEOPT_HAS_RECORD
-            } else {
-                0
+        /// After a direct call into compiled code: a stack map record
+        /// at this point, keyed by the site, so the call's return
+        /// address names the site.
+        fn site_mark(&mut self) -> Result<(), String> {
+            if jit_cur_cell() == 0 {
+                return Ok(());
+            }
+            let f = match self.sh.module.get_function("llvm.experimental.stackmap") {
+                Some(f) => f,
+                None => {
+                    let ty = self
+                        .sh
+                        .ctx
+                        .void_type()
+                        .fn_type(&[self.i64t().into(), self.sh.ctx.i32_type().into()], true);
+                    self.sh
+                        .module
+                        .add_function("llvm.experimental.stackmap", ty, None)
+                }
             };
-            self.c64(jit_func_id() as u64 | bit)
+            self.b
+                .build_call(
+                    f,
+                    &[
+                        self.c64(self.cur_site as u64).into(),
+                        self.sh.ctx.i32_type().const_zero().into(),
+                    ],
+                    "",
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(())
         }
 
-        /// Before a return: the head is the displaced record again.
-        fn frame_pop(&mut self) -> Result<(), String> {
-            let Some((_, head)) = self.frame_rec else {
-                return Ok(());
-            };
-            let cellp = self
-                .b
-                .build_int_to_ptr(self.c64(jit_frame_head_cell() as u64), self.ptrt(), "fhead")
-                .map_err(|e| e.to_string())?;
-            self.b.build_store(cellp, head).map_err(|e| e.to_string())?;
-            Ok(())
+        /// A deopt helper's function id argument.
+        fn deopt_fid(&self) -> IntValue<'ctx> {
+            self.c64(jit_func_id() as u64)
         }
 
         /// Leave the function with null when an error is pending, as
@@ -1537,7 +1753,6 @@ pub mod llvm {
             let raised = self.icmp(IntPredicate::NE, err, self.c64(0))?;
             self.cbr(raised, leave, cont)?;
             self.b.position_at_end(leave);
-            self.frame_pop()?;
             self.b
                 .build_return(Some(&self.c64(TAG_NULL)))
                 .map_err(|e| e.to_string())?;
@@ -1713,8 +1928,6 @@ pub mod llvm {
                     self.osr_vars.insert(vid);
                 }
             }
-
-            self.frame_push()?;
 
             if self.entries.is_empty() {
                 let entry = &mir.blocks[0];
@@ -2011,12 +2224,10 @@ pub mod llvm {
             match term {
                 Terminator::Return(v) => {
                     let r = self.boxed(v)?;
-                    self.frame_pop()?;
                     self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
                 }
                 Terminator::ReturnNull => {
                     let r = self.c64(TAG_NULL);
-                    self.frame_pop()?;
                     self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
                 }
                 Terminator::Branch { target, args } => {
@@ -2309,13 +2520,12 @@ pub mod llvm {
                     for a in args {
                         call_args.push(self.boxed(a)?.into());
                     }
-                    self.site_enter()?;
                     let call = self
                         .b
                         .build_call(self.sh.main_fn, &call_args, "self")
                         .map_err(|e| e.to_string())?;
                     let v = call.try_as_basic_value().basic().unwrap();
-                    self.site_leave()?;
+                    self.site_mark()?;
                     self.error_poll()?;
                     v
                 }
@@ -3247,7 +3457,6 @@ pub mod llvm {
             let fid = self.deopt_fid();
             let n = self.c64(params.len() as u64);
             let result = self.call_helper("wren_deopt_n", &[fid, n, buf])?;
-            self.frame_pop()?;
             self.b
                 .build_return(Some(&result))
                 .map_err(|e| e.to_string())?;
@@ -3306,7 +3515,6 @@ pub mod llvm {
             let pcv = self.c64(pc as u64);
             let n = self.c64(words as u64);
             let result = self.call_helper("wren_deopt_at", &[fid, pcv, n, buf])?;
-            self.frame_pop()?;
             self.b
                 .build_return(Some(&result))
                 .map_err(|e| e.to_string())?;
@@ -3914,7 +4122,6 @@ pub mod llvm {
                 .map_err(|e| e.to_string())?;
             let mut a: Vec<BasicMetadataValueEnum> = vec![r.into()];
             a.extend(args.iter().map(|v| BasicMetadataValueEnum::from(*v)));
-            self.site_enter()?;
             let call = match jit_ptr {
                 Some(jit_ptr) => {
                     let ty = self.helper_type(1 + args.len());
@@ -3932,10 +4139,10 @@ pub mod llvm {
                     .map_err(|e| e.to_string())?,
             };
             let fv = call.try_as_basic_value().basic().unwrap().into_int_value();
+            self.site_mark()?;
             self.b
                 .build_store(depth_p, depth)
                 .map_err(|e| e.to_string())?;
-            self.site_leave()?;
             self.error_poll()?;
             Ok(Some((fv, self.b.get_insert_block().unwrap())))
         }
@@ -4170,14 +4377,13 @@ pub mod llvm {
                                 .map_err(|e| e.to_string())?;
                             let mut a: Vec<BasicMetadataValueEnum> = vec![inst.into()];
                             a.extend(arg_vals.iter().map(|v| BasicMetadataValueEnum::from(*v)));
-                            self.site_enter()?;
                             self.b
                                 .build_indirect_call(ty, ptr, &a, "init")
                                 .map_err(|e| e.to_string())?;
+                            self.site_mark()?;
                             self.b
                                 .build_store(depth_p, depth)
                                 .map_err(|e| e.to_string())?;
-                            self.site_leave()?;
                             self.error_poll()?;
                             incoming.push((inst.into(), self.b.get_insert_block().unwrap()));
                             self.br(merge)?;

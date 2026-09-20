@@ -1052,6 +1052,10 @@ pub struct ExecutionEngine {
     /// Native code replaced by a recompile. Frames may still be running
     /// it, so it is kept for the engine's lifetime.
     retired_code: Vec<ExecutableFunction>,
+    /// Every compiled body's code range and call sites, by start
+    /// address; a trace names compiled frames through it. Retired code
+    /// stays, as its frames may.
+    code_sites: Vec<crate::codegen::CodeSites>,
     /// The thread top-tier compiles run on, started on first use.
     #[cfg(feature = "host")]
     promoter: Option<Promoter>,
@@ -1324,6 +1328,7 @@ impl ExecutionEngine {
             method_binding: Vec::new(),
             deopt_exits: 0,
             retired_code: Vec::new(),
+            code_sites: Vec::new(),
             #[cfg(feature = "host")]
             promoter: None,
             #[cfg(feature = "host")]
@@ -1405,6 +1410,66 @@ impl ExecutionEngine {
         // per-function transitions.
         self.tier.register(id, std::ptr::null_mut());
         id
+    }
+
+    /// Note a compiled body's code range and call sites for traces.
+    pub fn register_code_sites(&mut self, sites: crate::codegen::CodeSites) {
+        let i = self.code_sites.partition_point(|c| c.start < sites.start);
+        self.code_sites.insert(i, sites);
+    }
+
+    /// The compiled body a return address is inside and the site of the
+    /// call returning there.
+    fn site_at(&self, ra: usize) -> Option<(u32, u32)> {
+        let i = self.code_sites.partition_point(|c| c.start < ra);
+        let c = self.code_sites.get(i.checked_sub(1)?)?;
+        c.site_at(ra).map(|site| (c.func_id, site))
+    }
+
+    /// The compiled frames of one segment, innermost first, as
+    /// (function id, site): the frame at `fp` with its `key`, then its
+    /// callers up the frame-pointer chain while their return addresses
+    /// are in compiled code. `WLIFT_FRAME_TRACE=1` prints the walk;
+    /// safe to run with.
+    pub fn native_frames(&self, fp: u64, key: u64) -> Vec<(u32, u32)> {
+        use crate::codegen::runtime_fns::KEY_SHADOWED;
+        let trace = std::env::var_os("WLIFT_FRAME_TRACE").is_some();
+        let mut out = Vec::new();
+        if fp == 0 {
+            return out;
+        }
+        if key & KEY_SHADOWED == 0 {
+            out.push((key as u32, (key >> 32) as u32));
+        } else if trace {
+            eprintln!("frame-trace: shadowed fid={} at {fp:#x}", key as u32);
+        }
+        let mut fp = fp as usize;
+        while out.len() < 100_000 {
+            // Frame pointers of compiled frames are aligned and above
+            // the frame they are read from.
+            if !fp.is_multiple_of(8) {
+                break;
+            }
+            let ra = unsafe { *((fp + 8) as *const usize) };
+            let Some((fid, site)) = self.site_at(ra) else {
+                if trace {
+                    eprintln!("frame-trace: {ra:#x} not compiled; segment ends");
+                }
+                break;
+            };
+            if trace {
+                eprintln!("frame-trace: {ra:#x} fid={fid} site={site}");
+            }
+            if site != crate::codegen::SITE_NONE {
+                out.push((fid, site));
+            }
+            let up = unsafe { *(fp as *const usize) };
+            if up <= fp {
+                break;
+            }
+            fp = up;
+        }
+        out
     }
 
     /// Defining module for a function, if recorded. Callers push new
@@ -3653,6 +3718,9 @@ impl ExecutionEngine {
         };
         let osr_entries = executable.osr_entries().to_vec();
         let installed_code_size = executable.code_size();
+        for sites in executable.code_sites(idx as u32) {
+            self.register_code_sites(sites);
+        }
         // `WLIFT_JIT_CODE_DIR=<dir>` writes each installed body's machine
         // code to `<dir>/<id>-<tier>.bin` for a disassembler; safe to
         // run with.
@@ -4336,8 +4404,8 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let modvars_cell = self.modvars_cell_addr(id);
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
-        crate::codegen::cranelift_backend::cl::set_jit_frame_head_cell(
-            crate::codegen::runtime_fns::jit_frame_head_cell(),
+        crate::codegen::cranelift_backend::cl::set_jit_cur_cell(
+            crate::codegen::runtime_fns::jit_cur_cell(),
         );
         crate::codegen::set_jit_bump_region(Self::bump_region_for_compile());
         crate::codegen::set_jit_safepoint_page(self.safepoint_page_for_compile());
@@ -4357,7 +4425,7 @@ impl ExecutionEngine {
                 cha_for_codegen,
             );
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
-        crate::codegen::cranelift_backend::cl::set_jit_frame_head_cell(0);
+        crate::codegen::cranelift_backend::cl::set_jit_cur_cell(0);
         crate::codegen::set_jit_bump_region(0);
         crate::codegen::set_jit_safepoint_page(0);
         crate::codegen::set_jit_list_class(0);
@@ -4624,7 +4692,7 @@ impl ExecutionEngine {
         let defining_class = self.method_binding[idx].1 as usize;
         let note_field_kinds = crate::codegen::top_tier_is_llvm();
         let modvars_cell = self.modvars_cell_addr(id);
-        let frame_head_cell = crate::codegen::runtime_fns::jit_frame_head_cell();
+        let cur_cell = crate::codegen::runtime_fns::jit_cur_cell();
         let callee_purity = self.compute_callee_purity_map();
         let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
             Some(self.compute_inline_bodies())
@@ -4686,7 +4754,7 @@ impl ExecutionEngine {
             }
             use crate::codegen::cranelift_backend::cl;
             cl::set_jit_modvars_cell(modvars_cell);
-            cl::set_jit_frame_head_cell(frame_head_cell);
+            cl::set_jit_cur_cell(cur_cell);
             cl::set_jit_tier_hook(tier_hook.clone());
             cl::set_jit_retier_cell(tier_cell_addr, generation);
             cl::set_jit_func_id(id.0);
@@ -4718,7 +4786,7 @@ impl ExecutionEngine {
             crate::codegen::set_jit_safepoint_page(0);
             crate::codegen::set_jit_list_class(0);
             cl::set_jit_modvars_cell(0);
-            cl::set_jit_frame_head_cell(0);
+            cl::set_jit_cur_cell(0);
             let result = result
                 .map_err(|e| {
                     if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {

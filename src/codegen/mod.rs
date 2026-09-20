@@ -1930,6 +1930,59 @@ pub struct CompiledArtifact {
     pub needs_shadow_frame: bool,
 }
 
+/// A compiled body's code range and, by return address, the site of
+/// each call in it: what a trace reads for a compiled frame found
+/// through the frame-pointer chain.
+#[derive(Clone, Debug)]
+pub struct CodeSites {
+    pub start: usize,
+    pub end: usize,
+    pub func_id: u32,
+    pub sites: SiteTable,
+}
+
+/// How a body's table names the site at a code offset.
+#[derive(Clone, Debug)]
+pub enum SiteTable {
+    /// Half-open offset ranges, each with the site of the instruction
+    /// emitted over it (Cranelift's source locations).
+    Ranges(Vec<(u32, u32, u32)>),
+    /// Marks planted right after each call, ascending: a return
+    /// address's site is the first mark at or past it (LLVM's stack
+    /// maps).
+    Marks(Vec<(u32, u32)>),
+}
+
+/// Site word of a return address the trace leaves out: a call the
+/// body made on the trace's behalf, not the program's.
+pub const SITE_NONE: u32 = u32::MAX - 1;
+
+impl CodeSites {
+    /// The site of the call returning to `ra`, when `ra` is in this
+    /// body; [`SITE_NONE`] when the body has no site for it.
+    pub fn site_at(&self, ra: usize) -> Option<u32> {
+        if ra <= self.start || ra > self.end {
+            return None;
+        }
+        let off = (ra - self.start) as u32;
+        Some(match &self.sites {
+            SiteTable::Ranges(ranges) => {
+                // The call ends at `ra`; its last byte is inside its range.
+                let at = off - 1;
+                let i = ranges.partition_point(|(s, _, _)| *s <= at);
+                match i.checked_sub(1).map(|i| ranges[i]) {
+                    Some((_, e, site)) if at < e => site,
+                    _ => SITE_NONE,
+                }
+            }
+            SiteTable::Marks(marks) => {
+                let i = marks.partition_point(|(m, _)| *m < off);
+                marks.get(i).map(|(_, site)| *site).unwrap_or(SITE_NONE)
+            }
+        })
+    }
+}
+
 /// Native entry point for a compiled loop/header OSR target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeOsrEntry {
@@ -2054,6 +2107,25 @@ impl ExecutableFunction {
             ExecutableFunction::Llvm(l) => &l.osr_entries,
             _ => &[],
         }
+    }
+
+    /// The code ranges and call sites of the functions this code holds,
+    /// with `func_id` filled in, for a trace to name its frames.
+    pub fn code_sites(&self, func_id: u32) -> Vec<CodeSites> {
+        let sites: &[CodeSites] = match self {
+            #[cfg(feature = "cranelift")]
+            ExecutableFunction::Cranelift(cl) => &cl.sites,
+            #[cfg(feature = "llvm")]
+            ExecutableFunction::Llvm(l) => &l.sites,
+            _ => &[],
+        };
+        sites
+            .iter()
+            .map(|s| CodeSites {
+                func_id,
+                ..s.clone()
+            })
+            .collect()
     }
 
     /// Whether the LLVM tier produced this code.

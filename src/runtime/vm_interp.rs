@@ -2824,10 +2824,16 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                         frame.values = std::mem::take(&mut values);
                                     }
                                     let result_bits = unsafe {
+                                        use crate::codegen::runtime_fns::{
+                                            EntryLink, enter_link, jit_state, leave_link,
+                                        };
+                                        let j = jit_state();
+                                        let mut link = EntryLink::new();
+                                        enter_link(j, &mut link);
                                         let r0 =
                                             crate::codegen::runtime_fns::jit_root_at(root_base)
                                                 .to_bits();
-                                        match argc {
+                                        let result = match argc {
                                             0 => {
                                                 let f: extern "C" fn(u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
@@ -2872,7 +2878,9 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                                     std::mem::transmute(jit_ptr);
                                                 f(r0, r1, r2, r3)
                                             }
-                                        }
+                                        };
+                                        leave_link(j, &link);
+                                        result
                                     };
                                     crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
                                     // Restore the caller's module context so
@@ -3016,7 +3024,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     closure: Some(closure_ptr),
                                     defining_class,
                                     bc_ptr: target_bc_ptr,
-                                    native_mark: crate::codegen::runtime_fns::frame_head(),
+                                    native_mark: crate::codegen::runtime_fns::entry_top(),
                                 });
                             }
 
@@ -3154,7 +3162,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     closure: Some(closure_ptr),
                                     defining_class,
                                     bc_ptr: target_bc_ptr,
-                                    native_mark: crate::codegen::runtime_fns::frame_head(),
+                                    native_mark: crate::codegen::runtime_fns::entry_top(),
                                 });
                             }
 
@@ -4223,7 +4231,7 @@ pub fn eval_in_vm(
             closure: None,
             defining_class: None,
             bc_ptr: std::ptr::null(),
-            native_mark: crate::codegen::runtime_fns::frame_head(),
+            native_mark: crate::codegen::runtime_fns::entry_top(),
         });
     }
 
@@ -4802,7 +4810,7 @@ fn dispatch_closure_bc_inner(
             closure: Some(closure_ptr),
             defining_class,
             bc_ptr: target_bc_ptr,
-            native_mark: crate::codegen::runtime_fns::frame_head(),
+            native_mark: crate::codegen::runtime_fns::entry_top(),
         });
     }
 
@@ -4843,16 +4851,33 @@ pub unsafe fn call_jit_fn_pub(fn_ptr: *const u8, args: &[Value]) -> u64 {
 /// array, so a loop with any number of them can be entered.
 #[inline(always)]
 unsafe fn call_osr_entry(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    use crate::codegen::runtime_fns::{EntryLink, enter_link, jit_state, leave_link};
     unsafe {
         ensure_ctx_reg();
+        let j = jit_state();
+        let mut link = EntryLink::new();
+        enter_link(j, &mut link);
         let f: extern "C" fn(*const u64) -> u64 = std::mem::transmute(fn_ptr);
-        f(args.as_ptr() as *const u64)
+        let result = f(args.as_ptr() as *const u64);
+        leave_link(j, &link);
+        result
     }
 }
 
 /// Sets x20 = JitContext pointer before the call (preserved by callee-saved ABI).
 #[inline(always)]
 unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    use crate::codegen::runtime_fns::{EntryLink, enter_link, jit_state, leave_link};
+    let j = jit_state();
+    let mut link = EntryLink::new();
+    unsafe { enter_link(j, &mut link) };
+    let result = unsafe { call_jit_fn_inner(fn_ptr, args) };
+    unsafe { leave_link(j, &link) };
+    result
+}
+
+#[inline(always)]
+unsafe fn call_jit_fn_inner(fn_ptr: *const u8, args: &[Value]) -> u64 {
     unsafe {
         ensure_ctx_reg();
         let b = |i: usize| args[i].to_bits();
@@ -6007,7 +6032,7 @@ mod tests {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
-                native_mark: crate::codegen::runtime_fns::frame_head(),
+                native_mark: crate::codegen::runtime_fns::entry_top(),
             });
         }
         vm.fiber = fiber;
@@ -6042,7 +6067,7 @@ mod tests {
                 closure: None,
                 defining_class: None,
                 bc_ptr: std::ptr::null(),
-                native_mark: crate::codegen::runtime_fns::frame_head(),
+                native_mark: crate::codegen::runtime_fns::entry_top(),
             });
         }
         vm.fiber = fiber;

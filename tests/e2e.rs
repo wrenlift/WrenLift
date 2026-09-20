@@ -6546,3 +6546,81 @@ System.print(inner)
     assert!(matches!(result, InterpretResult::Success), "{output}");
     assert_eq!(output.trim(), "1500000\n1000000\ntrue\n3001\n13455000\n300");
 }
+
+/// A trace through compiled frames names each direct call's site from
+/// its return address: a recursion compiled with direct calls shows
+/// every level.
+#[test]
+fn e2e_trace_names_direct_call_frames() {
+    let src = r#"
+class Mesh {
+  construct new() { _n = 0 }
+  boom(i) {
+    if (i == 3000000) Fiber.abort("boom at %(i)")
+    return i
+  }
+  deep(i, d) {
+    if (d == 0) return boom(i)
+    return deep(i, d - 1) + 1
+  }
+}
+
+class Scene {
+  construct new() { _mesh = Mesh.new() }
+  render(i) {
+    var x = _mesh.deep(i, 3)
+    return x + i
+  }
+  run() {
+    var t = 0
+    for (i in 0..4000000) t = t + render(i)
+    return t
+  }
+}
+
+Scene.new().run()
+"#;
+    use std::sync::Arc;
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = errors.clone();
+    let config = VMConfig {
+        error_fn: Some(Box::new(move |_, _, _, msg| {
+            sink.lock().unwrap().push(msg.to_string());
+        })),
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        opt_threshold: 4,
+        ..VMConfig::default()
+    };
+    let (result, _, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::RuntimeError));
+    let errors = errors.lock().unwrap().clone();
+    let mut text = String::new();
+    let mut esc = false;
+    for c in errors.join("\n").chars() {
+        if esc {
+            esc = !c.is_ascii_alphabetic();
+        } else if c == '\x1b' {
+            esc = true;
+        } else {
+            text.push(c);
+        }
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim_start_matches(['│', ' ']).strip_prefix("at "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "boom(_) (main:5)",
+            "deep(_,_) (main:9)",
+            "deep(_,_) (main:10)",
+            "deep(_,_) (main:10)",
+            "deep(_,_) (main:10)",
+            "run() (main:22)",
+            "<module> (main:27)",
+        ],
+        "{text}"
+    );
+}
