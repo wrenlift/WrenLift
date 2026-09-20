@@ -56,12 +56,6 @@ fn env_trace_native_entry() -> bool {
 }
 
 #[inline]
-fn env_trace_ic_jit() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    env_flag(&CACHED, "WLIFT_TRACE_IC_JIT")
-}
-
-#[inline]
 fn env_trace_jit_call() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     env_flag(&CACHED, "WLIFT_TRACE_JIT_CALL")
@@ -85,13 +79,6 @@ fn env_nested_osr_disabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| std::env::var_os("WLIFT_DISABLE_NESTED_OSR").is_some())
-}
-
-#[inline]
-fn env_ic_jit_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -875,17 +862,6 @@ fn set_reg(values: &mut [Value], idx: u16, val: Value) {
     );
     unsafe {
         *values.get_unchecked_mut(i) = val;
-    }
-}
-
-/// Read a u16 at a fixed bytecode offset without advancing pc.
-#[inline(always)]
-fn read_u16_at(code: &[u8], offset: u32) -> u16 {
-    let i = offset as usize;
-    unsafe {
-        let lo = *code.get_unchecked(i);
-        let hi = *code.get_unchecked(i + 1);
-        u16::from_le_bytes([lo, hi])
     }
 }
 
@@ -2520,159 +2496,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let arg_regs_pc = pc;
                     pc += (argc as u32) * 2;
 
-                    // ── IC fast path: monomorphic inline cache ──────────────
-                    // Stripped to bare minimum: class check → call → store.
-                    // No tier-up profiling, no IC re-validation, no stats.
-                    // Tier-up happens via slow path + back-edge counting.
-                    let ic_table = unsafe { &*bc.ic_table.get() };
-                    // Short-circuit on the opt-in flag first: when
-                    // `WLIFT_ENABLE_IC_JIT` isn't set (the default),
-                    // none of the IC kind=1 work below executes — and
-                    // the cached `env_ic_jit_enabled()` reduces to a
-                    // single load + branch the predictor pins as
-                    // never-taken.
-                    let ic_snap = if env_ic_jit_enabled() && ic_idx < ic_table.len() {
-                        ic_table[ic_idx].snapshot()
-                    } else {
-                        None
-                    };
-                    if let Some(ic) = ic_snap.as_ref()
-                        && ic.kind == 1
-                        && recv_val.is_object()
-                    {
-                        let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
-                        let recv_class = unsafe { (*(obj_ptr as *const ObjHeader)).class as usize };
-                        let fn_idx_ic = ic.func_id as usize;
-                        let is_leaf = vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
-                        // The IC kind=1 inline JIT-leaf dispatch
-                        // passes recv + args in registers, which the
-                        // GC root scanner can't see (no JIT-frame
-                        // stack maps). To stay sound we restrict the
-                        // fast path to callees that transitively
-                        // can't fire a GC: no allocations in the
-                        // body, and no calls that allocate either.
-                        // `func_is_alloc_free` is computed by the
-                        // module-level purity / alloc-free pass and
-                        // lives as a Vec<bool> indexed by FuncId for
-                        // O(1) lookup on this hot path.
-                        //
-                        // Setting `WLIFT_ENABLE_IC_JIT=1` overrides
-                        // the alloc-free gate for benchmarks /
-                        // diagnosis. `WLIFT_DISABLE_IC_JIT=1` turns
-                        // the fast path off entirely.
-                        // BISECT: temporarily revert the alloc-free
-                        // gate to the previous behavior (env-var
-                        // opt-in only). The Linux x86_64 CI bench
-                        // is dumping core on delta_blue and the
-                        // alloc-free auto-enable is the most
-                        // likely culprit — the analysis runs over
-                        // engine MIR concurrently with JIT
-                        // submissions, and a stale read could
-                        // route a not-actually-alloc-free callee
-                        // into the IC fast path.
-                        if recv_class == ic.class && is_leaf {
-                            if env_trace_ic_jit() {
-                                let fn_idx_ic = ic.func_id as usize;
-                                let name = vm
-                                    .engine
-                                    .get_mir(FuncId(fn_idx_ic as u32))
-                                    .map(|m| vm.interner.resolve(m.name).to_string())
-                                    .unwrap_or_else(|| "<unknown>".into());
-                                eprintln!(
-                                    "ic-jit: dispatch fn_idx={} name='{}' argc={}",
-                                    fn_idx_ic, name, argc
-                                );
-                            }
-                            let jit_ptr = ic.jit_ptr;
-                            ensure_ctx_reg();
-                            // Read recv + arg values, then push them
-                            // as JIT roots so a GC inside the callee
-                            // updates these pointers before the JIT'd
-                            // body dereferences them. Without this,
-                            // a generational promote during the
-                            // callee leaves the u64 args pointing at
-                            // freed memory; the JIT callee reads
-                            // garbage and the caller's `values`
-                            // entries (now updated via frame.values
-                            // tracing) disagree with the args the
-                            // callee was invoked with.
-                            let arg_count = argc;
-                            let mut arg_regs: SmallVec<[u16; 4]> = SmallVec::new();
-                            for i in 0..arg_count {
-                                arg_regs.push(read_u16_at(code, arg_regs_pc + (i as u32) * 2));
-                            }
-                            let root_base = crate::codegen::runtime_fns::jit_roots_snapshot_len();
-                            crate::codegen::runtime_fns::push_jit_root(recv_val);
-                            for &reg in &arg_regs {
-                                crate::codegen::runtime_fns::push_jit_root(get_reg(&values, reg));
-                            }
-                            // Publish caller's register file before
-                            // the JIT call so its remaining live
-                            // pointers also get traced through
-                            // mir_frames.
-                            unsafe {
-                                let frame = (*fiber).mir_frames.last_mut().unwrap();
-                                frame.pc = pc;
-                                frame.values = std::mem::take(&mut values);
-                            }
-                            let result_bits = unsafe {
-                                let recv_bits =
-                                    crate::codegen::runtime_fns::jit_root_at(root_base).to_bits();
-                                match argc {
-                                    0 => {
-                                        let f: extern "C" fn(u64) -> u64 =
-                                            std::mem::transmute(jit_ptr);
-                                        f(recv_bits)
-                                    }
-                                    1 => {
-                                        let a1 =
-                                            crate::codegen::runtime_fns::jit_root_at(root_base + 1)
-                                                .to_bits();
-                                        let f: extern "C" fn(u64, u64) -> u64 =
-                                            std::mem::transmute(jit_ptr);
-                                        f(recv_bits, a1)
-                                    }
-                                    2 => {
-                                        let a1 =
-                                            crate::codegen::runtime_fns::jit_root_at(root_base + 1)
-                                                .to_bits();
-                                        let a2 =
-                                            crate::codegen::runtime_fns::jit_root_at(root_base + 2)
-                                                .to_bits();
-                                        let f: extern "C" fn(u64, u64, u64) -> u64 =
-                                            std::mem::transmute(jit_ptr);
-                                        f(recv_bits, a1, a2)
-                                    }
-                                    _ => {
-                                        let a1 =
-                                            crate::codegen::runtime_fns::jit_root_at(root_base + 1)
-                                                .to_bits();
-                                        let a2 =
-                                            crate::codegen::runtime_fns::jit_root_at(root_base + 2)
-                                                .to_bits();
-                                        let a3 =
-                                            crate::codegen::runtime_fns::jit_root_at(root_base + 3)
-                                                .to_bits();
-                                        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                                            std::mem::transmute(jit_ptr);
-                                        f(recv_bits, a1, a2, a3)
-                                    }
-                                }
-                            };
-                            crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
-                            // Reload the (possibly GC-updated)
-                            // register file from the frame.
-                            unsafe {
-                                values = std::mem::take(
-                                    &mut (*fiber).mir_frames.last_mut().unwrap().values,
-                                );
-                            }
-                            set_reg(&mut values, dst, Value::from_bits(result_bits));
-                            steps += 1;
-                            continue;
-                        }
-                    }
-
                     // Save pc before slow-path dispatch (for error reporting / frame push)
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -2745,6 +2568,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     // JIT will see when it consumes the IC, so the
                     // interpreter and JIT share a view of every
                     // monomorphic call site CHA covers.
+                    let ic_table = unsafe { &*bc.ic_table.get() };
                     let cha_method = if ic_idx < ic_table.len() {
                         match ic_table[ic_idx].snapshot() {
                             Some(ic)
