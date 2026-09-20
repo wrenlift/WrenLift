@@ -3037,7 +3037,20 @@ pub mod cl {
                 retier_polls.insert(*header, (buf, live));
             }
         }
-        let exit_value_types = if cold_counters.is_empty() && retier_polls.is_empty() {
+        // Also the table every guard's snapshot for the interpreter
+        // boxes by, so a body with guards has it whether or not it polls.
+        let has_deopts = mir.blocks.iter().any(|b| {
+            b.instructions.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    Instruction::GuardNumAt { .. }
+                        | Instruction::GuardClassAt { .. }
+                        | Instruction::SlowPathExit { .. }
+                )
+            })
+        });
+        let exit_value_types = if cold_counters.is_empty() && retier_polls.is_empty() && !has_deopts
+        {
             Vec::new()
         } else {
             infer_osr_value_types(mir)
