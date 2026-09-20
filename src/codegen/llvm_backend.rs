@@ -565,13 +565,18 @@ pub mod llvm {
                 bail!("unknown runtime helper {name}");
             };
             let ty = self.helper_type(args.len());
-            self.call_addr(
-                ty,
-                addr,
-                &args.iter().map(|a| (*a).into()).collect::<Vec<_>>(),
-                name,
-            )
-            .map(|v| v.into_int_value())
+            let v = self
+                .call_addr(
+                    ty,
+                    addr,
+                    &args.iter().map(|a| (*a).into()).collect::<Vec<_>>(),
+                    name,
+                )?
+                .into_int_value();
+            if crate::codegen::runtime_fns::helper_can_raise(name) {
+                self.error_poll()?;
+            }
+            Ok(v)
         }
 
         fn call_addr(
@@ -1336,9 +1341,69 @@ pub mod llvm {
             self.icmp(IntPredicate::EQ, m, self.c64(QNAN))
         }
 
-        /// At a loop header: load a word from the safepoint page,
-        /// unreadable while a collector waits, so the load faults and
-        /// the fault handler parks the thread. Volatile, so it stays.
+        /// Leave the function with null when an error is pending, as
+        /// the interpreter would have unwound, instead of running on
+        /// and raising another over it. Emitted after every call that
+        /// can raise — a dispatch, a compiled callee, a helper's slow
+        /// path — so an inline fast path never pays for it: the pending
+        /// word first, the helper only when it is set.
+        fn error_poll(&mut self) -> Result<(), String> {
+            let addr = crate::codegen::runtime_fns::ERROR_PENDING.0.as_ptr() as u64;
+            let p = self
+                .b
+                .build_int_to_ptr(self.c64(addr), self.ptrt(), "epp")
+                .map_err(|e| e.to_string())?;
+            let pending = self
+                .b
+                .build_load(self.sh.ctx.i32_type(), p, "ep")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let set = self.icmp(
+                IntPredicate::NE,
+                pending,
+                self.sh.ctx.i32_type().const_zero(),
+            )?;
+            let check = self.new_block("echk");
+            let leave = self.new_block("elv");
+            let cont = self.new_block("ecnt");
+            self.cbr(set, check, cont)?;
+            self.b.position_at_end(check);
+            // The helper only reads: a loop keeps what it hoisted.
+            let Some(addr) = crate::codegen::runtime_fns::resolve("wren_aot_check_error") else {
+                bail!("unknown runtime helper wren_aot_check_error");
+            };
+            let ty = self.helper_type(0);
+            let fp = self
+                .b
+                .build_int_to_ptr(self.c64(addr as u64), self.ptrt(), "fp")
+                .map_err(|e| e.to_string())?;
+            let call = self
+                .b
+                .build_indirect_call(ty, fp, &[], "err")
+                .map_err(|e| e.to_string())?;
+            // memory(read): every location may be read, none written.
+            for (name, v) in [("memory", 0b010101), ("nounwind", 0)] {
+                let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+                call.add_attribute(
+                    AttributeLoc::Function,
+                    self.sh.ctx.create_enum_attribute(kind, v),
+                );
+            }
+            let err = call
+                .try_as_basic_value()
+                .basic()
+                .ok_or("void helper")?
+                .into_int_value();
+            let raised = self.icmp(IntPredicate::NE, err, self.c64(0))?;
+            self.cbr(raised, leave, cont)?;
+            self.b.position_at_end(leave);
+            self.b
+                .build_return(Some(&self.c64(TAG_NULL)))
+                .map_err(|e| e.to_string())?;
+            self.b.position_at_end(cont);
+            Ok(())
+        }
+
         fn safepoint_poll(&mut self) -> Result<(), String> {
             let page = crate::codegen::jit_safepoint_page();
             if page == 0 {
@@ -1633,6 +1698,7 @@ pub mod llvm {
                 if loop_headers.contains(&bi) {
                     self.safepoint_poll()?;
                 }
+
                 self.lower_block(bi)?;
             }
             for bb in self.blocks.iter() {
@@ -1917,6 +1983,7 @@ pub mod llvm {
                     self.br(merge)?;
                     self.b.position_at_end(slow);
                     let s = self.call_helper("wren_num_neg", &[la])?;
+                    self.error_poll()?;
                     let slow_end = self.b.get_insert_block().unwrap();
                     self.br(merge)?;
                     self.b.position_at_end(merge);
@@ -2093,7 +2160,9 @@ pub mod llvm {
                         .b
                         .build_call(self.sh.main_fn, &call_args, "self")
                         .map_err(|e| e.to_string())?;
-                    call.try_as_basic_value().basic().unwrap()
+                    let v = call.try_as_basic_value().basic().unwrap();
+                    self.error_poll()?;
+                    v
                 }
 
                 I::MakeList(elems) => {
@@ -2182,7 +2251,8 @@ pub mod llvm {
                     for x in args {
                         a.push(self.boxed(x)?);
                     }
-                    self.call_helper("wren_subscript_get", &a)?.into()
+                    let v = self.call_helper("wren_subscript_get", &a)?;
+                    v.into()
                 }
                 I::SubscriptSet {
                     receiver,
@@ -2205,7 +2275,8 @@ pub mod llvm {
                         a.push(self.boxed(x)?);
                     }
                     a.push(self.boxed(value)?);
-                    self.call_helper("wren_subscript_set", &a)?.into()
+                    let v = self.call_helper("wren_subscript_set", &a)?;
+                    v.into()
                 }
                 I::BitAnd(a, b) => self.helper2("wren_bit_and", a, b)?.into(),
                 I::BitOr(a, b) => self.helper2("wren_bit_or", a, b)?.into(),
@@ -3707,7 +3778,8 @@ pub mod llvm {
             self.b
                 .build_store(depth_p, depth)
                 .map_err(|e| e.to_string())?;
-            Ok(Some((fv, call_bb)))
+            self.error_poll()?;
+            Ok(Some((fv, self.b.get_insert_block().unwrap())))
         }
 
         fn known_call_nocheck(
@@ -3946,6 +4018,7 @@ pub mod llvm {
                             self.b
                                 .build_store(depth_p, depth)
                                 .map_err(|e| e.to_string())?;
+                            self.error_poll()?;
                             incoming.push((inst.into(), self.b.get_insert_block().unwrap()));
                             self.br(merge)?;
                         }

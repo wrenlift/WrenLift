@@ -531,6 +531,7 @@ pub mod cl {
             let call = builder
                 .ins()
                 .call(f, &[receiver, method_val, count, buf_ptr]);
+            emit_error_poll(builder, module, get_runtime_fn)?;
             return Ok(builder.inst_results(call)[0]);
         }
         let call_name = match args.len() {
@@ -548,6 +549,7 @@ pub mod cl {
         let mut call_args = vec![receiver, method_val];
         call_args.extend_from_slice(args);
         let call = builder.ins().call(f, &call_args);
+        emit_error_poll(builder, module, get_runtime_fn)?;
         Ok(builder.inst_results(call)[0])
     }
 
@@ -1642,6 +1644,57 @@ pub mod cl {
             .flat_map(|b| b.params.iter())
             .filter(|(_, t)| *t == MirType::Value)
             .all(|(p, _)| nums.contains(p))
+    }
+
+    thread_local! {
+        /// Whether the body this thread lowers polls for errors.
+        static ERROR_POLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Leave the function with null when an error is pending, as the
+    /// interpreter would have unwound, instead of running on and
+    /// raising another over it. Emitted after every call that can
+    /// raise — a dispatch, a compiled callee, a helper's slow path — so
+    /// an inline fast path never pays for it: the pending word first,
+    /// the helper only when it is set.
+    fn emit_error_poll<G>(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut G,
+    ) -> Result<(), String>
+    where
+        G: FnMut(
+                &mut dyn Module,
+                &mut FunctionBuilder,
+                &str,
+                usize,
+            ) -> Result<cranelift_codegen::ir::FuncRef, String>
+            + ?Sized,
+    {
+        if !ERROR_POLL.get() {
+            return Ok(());
+        }
+        let word = builder.ins().iconst(
+            types::I64,
+            crate::codegen::runtime_fns::ERROR_PENDING.0.as_ptr() as i64,
+        );
+        let pending = builder.ins().uload32(MemFlags::trusted(), word, 0);
+        let check = builder.create_block();
+        let leave = builder.create_block();
+        let cont = builder.create_block();
+        builder.set_cold_block(check);
+        builder.set_cold_block(leave);
+        builder.ins().brif(pending, check, &[], cont, &[]);
+        builder.switch_to_block(check);
+        let f = get_runtime_fn(module, builder, "wren_aot_check_error", 0)?;
+        let call = builder.ins().call(f, &[]);
+        let err = builder.inst_results(call)[0];
+        builder.ins().brif(err, leave, &[], cont, &[]);
+        builder.switch_to_block(leave);
+        let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+        builder.ins().return_(&[null]);
+        builder.switch_to_block(cont);
+        Ok(())
     }
 
     /// Iterations an optimised body's outermost loop runs between
@@ -2972,6 +3025,10 @@ pub mod cl {
     ) -> Result<(), String> {
         // A splice that failed to lower may have left its receiver here.
         INLINE_CLASS.set(None);
+        // A JIT body polls for a pending error after each helper that
+        // can raise; AOT polls at block entries, and the inner f64 body
+        // makes no such calls.
+        ERROR_POLL.set(aot_config.is_none() && f64_self_id.is_none());
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
         for (i, _) in mir.blocks.iter().enumerate() {
@@ -4309,6 +4366,7 @@ pub mod cl {
         let f = get_runtime_fn(module, builder, slow_fn, 2)?;
         let call = builder.ins().call(f, &[la, lb]);
         let slow_result = builder.inst_results(call)[0];
+        emit_error_poll(builder, module, get_runtime_fn)?;
         builder
             .ins()
             .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4518,6 +4576,7 @@ pub mod cl {
                 let f = get_runtime_fn(module, builder, "wren_num_neg", 1)?;
                 let call = builder.ins().call(f, &[la]);
                 let slow_result = builder.inst_results(call)[0];
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 builder
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4838,6 +4897,7 @@ pub mod cl {
                     let count = builder.ins().iconst(types::I64, args.len() as i64);
                     let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
                     let call = builder.ins().call(f, &[r, method_val, count, buf]);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
                     return Ok(Some(builder.inst_results(call)[0]));
                 }
                 let r = get(receiver);
@@ -5014,6 +5074,7 @@ pub mod cl {
                                     call_args.push(null);
                                 }
                                 let call = builder.ins().call(fn_ref, &call_args);
+                                emit_error_poll(builder, module, get_runtime_fn)?;
                                 builder.inst_results(call)[0]
                             };
                             builder
@@ -5072,6 +5133,7 @@ pub mod cl {
                             }
                             let count = builder.ins().iconst(types::I64, args.len() as i64);
                             let call = builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                            emit_error_poll(builder, module, get_runtime_fn)?;
                             builder.inst_results(call)[0]
                         } else {
                             let call_name = match args.len() {
@@ -5091,6 +5153,7 @@ pub mod cl {
                                 slow_args.push(get(a));
                             }
                             let slow_call = builder.ins().call(f, &slow_args);
+                            emit_error_poll(builder, module, get_runtime_fn)?;
                             builder.inst_results(slow_call)[0]
                         };
                         builder
@@ -5251,6 +5314,7 @@ pub mod cl {
                                         fast_args.push(get(a));
                                     }
                                     let fast_call = builder.ins().call(fast_f, &fast_args);
+                                    emit_error_poll(builder, module, get_runtime_fn)?;
                                     let fast_result = builder.inst_results(fast_call)[0];
                                     builder
                                         .ins()
@@ -5400,6 +5464,7 @@ pub mod cl {
                         let mut call_args = vec![packed_val, r];
                         call_args.extend(arg_vals.iter().copied());
                         let call = builder.ins().call(f, &call_args);
+                        emit_error_poll(builder, module, get_runtime_fn)?;
                         let fast_result = builder.inst_results(call)[0];
                         builder
                             .ins()
@@ -5534,6 +5599,7 @@ pub mod cl {
                     }
                     let count = builder.ins().iconst(types::I64, args.len() as i64);
                     let call = builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
                     builder.inst_results(call)[0]
                 } else {
                     let call_name = match args.len() {
@@ -5553,6 +5619,7 @@ pub mod cl {
                         call_args.push(get(a));
                     }
                     let result = builder.ins().call(f, &call_args);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
                     builder.inst_results(result)[0]
                 };
                 Ok(Some(result_val))
@@ -5816,6 +5883,7 @@ pub mod cl {
                         call_args.push(get(a));
                     }
                     let call = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
                     let fast_result = builder.inst_results(call)[0];
                     builder
                         .ins()
@@ -5939,6 +6007,7 @@ pub mod cl {
                         fast_args.push(get(a));
                     }
                     let fast_call = builder.ins().call(fast_f, &fast_args);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
                     let fast_result = builder.inst_results(fast_call)[0];
                     builder
                         .ins()
@@ -5982,6 +6051,7 @@ pub mod cl {
                         call_args.push(get(a));
                     }
                     let result = builder.ins().call(f, &call_args);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
                     Ok(Some(builder.inst_results(result)[0]))
                 } else {
                     let method_bits = method.index() as u64;
@@ -6048,6 +6118,7 @@ pub mod cl {
                 }
                 let f = get_runtime_fn(module, builder, call_name, call_args.len())?;
                 let result = builder.ins().call(f, &call_args);
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
 
@@ -6151,6 +6222,7 @@ pub mod cl {
             Instruction::ToString(a) => {
                 let f = get_runtime_fn(module, builder, "wren_to_string", 1)?;
                 let result = builder.ins().call(f, &[get(a)]);
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
 
@@ -6725,6 +6797,7 @@ pub mod cl {
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_get", 2)?;
                 let slow_call = builder.ins().call(slow_fn, &[r, idx]);
                 let slow_result = builder.inst_results(slow_call)[0];
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 builder
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -6740,6 +6813,7 @@ pub mod cl {
                     call_args.push(get(a));
                 }
                 let result = builder.ins().call(f, &call_args);
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::SubscriptSet {
@@ -6878,6 +6952,7 @@ pub mod cl {
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_set", 3)?;
                 let slow_call = builder.ins().call(slow_fn, &[r, idx, val]);
                 let slow_result = builder.inst_results(slow_call)[0];
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 builder
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -6897,6 +6972,7 @@ pub mod cl {
                 }
                 call_args.push(get(value));
                 let result = builder.ins().call(f, &call_args);
+                emit_error_poll(builder, module, get_runtime_fn)?;
                 Ok(Some(builder.inst_results(result)[0]))
             }
 

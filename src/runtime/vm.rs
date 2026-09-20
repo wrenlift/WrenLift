@@ -2698,6 +2698,7 @@ impl VM {
         let result = match result {
             Ok(_) if self.has_error => {
                 self.has_error = false;
+                crate::codegen::runtime_fns::clear_error_pending();
                 let msg = self
                     .last_error
                     .take()
@@ -3475,6 +3476,7 @@ impl VM {
             Ok(v) => Some(v),
             Err(e) => {
                 self.has_error = true;
+                crate::codegen::runtime_fns::note_error_pending();
                 self.last_error = Some(e.to_string());
                 Some(Value::null())
             }
@@ -4229,6 +4231,7 @@ impl NativeContext for VM {
             eprintln!("error-trace: raise {msg} vm.fiber={:p}", self.fiber);
         }
         self.has_error = true;
+        crate::codegen::runtime_fns::note_error_pending();
         self.last_error = Some(msg);
     }
 
@@ -5092,6 +5095,7 @@ impl VM {
             if mir.blocks.is_empty() {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 self.has_error = true;
+                crate::codegen::runtime_fns::note_error_pending();
                 self.last_error = Some(format!(
                     "method dispatch hit AOT stub with no body (func_id={})",
                     func_id.0
@@ -5221,6 +5225,7 @@ impl VM {
             if mir.blocks.is_empty() {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 self.has_error = true;
+                crate::codegen::runtime_fns::note_error_pending();
                 self.last_error = Some(format!(
                     "constructor dispatch hit AOT stub with no body (func_id={})",
                     func_id.0

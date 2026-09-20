@@ -2078,6 +2078,58 @@ pub extern "C" fn wren_aot_check_error() -> u64 {
     }
 }
 
+/// A word on a cache line of its own: compiled code reads it after
+/// every call, and a line that any hot counter is written to would
+/// stall those reads.
+#[repr(align(128))]
+pub struct PendingWord(pub std::sync::atomic::AtomicU32);
+
+/// Set while any VM has an error to unwind: compiled code polls this
+/// word after every call that can raise and asks `wren_aot_check_error`
+/// only when it is set, so the poll costs a load on the way through
+/// and the helper answers for the VM in hand. Raised with every error,
+/// lowered when one is drained; a stale raise costs a call, a missed
+/// one is a poll that goes on.
+pub static ERROR_PENDING: PendingWord = PendingWord(std::sync::atomic::AtomicU32::new(0));
+
+#[inline]
+pub fn note_error_pending() {
+    ERROR_PENDING
+        .0
+        .store(1, std::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+pub fn clear_error_pending() {
+    ERROR_PENDING
+        .0
+        .store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the helper `name` can leave an error pending: it dispatches
+/// a method, runs a compiled callee, or raises on its operand. A body
+/// polls [`ERROR_PENDING`] after every call to one.
+pub fn helper_can_raise(name: &str) -> bool {
+    const PREFIXES: [&str; 11] = [
+        "wren_call_",
+        "wren_known_call_",
+        "wren_ic_call_",
+        "wren_ic_host_",
+        "wren_ic_native_",
+        "wren_ic_ctor_",
+        "wren_super_call",
+        "wren_construct_",
+        "wren_num_",
+        "wren_bit_",
+        "wren_cmp_",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+        || matches!(
+            name,
+            "wren_to_string" | "wren_subscript_get" | "wren_subscript_set"
+        )
+}
+
 /// Load the JIT code pointer for a given function ID.
 /// Returns the function pointer as u64 (0 if not compiled).
 /// Used by CallKnownFunc to do direct JIT-to-JIT calls.
@@ -2569,6 +2621,7 @@ fn handle_jit_fiber_action(
                 Err(e) => {
                     // Propagate the runtime error from the child fiber.
                     vm.has_error = true;
+                    note_error_pending();
                     vm.last_error = Some(e.to_string());
                     Value::null().to_bits()
                 }
@@ -5236,6 +5289,7 @@ pub unsafe extern "C" fn wren_deopt_at(func_id: u64, pc: u64, n: u64, buf: *cons
             Some(&(c, d)) if !c.is_null() => (c, d),
             _ => {
                 vm.has_error = true;
+                note_error_pending();
                 vm.last_error = Some(format!(
                     "deoptimisation of FuncId({}) found no closure to resume",
                     func_id

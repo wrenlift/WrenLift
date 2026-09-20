@@ -310,6 +310,7 @@ fn call_foreign_dynamic_with_frame_sync(
         Err(panic) => {
             let msg = panic_message(&panic);
             vm.has_error = true;
+            crate::codegen::runtime_fns::note_error_pending();
             vm.last_error = Some(format!("foreign panic: {}", msg));
             Value::null()
         }
@@ -347,6 +348,7 @@ fn call_foreign_c_with_frame_sync(
         Err(panic) => {
             let msg = panic_message(&panic);
             vm.has_error = true;
+            crate::codegen::runtime_fns::note_error_pending();
             vm.last_error = Some(format!("foreign panic: {}", msg));
             Value::null()
         }
@@ -468,6 +470,7 @@ fn try_run_root_frame_native(
 
     if vm.has_error {
         vm.has_error = false;
+        crate::codegen::runtime_fns::clear_error_pending();
         let err = vm
             .last_error
             .take()
@@ -718,6 +721,7 @@ fn try_enter_loop_osr(
 
     if vm.has_error {
         vm.has_error = false;
+        crate::codegen::runtime_fns::clear_error_pending();
         let err = vm
             .last_error
             .take()
@@ -935,6 +939,7 @@ fn take_native_error(vm: &mut VM, fiber: *mut ObjFiber) -> Option<NativeError> {
         );
     }
     vm.has_error = false;
+    crate::codegen::runtime_fns::clear_error_pending();
     let msg = vm
         .last_error
         .take()
@@ -1220,6 +1225,7 @@ fn run_guarded_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Run
             return run.result.take().unwrap_or(Err(RuntimeError::Unreachable));
         }
         vm.has_error = false;
+        crate::codegen::runtime_fns::clear_error_pending();
         let err = vm
             .last_error
             .take()
@@ -1425,6 +1431,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         // error and continue the loop so the
                         // caller picks the value up.
                         vm.has_error = false;
+                        crate::codegen::runtime_fns::clear_error_pending();
                         vm.last_error = None;
                         unsafe {
                             (*fiber).mir_frames.pop();
