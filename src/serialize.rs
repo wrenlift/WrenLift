@@ -28,6 +28,7 @@
 
 use crate::intern::Interner;
 use crate::mir::ModuleMir;
+use crate::sema::resolve::ImportSource;
 
 /// Magic header at the start of every serialized module. "WLBC" =
 /// wren_lift bytecode cache.
@@ -59,11 +60,13 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 ///   install path can honour `import "<module>" for <name>` source
 ///   pins (was lost on the wlbc round-trip, breaking dispatcher
 ///   re-export modules where two siblings export the same class).
+/// - v8: `var_sources` entries carry the exported name of a slot
+///   bound under an alias (`import "m" for A as B`).
 /// - v5 (2026-04-26): `Instruction::Call::pure_call` field added
 ///   to seed the effect-summary pass.
 /// - v4: prior; first version this constant gained a written-down
 ///   bump policy.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Combined payload: everything a fresh `VM` needs to materialise the
 /// module without touching the parser, resolver, MIR builder, or the
@@ -82,13 +85,24 @@ pub struct ModuleBlob {
     pub interner: Interner,
     pub module: ModuleMir,
     pub var_names: Vec<String>,
-    pub var_sources: Vec<Option<String>>,
+    pub var_sources: Vec<Option<ImportSource>>,
     /// Ordered (inherited + own) field-name list per class declared
     /// in this module. Harvested into `vm.field_layouts` at install
     /// time so a later source compile (e.g. user code subclassing a
     /// class defined in this module) can resolve the parent layout
     /// without re-running the parent's source compile.
     pub class_field_names: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// v7 layout — kept solely for the back-compat read path in
+/// `load()`: its sources name the module only.
+#[derive(serde::Deserialize)]
+struct ModuleBlobV7 {
+    interner: Interner,
+    module: ModuleMir,
+    var_names: Vec<String>,
+    var_sources: Vec<Option<String>>,
+    class_field_names: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// v6 layout — kept solely for the back-compat read path in
@@ -173,7 +187,7 @@ pub fn emit(
     interner: &Interner,
     module: &ModuleMir,
     var_names: &[String],
-    var_sources: &[Option<String>],
+    var_sources: &[Option<ImportSource>],
     class_field_names: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<Vec<u8>, SerializeError> {
     let blob = ModuleBlob {
@@ -202,13 +216,13 @@ pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
         return Err(SerializeError::BadMagic);
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    // v5 and v6 are the previous wlbc layouts kept for back-compat
+    // v5, v6 and v7 are the previous wlbc layouts kept for back-compat
     // so already-published registry artifacts still install. v5/v6
     // lack `class_field_names`, so downstream source compiles that
     // subclass a class defined in a legacy bundle will hit the
     // "field layout is not yet registered" panic — republish the
     // affected package against the current wren_lift sources.
-    if version != VERSION && version != 5 && version != 6 {
+    if version != VERSION && version != 5 && version != 6 && version != 7 {
         return Err(SerializeError::VersionMismatch {
             expected: VERSION,
             found: version,
@@ -247,14 +261,36 @@ pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
             interner: v6.interner,
             module: v6.module,
             var_names: v6.var_names,
-            var_sources: v6.var_sources,
+            var_sources: module_only(v6.var_sources),
             class_field_names: std::collections::HashMap::new(),
+        });
+    }
+    if version == 7 {
+        let (v7, _consumed) = bincode::serde::decode_from_slice::<ModuleBlobV7, _>(
+            payload,
+            bincode::config::standard(),
+        )
+        .map_err(|e| SerializeError::Decode(e.to_string()))?;
+        return Ok(ModuleBlob {
+            interner: v7.interner,
+            module: v7.module,
+            var_names: v7.var_names,
+            var_sources: module_only(v7.var_sources),
+            class_field_names: v7.class_field_names,
         });
     }
     let (blob, _consumed) =
         bincode::serde::decode_from_slice::<ModuleBlob, _>(payload, bincode::config::standard())
             .map_err(|e| SerializeError::Decode(e.to_string()))?;
     Ok(blob)
+}
+
+/// Sources from a layout that named the module only.
+fn module_only(sources: Vec<Option<String>>) -> Vec<Option<ImportSource>> {
+    sources
+        .into_iter()
+        .map(|s| s.map(|module| ImportSource { module, name: None }))
+        .collect()
 }
 
 /// Cheap magic-bytes probe so the CLI can pick the .wlbc path without

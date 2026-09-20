@@ -133,13 +133,13 @@ pub struct AotModule {
     /// looks up each class's `name` here to find which slot the
     /// installed `*mut ObjClass` should land in.
     pub module_var_names: Vec<String>,
-    /// Per-slot import source — `Some(path)` when the slot was
-    /// declared via `import "<path>" for <name>`, `None` for
-    /// locally-defined or prelude vars. The bootstrap reads this
-    /// to know which dependency's modvars to copy from at
-    /// startup, replicating the cross-module class-binding the
-    /// JIT install loop does inline.
-    pub module_var_sources: Vec<Option<String>>,
+    /// Per-slot import source — `Some` when the slot was declared
+    /// via `import "<path>" for <name>` (perhaps under another
+    /// name), `None` for locally-defined or prelude vars. The
+    /// bootstrap reads this to know which dependency's modvars to
+    /// copy from at startup, replicating the cross-module
+    /// class-binding the JIT install loop does inline.
+    pub module_var_sources: Vec<Option<crate::sema::resolve::ImportSource>>,
     pub mir: ModuleMir,
     pub interner: Interner,
 }
@@ -1846,8 +1846,13 @@ pub fn compile_walk_to_object_with_manifest(
             );
         }
         for (slot, source) in aot_mod.module_var_sources.iter().enumerate() {
-            let Some(source_path) = source else { continue };
-            let var_name = &aot_mod.module_var_names[slot];
+            let Some(source) = source else { continue };
+            let source_path = &source.module;
+            // The name the source exports it as.
+            let var_name = source
+                .name
+                .as_ref()
+                .unwrap_or(&aot_mod.module_var_names[slot]);
             // Match against any earlier-installed module
             // sharing the import path. Dependency-first walker
             // order guarantees the source has been emitted by

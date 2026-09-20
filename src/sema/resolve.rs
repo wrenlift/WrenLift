@@ -53,13 +53,21 @@ pub struct ResolveResult {
     pub boxed_locals: HashMap<usize, std::collections::HashSet<SymbolId>>,
     /// Module-level variable names, in declaration order.
     pub module_vars: Vec<SymbolId>,
-    /// For each entry in `module_vars`, the source module it was
-    /// imported from (`Some("./foo")` for `import "./foo" for x`)
-    /// or `None` for local declarations. Parallel to `module_vars`.
-    /// Lets the runtime disambiguate when two modules export the
-    /// same class name — the generic `find_imported_var` fallback
-    /// returns any match in an unspecified order.
-    pub module_var_sources: Vec<Option<String>>,
+    /// For each entry in `module_vars`, where it was imported from
+    /// (`import "./foo" for x`, `import "./foo" for x as y`) or `None`
+    /// for a local declaration. Parallel to `module_vars`. Lets the
+    /// runtime disambiguate when two modules export the same class
+    /// name — the generic `find_imported_var` fallback returns any
+    /// match in an unspecified order.
+    pub module_var_sources: Vec<Option<ImportSource>>,
+}
+
+/// The module a variable was imported from and, when it was bound
+/// under another name, the name the module exports it as.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImportSource {
+    pub module: String,
+    pub name: Option<String>,
 }
 
 /// Information about a captured upvalue.
@@ -149,7 +157,7 @@ pub struct Resolver<'a> {
     interner: &'a Interner,
     scopes: Vec<Scope>,
     module_vars: Vec<SymbolId>,
-    module_var_sources: Vec<Option<String>>,
+    module_var_sources: Vec<Option<ImportSource>>,
     resolutions: HashMap<usize, ResolvedName>,
     upvalue_map: HashMap<usize, Vec<UpvalueInfo>>,
     /// Locals captured by nested closures, keyed by the originating
@@ -196,7 +204,14 @@ impl<'a> Resolver<'a> {
                 Stmt::Import { module, names } => {
                     for import_name in names {
                         let sym = import_name.alias.as_ref().unwrap_or(&import_name.name);
-                        self.define_module_var(sym.0, sym.1.clone(), Some(module.0.clone()));
+                        let source = ImportSource {
+                            module: module.0.clone(),
+                            name: import_name
+                                .alias
+                                .as_ref()
+                                .map(|_| self.interner.resolve(import_name.name.0).to_string()),
+                        };
+                        self.define_module_var(sym.0, sym.1.clone(), Some(source));
                     }
                 }
                 _ => {}
@@ -222,7 +237,7 @@ impl<'a> Resolver<'a> {
 
     // -- Module vars --------------------------------------------------------
 
-    fn define_module_var(&mut self, name: SymbolId, span: Span, source: Option<String>) {
+    fn define_module_var(&mut self, name: SymbolId, span: Span, source: Option<ImportSource>) {
         if self.module_vars.contains(&name) {
             self.errors.push(
                 Diagnostic::error(format!(

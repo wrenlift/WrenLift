@@ -6411,3 +6411,63 @@ Scene.new().run()
     assert!(text.contains("at run() (main:21)"), "{text}");
     assert!(text.contains("at <module> (main:26)"), "{text}");
 }
+
+/// A host binds a class's `foreign` methods through the config
+/// callback; the class needs no `#!native` library for them.
+#[test]
+fn e2e_host_binds_foreign_methods() {
+    use wren_lift::runtime::object::NativeContext;
+    use wren_lift::runtime::value::Value;
+    fn twice(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+        Value::num(args[1].as_num().unwrap_or(0.0) * 2.0)
+    }
+    fn tag(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+        ctx.alloc_string("host".to_string())
+    }
+    let src = r#"
+class Host {
+  construct new() {}
+  foreign twice(n)
+  foreign static tag
+}
+var h = Host.new()
+System.print(h.twice(21))
+System.print(Host.tag)
+"#;
+    let config = VMConfig {
+        bind_foreign_method_fn: Some(Box::new(|module, class, is_static, signature| {
+            assert_eq!(module, "main");
+            assert_eq!(class, "Host");
+            match (is_static, signature) {
+                (false, "twice(_)") => Some(twice),
+                (true, "tag") => Some(tag),
+                _ => None,
+            }
+        })),
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(src, config);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "42\nhost");
+}
+
+/// `import "m" for A as B` binds B to what m exports as A.
+#[test]
+fn e2e_import_alias_binds_the_exported_name() {
+    let config = VMConfig {
+        load_module_fn: Some(Box::new(|name: &str, _from: &str| -> Option<String> {
+            (name == "m").then(|| "class A {\n  static hi { \"hi\" }\n}\nvar v = 7\n".to_string())
+        })),
+        ..VMConfig::default()
+    };
+    let (result, output, _) = run_with_config(
+        r#"
+import "m" for A as B, v as w
+System.print(B.hi)
+System.print(w)
+"#,
+        config,
+    );
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "hi\n7");
+}

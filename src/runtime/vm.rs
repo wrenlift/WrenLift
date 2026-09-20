@@ -155,23 +155,16 @@ pub struct CompiledModule {
 /// loader.
 pub type LoadBytecodeFn = Box<dyn Fn(&str, &str) -> Option<CompiledModule>>;
 
-/// Callback to bind a foreign method.
+/// Callback to bind a foreign method: `(module, class, is_static,
+/// signature)`, asked at class install for every `foreign` method
+/// before the class's `#!native` library is consulted.
 pub type BindForeignMethodFn = Box<dyn Fn(&str, &str, bool, &str) -> Option<NativeFn>>;
-
-/// Callback to bind a foreign class (allocate + optional finalize).
-pub type BindForeignClassFn = Box<dyn Fn(&str, &str) -> Option<ForeignClassMethods>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ErrorKind {
     Compile,
     Runtime,
     StackTrace,
-}
-
-/// Foreign class method pair.
-pub struct ForeignClassMethods {
-    pub allocate: NativeFn,
-    pub finalize: Option<fn(*mut u8)>,
 }
 
 /// VM configuration. Set before creating the VM.
@@ -182,7 +175,6 @@ pub struct VMConfig {
     pub load_module_fn: Option<LoadModuleFn>,
     pub load_bytecode_fn: Option<LoadBytecodeFn>,
     pub bind_foreign_method_fn: Option<BindForeignMethodFn>,
-    pub bind_foreign_class_fn: Option<BindForeignClassFn>,
     pub initial_heap_size: usize,
     pub min_heap_size: usize,
     pub heap_growth_percent: u32,
@@ -212,7 +204,6 @@ impl Default for VMConfig {
             load_module_fn: None,
             load_bytecode_fn: None,
             bind_foreign_method_fn: None,
-            bind_foreign_class_fn: None,
             initial_heap_size: 10 * 1024 * 1024,
             min_heap_size: 1024 * 1024,
             heap_growth_percent: 50,
@@ -1137,8 +1128,8 @@ impl VM {
         // are, so a compiled module loads on demand as one does.
         let mut imports: Vec<String> = Vec::new();
         for source in blob.var_sources.iter().flatten() {
-            if !imports.contains(source) {
-                imports.push(source.clone());
+            if !imports.contains(&source.module) {
+                imports.push(source.module.clone());
             }
         }
         for import in imports {
@@ -2099,7 +2090,7 @@ impl VM {
         interner: &crate::intern::Interner,
         mut module_mir: crate::mir::ModuleMir,
         var_names: Vec<String>,
-        var_sources: Vec<Option<String>>,
+        var_sources: Vec<Option<crate::sema::resolve::ImportSource>>,
         class_field_names: std::collections::HashMap<String, Vec<String>>,
     ) -> InterpretResult {
         // Register every class declared in this module into the
@@ -2244,8 +2235,9 @@ impl VM {
                 // over anything else — they're baked in and can't be
                 // shadowed by a module-var slot pointing elsewhere.
                 module_vars.push(value);
-            } else if let Some(import_source) = source {
-                // The var came from `import "<import_source>" for <name>`.
+            } else if let Some(source) = source {
+                // The var came from `import "<import_source>" for <name>`,
+                // perhaps under another name.
                 // Resolve against that specific module rather than scanning
                 // every loaded module by name — otherwise two modules that
                 // both export a class called "Response" leak into each
@@ -2257,13 +2249,15 @@ impl VM {
                 // path for relative imports). Resolve through the same
                 // hook the import-loop uses so they line up. Falls back
                 // to the raw name for builtin / scoped imports.
+                let import_source = &source.module;
+                let exported = source.name.as_deref().unwrap_or(name);
                 let canonical = self
                     .config
                     .resolve_module_fn
                     .as_ref()
                     .and_then(|fn_| fn_(import_source, module_name))
                     .unwrap_or_else(|| import_source.clone());
-                let mut resolved = self.find_imported_var_from(name, &canonical);
+                let mut resolved = self.find_imported_var_from(exported, &canonical);
                 // Bundle-installed modules register under bare names
                 // built from on-disk relative paths (`css`, `forms`,
                 // `lib.catalog`) but their importers' `var_sources`
@@ -2288,7 +2282,7 @@ impl VM {
                         .trim_end_matches(".wren")
                         .replace('/', ".");
                     if !stripped.is_empty() {
-                        resolved = self.find_imported_var_from(name, &stripped);
+                        resolved = self.find_imported_var_from(exported, &stripped);
                     }
                 }
                 if let Some(value) = resolved {
@@ -2436,11 +2430,13 @@ impl VM {
             // the entry-or-insert idiom leaves them alone.
             let class_name_str = self.interner.resolve(class_mir.name).to_string();
             let total_fields = (class_mir.num_fields + inherited_fields) as usize;
-            self.field_layouts.entry(class_name_str).or_insert_with(|| {
-                (0..total_fields)
-                    .map(|i| format!("__inherited_slot_{}", i))
-                    .collect()
-            });
+            self.field_layouts
+                .entry(class_name_str.clone())
+                .or_insert_with(|| {
+                    (0..total_fields)
+                        .map(|i| format!("__inherited_slot_{}", i))
+                        .collect()
+                });
 
             // Register each method's MIR and bind to the class
             for method_mir in class_mir.methods {
@@ -2515,6 +2511,34 @@ impl VM {
                 }
             }
 
+            // The host binds foreign methods first, by module, class,
+            // staticness and signature; what it leaves goes to the
+            // class's native library.
+            let mut unbound: Vec<&crate::mir::ForeignMethodMir> = Vec::new();
+            for fm in &class_mir.foreign_methods {
+                let native = self
+                    .config
+                    .bind_foreign_method_fn
+                    .as_ref()
+                    .and_then(|bind| {
+                        bind(&module_key, &class_name_str, fm.is_static, &fm.signature)
+                    });
+                let Some(native) = native else {
+                    unbound.push(fm);
+                    continue;
+                };
+                let bind_sym = if fm.is_static {
+                    self.interner.intern(&format!("static:{}", fm.signature))
+                } else {
+                    self.interner.intern(&fm.signature)
+                };
+                unsafe {
+                    (*class_ptr).is_foreign = true;
+                    (*class_ptr).note_bound_signature(&fm.signature);
+                    (*class_ptr).bind_native(bind_sym, native);
+                }
+            }
+
             // Resolve #!native / #!symbol foreign methods via dlopen/dlsym.
             // Unresolved methods remain absent from the method table — calls
             // surface as a normal method-not-found runtime error.
@@ -2536,7 +2560,7 @@ impl VM {
                         unsafe {
                             (*class_ptr).is_foreign = true;
                         }
-                        for fm in &class_mir.foreign_methods {
+                        for fm in &unbound {
                             let symbol_name: String = fm.symbol.clone().unwrap_or_else(|| {
                                 crate::runtime::foreign::base_name_of_signature(&fm.signature)
                                     .to_string()
@@ -2590,14 +2614,12 @@ impl VM {
                         crate::diagnostics::Diagnostic::error(err.to_string()).eprint_no_source();
                     }
                 }
-            } else if !class_mir.foreign_methods.is_empty() {
-                // Without `#!native`, foreign methods don't route through
-                // bind_foreign_method_fn. Surface a diagnostic so silent
-                // "method not found" errors aren't mysterious.
-                let class_name = self.interner.resolve(class_mir.name).to_string();
+            } else if !unbound.is_empty() {
+                // Nothing binds them: say so rather than leaving a
+                // "method not found" for later.
                 crate::diagnostics::Diagnostic::warning(format!(
                     "class '{}' has foreign methods but no #!native directive",
-                    class_name
+                    class_name_str
                 ))
                 .eprint_no_source();
             }

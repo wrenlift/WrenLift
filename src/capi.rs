@@ -135,7 +135,9 @@ pub struct WrenConfiguration {
     pub reallocate_fn: *mut c_void, // Not used, kept for ABI compat
     pub resolve_module_fn: Option<WrenResolveModuleFn>,
     pub load_module_fn: Option<WrenLoadModuleFn>,
+    /// Not read: the host binds through `VMConfig::bind_foreign_method_fn`.
     pub bind_foreign_method_fn: Option<WrenBindForeignMethodFn>,
+    /// Not read.
     pub bind_foreign_class_fn: Option<WrenBindForeignClassFn>,
     pub write_fn: Option<WrenWriteFn>,
     pub error_fn: Option<WrenErrorFn>,
