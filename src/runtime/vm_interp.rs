@@ -546,6 +546,10 @@ fn try_enter_loop_osr(
     osr_args.push(Value::null());
     for (i, &reg) in entry.live_in_regs.iter().enumerate() {
         let mut value = values.get(reg as usize).copied();
+        // A module variable the loop carries in a parameter.
+        if let Some(Some(slot)) = entry.live_in_modvar.get(i).copied() {
+            value = vm.engine.module_var(func_id, slot);
+        }
         // A split parameter: the register holds the object, the entry
         // wants one of its fields.
         if let Some(Some(field)) = entry.live_in_field.get(i).copied() {

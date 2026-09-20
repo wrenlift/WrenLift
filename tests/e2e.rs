@@ -6471,3 +6471,54 @@ System.print(w)
     assert!(matches!(result, InterpretResult::Success), "{output}");
     assert_eq!(output.trim(), "hi\n7");
 }
+
+/// A module-level loop carries the module variables it writes as
+/// values; a deopt inside it and each exit write them back.
+#[test]
+fn e2e_module_loop_carries_its_variables() {
+    let (result, output, _) = run(r#"
+class P {
+  construct new() { _x = 1 }
+  x { _x }
+}
+class Q {
+  construct new() { _x = 2 }
+  x { _x }
+}
+var p1 = P.new()
+var p2 = Q.new()
+var p = p1
+var sum = 0
+var i = 0
+while (i < 1000000) {
+  sum = sum + p.x
+  i = i + 1
+  p = (i < 500000) ? p1 : p2
+}
+System.print(sum)
+System.print(i)
+System.print(p is Q)
+var s = "a"
+var n = 0
+while (n < 3000) {
+  s = s + "b"
+  n = n + 1
+}
+System.print(s.count)
+var outer = 0
+var inner = 0
+var t = 0
+while (outer < 300) {
+  inner = 0
+  while (inner < 300) {
+    t = t + inner
+    inner = inner + 1
+  }
+  outer = outer + 1
+}
+System.print(t)
+System.print(inner)
+"#);
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output.trim(), "1500000\n1000000\ntrue\n3001\n13455000\n300");
+}

@@ -517,6 +517,11 @@ pub enum DeoptSource {
     },
 }
 
+/// Bit of a [`DeoptReg::reg`] naming a module variable slot instead
+/// of a register: the value is written to the variable when the
+/// interpreter resumes, for a loop that carried it in a parameter.
+pub const DEOPT_MODVAR_REG: u32 = 1 << 31;
+
 /// A register of the interpreter's frame and where its value comes
 /// from at a deopt point.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1009,6 +1014,19 @@ pub struct MirFunction {
     /// Compile-time only.
     #[serde(skip)]
     pub scalar_param_sources: std::collections::HashMap<ValueId, (ValueId, u16)>,
+    /// Loop header parameters that carry a module variable around the
+    /// loop, by slot: the loop reads and writes the parameter instead
+    /// of the variable, and stores it back on every exit. An OSR entry
+    /// reads the variable for such a parameter, and a deopt inside the
+    /// loop writes it back. Compile-time only.
+    #[serde(skip)]
+    pub promoted_modvar_params: std::collections::HashMap<ValueId, u16>,
+    /// Where a loop header's bytecode is and which registers hold what
+    /// there, for a speculative guard placed before the loop to resume
+    /// the interpreter at its entry. Filled by the engine for a compile
+    /// that may speculate; compile-time only.
+    #[serde(skip)]
+    pub loop_entries: std::collections::HashMap<BlockId, (u32, Vec<DeoptReg>)>,
     /// Loop headers the interpreter never transfers into: headers of
     /// generic loop copies the inliner made, and headers whose loop had
     /// no inline-cache data at compile time (the interpreter keeps
@@ -1056,6 +1074,8 @@ impl MirFunction {
             span_map: std::collections::HashMap::new(),
             speculated_num_params: Vec::new(),
             scalar_param_sources: std::collections::HashMap::new(),
+            promoted_modvar_params: std::collections::HashMap::new(),
+            loop_entries: std::collections::HashMap::new(),
             osr_excluded: std::collections::HashSet::new(),
             ic_sites: std::collections::HashMap::new(),
         }

@@ -5505,6 +5505,13 @@ impl VM {
         let mut values = vec![Value::UNDEFINED; bc.register_count as usize];
         for (i, &(reg, _)) in regs.iter().enumerate() {
             let v = crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
+            // A module variable a loop carried in a parameter goes
+            // back to the module.
+            if reg & crate::mir::DEOPT_MODVAR_REG != 0 {
+                let slot = (reg & !crate::mir::DEOPT_MODVAR_REG) as u16;
+                self.engine.set_module_var(func_id, slot, v);
+                continue;
+            }
             let r = reg as usize;
             if r >= values.len() {
                 values.resize(r + 1, Value::UNDEFINED);

@@ -72,6 +72,7 @@ impl MirPass for UnboxParams {
         for bi in 0..func.blocks.len() {
             let mut consts: Vec<(ValueId, Instruction)> = Vec::new();
             let mut cache: HashMap<u64, ValueId> = HashMap::new();
+            let mut unboxes: HashMap<ValueId, ValueId> = HashMap::new();
             let targets: Vec<(BlockId, Vec<ValueId>)> = edges(&func.blocks[bi].terminator)
                 .into_iter()
                 .map(|(t, a)| (t, a.to_vec()))
@@ -91,6 +92,12 @@ impl MirPass for UnboxParams {
                     }
                     out[i] = match f64_source(*arg, &defs, &chosen).expect("checked above") {
                         Source::Value(v) => v,
+                        Source::Guarded(g) => *unboxes.entry(g).or_insert_with(|| {
+                            let id = ValueId(func.next_value);
+                            func.next_value += 1;
+                            consts.push((id, Instruction::Unbox(g)));
+                            id
+                        }),
                         Source::Const(c) => *cache.entry(c.to_bits()).or_insert_with(|| {
                             let id = ValueId(func.next_value);
                             func.next_value += 1;
@@ -233,6 +240,8 @@ impl MirPass for UnboxParams {
 enum Source {
     Value(ValueId),
     Const(f64),
+    /// A boxed value a guard has proven a Num; the edge unboxes it.
+    Guarded(ValueId),
 }
 
 /// The f64 behind a boxed edge argument, if it has one.
@@ -249,6 +258,9 @@ fn f64_source(
         match defs.get(&cur)? {
             Instruction::Box(f) => return Some(Source::Value(*f)),
             Instruction::ConstNum(c) => return Some(Source::Const(*c)),
+            Instruction::GuardNumAt { .. } | Instruction::GuardNum(_) => {
+                return Some(Source::Guarded(cur));
+            }
             Instruction::Move(a) => cur = *a,
             _ => return None,
         }

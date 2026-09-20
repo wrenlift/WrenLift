@@ -71,6 +71,7 @@ pub mod llvm {
         Vec<bool>,
         Vec<Option<u16>>,
         Vec<bool>,
+        Vec<Option<u16>>,
     );
 
     /// `WLIFT_LLVM_IR=1` prints every module after optimisation.
@@ -286,6 +287,9 @@ pub mod llvm {
                         .map(|v| mir.scalar_param_sources.get(v).map(|(_, f)| *f))
                         .collect(),
                     live.iter().map(|v| i64_params.contains(v)).collect(),
+                    live.iter()
+                        .map(|v| mir.promoted_modvar_params.get(v).copied())
+                        .collect(),
                 ));
             }
         }
@@ -340,7 +344,7 @@ pub mod llvm {
             );
         }
         let mut osr_entries = Vec::with_capacity(osr_defs.len());
-        for (target_block, param_count, name, regs, num, field, int) in osr_defs {
+        for (target_block, param_count, name, regs, num, field, int, modvar) in osr_defs {
             let Ok(addr) = engine.get_function_address(&name) else {
                 continue;
             };
@@ -352,6 +356,7 @@ pub mod llvm {
                 live_in_num: num,
                 live_in_field: field,
                 live_in_int: int,
+                live_in_modvar: modvar,
             });
         }
         Ok(LlvmCompiledCode {

@@ -1953,6 +1953,10 @@ pub struct NativeOsrEntry {
     /// live-in as an integer, so the transfer must decline unless the
     /// value is an integral Num within 2^53.
     pub live_in_int: Vec<bool>,
+    /// Parallel to `live_in_regs`: when set, the live-in is the module
+    /// variable in this slot, which the loop carries in a parameter; it
+    /// is read from the module, not from a register.
+    pub live_in_modvar: Vec<Option<u16>>,
 }
 
 unsafe impl Send for NativeOsrEntry {}

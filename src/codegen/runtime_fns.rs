@@ -1562,7 +1562,12 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
         let needs_field = entry.live_in_field.get(i).copied().flatten().is_some();
         let needs_num = entry.live_in_num.get(i).copied().unwrap_or(false);
         let needs_int = entry.live_in_int.get(i).copied().unwrap_or(false);
-        let value = pairs.iter().find(|(r, _)| r == reg).map(|(_, v)| *v);
+        // A module variable the loop carries in a parameter: the body
+        // polling here stored it back first.
+        let value = match entry.live_in_modvar.get(i).copied().flatten() {
+            Some(slot) => vm.engine.module_var(id, slot),
+            None => pairs.iter().find(|(r, _)| r == reg).map(|(_, v)| *v),
+        };
         match value {
             Some(v)
                 if !needs_field

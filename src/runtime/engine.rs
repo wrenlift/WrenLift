@@ -587,6 +587,12 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     if std::env::var_os("WLIFT_DISABLE_MATH_GUARD").is_none() {
         crate::mir::opt::math_guard::MathGuard::new(interner).run(mir);
     }
+    // A module variable a loop writes is carried around it as a value,
+    // before the passes that need the loop's numbers known.
+    // WLIFT_DISABLE_MODVAR_PROMOTE keeps the loads and stores; safe to run with.
+    if std::env::var_os("WLIFT_DISABLE_MODVAR_PROMOTE").is_none() {
+        crate::mir::opt::promote_modvars::PromoteModuleVars.run(mir);
+    }
     let constfold = ConstFold;
     let dce = Dce;
     let cse = Cse::default();
@@ -2308,6 +2314,7 @@ impl ExecutionEngine {
                 live_in_num: entry.live_in_num.clone(),
                 live_in_field: entry.live_in_field.clone(),
                 live_in_int: entry.live_in_int.clone(),
+                live_in_modvar: entry.live_in_modvar.clone(),
             });
         }
         None
@@ -2594,6 +2601,33 @@ impl ExecutionEngine {
         let len = cell.len.load(Ordering::Acquire);
         let ptr = cell.ptr.load(Ordering::Acquire);
         (ptr, len as u32)
+    }
+
+    /// The value of slot `slot` of `id`'s module, if the module has it.
+    pub fn module_var(&self, id: FuncId, slot: u16) -> Option<crate::runtime::value::Value> {
+        let (ptr, len) = self.module_vars_for(id);
+        if ptr.is_null() || slot as u32 >= len {
+            return None;
+        }
+        Some(crate::runtime::value::Value::from_bits(unsafe {
+            *ptr.add(slot as usize)
+        }))
+    }
+
+    /// Write slot `slot` of `id`'s module; false when the module has no
+    /// such slot.
+    pub fn set_module_var(
+        &mut self,
+        id: FuncId,
+        slot: u16,
+        value: crate::runtime::value::Value,
+    ) -> bool {
+        let (ptr, len) = self.module_vars_for(id);
+        if ptr.is_null() || slot as u32 >= len {
+            return false;
+        }
+        unsafe { *ptr.add(slot as usize) = value.to_bits() };
+        true
     }
 
     /// Shape of the class held by module variable `idx` of `module`
@@ -3188,6 +3222,46 @@ impl ExecutionEngine {
             }
         }
         Some(exits)
+    }
+
+    /// For each loop header the bytecode can enter, its offset and the
+    /// registers live there, each holding the value of the same name.
+    /// A header with a live-in the bytecode has no register for (one a
+    /// compile pass made) is left out: no guard can resume there.
+    fn loop_entries(
+        &mut self,
+        id: FuncId,
+        clone: &MirFunction,
+    ) -> HashMap<crate::mir::BlockId, (u32, Vec<crate::mir::DeoptReg>)> {
+        use crate::mir::{DeoptReg, DeoptSource, live_in_sets};
+        let mut out = HashMap::new();
+        let Some(bc) = self.ensure_bytecode(id) else {
+            return out;
+        };
+        let registers = match self.functions.get(id.0 as usize) {
+            Some(f) => f.mir().next_value,
+            None => return out,
+        };
+        let live = live_in_sets(clone);
+        for point in unsafe { &(*bc).osr_points } {
+            let header = point.target_block;
+            if header.0 as usize >= clone.blocks.len() {
+                continue;
+            }
+            let regs: Option<Vec<DeoptReg>> = live
+                .iter(header.0 as usize)
+                .map(|v| {
+                    (v.0 < registers).then_some(DeoptReg {
+                        reg: v.0,
+                        source: DeoptSource::Value(v),
+                    })
+                })
+                .collect();
+            if let Some(regs) = regs {
+                out.insert(header, (point.target_offset, regs));
+            }
+        }
+        out
     }
 
     /// The clone with non-escaping instances kept as field values.
@@ -4020,9 +4094,12 @@ impl ExecutionEngine {
         };
         // Only the bytecode's own registers mean the same thing in both
         // bodies; a value the JIT pipeline created is numbered per
-        // compile.
+        // compile, unless it is a module variable read for the entry.
         let registers = self.functions.get(idx)?.mir().next_value;
-        if entry.live_in_regs.iter().any(|r| *r >= registers) {
+        let past_registers = entry.live_in_regs.iter().enumerate().any(|(i, r)| {
+            *r >= registers && entry.live_in_modvar.get(i).copied().flatten().is_none()
+        });
+        if past_registers {
             if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
                 eprintln!(
                     "osr-trace: retier off FuncId({}) bb{}: live-in past the bytecode's registers {:?} (next {})",
@@ -4236,6 +4313,10 @@ impl ExecutionEngine {
             tier,
         );
         let speculate = !self.speculation_failed[idx];
+        let mut sroa_mir = sroa_mir;
+        if speculate {
+            Arc::make_mut(&mut sroa_mir).loop_entries = self.loop_entries(id, &sroa_mir);
+        }
         let compile_mir =
             Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref(), speculate);
         let devirt_hints = callsite_ic_ptrs
@@ -4519,11 +4600,14 @@ impl ExecutionEngine {
         } else {
             sroa_mir
         };
-        let sroa_mir = if tier == CompileTier::Optimized {
+        let mut sroa_mir = if tier == CompileTier::Optimized {
             Self::plant_cold_loop_exits(sroa_mir, &cold)
         } else {
             sroa_mir
         };
+        if speculating {
+            Arc::make_mut(&mut sroa_mir).loop_entries = self.loop_entries(id, &sroa_mir);
+        }
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let bump_region = Self::bump_region_for_compile();
         let safepoint_page = self.safepoint_page_for_compile();
