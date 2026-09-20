@@ -1939,6 +1939,11 @@ pub mod cl {
         crate::codegen::direct_calls_enabled()
     }
 
+    /// Address space reserved per compiled body for its code and data;
+    /// only the pages used are ever committed.
+    #[cfg(not(windows))]
+    const JIT_ARENA_BYTES: usize = 4 << 20;
+
     /// Compiled output from the Cranelift backend.
     pub struct CraneliftCompiledCode {
         /// The JIT module (keeps executable memory alive).
@@ -2001,6 +2006,17 @@ pub mod cl {
 
         // 2. Create JIT module with runtime symbol resolution
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // One reservation holds the body's code and its data (the loop
+        // entry request word, f64 constants): the code reaches them
+        // pc-relative, which has a 2 GB reach, so they must not be
+        // mapped on the far side of whatever the host reserved. Not on
+        // Windows, where a reservation is committed up front.
+        #[cfg(not(windows))]
+        {
+            let arena = cranelift_jit::ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES)
+                .map_err(|e| e.to_string())?;
+            jit_builder.memory_provider(Box::new(arena));
+        }
 
         // Register all runtime function symbols
         for (name, addr) in runtime_symbols() {
