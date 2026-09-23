@@ -193,6 +193,20 @@ fn call_native_with_frame_sync(
     with_frame_sync(vm, fiber, pc, values, |vm| func(vm, args))
 }
 
+/// Read through the stable module cell after any reentrant host call.
+#[inline]
+fn module_cell_values(cell: *const super::engine::ModuleVarsCell) -> (*mut u64, u32) {
+    use std::sync::atomic::Ordering;
+    if cell.is_null() {
+        return (std::ptr::null_mut(), 0);
+    }
+    let cell = unsafe { &*cell };
+    (
+        cell.ptr.load(Ordering::Acquire),
+        cell.len.load(Ordering::Acquire) as u32,
+    )
+}
+
 /// `call_native_with_frame_sync` for a host's method, told its context.
 #[inline]
 fn call_host_with_frame_sync(
@@ -1273,7 +1287,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
     // (module name Rc pointer, module count) → module entry. A few
     // entries, because a caller and its callee can hold different Rcs
     // of the same name and would otherwise alternate misses.
-    let mut module_cache: [((usize, usize), *mut super::engine::ModuleEntry); 4] =
+    let mut module_cache: [((usize, usize), *const super::engine::ModuleVarsCell); 4] =
         [((0, 0), std::ptr::null_mut()); 4];
     let mut module_cache_next = 0usize;
     // The active frame's register file, taken out of the frame while the
@@ -1544,12 +1558,10 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
             values.resize(bc.register_count as usize, UNDEF);
         }
 
-        // Cache raw pointer to module vars — eliminates HashMap lookup per
-        // GetModuleVar/SetModuleVar. The module name is an Rc shared by
-        // every frame of that module, so the lookup is repeated only when
-        // the pointer changes or a module was added (which can rehash the
-        // table and move entries).
-        let module_entry_ptr: *mut super::engine::ModuleEntry = {
+        // A host callback can install a module and rehash the module table
+        // without leaving this dispatch loop. Cache the separately allocated
+        // cell, never a pointer into the HashMap or its Vec header.
+        let module_cell = {
             let key = (Arc::as_ptr(&module_name) as usize, vm.engine.modules.len());
             match module_cache.iter().find(|(k, _)| *k == key) {
                 Some((_, ptr)) => *ptr,
@@ -1557,19 +1569,14 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let ptr = vm
                         .engine
                         .modules
-                        .get_mut(module_name.as_str())
-                        .map(|m| m as *mut super::engine::ModuleEntry)
-                        .unwrap_or(std::ptr::null_mut());
+                        .get(module_name.as_str())
+                        .map(|m| m.cell as *const super::engine::ModuleVarsCell)
+                        .unwrap_or(std::ptr::null());
                     module_cache[module_cache_next] = (key, ptr);
                     module_cache_next = (module_cache_next + 1) % module_cache.len();
                     ptr
                 }
             }
-        };
-        let module_vars_ptr: *mut Vec<Value> = if module_entry_ptr.is_null() {
-            std::ptr::null_mut()
-        } else {
-            unsafe { &mut (*module_entry_ptr).vars as *mut Vec<Value> }
         };
 
         // Set JIT context for the current frame so JIT-compiled
@@ -1583,12 +1590,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
         // after a cross-fiber abort read stale pointers and return
         // UNDEFINED.
         {
-            let (mv_ptr, mv_count) = if !module_vars_ptr.is_null() {
-                let v = unsafe { &*module_vars_ptr };
-                (v.as_ptr() as *mut u64, v.len() as u32)
-            } else {
-                (std::ptr::null_mut(), 0)
-            };
+            let (mv_ptr, mv_count) = module_cell_values(module_cell);
             let mod_name_bytes = module_name.as_bytes();
             // SAFETY: the pointer is this thread's context, taken once per
             // run loop; nothing else holds a reference across this write.
@@ -1634,12 +1636,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     .and_then(|t| t.as_ref())
                     .is_some();
                 if has_tc {
-                    let (mv_ptr, mv_count) = if !module_vars_ptr.is_null() {
-                        let v = unsafe { &*module_vars_ptr };
-                        (v.as_ptr() as *mut u64, v.len() as u32)
-                    } else {
-                        (std::ptr::null_mut(), 0)
-                    };
+                    let (mv_ptr, mv_count) = module_cell_values(module_cell);
                     let vm_ptr = vm as *mut VM as *mut u8;
                     let mod_name_bytes = module_name.as_bytes();
                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
@@ -1828,9 +1825,9 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                 Op::GetModuleVar => {
                     let dst = read_u16(code, &mut pc);
                     let slot = read_u16(code, &mut pc) as usize;
-                    let val = if !module_vars_ptr.is_null() {
-                        let vars = unsafe { &*module_vars_ptr };
-                        vars.get(slot).copied().unwrap_or(Value::null())
+                    let (ptr, len) = module_cell_values(module_cell);
+                    let val = if slot < len as usize {
+                        unsafe { *(ptr as *const Value).add(slot) }
                     } else {
                         Value::null()
                     };
@@ -1841,15 +1838,13 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let val_reg = read_u16(code, &mut pc);
                     let slot = read_u16(code, &mut pc) as usize;
                     let v = get_reg(&values, val_reg);
-                    if !module_vars_ptr.is_null() {
-                        let vars = unsafe { &mut *module_vars_ptr };
-                        if vars.len() <= slot {
-                            while vars.len() <= slot {
-                                vars.push(Value::null());
-                            }
-                            unsafe { (*module_entry_ptr).sync_cell() };
-                        }
-                        vars[slot] = v;
+                    let (ptr, len) = module_cell_values(module_cell);
+                    if slot < len as usize {
+                        unsafe { *(ptr as *mut Value).add(slot) = v };
+                    } else if let Some(entry) = vm.engine.modules.get_mut(module_name.as_str()) {
+                        entry.vars.resize(slot + 1, Value::null());
+                        entry.vars[slot] = v;
+                        entry.sync_cell();
                     }
                     set_reg(&mut values, dst, v);
                 }
