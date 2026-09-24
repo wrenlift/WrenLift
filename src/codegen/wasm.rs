@@ -172,6 +172,7 @@ fn may_collect(inst: &Instruction) -> bool {
             | Instruction::NewInstance { .. }
             | Instruction::StringConcat(..)
             | Instruction::ToString(..)
+            | Instruction::ConstString(..)
             | Instruction::SubscriptGet { .. }
             | Instruction::SubscriptSet { .. }
     )
@@ -917,6 +918,9 @@ impl<'a> MirWasmEmitter<'a> {
                     Instruction::ToString(_) => {
                         self.register_import("wren_to_string", &[ValType::I64], &[ValType::I64]);
                     }
+                    Instruction::ConstString(_) => {
+                        self.register_import("wren_const_string", &[ValType::I64], &[ValType::I64]);
+                    }
                     Instruction::IsType(..) => {
                         self.register_import(
                             "wren_is_type",
@@ -1343,8 +1347,11 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::I64Const(0x7FFC_0000_0000_0000u64 as i64));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
+            // A literal is a string object made from its symbol, as
+            // the native backends make it.
             Instruction::ConstString(idx) => {
                 func.instruction(&WasmInst::I64Const(*idx as i64));
+                func.instruction(&WasmInst::Call(self.runtime_imports["wren_const_string"]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::ConstF64(n) => {
@@ -2954,6 +2961,31 @@ mod tests {
             "WAT should contain f64.const:\n{}",
             wat
         );
+    }
+
+    /// A string literal is the object `wren_const_string` makes from
+    /// its symbol, not the symbol's index.
+    #[test]
+    fn a_string_literal_is_made_by_the_runtime() {
+        let (_, mut mir) = setup();
+        let bb = mir.new_block();
+        let lit = mir.new_value();
+        mir.block_mut(bb)
+            .instructions
+            .push((lit, Instruction::ConstString(7)));
+        mir.block_mut(bb).terminator = Terminator::Return(lit);
+        let module = emit_mir(&mir).unwrap();
+        assert_valid(&module);
+
+        let engine = wasmtime::Engine::default();
+        let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let made = wasmtime::Func::wrap(&mut store, |sym: i64| -> i64 { 0x5_0000 + sym });
+        let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[made.into()]).unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
+        assert_eq!(func.call(&mut store, ()).unwrap(), 0x5_0007);
     }
 
     /// A body reads and writes module variables through the module's

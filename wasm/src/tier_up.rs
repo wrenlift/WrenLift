@@ -1570,6 +1570,18 @@ pub fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
     unsafe { wren_lift::codegen::runtime_fns::finish_alloc(vm, val) }
 }
 
+/// A string literal, made from its interned symbol.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_const_string(sym: u64) -> u64 {
+    let Some(vm) = current_vm_or_null() else {
+        return Value::null().to_bits();
+    };
+    let sym = wren_lift::intern::SymbolId::from_raw(sym as u32);
+    let val = vm.new_string(vm.interner.resolve(sym).to_string());
+    unsafe { wren_lift::codegen::runtime_fns::finish_alloc(vm, val) }
+}
+
 /// Convert any value to its string form. Used by string
 /// interpolation (`"%(x)"`) — every part lowers to a `ToString`
 /// before the `StringConcat` joins them, so this is a hot path

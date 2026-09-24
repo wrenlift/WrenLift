@@ -340,6 +340,7 @@ __wliftWrenImports = {
   wren_make_map_4:  wasm.wren_make_map_4,
   wren_make_range:  wasm.wren_make_range,
   wren_to_string:   wasm.wren_to_string,
+  wren_const_string: wasm.wren_const_string,
   wren_string_concat_2: wasm.wren_string_concat_2,
   wren_string_concat_3: wasm.wren_string_concat_3,
   wren_string_concat_4: wasm.wren_string_concat_4,
