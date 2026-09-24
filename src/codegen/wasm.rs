@@ -259,9 +259,10 @@ pub fn emit_mir_with_interner(
 #[derive(Clone, Copy, Default)]
 pub struct RuntimeAddrs {
     /// Address of `runtime::tier::current_module_vars_cell::CURRENT`
-    /// (a `*mut u64` cell). When `Some`, `GetModuleVar` /
-    /// `SetModuleVar` lower to inline `i32.load + i64.load` /
-    /// `+ i64.store`.
+    /// (a `*const ModuleVarsCell`, whose first word is the
+    /// variables' array). When `Some`, `GetModuleVar` /
+    /// `SetModuleVar` lower to inline `i32.load + i32.load +
+    /// i64.load` / `+ i64.store`.
     pub module_vars_ptr_addr: Option<u32>,
     /// Address of `runtime::tier::current_closure_cell::CURRENT`
     /// (a `*mut ObjClosure` cell). When `Some` together with a
@@ -828,8 +829,8 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     // Inline path bakes the `module_vars_ptr_addr`
-                    // cell address as an `i32.const` and does an
-                    // inline `i32.load + i64.load` (or
+                    // cell address as an `i32.const` and does
+                    // inline loads through the module's cell (or
                     // `+ i64.store` for SetModuleVar) — no boundary
                     // import needed. Fall back to the import call
                     // only when codegen has no cdylib memory
@@ -1686,22 +1687,23 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::GetModuleVar(idx) => {
                 if let Some(addr) = self.runtime_addrs.module_vars_ptr_addr {
                     // Inline:
-                    //   (i32.const ADDR)            ;; addr of CURRENT cell
-                    //   (i32.load)                  ;; data ptr (*mut u64)
+                    //   (i32.const ADDR)            ;; addr of CURRENT
+                    //   (i32.load)                  ;; the module's cell
+                    //   (i32.load)                  ;; its array (*mut u64)
                     //   (i64.load offset=idx*8)     ;; vars[idx]
                     //   (local.set dst)
-                    // Three wasm instructions vs the wasm-bindgen
-                    // boundary call the import path emitted —
-                    // the hot read in `fib`, `simd batch`, and
-                    // any other tier'd-up code that touches a
-                    // top-level `var` lands inline.
+                    // The array is read through the cell on every
+                    // access, so a callee that grows the module's
+                    // variables mid-call leaves no stale array.
                     let mem_offset = (*idx as u64) * 8;
                     func.instruction(&WasmInst::I32Const(addr as i32));
-                    func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    }));
+                    for _ in 0..2 {
+                        func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    }
                     func.instruction(&WasmInst::I64Load(wasm_encoder::MemArg {
                         offset: mem_offset,
                         align: 3,
@@ -1717,19 +1719,21 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::SetModuleVar(idx, val) => {
                 if let Some(addr) = self.runtime_addrs.module_vars_ptr_addr {
                     // Inline:
-                    //   (i32.const ADDR) (i32.load)         ;; data ptr
-                    //   (local.get val)                      ;; new value
+                    //   (i32.const ADDR) (i32.load) (i32.load) ;; array
+                    //   (local.get val)                         ;; new value
                     //   (i64.store offset=idx*8)
                     //   ;; result expression mirrors the host
                     //   ;; helper which returns the stored value
                     //   (local.get val) (local.set dst)
                     let mem_offset = (*idx as u64) * 8;
                     func.instruction(&WasmInst::I32Const(addr as i32));
-                    func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    }));
+                    for _ in 0..2 {
+                        func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                    }
                     func.instruction(&WasmInst::LocalGet(self.local(*val)));
                     func.instruction(&WasmInst::I64Store(wasm_encoder::MemArg {
                         offset: mem_offset,
@@ -2950,6 +2954,78 @@ mod tests {
             "WAT should contain f64.const:\n{}",
             wat
         );
+    }
+
+    /// A body reads and writes module variables through the module's
+    /// cell on every access: when the variables move to a new array
+    /// (a callee grew them), the next access finds the new one
+    /// without the body being entered again.
+    #[test]
+    fn module_variables_follow_their_cell() {
+        let (interner, mut mir) = setup();
+        let bb = mir.new_block();
+        let read = mir.new_value();
+        let two = mir.new_value();
+        let wrote = mir.new_value();
+        mir.block_mut(bb)
+            .instructions
+            .push((read, Instruction::GetModuleVar(1)));
+        mir.block_mut(bb)
+            .instructions
+            .push((two, Instruction::ConstNum(2.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((wrote, Instruction::SetModuleVar(2, two)));
+        mir.block_mut(bb).terminator = Terminator::Return(read);
+
+        // CURRENT at 16 holds the cell's address; the cell at 32 is
+        // { array, len }; one array at 64, the next at 128.
+        let (current, cell, first, second) = (16u32, 32u32, 64u32, 128u32);
+        let addrs = RuntimeAddrs {
+            module_vars_ptr_addr: Some(current),
+            ..RuntimeAddrs::default()
+        };
+        let module = emit_mir_with_runtime_addrs(&mir, &interner, addrs).unwrap();
+        assert_valid(&module);
+
+        let engine = wasmtime::Engine::default();
+        let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let memory = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None)).unwrap();
+        let word = |store: &mut wasmtime::Store<()>, at: u32, v: u32| {
+            memory.write(store, at as usize, &v.to_le_bytes()).unwrap()
+        };
+        let slot = |store: &mut wasmtime::Store<()>, array: u32, i: u32, v: f64| {
+            memory
+                .write(store, (array + i * 8) as usize, &v.to_bits().to_le_bytes())
+                .unwrap()
+        };
+        let read_slot = |store: &wasmtime::Store<()>, array: u32, i: u32| {
+            let mut b = [0u8; 8];
+            memory
+                .read(store, (array + i * 8) as usize, &mut b)
+                .unwrap();
+            f64::from_bits(u64::from_le_bytes(b))
+        };
+        word(&mut store, current, cell);
+        word(&mut store, cell, first);
+        word(&mut store, cell + 4, 4);
+        slot(&mut store, first, 1, 111.0);
+        slot(&mut store, second, 1, 222.0);
+        let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[memory.into()]).unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
+
+        let got = f64::from_bits(func.call(&mut store, ()).unwrap() as u64);
+        assert_eq!(got, 111.0);
+        assert_eq!(read_slot(&store, first, 2), 2.0);
+
+        // The variables grow into a new array; only the cell changes.
+        word(&mut store, cell, second);
+        let got = f64::from_bits(func.call(&mut store, ()).unwrap() as u64);
+        assert_eq!(got, 222.0);
+        assert_eq!(read_slot(&store, second, 2), 2.0);
     }
 
     #[test]

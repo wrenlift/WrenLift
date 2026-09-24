@@ -4387,19 +4387,18 @@ fn dispatch_closure_bc_inner(
             // nested `tier::dispatch` calls would clobber the
             // cell otherwise.
             let prev_closure = crate::runtime::tier::enter_closure(closure_ptr);
-            // Same shape for the module-vars data pointer:
-            // JIT'd `Instruction::GetModuleVar` / `SetModuleVar`
-            // lower to inline `i32.load + i64.load` against this
-            // cell's address, so the cell needs to point at the
-            // callee's module's `vars` Vec data on every BC→JIT
-            // entry. The lookup chain (closure→fn→fn_id→
+            // Same shape for the module's variable cell: JIT'd
+            // `Instruction::GetModuleVar` / `SetModuleVar` lower to
+            // inline loads through the static's address, so it
+            // needs to point at the callee's module's cell on
+            // every BC→JIT entry. The lookup chain (closure→fn→fn_id→
             // engine.modules[name]) costs ~one HashMap probe per
             // dispatch; in-module recursive `call_indirect` calls
             // inside the JIT'd body don't go through here, so
             // the ~13.5k recursive `fib.call(...)` invocations
             // never repeat the lookup.
             let new_vars =
-                unsafe { crate::runtime::tier::module_vars_ptr_for_closure(vm, closure_ptr) };
+                unsafe { crate::runtime::tier::module_vars_cell_for_closure(vm, closure_ptr) };
             let prev_vars = crate::runtime::tier::enter_module_vars(new_vars);
             let result_bits = crate::runtime::tier::dispatch(slot, "", &args_bits);
             crate::runtime::tier::restore_module_vars(prev_vars);

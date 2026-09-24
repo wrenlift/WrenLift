@@ -204,38 +204,44 @@ pub fn current_closure() -> *mut crate::runtime::object::ObjClosure {
 
 #[cfg(target_arch = "wasm32")]
 mod current_module_vars_cell {
+    use crate::runtime::engine::ModuleVarsCell;
     use std::cell::UnsafeCell;
 
-    /// Data pointer of the currently-executing module's
-    /// `vars: Vec<Value>`. Set by every dispatch boundary that
-    /// crosses into JIT'd wasm (BC → tier and tier → tier across
-    /// modules); read inline by JIT'd `Instruction::GetModuleVar`
-    /// / `SetModuleVar` lowerings via an `i32.const ADDR;
-    /// i32.load; i64.load offset=idx*8` triple — replacing the
-    /// per-access wasm-bindgen call into `wren_get_module_var`.
-    /// The static lives at a stable address in the cdylib's
-    /// linear memory; codegen bakes that address as an i32.const
-    /// literal in the JIT'd module.
-    pub(super) struct VarsCell(UnsafeCell<*mut u64>);
+    /// The variable cell of the currently-executing module. Set by
+    /// every dispatch boundary that crosses into JIT'd wasm (BC →
+    /// tier and tier → tier across modules); read inline by JIT'd
+    /// `Instruction::GetModuleVar` / `SetModuleVar` lowerings via
+    /// `i32.const ADDR; i32.load; i32.load; i64.load offset=idx*8`
+    /// — the array is read through the module's cell on every
+    /// access, so a callee that grows the module's variables
+    /// mid-call leaves no stale array behind. The static lives at
+    /// a stable address in the cdylib's linear memory; codegen
+    /// bakes that address as an i32.const literal in the JIT'd
+    /// module.
+    pub(super) struct VarsCell(UnsafeCell<*const ModuleVarsCell>);
     unsafe impl Sync for VarsCell {}
-    pub(super) static CURRENT: VarsCell = VarsCell(UnsafeCell::new(std::ptr::null_mut()));
+    pub(super) static CURRENT: VarsCell = VarsCell(UnsafeCell::new(std::ptr::null()));
     impl VarsCell {
-        pub(super) fn get(&self) -> *mut u64 {
+        pub(super) fn get(&self) -> *const ModuleVarsCell {
             unsafe { *self.0.get() }
         }
-        pub(super) fn set(&self, p: *mut u64) {
+        pub(super) fn set(&self, p: *const ModuleVarsCell) {
             unsafe { *self.0.get() = p }
         }
     }
 }
 
 /// Read the data pointer for the currently-executing module's
-/// `vars` Vec. Null outside any tier-up dispatch window. JIT'd
-/// modules read this via inline `i32.load` against the static's
-/// fixed address — see [`current_module_vars_addr`].
+/// `vars` Vec, through its cell. Null outside any tier-up dispatch
+/// window. JIT'd modules read the cell via inline loads against
+/// the static's fixed address — see [`current_module_vars_addr`].
 #[cfg(target_arch = "wasm32")]
 pub fn current_module_vars() -> *mut u64 {
-    current_module_vars_cell::CURRENT.get()
+    let cell = current_module_vars_cell::CURRENT.get();
+    if cell.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*cell).ptr.load(std::sync::atomic::Ordering::Acquire) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -247,10 +253,11 @@ pub fn current_module_vars() -> *mut u64 {
 /// inside the cdylib's linear memory, returned as a wasm32 i32.
 /// Used by the wasm codegen to bake an `i32.const ADDR` into
 /// JIT'd modules so `Instruction::GetModuleVar(idx)` lowers to
-/// `(i32.const ADDR) (i32.load) (i64.load offset=idx*8)` — three
-/// inline instructions instead of an `(import "wren"
-/// "wren_get_module_var")` wasm-bindgen boundary call. Returns
-/// `None` on host builds (no cdylib memory to point at).
+/// `(i32.const ADDR) (i32.load) (i32.load) (i64.load
+/// offset=idx*8)` — inline loads through the module's cell
+/// instead of an `(import "wren" "wren_get_module_var")`
+/// wasm-bindgen boundary call. Returns `None` on host builds (no
+/// cdylib memory to point at).
 #[cfg(target_arch = "wasm32")]
 pub fn current_module_vars_addr() -> Option<u32> {
     Some(&current_module_vars_cell::CURRENT as *const _ as usize as u32)
@@ -324,24 +331,22 @@ pub fn closure_upvalues_data_offset() -> u32 {
     0
 }
 
-/// Save / install the current module-vars data pointer; return
-/// the previous value for the caller to restore on exit. Same
-/// RAII pattern as `enter_closure` / `enter_vm`. The dispatcher
-/// computes the new pointer by walking
-/// `closure.function.fn_id → engine.func_module(id) →
-/// engine.modules[name].vars.as_mut_ptr()` once per BC→JIT or
-/// cross-module JIT→JIT entry. In-module call_indirect calls
-/// inside a tier'd-up function don't go through the dispatcher,
-/// so the cell stays valid for the whole nested-call chain
-/// without per-call updates.
-/// Save / install the module-vars data pointer. The hot path
-/// in a steady-state outer loop (BC repeatedly calling into the
-/// same tier'd-up function) writes the same pointer the cell
-/// already holds, so skip the store when `prev == p`. The
-/// returned `prev` is what the matching `restore_module_vars`
-/// will compare against to decide whether to reinstall.
+/// Save / install the current module's variable cell; return the
+/// previous one for the caller to restore on exit. Same RAII
+/// pattern as `enter_closure` / `enter_vm`. The dispatcher finds
+/// the cell by walking `closure.function.fn_id →
+/// engine.func_module(id) → engine.modules[name].cell` once per
+/// BC→JIT or cross-module JIT→JIT entry. In-module call_indirect
+/// calls inside a tier'd-up function don't go through the
+/// dispatcher, so the cell stays valid for the whole nested-call
+/// chain without per-call updates. The hot path in a steady-state
+/// outer loop (BC repeatedly calling into the same tier'd-up
+/// function) writes the cell the static already holds, so the
+/// store is skipped when `prev == p`.
 #[allow(unused_variables)]
-pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
+pub fn enter_module_vars(
+    p: *const crate::runtime::engine::ModuleVarsCell,
+) -> *const crate::runtime::engine::ModuleVarsCell {
     #[cfg(target_arch = "wasm32")]
     {
         let prev = current_module_vars_cell::CURRENT.get();
@@ -352,12 +357,12 @@ pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::ptr::null_mut()
+        std::ptr::null()
     }
 }
 
 #[allow(unused_variables)]
-pub fn restore_module_vars(prev: *mut u64) {
+pub fn restore_module_vars(prev: *const crate::runtime::engine::ModuleVarsCell) {
     #[cfg(target_arch = "wasm32")]
     {
         if current_module_vars_cell::CURRENT.get() != prev {
@@ -367,30 +372,29 @@ pub fn restore_module_vars(prev: *mut u64) {
 }
 
 /// Walk `closure → function → fn_id → engine.func_module(id) →
-/// engine.modules[name].vars.as_mut_ptr()` to find the module
-/// vars data pointer for a closure that's about to enter JIT'd
-/// code. Returns null if any link is missing (closure outside
-/// any registered module — should never happen in practice but
-/// matches the existing `current_vm` null-on-not-set ergonomics).
+/// engine.modules[name].cell` to find the variable cell of the
+/// module a closure about to enter JIT'd code belongs to. Returns
+/// null if any link is missing (closure outside any registered
+/// module — should never happen in practice but matches the
+/// existing `current_vm` null-on-not-set ergonomics).
 ///
 /// Steady-state hot path (BC repeatedly dispatching the same
 /// tier'd-up closure — fib's recursion, Adder.add's outer loop)
 /// is short-circuited by a single-entry "last closure → module
 /// cell" cache, so the second call onward skips the HashMap
-/// probe. The array pointer is read through the cell each time:
-/// the variables may have grown into a new allocation since.
+/// probe.
 ///
 /// # Safety
 /// `closure` must be a live `ObjClosure` and `vm` must be a live
 /// VM. Both invariants hold whenever this is called from the
 /// tier dispatch boundaries.
 #[cfg(target_arch = "wasm32")]
-pub unsafe fn module_vars_ptr_for_closure(
+pub unsafe fn module_vars_cell_for_closure(
     vm: &mut crate::runtime::vm::VM,
     closure: *mut crate::runtime::object::ObjClosure,
-) -> *mut u64 {
+) -> *const crate::runtime::engine::ModuleVarsCell {
     if closure.is_null() {
-        return std::ptr::null_mut();
+        return std::ptr::null();
     }
     // Fast path: did we look up this exact closure last time?
     // wasm32 is single-threaded so the cell is a plain static
@@ -398,17 +402,17 @@ pub unsafe fn module_vars_ptr_for_closure(
     {
         let cached = last_module_vars_cache::CURRENT.get();
         if cached.0 == closure && !cached.1.is_null() {
-            return unsafe { (*cached.1).ptr.load(std::sync::atomic::Ordering::Acquire) };
+            return cached.1;
         }
     }
     let fn_ptr = unsafe { (*closure).function };
     if fn_ptr.is_null() {
-        return std::ptr::null_mut();
+        return std::ptr::null();
     }
     let func_id = FuncId(unsafe { (*fn_ptr).fn_id });
     let module_name = match vm.engine.func_module(func_id) {
         Some(name) => name.clone(),
-        None => return std::ptr::null_mut(),
+        None => return std::ptr::null(),
     };
     // `engine.modules` keys on `String` (not `Rc<String>`), so
     // pass an `&str` view of the Rc for the lookup.
@@ -418,10 +422,10 @@ pub unsafe fn module_vars_ptr_for_closure(
         .get(module_name.as_str())
         .map(|entry| entry.cell as *const crate::runtime::engine::ModuleVarsCell)
     else {
-        return std::ptr::null_mut();
+        return std::ptr::null();
     };
     last_module_vars_cache::CURRENT.set((closure, cell));
-    unsafe { (*cell).ptr.load(std::sync::atomic::Ordering::Acquire) }
+    cell
 }
 
 /// A collection has run: a closure it freed may come back at the

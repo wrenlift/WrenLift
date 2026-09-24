@@ -455,10 +455,12 @@ pub fn enter_closure(
 pub fn restore_closure(_prev: *mut crate::runtime::object::ObjClosure) {}
 
 #[allow(unused_variables)]
-pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
-    std::ptr::null_mut()
+pub fn enter_module_vars(
+    p: *const crate::runtime::engine::ModuleVarsCell,
+) -> *const crate::runtime::engine::ModuleVarsCell {
+    std::ptr::null()
 }
-pub fn restore_module_vars(_prev: *mut u64) {}
+pub fn restore_module_vars(_prev: *const crate::runtime::engine::ModuleVarsCell) {}
 
 pub fn bump_dispatch_hook_hits() {}
 pub fn dispatch_hook_hits() -> u64 {

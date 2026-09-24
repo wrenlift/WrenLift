@@ -1029,7 +1029,7 @@ fn wren_call_1_inner(vm: &mut wren_lift::runtime::vm::VM, root_base: usize, meth
                 // `GetModuleVar` lowerings read from the cell.
                 let prev_closure = wren_lift::runtime::tier::enter_closure(closure_ptr);
                 let new_vars = unsafe {
-                    wren_lift::runtime::tier::module_vars_ptr_for_closure(vm, closure_ptr)
+                    wren_lift::runtime::tier::module_vars_cell_for_closure(vm, closure_ptr)
                 };
                 let prev_vars = wren_lift::runtime::tier::enter_module_vars(new_vars);
                 let result = js_jit_call_1(slot, arg.to_bits());
@@ -1181,7 +1181,7 @@ fn wren_call_n_inner(
                 DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
                 let prev_closure = wren_lift::runtime::tier::enter_closure(closure_ptr);
                 let new_vars = unsafe {
-                    wren_lift::runtime::tier::module_vars_ptr_for_closure(vm, closure_ptr)
+                    wren_lift::runtime::tier::module_vars_cell_for_closure(vm, closure_ptr)
                 };
                 let prev_vars = wren_lift::runtime::tier::enter_module_vars(new_vars);
                 let result = match arity {
