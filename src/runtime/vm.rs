@@ -4026,6 +4026,8 @@ impl VM {
             None
         };
         self.collect_garbage_stopped();
+        #[cfg(all(target_arch = "wasm32", not(feature = "host")))]
+        super::tier::forget_collected();
         #[cfg(feature = "host")]
         {
             self.collections_seen = self

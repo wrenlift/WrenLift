@@ -1248,12 +1248,16 @@ fn wren_call_n_inner(
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod main_module_cache {
     use std::cell::UnsafeCell;
-    use wren_lift::runtime::engine::ModuleEntry;
+    use wren_lift::runtime::engine::ModuleVarsCell;
     use wren_lift::runtime::vm::VM;
 
+    /// The main module's variable cell, by VM. The cell, not the
+    /// module entry: an import installs a module mid-run and the
+    /// module table can rehash, moving every entry, while the cell
+    /// stays where it is.
     pub(super) struct Cell {
         pub(super) vm: UnsafeCell<*mut VM>,
-        pub(super) module: UnsafeCell<*const ModuleEntry>,
+        pub(super) module: UnsafeCell<*const ModuleVarsCell>,
     }
     unsafe impl Sync for Cell {}
 
@@ -1289,7 +1293,7 @@ pub fn reset_jit_runtime_caches() {}
 fn cached_main_module(
     vm: &wren_lift::runtime::vm::VM,
     vm_ptr: *mut wren_lift::runtime::vm::VM,
-) -> *const wren_lift::runtime::engine::ModuleEntry {
+) -> *const wren_lift::runtime::engine::ModuleVarsCell {
     // SAFETY: wasm32 single-threaded; UnsafeCell access is the
     // standard pattern for these runtime caches.
     let cached_vm = unsafe { *main_module_cache::CACHE.vm.get() };
@@ -1299,16 +1303,37 @@ fn cached_main_module(
             return cached_module;
         }
     }
-    let module_ptr: *const wren_lift::runtime::engine::ModuleEntry = vm
+    let cell: *const wren_lift::runtime::engine::ModuleVarsCell = vm
         .engine
         .modules
         .get("main")
-        .map_or(std::ptr::null(), |m| m);
+        .map_or(std::ptr::null(), |m| m.cell);
     unsafe {
         *main_module_cache::CACHE.vm.get() = vm_ptr;
-        *main_module_cache::CACHE.module.get() = module_ptr;
+        *main_module_cache::CACHE.module.get() = cell;
     }
-    module_ptr
+    cell
+}
+
+/// Slot `idx` of the main module's variables, read through its cell;
+/// None when there is no main module or no such slot.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn main_module_slot(
+    vm: &wren_lift::runtime::vm::VM,
+    vm_ptr: *mut wren_lift::runtime::vm::VM,
+    idx: usize,
+) -> Option<*mut Value> {
+    use std::sync::atomic::Ordering;
+    let cell = cached_main_module(vm, vm_ptr);
+    if cell.is_null() {
+        return None;
+    }
+    // SAFETY: a module's cell is leaked with it and zeroed when the
+    // module goes, so it is readable for the VM's lifetime.
+    let cell = unsafe { &*cell };
+    let ptr = cell.ptr.load(Ordering::Acquire);
+    let len = cell.len.load(Ordering::Acquire);
+    (!ptr.is_null() && idx < len).then(|| unsafe { (ptr as *mut Value).add(idx) })
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1319,23 +1344,10 @@ pub fn wren_get_module_var(slot_idx: u64) -> u64 {
         return Value::null().to_bits();
     }
     let vm = unsafe { &*vm_ptr };
-    let module_ptr = cached_main_module(vm, vm_ptr);
-    if module_ptr.is_null() {
-        return Value::null().to_bits();
+    match main_module_slot(vm, vm_ptr, slot_idx as usize) {
+        Some(slot) => unsafe { *slot }.to_bits(),
+        None => Value::null().to_bits(),
     }
-    let idx = slot_idx as usize;
-    // SAFETY: module_ptr is a non-null pointer into
-    // `vm.engine.modules` whose backing storage is owned by `vm`
-    // for the duration of `run()`. The Vec's stable address is
-    // implied by the fact that we don't mutate
-    // `vm.engine.modules` between fetches in normal scripts.
-    let module = unsafe { &*module_ptr };
-    module
-        .vars
-        .get(idx)
-        .copied()
-        .unwrap_or(Value::null())
-        .to_bits()
 }
 
 /// Read field `field_idx` of the receiver instance. The wasm
@@ -1644,27 +1656,18 @@ pub fn wren_subscript_set_1(receiver: u64, index: u64, value: u64) -> u64 {
 pub fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     // The host impl reads `JitContext.module_vars` — a pointer
     // populated by the Cranelift entry shim, but null on wasm.
-    // Mirror `wren_get_module_var`'s pattern instead: walk the
-    // `current_vm()` and mutate the module's `vars` vector
-    // directly. The cdylib's `module_vars: NonNull<u64>` cache
-    // points at this same Vec's backing storage, so updates here
-    // are visible to subsequent `wren_get_module_var` calls.
+    // Mirror `wren_get_module_var`'s pattern instead: write the
+    // slot through the main module's cell, which names the same
+    // storage every other reader of the module sees.
     let vm_ptr = wren_lift::runtime::tier::current_vm();
     if vm_ptr.is_null() {
         return value;
     }
     let vm = unsafe { &*vm_ptr };
-    let module_ptr = cached_main_module(vm, vm_ptr);
-    if module_ptr.is_null() {
-        return value;
-    }
-    // SAFETY: cached_main_module returns a stable pointer into
-    // `vm.engine.modules`. We need `&mut` for the assignment;
-    // wasm32 is single-threaded so the aliasing rules hold.
-    let module = unsafe { &mut *(module_ptr as *mut wren_lift::runtime::engine::ModuleEntry) };
-    let idx = slot as usize;
-    if let Some(slot_ref) = module.vars.get_mut(idx) {
-        *slot_ref = Value::from_bits(value);
+    if let Some(slot) = main_module_slot(vm, vm_ptr, slot as usize) {
+        // SAFETY: wasm32 is single-threaded; nothing else holds the
+        // slot while compiled code writes it.
+        unsafe { *slot = Value::from_bits(value) };
     }
     value
 }
@@ -1866,14 +1869,8 @@ pub fn wren_jit_slot_for_module_var(slot_idx: u64) -> u32 {
         return 0;
     }
     let vm = unsafe { &*vm_ptr };
-    let module_ptr = cached_main_module(vm, vm_ptr);
-    if module_ptr.is_null() {
-        return 0;
-    }
-    let module = unsafe { &*module_ptr };
-    let idx = slot_idx as usize;
-    let receiver = match module.vars.get(idx).copied() {
-        Some(v) => v,
+    let receiver = match main_module_slot(vm, vm_ptr, slot_idx as usize) {
+        Some(slot) => unsafe { *slot },
         None => return 0,
     };
     if !receiver.is_object() {

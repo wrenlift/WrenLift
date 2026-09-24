@@ -375,11 +375,10 @@ pub fn restore_module_vars(prev: *mut u64) {
 ///
 /// Steady-state hot path (BC repeatedly dispatching the same
 /// tier'd-up closure — fib's recursion, Adder.add's outer loop)
-/// is short-circuited by a single-entry "last closure → vars
-/// ptr" cache: ~13.5k recursive `fib(20)` calls all hit the
-/// same closure, so the second call onward returns the cached
-/// pointer without a HashMap probe. Cache invalidates whenever
-/// a different closure is seen.
+/// is short-circuited by a single-entry "last closure → module
+/// cell" cache, so the second call onward skips the HashMap
+/// probe. The array pointer is read through the cell each time:
+/// the variables may have grown into a new allocation since.
 ///
 /// # Safety
 /// `closure` must be a live `ObjClosure` and `vm` must be a live
@@ -398,8 +397,8 @@ pub unsafe fn module_vars_ptr_for_closure(
     // UnsafeCell — no atomics, no thread-locals.
     {
         let cached = last_module_vars_cache::CURRENT.get();
-        if cached.0 == closure {
-            return cached.1;
+        if cached.0 == closure && !cached.1.is_null() {
+            return unsafe { (*cached.1).ptr.load(std::sync::atomic::Ordering::Acquire) };
         }
     }
     let fn_ptr = unsafe { (*closure).function };
@@ -413,12 +412,24 @@ pub unsafe fn module_vars_ptr_for_closure(
     };
     // `engine.modules` keys on `String` (not `Rc<String>`), so
     // pass an `&str` view of the Rc for the lookup.
-    let result = match vm.engine.modules.get_mut(module_name.as_str()) {
-        Some(entry) => entry.vars.as_mut_ptr() as *mut u64,
-        None => std::ptr::null_mut(),
+    let Some(cell) = vm
+        .engine
+        .modules
+        .get(module_name.as_str())
+        .map(|entry| entry.cell as *const crate::runtime::engine::ModuleVarsCell)
+    else {
+        return std::ptr::null_mut();
     };
-    last_module_vars_cache::CURRENT.set((closure, result));
-    result
+    last_module_vars_cache::CURRENT.set((closure, cell));
+    unsafe { (*cell).ptr.load(std::sync::atomic::Ordering::Acquire) }
+}
+
+/// A collection has run: a closure it freed may come back at the
+/// same address as another module's, so the closure-keyed cache
+/// is emptied.
+#[cfg(target_arch = "wasm32")]
+pub fn forget_collected() {
+    last_module_vars_cache::CURRENT.set((std::ptr::null_mut(), std::ptr::null()));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -426,23 +437,23 @@ mod last_module_vars_cache {
     use crate::runtime::object::ObjClosure;
     use std::cell::UnsafeCell;
 
-    /// Single-entry "last closure → module vars data ptr"
-    /// cache. Invalidates when a different closure is seen.
-    /// Steady-state outer loops where the same closure is
-    /// dispatched each iteration get a cache hit on every
-    /// subsequent call, skipping the per-dispatch HashMap probe
-    /// in `module_vars_ptr_for_closure`.
-    pub(super) struct Cache(UnsafeCell<(*mut ObjClosure, *mut u64)>);
+    use crate::runtime::engine::ModuleVarsCell;
+
+    /// Single-entry "last closure → its module's cell" cache.
+    /// Invalidates when a different closure is seen, and at every
+    /// collection (`forget_collected`). Steady-state outer loops
+    /// where the same closure is dispatched each iteration get a
+    /// cache hit on every subsequent call, skipping the
+    /// per-dispatch HashMap probe in `module_vars_ptr_for_closure`.
+    pub(super) struct Cache(UnsafeCell<(*mut ObjClosure, *const ModuleVarsCell)>);
     unsafe impl Sync for Cache {}
-    pub(super) static CURRENT: Cache = Cache(UnsafeCell::new((
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    )));
+    pub(super) static CURRENT: Cache =
+        Cache(UnsafeCell::new((std::ptr::null_mut(), std::ptr::null())));
     impl Cache {
-        pub(super) fn get(&self) -> (*mut ObjClosure, *mut u64) {
+        pub(super) fn get(&self) -> (*mut ObjClosure, *const ModuleVarsCell) {
             unsafe { *self.0.get() }
         }
-        pub(super) fn set(&self, v: (*mut ObjClosure, *mut u64)) {
+        pub(super) fn set(&self, v: (*mut ObjClosure, *const ModuleVarsCell)) {
             unsafe { *self.0.get() = v }
         }
     }
