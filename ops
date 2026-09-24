@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1790280108,"nonce":"ivCP7arfsBhzjPu2ycQBYouvJNE=","message":"Confirmed on CI at bb2542c: all six jobs green, including LLVM tier on macos-14, windows-2022 and ubuntu-latest. Closing.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1790280109,"nonce":"NdKisbRULKQB6g2kRRZnpRGoUMw=","status":2}]}
