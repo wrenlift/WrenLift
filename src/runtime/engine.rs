@@ -856,6 +856,25 @@ fn mir_calls_any_tainted_method(
 
 /// Check if a MIR function can stay on the direct native fast path for the
 /// given compilation tier.
+/// A saved return address with any signature above it removed.
+///
+/// Compiled code signs the return address it saves where the platform
+/// asks for it — Apple Silicon signs with the B key, which Cranelift
+/// enables for every body it compiles there — and the signature sits
+/// in the bits above the user address space. Only tried when the word
+/// as saved names no compiled body, so an unsigned address is never
+/// touched.
+#[cfg(target_pointer_width = "64")]
+fn strip_return_signature(word: usize) -> usize {
+    word & 0x0000_7fff_ffff_ffff
+}
+
+/// A narrower address has no room above it for a signature.
+#[cfg(not(target_pointer_width = "64"))]
+fn strip_return_signature(word: usize) -> usize {
+    word
+}
+
 fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
     use crate::mir::Instruction;
     for block in &mir.blocks {
@@ -1419,7 +1438,8 @@ impl ExecutionEngine {
     }
 
     /// The compiled body a return address is inside and the site of the
-    /// call returning there.
+    /// call returning there. The frame's saved word may carry a
+    /// signature above the address (see [`strip_return_signature`]).
     fn site_at(&self, ra: usize) -> Option<(&crate::codegen::CodeSites, u32)> {
         let i = self.code_sites.partition_point(|c| c.start < ra);
         let c = self.code_sites.get(i.checked_sub(1)?)?;
@@ -1457,7 +1477,12 @@ impl ExecutionEngine {
             if handle == 0 || !handle.is_multiple_of(8) {
                 break;
             }
-            let ra = unsafe { *((handle + 8) as *const usize) };
+            let saved = unsafe { *((handle + 8) as *const usize) };
+            let ra = if self.site_at(saved).is_some() {
+                saved
+            } else {
+                strip_return_signature(saved)
+            };
             let Some((body, site)) = self.site_at(ra) else {
                 if trace {
                     eprintln!("frame-trace: {ra:#x} not compiled; segment ends");
@@ -5549,5 +5574,28 @@ mod tests {
             let val = Value::from_bits(result.unwrap());
             assert_eq!(val.as_bool(), Some(true));
         }
+    }
+    /// Apple Silicon signs the return address a frame saves; the walk
+    /// names the body it points into all the same.
+    #[test]
+    fn a_frame_names_its_body_through_a_signed_return_address() {
+        use crate::codegen::{CodeSites, SiteTable};
+        let mut engine = ExecutionEngine::new(ExecutionMode::Tiered);
+        // A body at an address nothing is read from: the walk reads the
+        // stack, and looks the return address up in this table.
+        let start = 0x1_0000_0000usize;
+        engine.register_code_sites(CodeSites {
+            start,
+            end: start + 0x100,
+            func_id: 7,
+            sites: SiteTable::Ranges(vec![(0, 0x100, 42)]),
+        });
+        // One frame: the pair a prologue saves, with the return address
+        // signed above the user address space.
+        let signed = (start + 0x10) | 0xd21c_8000_0000_0000;
+        let frame = [0usize, signed];
+        let fp = frame.as_ptr() as u64;
+        let key = 3 | (99 << 32);
+        assert_eq!(engine.native_frames(fp, key), vec![(3, 99), (7, 42)]);
     }
 }
