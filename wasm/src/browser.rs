@@ -256,10 +256,8 @@ pub unsafe extern "C" fn browser_fetch_bytes(vm: *mut VM) {
 ///       ...
 ///   }
 ///
-/// The fiber must stay GC-rooted by Wren-side code (typically
-/// the `var f = Fiber.new {…}` reference the user holds).
-/// The scheduler only stores a raw pointer; it doesn't add a
-/// new GC root.
+/// The scheduler roots the fiber until it resumes it, so it
+/// survives a collection even when no Wren code holds it.
 ///
 /// # Safety
 ///
@@ -279,7 +277,7 @@ pub unsafe extern "C" fn browser_park_self(vm: *mut VM) {
         };
         let fiber = vm_ref.fiber;
         if !fiber.is_null() {
-            crate::park_fiber(fiber, handle);
+            crate::park_fiber(vm_ref, fiber, handle);
         }
         if vm_ref.api_stack.is_empty() {
             vm_ref.api_stack.push(Value::null());

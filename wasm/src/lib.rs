@@ -319,13 +319,10 @@ pub fn create_pending_future() -> u32 {
 // `vm_interp::run_fiber`. Between drains it `await`s a microtask
 // so the JS event loop can fire pending Promise callbacks.
 //
-// **GC rooting:** the raw `*mut ObjFiber` here is *not* a GC
-// root. Callers rely on the Wren-side `var` reference the user
-// holds (`var f = Fiber.new {…}`) keeping the fiber alive across
-// the parked window. If a fiber drops out of all Wren scopes
-// while still parked the resume is undefined behaviour. In
-// practice, fibers ARE held by `var` declarations because the
-// host needs the handle to call `.try()` in the first place.
+// **GC rooting:** a parked fiber may be reachable from nothing
+// else — the main fiber once `interpret` has returned, or a fiber
+// no `var` holds — so each entry roots its fiber through a VM
+// handle from park until the scheduler has resumed it.
 //
 // `*mut ObjFiber` isn't `Send` by default; we wrap it in a
 // `ParkedFiber` and add an `unsafe impl Send` since wasm32 is
@@ -341,6 +338,8 @@ pub fn create_pending_future() -> u32 {
 struct ParkedFiber {
     fiber: *mut ObjFiber,
     handle: u32,
+    /// The VM handle slot rooting `fiber` while it is parked.
+    root: usize,
 }
 // SAFETY: wasm32 is single-threaded. The pointer is dereferenced
 // only on the same thread that pushed it, inside the
@@ -353,13 +352,46 @@ fn parked_fibers() -> &'static Mutex<Vec<ParkedFiber>> {
     PARKED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Handle slots that rooted a parked fiber and have been released,
+/// reused so a program that parks every frame does not grow the VM's
+/// handle table.
+fn free_roots() -> &'static Mutex<Vec<usize>> {
+    static FREE: std::sync::OnceLock<Mutex<Vec<usize>>> = std::sync::OnceLock::new();
+    FREE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A handle slot holding `fiber`, so a collection keeps it while it
+/// is parked.
+fn root_parked(vm: &mut VM, fiber: *mut ObjFiber) -> usize {
+    let value = wren_lift::runtime::value::Value::object(fiber as *mut u8);
+    match free_roots().lock().expect("free roots poisoned").pop() {
+        Some(slot) => {
+            vm.handles[slot].value = value;
+            slot
+        }
+        None => vm.make_handle(value),
+    }
+}
+
+/// Release a slot `root_parked` took.
+#[allow(dead_code)]
+fn unroot_parked(vm: &mut VM, slot: usize) {
+    vm.release_handle(slot);
+    free_roots().lock().expect("free roots poisoned").push(slot);
+}
+
 /// `browser_park_self` calls this — pushes the current fiber +
 /// the handle it's awaiting onto the parked list.
-pub fn park_fiber(fiber: *mut ObjFiber, handle: u32) {
+pub fn park_fiber(vm: &mut VM, fiber: *mut ObjFiber, handle: u32) {
+    let root = root_parked(vm, fiber);
     parked_fibers()
         .lock()
         .expect("parked fiber list poisoned")
-        .push(ParkedFiber { fiber, handle });
+        .push(ParkedFiber {
+            fiber,
+            handle,
+            root,
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,11 +1961,12 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
 
     // Wipe any leftover parked fibers from a prior `run()` —
     // those fibers belong to a now-dropped VM and the pointers
-    // are invalid.
+    // are invalid, and so are the handle slots that rooted them.
     parked_fibers()
         .lock()
         .expect("parked fiber list poisoned")
         .clear();
+    free_roots().lock().expect("free roots poisoned").clear();
 
     // Install the precompiled prelude into module
     // `wlift_prelude`. Cheap: bytecode deserialise, no parse /
@@ -2113,6 +2146,8 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                 // route it through.
                 vm.fiber = entry.fiber;
                 let res = wren_lift::runtime::vm_interp::run_fiber(&mut vm);
+                // Parked again, it holds a root of its own by now.
+                unroot_parked(&mut vm, entry.root);
                 if let Err(e) = res {
                     // Route through `report_runtime_error` so the
                     // scheduler-resumed abort gets the same ariadne
