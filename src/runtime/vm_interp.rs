@@ -1650,7 +1650,10 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         ctx.jit_code_len = vm.engine.jit_code.len() as u32;
                     });
                     let recycled = vm.register_pool.pop();
-                    let tc = vm.engine.threaded_code[fn_idx_tc]
+                    // The body's own allocation, not the table's buffer:
+                    // the table grows while this runs.
+                    let tc: &crate::mir::threaded::ThreadedCode = vm.engine.threaded_code
+                        [fn_idx_tc]
                         .as_ref()
                         .unwrap()
                         .as_ref()
@@ -4699,7 +4702,7 @@ fn dispatch_closure_bc_inner(
                 ctx.jit_code_len = vm.engine.jit_code.len() as u32;
             });
             let recycled = vm.register_pool.pop();
-            let tc = vm.engine.threaded_code[fn_idx]
+            let tc: &crate::mir::threaded::ThreadedCode = vm.engine.threaded_code[fn_idx]
                 .as_ref()
                 .unwrap()
                 .as_ref()

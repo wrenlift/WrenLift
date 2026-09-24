@@ -1102,7 +1102,10 @@ pub struct ExecutionEngine {
     /// `None` = not yet checked. `Some(None)` = checked, not eligible.
     /// `Some(Some(tc))` = eligible, threaded code ready.
     #[cfg(feature = "host")]
-    pub threaded_code: Vec<Option<Option<crate::mir::threaded::ThreadedCode>>>,
+    /// Each body in an allocation of its own: a thread runs one while
+    /// another installs a module and grows this table, and the running
+    /// body must not move with the table's buffer.
+    pub threaded_code: Vec<Option<Option<Box<crate::mir::threaded::ThreadedCode>>>>,
     /// Tier-up promotion broker.
     pub tier: super::tier::TierManager,
     /// Cached per-callee purity map. Recomputed only when the
@@ -1621,11 +1624,11 @@ impl ExecutionEngine {
                 return None;
             }
             let tc = crate::mir::threaded::lower_mir_to_threaded(&mir, Some(interner));
-            self.threaded_code[idx] = Some(Some(tc));
+            self.threaded_code[idx] = Some(Some(Box::new(tc)));
         }
         self.threaded_code[idx]
             .as_ref()
-            .and_then(|opt| opt.as_ref())
+            .and_then(|opt| opt.as_deref())
     }
 
     /// Get a function body by ID.
@@ -5597,5 +5600,33 @@ mod tests {
         let fp = frame.as_ptr() as u64;
         let key = 3 | (99 << 32);
         assert_eq!(engine.native_frames(fp, key), vec![(3, 99), (7, 42)]);
+    }
+
+    /// A thread runs a threaded body while another installs a module
+    /// and grows the table; the running body stays where it is.
+    #[test]
+    fn a_threaded_body_outlives_a_growing_table() {
+        let mut interner = Interner::new();
+        let name = interner.intern("counted");
+        let mut mir = MirFunction::new(name, 0);
+        let bb = mir.new_block();
+        let v = mir.new_value();
+        mir.block_mut(bb)
+            .instructions
+            .push((v, crate::mir::Instruction::ConstNum(1.0)));
+        mir.block_mut(bb).terminator = crate::mir::Terminator::Return(v);
+        let mut engine = ExecutionEngine::new(ExecutionMode::Tiered);
+        let id = engine.register_function(mir);
+        let Some(body) = engine.ensure_threaded_code(id, &interner) else {
+            return;
+        };
+        let before = body as *const crate::mir::threaded::ThreadedCode;
+        for _ in 0..64 {
+            engine.register_function(make_mir());
+        }
+        let after = engine
+            .ensure_threaded_code(id, &interner)
+            .map(|b| b as *const crate::mir::threaded::ThreadedCode);
+        assert_eq!(after, Some(before), "the body moved with the table");
     }
 }
