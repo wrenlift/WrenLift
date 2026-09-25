@@ -1427,7 +1427,41 @@ pub fn osr_rematerializable_defs(
             defs.insert(vid, inst.clone());
         }
     }
+    // A test of such a read against a class, object or function (an
+    // inlined call's guard, placed before the loop) is recomputed from
+    // it; the loop would otherwise have no entry.
+    let reads: Vec<ValueId> = defs
+        .iter()
+        .filter(|(_, i)| matches!(i, Instruction::GetModuleVar(_)))
+        .map(|(v, _)| *v)
+        .collect();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        if reachable.contains(&idx) {
+            continue;
+        }
+        for &(vid, ref inst) in &block.instructions {
+            if let Instruction::ClassIs(a, _)
+            | Instruction::ObjectIs(a, _)
+            | Instruction::ClosureFnIs(a, _) = inst
+                && reads.contains(a)
+            {
+                defs.insert(vid, inst.clone());
+            }
+        }
+    }
     defs
+}
+
+/// The values a loop entry recomputes that are not constants, in the
+/// order it must compute them: module variable reads, then the tests
+/// on them.
+pub fn osr_entry_recomputed(func: &MirFunction, target: BlockId) -> Vec<(ValueId, Instruction)> {
+    let mut out: Vec<(ValueId, Instruction)> = osr_rematerializable_defs(func, target)
+        .into_iter()
+        .filter(|(_, i)| !is_osr_rematerializable(i))
+        .collect();
+    out.sort_by_key(|(v, i)| (!matches!(i, Instruction::GetModuleVar(_)), v.0));
+    out
 }
 
 /// Values used by a loop/header region but defined outside it, excluding

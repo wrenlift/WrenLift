@@ -6738,3 +6738,62 @@ for (k in 0...3000) K.run(t, false)
     }
     assert_eq!(getter_sites(&vm), 1);
 }
+
+/// A loop calling a sibling static method gets that method inlined
+/// behind a test of the class the module variable holds, placed before
+/// the loop. The interpreter must still be able to enter the compiled
+/// loop: the entry recomputes the test instead of refusing the loop.
+#[test]
+fn e2e_loop_with_an_inlined_static_call_is_entered_from_the_interpreter() {
+    let _guard = lock_osr_test();
+    if wren_lift::codegen::top_tier() == wren_lift::codegen::TopTier::Off {
+        return;
+    }
+    let source = r#"
+class Bench {
+  static step(acc, i) { (acc * 31 + (i % 8)) % 4294967296 }
+  static run() {
+    var sum = 0
+    var i = 0
+    while (i < 3000000) {
+      sum = Bench.step(sum, i)
+      i = i + 1
+    }
+    return sum
+  }
+}
+System.print(Bench.run())
+"#;
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        ..VMConfig::default()
+    });
+    vm.engine.collect_tier_stats = true;
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", source);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    let (reference, expected, _) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Interpreter,
+            ..VMConfig::default()
+        },
+    );
+    assert!(matches!(reference, InterpretResult::Success));
+    assert_eq!(output, expected);
+    let run = (0..vm.engine.function_count() as u32)
+        .map(wren_lift::runtime::engine::FuncId)
+        .find(|id| {
+            vm.engine
+                .get_mir(*id)
+                .is_some_and(|m| vm.interner.resolve(m.name) == "run()")
+        })
+        .expect("run() is registered");
+    let stats = &vm.engine.tier_stats[run.0 as usize];
+    assert!(
+        stats.osr_entries > 0,
+        "run()'s loop was never entered from the interpreter\n{output}"
+    );
+}

@@ -8,7 +8,8 @@ pub mod cl {
     use crate::intern::Interner;
     use crate::mir::{
         BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
-        osr_external_live_values, osr_reachable_blocks, osr_rematerializable_defs,
+        is_osr_rematerializable, osr_entry_recomputed, osr_external_live_values,
+        osr_reachable_blocks, osr_rematerializable_defs,
     };
     use crate::runtime::object_layout::*;
     use cranelift_codegen::Context;
@@ -2757,28 +2758,106 @@ pub mod cl {
         }
     }
 
-    /// The values a loop entry rebuilds rather than loads: constants,
-    /// and module variables read just before the loop.
-    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
+    /// Whether `v` is an object of the class at `class_ptr`, as a raw
+    /// bool.
+    fn emit_class_is(builder: &mut FunctionBuilder, v: Value, class_ptr: usize) -> Value {
+        let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+        let high = builder.ins().band(v, tag_obj);
+        let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+        let object_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, types::I8);
+        let no = builder.ins().iconst(types::I8, 0);
+        builder.ins().brif(
+            is_obj,
+            object_block,
+            &[],
+            merge_block,
+            &[BlockArg::Value(no)],
+        );
+        builder.switch_to_block(object_block);
+        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+        let obj_ptr = builder.ins().band(v, ptr_mask);
+        let class = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+        let expected = builder.ins().iconst(types::I64, class_ptr as i64);
+        let hit = builder.ins().icmp(IntCC::Equal, class, expected);
+        builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
+        builder.switch_to_block(merge_block);
+        builder.block_params(merge_block)[0]
+    }
+
+    /// Whether `v` is the object at `obj_ptr`, as a raw bool.
+    fn emit_object_is(builder: &mut FunctionBuilder, v: Value, obj_ptr: usize) -> Value {
+        let expected = builder
+            .ins()
+            .iconst(types::I64, (TAG_OBJ | (obj_ptr as u64 & PTR_MASK)) as i64);
+        builder.ins().icmp(IntCC::Equal, v, expected)
+    }
+
+    /// Whether `v` is a closure of the function at `fn_ptr`, as a raw
+    /// bool.
+    fn emit_closure_fn_is(builder: &mut FunctionBuilder, v: Value, fn_ptr: usize) -> Value {
+        let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+        let high = builder.ins().band(v, tag_obj);
+        let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+        let object_block = builder.create_block();
+        let closure_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, types::I8);
+        let no = builder.ins().iconst(types::I8, 0);
+        builder.ins().brif(
+            is_obj,
+            object_block,
+            &[],
+            merge_block,
+            &[BlockArg::Value(no)],
+        );
+        builder.switch_to_block(object_block);
+        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+        let obj_ptr = builder.ins().band(v, ptr_mask);
+        let obj_type =
+            builder
+                .ins()
+                .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
+        let closure_tag = builder
+            .ins()
+            .iconst(types::I64, crate::runtime::object::ObjType::Closure as i64);
+        let is_closure = builder.ins().icmp(IntCC::Equal, obj_type, closure_tag);
+        builder.ins().brif(
+            is_closure,
+            closure_block,
+            &[],
+            merge_block,
+            &[BlockArg::Value(no)],
+        );
+        builder.switch_to_block(closure_block);
+        let function =
+            builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), obj_ptr, CLOSURE_FUNCTION);
+        let expected = builder.ins().iconst(types::I64, fn_ptr as i64);
+        let hit = builder.ins().icmp(IntCC::Equal, function, expected);
+        builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
+        builder.switch_to_block(merge_block);
+        builder.block_params(merge_block)[0]
+    }
+
+    /// The constants a loop entry rebuilds rather than loads, defined
+    /// once at the function's entry for every path. What else it
+    /// rebuilds (`osr_entry_recomputed`) is computed on its own path.
     fn emit_osr_external_constants(
         mir: &MirFunction,
         target: BlockId,
         builder: &mut FunctionBuilder,
-        module: &mut dyn Module,
-        get_runtime_fn: &mut dyn FnMut(
-            &mut dyn Module,
-            &mut FunctionBuilder,
-            &str,
-            usize,
-        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
-        aot_config: Option<&AotLoweringConfig>,
     ) -> Result<Vec<(ValueId, Value)>, String> {
         let mut out = Vec::new();
         for (vid, inst) in osr_rematerializable_defs(mir, target) {
+            if !is_osr_rematerializable(&inst) {
+                continue;
+            }
             let value = match inst {
-                Instruction::GetModuleVar(idx) => {
-                    emit_get_module_var(builder, module, get_runtime_fn, idx, aot_config)?
-                }
                 Instruction::ConstNum(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
                 Instruction::ConstBool(b) => {
                     let bits = if b { TAG_TRUE } else { TAG_FALSE } as i64;
@@ -3114,6 +3193,19 @@ pub mod cl {
                     let var = builder.declare_var(ty);
                     osr_vars.insert(*vid, var);
                 }
+                // What the entry recomputes rather than receives: a
+                // module variable read, or a raw-bool test of one.
+                for (vid, inst) in osr_entry_recomputed(mir, layout.target_block) {
+                    if osr_vars.contains_key(&vid) {
+                        continue;
+                    }
+                    let ty = if matches!(inst, Instruction::GetModuleVar(_)) {
+                        types::I64
+                    } else {
+                        types::I8
+                    };
+                    osr_vars.insert(vid, builder.declare_var(ty));
+                }
             }
         }
         // Constants a loop entry would otherwise rebuild are defined
@@ -3215,14 +3307,7 @@ pub mod cl {
                 builder.ins().stack_store(types::I64, zero, *counter, 0);
             }
             for layout in &entries.layouts {
-                for (vid, v) in emit_osr_external_constants(
-                    mir,
-                    layout.target_block,
-                    builder,
-                    module,
-                    &mut |m, b, name, n| declare_runtime_fn(m, b, name, n),
-                    aot_config,
-                )? {
+                for (vid, v) in emit_osr_external_constants(mir, layout.target_block, builder)? {
                     if pre_defined.insert(vid) {
                         val_map.insert(vid, v);
                     }
@@ -3291,6 +3376,32 @@ pub mod cl {
                     };
                     builder.def_var(osr_vars[vid], v);
                 }
+                // Recomputed here, on the entry's own path: the body
+                // computes them where it always did.
+                let mut recomputed: HashMap<ValueId, Value> = HashMap::new();
+                for (vid, inst) in osr_entry_recomputed(mir, layout.target_block) {
+                    let v = match inst {
+                        Instruction::GetModuleVar(idx) => emit_get_module_var(
+                            builder,
+                            module,
+                            &mut |m, b, name, n| declare_runtime_fn(m, b, name, n),
+                            idx,
+                            aot_config,
+                        )?,
+                        Instruction::ClassIs(a, class) => {
+                            emit_class_is(builder, recomputed[&a], class)
+                        }
+                        Instruction::ObjectIs(a, obj) => {
+                            emit_object_is(builder, recomputed[&a], obj)
+                        }
+                        Instruction::ClosureFnIs(a, function) => {
+                            emit_closure_fn_is(builder, recomputed[&a], function)
+                        }
+                        _ => return Err("a loop entry cannot recompute this value".into()),
+                    };
+                    builder.def_var(osr_vars[&vid], v);
+                    recomputed.insert(vid, v);
+                }
                 let target_block = &mir.blocks[layout.target_block.0 as usize];
                 let mut args: Vec<BlockArg> = Vec::with_capacity(target_block.params.len());
                 for (_, ty) in &target_block.params {
@@ -3323,6 +3434,17 @@ pub mod cl {
         // NaN-boxed TAG_TRUE/TAG_FALSE. Used to skip the expensive truthiness
         // check in CondBranch when the condition is a direct fcmp/icmp result.
         let mut raw_bools: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+        // A test a loop entry recomputes is a raw bool wherever a block
+        // reads it, whichever block is lowered first.
+        if let Some(entries) = entries {
+            for layout in &entries.layouts {
+                for (vid, inst) in osr_entry_recomputed(mir, layout.target_block) {
+                    if !matches!(inst, Instruction::GetModuleVar(_)) {
+                        raw_bools.insert(vid);
+                    }
+                }
+            }
+        }
 
         // Cache for declared runtime functions
         let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> = HashMap::new();
@@ -6931,33 +7053,7 @@ pub mod cl {
             // Raw i8 results: an object test, then the class (or the
             // closure's function) compared against the baked pointer.
             Instruction::ClassIs(a, class_ptr) => {
-                let v = get(a);
-                let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
-                let high = builder.ins().band(v, tag_obj);
-                let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
-                let object_block = builder.create_block();
-                let merge_block = builder.create_block();
-                builder.append_block_param(merge_block, types::I8);
-                let no = builder.ins().iconst(types::I8, 0);
-                builder.ins().brif(
-                    is_obj,
-                    object_block,
-                    &[],
-                    merge_block,
-                    &[BlockArg::Value(no)],
-                );
-                builder.switch_to_block(object_block);
-                let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                let obj_ptr = builder.ins().band(v, ptr_mask);
-                let class =
-                    builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
-                let expected = builder.ins().iconst(types::I64, *class_ptr as i64);
-                let hit = builder.ins().icmp(IntCC::Equal, class, expected);
-                builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
-                builder.switch_to_block(merge_block);
-                Ok(Some(builder.block_params(merge_block)[0]))
+                Ok(Some(emit_class_is(builder, get(a), *class_ptr)))
             }
             Instruction::GuardClassAt {
                 value,
@@ -7048,11 +7144,7 @@ pub mod cl {
                 Ok(Some(builder.ins().icmp(IntCC::NotEqual, masked, qnan)))
             }
             Instruction::ObjectIs(a, obj_ptr) => {
-                let v = get(a);
-                let expected = builder
-                    .ins()
-                    .iconst(types::I64, (TAG_OBJ | (*obj_ptr as u64 & PTR_MASK)) as i64);
-                Ok(Some(builder.ins().icmp(IntCC::Equal, v, expected)))
+                Ok(Some(emit_object_is(builder, get(a), *obj_ptr)))
             }
             Instruction::NewInstance { class, .. } => {
                 let class_val = builder
@@ -7066,50 +7158,7 @@ pub mod cl {
                 )?))
             }
             Instruction::ClosureFnIs(a, fn_ptr) => {
-                let v = get(a);
-                let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
-                let high = builder.ins().band(v, tag_obj);
-                let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
-                let object_block = builder.create_block();
-                let closure_block = builder.create_block();
-                let merge_block = builder.create_block();
-                builder.append_block_param(merge_block, types::I8);
-                let no = builder.ins().iconst(types::I8, 0);
-                builder.ins().brif(
-                    is_obj,
-                    object_block,
-                    &[],
-                    merge_block,
-                    &[BlockArg::Value(no)],
-                );
-                builder.switch_to_block(object_block);
-                let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                let obj_ptr = builder.ins().band(v, ptr_mask);
-                let obj_type =
-                    builder
-                        .ins()
-                        .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
-                let closure_tag = builder
-                    .ins()
-                    .iconst(types::I64, crate::runtime::object::ObjType::Closure as i64);
-                let is_closure = builder.ins().icmp(IntCC::Equal, obj_type, closure_tag);
-                builder.ins().brif(
-                    is_closure,
-                    closure_block,
-                    &[],
-                    merge_block,
-                    &[BlockArg::Value(no)],
-                );
-                builder.switch_to_block(closure_block);
-                let function =
-                    builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), obj_ptr, CLOSURE_FUNCTION);
-                let expected = builder.ins().iconst(types::I64, *fn_ptr as i64);
-                let hit = builder.ins().icmp(IntCC::Equal, function, expected);
-                builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
-                builder.switch_to_block(merge_block);
-                Ok(Some(builder.block_params(merge_block)[0]))
+                Ok(Some(emit_closure_fn_is(builder, get(a), *fn_ptr)))
             }
             Instruction::IsType(a, class_sym) => {
                 let f = get_runtime_fn(module, builder, "wren_is_type", 2)?;

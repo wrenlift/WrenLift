@@ -41,7 +41,8 @@ pub mod llvm {
     use crate::intern::Interner;
     use crate::mir::{
         BlockId, DeoptReg, Instruction, MirFunction, MirType, Terminator, ValueId,
-        osr_reachable_blocks, osr_rematerializable_defs,
+        is_osr_rematerializable, osr_entry_recomputed, osr_reachable_blocks,
+        osr_rematerializable_defs,
     };
     use crate::runtime::object_layout::*;
 
@@ -2158,11 +2159,21 @@ pub mod llvm {
                         let (slotp, _) = self.slots[p];
                         self.b.build_store(slotp, v).map_err(|e| e.to_string())?;
                     }
-                    for (vid, inst) in osr_rematerializable_defs(mir, layout.target_block) {
+                    // Constants, then what the entry recomputes in the
+                    // order its operands need: the reads before the tests.
+                    let constants = osr_rematerializable_defs(mir, layout.target_block)
+                        .into_iter()
+                        .filter(|(_, i)| is_osr_rematerializable(i));
+                    let recomputed = osr_entry_recomputed(mir, layout.target_block);
+                    for (vid, inst) in constants.chain(recomputed) {
                         let v: BasicValueEnum = match inst {
-                            Instruction::GetModuleVar(_) => self
-                                .lower_instruction(vid, &inst)?
-                                .ok_or("a module variable read yields a value")?,
+                            Instruction::GetModuleVar(_)
+                            | Instruction::ClassIs(..)
+                            | Instruction::ObjectIs(..)
+                            | Instruction::ClosureFnIs(..) => {
+                                self.lower_instruction(vid, &inst)?
+                                    .ok_or("a recomputed value yields a value")?
+                            }
                             Instruction::ConstNum(n) => self.c64(n.to_bits()).into(),
                             Instruction::ConstBool(b) => {
                                 self.c64(if b { TAG_TRUE } else { TAG_FALSE }).into()
