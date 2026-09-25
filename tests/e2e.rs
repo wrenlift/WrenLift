@@ -6647,3 +6647,94 @@ Scene.new().run()
     // Unblock when open issue fixed: git-bug 8b8fab46f7d7232798f22e3b3c1ed1221d9b557d2d0431d4e3c99ece074fb620
     //assert_eq!(lines[lines.len() - 2], expected[6], "{text}");
 }
+
+/// A getter site first reached from compiled code is answered by the
+/// runtime's frameless accessor path, and must still record the getter
+/// in its cache for the next compile of the caller to load the field.
+/// A second class defining the getter keeps the compile from resolving
+/// the site through the class hierarchy instead, and a call from
+/// another site fills the method cache, so the site's first call is a
+/// cache hit the shortcut answers.
+#[test]
+fn e2e_getter_site_reached_from_compiled_code_records_the_getter() {
+    use wren_lift::runtime::engine::{FuncId, TierState};
+    if wren_lift::codegen::top_tier() == wren_lift::codegen::TopTier::Off {
+        return;
+    }
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 20,
+        opt_threshold: 40,
+        ..VMConfig::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let warm = r#"
+class T {
+  construct new() { _v = 1 }
+  v { _v }
+}
+class U {
+  construct new() { _v = 2 }
+  v { _v }
+}
+class K {
+  static run(t, reach) {
+    var s = 0
+    for (i in 0...50) {
+      if (reach) {
+        s = s + t.v
+      } else {
+        s = s + 1
+      }
+    }
+    return s
+  }
+}
+var t = T.new()
+var first = t.v
+for (k in 0...3000) K.run(t, false)
+"#;
+    assert!(matches!(
+        vm.interpret("main", warm),
+        InterpretResult::Success
+    ));
+    let run = (0..vm.engine.function_count() as u32)
+        .map(FuncId)
+        .find(|id| {
+            vm.engine
+                .get_mir(*id)
+                .is_some_and(|m| vm.interner.resolve(m.name) == "run(_,_)")
+        })
+        .expect("run(_,_) is registered");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while vm.engine.tier_state(run) != TierState::OptimizedNative
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        vm.engine.poll_compilations();
+        let _ = vm.interpret("tick", "var x = 1\n");
+    }
+    assert_eq!(vm.engine.tier_state(run), TierState::OptimizedNative);
+    let getter_sites = |vm: &VM| {
+        let bc = vm.engine.peek_bytecode(run).expect("run(_,_) has bytecode");
+        let table = unsafe { &*bc.ic_table.get() };
+        table
+            .iter()
+            .filter(|ic| ic.snapshot().is_some_and(|s| s.kind == 5))
+            .count()
+    };
+    assert_eq!(getter_sites(&vm), 0, "the getter site has not run yet");
+    let before = vm.engine.deopt_exits;
+    let then = "import \"main\" for K, T\nSystem.print(K.run(T.new(), true))\n";
+    assert!(matches!(
+        vm.interpret("then", then),
+        InterpretResult::Success
+    ));
+    assert_eq!(vm.take_output().trim(), "50");
+    if vm.engine.deopt_exits != before {
+        // The interpreter ran the site instead; it records its own kind.
+        return;
+    }
+    assert_eq!(getter_sites(&vm), 1);
+}

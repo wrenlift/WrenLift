@@ -311,6 +311,34 @@ enum Frameless {
     Miss,
 }
 
+/// A trivial accessor answered the site without a frame: record it in
+/// the site's cache as the full dispatch would, so a compile of the
+/// caller loads or stores the field inline. A site that already holds
+/// this class, or has gone polymorphic, is left as it is.
+#[inline(always)]
+fn note_accessor_fast_path_ic(
+    vm: &mut crate::runtime::vm::VM,
+    j: *mut JitThread,
+    ic_idx: Option<(usize, Option<u32>)>,
+    cache_key_class: *mut ObjClass,
+    method: Method,
+    defining_class: *mut ObjClass,
+) {
+    let Some((idx, func)) = ic_idx else {
+        return;
+    };
+    let Some(ic_ptr) = current_jit_callsite_ic(vm, j, idx, func) else {
+        return;
+    };
+    let known = unsafe { (*ic_ptr).snapshot() }.is_some_and(|ic| {
+        ic.kind & crate::mir::bytecode::IC_POLYMORPHIC != 0
+            || (ic.kind != 0 && ic.class == cache_key_class as usize)
+    });
+    if !known {
+        populate_callsite_ic(vm, ic_ptr, cache_key_class, method, defining_class);
+    }
+}
+
 /// A List fast path answered the site: record the receiver class in
 /// the site's cache (kind 9) so a compile of the caller knows it.
 #[inline(always)]
@@ -370,8 +398,9 @@ fn try_dispatch_call_noframe_fast(
     }
 
     let cache_key_class = cache_key_class(vm, recv, class);
-    if let Some((method, _defining_class)) = vm.method_cache.lookup(cache_key_class, method_sym) {
+    if let Some((method, defining_class)) = vm.method_cache.lookup(cache_key_class, method_sym) {
         if let Some(result) = try_dispatch_trivial_accessor_fastpath(vm, method, args) {
+            note_accessor_fast_path_ic(vm, j, ic_idx, cache_key_class, method, defining_class);
             vm.engine.note_runtime_call_stats(|s| {
                 s.wren_call_noframe_fastpath += 1;
                 s.dispatch_call_entries += 1;

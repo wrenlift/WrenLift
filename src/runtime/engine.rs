@@ -2308,7 +2308,10 @@ impl ExecutionEngine {
             let Some(bytecode) = bytecode else { continue };
             let ic_table = unsafe { &*bytecode.ic_table.get() };
             for entry in ic_table.iter() {
-                if entry.snapshot().is_some_and(|e| e.func_id == target_id) {
+                if entry
+                    .snapshot()
+                    .is_some_and(|e| e.names_function() && e.func_id == target_id)
+                {
                     entry.clear();
                 }
             }
@@ -5628,5 +5631,51 @@ mod tests {
             .ensure_threaded_code(id, &interner)
             .map(|b| b as *const crate::mir::threaded::ThreadedCode);
         assert_eq!(after, Some(before), "the body moved with the table");
+    }
+    /// Installing function N clears the entries that call N, not the
+    /// ones whose `func_id` holds N for another reason: a getter of
+    /// field N keeps its entry.
+    #[test]
+    fn installing_a_function_clears_only_entries_naming_it() {
+        use crate::mir::bytecode::CallSiteIC;
+        let mut interner = Interner::new();
+        let name = interner.intern("caller");
+        let method = interner.intern("m");
+        let mut mir = MirFunction::new(name, 1);
+        let bb = mir.new_block();
+        let recv = mir.new_value();
+        mir.block_mut(bb)
+            .instructions
+            .push((recv, crate::mir::Instruction::BlockParam(0)));
+        for _ in 0..2 {
+            let v = mir.new_value();
+            mir.block_mut(bb).instructions.push((
+                v,
+                crate::mir::Instruction::Call {
+                    receiver: recv,
+                    method,
+                    args: vec![],
+                    pure_call: false,
+                },
+            ));
+        }
+        mir.block_mut(bb).terminator = crate::mir::Terminator::ReturnNull;
+        let mut engine = ExecutionEngine::new(ExecutionMode::Tiered);
+        let caller = engine.register_function(mir);
+        let bc = engine.ensure_bytecode(caller).expect("bytecode");
+        let table = unsafe { &*(*bc).ic_table.get() };
+        assert!(table.len() >= 2);
+        let entry = |kind: u64| CallSiteIC {
+            class: 0x1000,
+            jit_ptr: std::ptr::null(),
+            closure: std::ptr::null(),
+            func_id: 0,
+            kind,
+        };
+        table[0].store(entry(5));
+        table[1].store(entry(1));
+        engine.invalidate_ic_entries_for(FuncId(0));
+        assert_eq!(table[0].kind(), 5, "a getter of field 0 stays");
+        assert_eq!(table[1].kind(), 0, "a call of function 0 goes");
     }
 }

@@ -240,6 +240,14 @@ impl CallSiteIC {
         })
     }
 
+    /// Whether `func_id` names a function: the closure, constructor
+    /// and closure-call kinds. The others keep a field index (5), a
+    /// host context (8) or nothing (4, 9) there.
+    #[inline]
+    pub fn names_function(&self) -> bool {
+        matches!(self.kind & !IC_POLYMORPHIC, 1 | 2 | 3 | 6 | 7)
+    }
+
     /// The kind alone, without the write count.
     #[inline(always)]
     pub fn kind(&self) -> u64 {
