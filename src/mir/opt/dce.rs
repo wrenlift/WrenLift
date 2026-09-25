@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use super::MirPass;
-use crate::mir::{BlockId, MirFunction, Terminator, ValueId};
+use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 
 pub struct Dce;
 
@@ -64,12 +64,13 @@ fn remove_unreachable_blocks(func: &mut MirFunction) -> bool {
 
 fn remove_dead_instructions(func: &mut MirFunction) -> bool {
     let used = compute_used_values(func);
+    let is_used = |v: &ValueId| used.get(v.0 as usize).copied().unwrap_or(false);
     let mut changed = false;
     for block in &mut func.blocks {
         let before = block.instructions.len();
         block
             .instructions
-            .retain(|(vid, inst)| used.contains(vid) || !inst.removable_when_unused());
+            .retain(|(vid, inst)| is_used(vid) || !inst.removable_when_unused());
         if block.instructions.len() != before {
             changed = true;
         }
@@ -77,40 +78,53 @@ fn remove_dead_instructions(func: &mut MirFunction) -> bool {
     changed
 }
 
-fn compute_used_values(func: &MirFunction) -> HashSet<ValueId> {
-    let mut used = HashSet::new();
-
-    // Seed from terminators.
+/// Whether each value, by id, is used.
+fn compute_used_values(func: &MirFunction) -> Vec<bool> {
+    let ids = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter().map(|(v, _)| v.0 as usize + 1))
+        .max()
+        .unwrap_or(0)
+        .max(func.next_value as usize);
+    let mut defs: Vec<Option<&Instruction>> = vec![None; ids];
     for block in &func.blocks {
-        for v in block.terminator.operands() {
-            used.insert(v);
+        for (v, inst) in &block.instructions {
+            defs[v.0 as usize] = Some(inst);
         }
     }
+    let mut used = vec![false; ids];
+    let mut work: Vec<ValueId> = Vec::new();
+    let mark = |v: ValueId, used: &mut Vec<bool>, work: &mut Vec<ValueId>| {
+        let i = v.0 as usize;
+        if i >= used.len() {
+            used.resize(i + 1, false);
+        }
+        if !used[i] {
+            used[i] = true;
+            work.push(v);
+        }
+    };
 
-    // Seed from side-effecting instructions.
+    // Seed from terminators and side-effecting instructions.
     for block in &func.blocks {
+        for v in block.terminator.operands() {
+            mark(v, &mut used, &mut work);
+        }
         for (_, inst) in &block.instructions {
             if !inst.removable_when_unused() {
                 for op in inst.operands() {
-                    used.insert(op);
+                    mark(op, &mut used, &mut work);
                 }
             }
         }
     }
 
-    // Fixpoint: mark operands of used instructions.
-    let mut progress = true;
-    while progress {
-        progress = false;
-        for block in &func.blocks {
-            for (vid, inst) in &block.instructions {
-                if used.contains(vid) {
-                    for op in inst.operands() {
-                        if used.insert(op) {
-                            progress = true;
-                        }
-                    }
-                }
+    // A used value's operands are used; each definition is read once.
+    while let Some(v) = work.pop() {
+        if let Some(Some(inst)) = defs.get(v.0 as usize) {
+            for op in inst.operands() {
+                mark(op, &mut used, &mut work);
             }
         }
     }
