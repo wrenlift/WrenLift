@@ -336,14 +336,16 @@ pub mod llvm {
     }
 
     /// `WLIFT_LLVM_PASSES` overrides the middle-end pipeline; `off` skips it.
-    /// The default is O2 and one non-trivial loop unswitch after it: a
-    /// guard on a loop-invariant condition, such as a field-kind byte
-    /// or a receiver's class, then leaves the loop, which O2 does not do
-    /// and O3 does at a compile cost the rest of the pipeline is not
-    /// worth.
+    /// The default is a function pipeline shorter than O2, since a body
+    /// runs slower code until its compile finishes: scalar cleanup, loop
+    /// rotation and hoisting, a non-trivial unswitch so a guard on a
+    /// loop-invariant condition (a field-kind byte, a receiver's class)
+    /// leaves the loop, then GVN, jump threading and SLP vectorisation.
     fn pass_spec() -> String {
         std::env::var("WLIFT_LLVM_PASSES").unwrap_or_else(|_| {
-            "default<O2>,function(loop-mssa(simple-loop-unswitch<nontrivial>),instcombine,simplifycfg)"
+            "function(sroa,early-cse<memssa>,instcombine,simplifycfg,\
+             loop-mssa(loop-rotate,licm<allowspeculation>,simple-loop-unswitch<nontrivial>),\
+             gvn,jump-threading,correlated-propagation,slp-vectorizer,instcombine,simplifycfg)"
                 .to_string()
         })
     }
