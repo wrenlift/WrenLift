@@ -6837,6 +6837,71 @@ System.print(total)
     assert_output(source, "5174001");
 }
 
+/// A loop whose only calls are to a native method, or only to a
+/// constructor, records its sites in the interpreter as it runs, so the
+/// loop is not taken for one that never ran and is entered from the
+/// interpreter on the first call.
+#[test]
+fn e2e_loop_over_natives_or_constructors_is_entered_from_the_interpreter() {
+    let _guard = lock_osr_test();
+    if wren_lift::codegen::top_tier() == wren_lift::codegen::TopTier::Off {
+        return;
+    }
+    let source = r#"
+class Point {
+  construct new(x) { _x = x }
+  x { _x }
+}
+class Bench {
+  static natives() {
+    var t = 0
+    var i = 0
+    while (i < 400000) {
+      t = System.clock
+      i = i + 1
+    }
+    return t > 0
+  }
+  static builds() {
+    var p = null
+    var i = 0
+    while (i < 400000) {
+      p = Point.new(i)
+      i = i + 1
+    }
+    return p.x
+  }
+}
+System.print(Bench.natives())
+System.print(Bench.builds())
+"#;
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 1,
+        ..VMConfig::default()
+    });
+    vm.engine.collect_tier_stats = true;
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", source);
+    let output = vm.take_output();
+    assert!(matches!(result, InterpretResult::Success), "{output}");
+    assert_eq!(output, "true\n399999\n");
+    for name in ["natives()", "builds()"] {
+        let id = (0..vm.engine.function_count() as u32)
+            .map(wren_lift::runtime::engine::FuncId)
+            .find(|id| {
+                vm.engine
+                    .get_mir(*id)
+                    .is_some_and(|m| vm.interner.resolve(m.name) == name)
+            })
+            .expect("registered");
+        assert!(
+            vm.engine.tier_stats[id.0 as usize].osr_entries > 0,
+            "{name}'s loop was never entered from the interpreter"
+        );
+    }
+}
+
 /// A loop-carried variable that starts null and is rebound to a fresh
 /// instance every trip is not scalar-replaced: the null reaches the
 /// loop through a parameter of its own, and the loop's parameter is fed

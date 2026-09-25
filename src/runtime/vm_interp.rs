@@ -2630,6 +2630,34 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             | Method::ForeignC(_)
                             | Method::ForeignCDynamic(_)),
                         ) => {
+                            // Record the target as compiled code would
+                            // (kinds 4 and 8, and 9 for a List's natives):
+                            // a loop whose calls are all natives otherwise
+                            // looks as if it never ran.
+                            if vm.engine.mode != ExecutionMode::Interpreter {
+                                let seen = match m {
+                                    Method::Native(_) if class == vm.list_class => {
+                                        Some((std::ptr::null(), 0, 9))
+                                    }
+                                    Method::Native(func) => Some((func as *const (), 0, 4)),
+                                    Method::Host(func, context) => {
+                                        Some((func as *const (), context as u64, 8))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((func, func_id, kind)) = seen
+                                    && let Some(ic) = ic_table.get(ic_idx)
+                                    && ic.snapshot().is_none_or(|s| s.kind == 0)
+                                {
+                                    ic.store_seen(crate::mir::bytecode::CallSiteIC {
+                                        class: cache_key_class as usize,
+                                        jit_ptr: std::ptr::null(),
+                                        closure: func as *const u8,
+                                        func_id,
+                                        kind,
+                                    });
+                                }
+                            }
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
                                     vm,
@@ -3047,6 +3075,23 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     vm.request_tier_up(target_func_id);
                                 }
                                 vm.engine.poll_compilations();
+                                // Record the target as compiled code would (kind 3).
+                                if let Some(ic) = ic_table.get(ic_idx)
+                                    && ic.snapshot().is_none_or(|s| s.kind == 0)
+                                {
+                                    ic.store_seen(crate::mir::bytecode::CallSiteIC {
+                                        class: cache_key_class as usize,
+                                        jit_ptr: vm
+                                            .engine
+                                            .jit_code
+                                            .get(target_func_id.0 as usize)
+                                            .copied()
+                                            .unwrap_or(std::ptr::null()),
+                                        closure: closure_ptr as *const u8,
+                                        func_id: target_func_id.0 as u64,
+                                        kind: 3,
+                                    });
+                                }
                             }
 
                             // JIT dispatch: call_constructor_sync handles its own
