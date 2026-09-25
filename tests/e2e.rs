@@ -6797,3 +6797,42 @@ System.print(Bench.run())
         "run()'s loop was never entered from the interpreter\n{output}"
     );
 }
+
+/// A hot read of fields that have only held Nums checks the class's
+/// field-kind bytes once for both fields. When one instance's field
+/// then takes a String, the check fails and the interpreter resumes
+/// with the value intact.
+#[test]
+fn e2e_a_field_that_stops_holding_nums_leaves_compiled_code() {
+    let source = r#"
+class Body {
+  construct new(x, v) {
+    _x = x
+    _v = v
+  }
+  x { _x }
+  v { _v }
+  v=(value) { _v = value }
+}
+class Sim {
+  static sum(bodies) {
+    var total = 0
+    for (b in bodies) {
+      var x = b.x
+      var v = b.v
+      total = total + x + (v is Num ? v : 1000)
+    }
+    return total
+  }
+}
+var bodies = []
+for (i in 0...4) bodies.add(Body.new(i, i * 0.5))
+var total = 0
+for (round in 0...20000) {
+  total = total + Sim.sum(bodies)
+  if (round == 15000) bodies[2].v = "far"
+}
+System.print(total)
+"#;
+    assert_output(source, "5174001");
+}

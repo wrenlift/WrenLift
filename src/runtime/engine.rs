@@ -214,6 +214,35 @@ fn promotion_gate_enabled() -> bool {
     })
 }
 
+/// `WLIFT_KIND_GUARDS=0` keeps a Num check on every field read the
+/// Cranelift top tier guards; unset lets one check of the class's
+/// field-kind bytes stand for them. Safe to run with either way.
+fn kind_guards_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WLIFT_KIND_GUARDS")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// The fields of the class at `class` whose kind byte says only Num
+/// today, a bit per index.
+fn class_num_fields(class: usize) -> u64 {
+    use crate::runtime::object::{FIELD_NUM, ObjClass};
+    let class = class as *const ObjClass;
+    let kinds = unsafe { (*class).field_kinds_ptr };
+    let len = unsafe { (*class).field_kinds.len() };
+    if kinds.is_null() {
+        return 0;
+    }
+    // The main thread may be or'ing a byte while the compile reads it;
+    // the compiled check reads it again at run time.
+    (0..len.min(64))
+        .filter(|&i| unsafe { std::ptr::read_volatile(kinds.add(i)) } == FIELD_NUM)
+        .fold(0, |mask, i| mask | 1 << i)
+}
+
 /// What the top tier could win on a function, judged from its MIR
 /// before a compile is spent: nothing for a loop-free body that is
 /// mostly a call, little for a loop whose body is mostly calls, and
@@ -4883,12 +4912,41 @@ impl ExecutionEngine {
                     .osr_excluded
                     .extend(cold.keys().copied());
             }
+            // The LLVM tier reads a field's kind byte only where a class
+            // guard in the same block pins the receiver, so it keeps them.
+            if !use_llvm {
+                use crate::mir::opt::MirPass;
+                crate::mir::opt::redundant_guards::RedundantGuards
+                    .run(Arc::make_mut(&mut compile_mir));
+            }
             let mir_ready = compile_started.elapsed();
             if std::env::var("WLIFT_JIT_DUMP").is_ok() {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
             use crate::codegen::cranelift_backend::cl;
+            // The kind bytes are current only while every body notes them.
+            if tier == CompileTier::Optimized
+                && !use_llvm
+                && note_field_kinds
+                && kind_guards_enabled()
+            {
+                let plan = crate::mir::opt::field_kinds::plan(&compile_mir, &class_num_fields);
+                if tier_trace_enabled() && !plan.is_empty() {
+                    let covered = plan
+                        .values()
+                        .filter(|g| **g == crate::mir::opt::field_kinds::KindGuard::Covered)
+                        .count();
+                    eprintln!(
+                        "tier-trace: FuncId({}) {} field-kind checks={} covered={}",
+                        id.0,
+                        trace_name_clone,
+                        plan.len() - covered,
+                        covered
+                    );
+                }
+                cl::set_jit_kind_plan(plan);
+            }
             cl::set_jit_modvars_cell(modvars_cell);
             cl::set_jit_cur_cell(cur_cell);
             cl::set_jit_tier_hook(tier_hook.clone());
@@ -4923,6 +4981,7 @@ impl ExecutionEngine {
             crate::codegen::set_jit_list_class(0);
             cl::set_jit_modvars_cell(0);
             cl::set_jit_cur_cell(0);
+            cl::set_jit_kind_plan(HashMap::new());
             let result = result
                 .map_err(|e| {
                     if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {

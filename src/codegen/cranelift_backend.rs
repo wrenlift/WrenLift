@@ -1439,6 +1439,69 @@ pub mod cl {
     }
 
     thread_local! {
+        /// The Num guards on field reads this thread's next compile
+        /// answers from field-kind bytes, by the guard's value.
+        static JIT_KIND_PLAN: std::cell::RefCell<HashMap<ValueId, crate::mir::opt::field_kinds::KindGuard>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+
+    pub fn set_jit_kind_plan(plan: HashMap<ValueId, crate::mir::opt::field_kinds::KindGuard>) {
+        JIT_KIND_PLAN.with(|p| *p.borrow_mut() = plan);
+    }
+
+    fn jit_kind_guard(v: ValueId) -> Option<crate::mir::opt::field_kinds::KindGuard> {
+        JIT_KIND_PLAN.with(|p| p.borrow().get(&v).copied())
+    }
+
+    /// An i8 that is set when a byte of the class's field kinds for
+    /// `fields`, a bit per index, says anything but Num.
+    fn emit_kind_check(builder: &mut FunctionBuilder, class: usize, fields: u64) -> Value {
+        use crate::runtime::object::{FIELD_NUM, ObjClass};
+        let class = class as *const ObjClass;
+        let kinds = unsafe { (*class).field_kinds_ptr };
+        let len = unsafe { (*class).field_kinds.len() };
+        let hi = 63 - fields.leading_zeros() as usize;
+        if kinds.is_null() || fields == 0 || hi >= len {
+            return builder.ins().iconst(types::I8, 1);
+        }
+        let base = builder.ins().iconst(types::I64, kinds as i64);
+        let mut fails: Option<Value> = None;
+        for (start, size) in crate::mir::opt::field_kinds::kind_chunks(fields, len) {
+            let ty = match size {
+                8 => types::I64,
+                4 => types::I32,
+                2 => types::I16,
+                _ => types::I8,
+            };
+            let mut mask = 0u64;
+            let mut want = 0u64;
+            for b in start..start + size {
+                if fields & (1 << b) != 0 {
+                    mask |= 0xFF << (8 * (b - start));
+                    want |= (FIELD_NUM as u64) << (8 * (b - start));
+                }
+            }
+            let word = builder
+                .ins()
+                .load(ty, MemFlags::new().with_notrap(), base, start as i32);
+            let word = if ty == types::I64 {
+                word
+            } else {
+                builder.ins().uextend(types::I64, word)
+            };
+            let mask = builder.ins().iconst(types::I64, mask as i64);
+            let want = builder.ins().iconst(types::I64, want as i64);
+            let masked = builder.ins().band(word, mask);
+            let bad = builder.ins().icmp(IntCC::NotEqual, masked, want);
+            fails = Some(match fails {
+                Some(acc) => builder.ins().bor(acc, bad),
+                None => bad,
+            });
+        }
+        fails.unwrap_or_else(|| builder.ins().iconst(types::I8, 1))
+    }
+
+    thread_local! {
         /// The function this thread is compiling, for code that names
         /// itself to the runtime (guard deopts).
         static JIT_FUNC_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
@@ -4021,6 +4084,7 @@ pub mod cl {
                     inline_bodies.as_ref(),
                     cha_by_method.as_ref(),
                     Some((&raw_bools, &exit_value_types)),
+                    Some(vid),
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -4550,6 +4614,8 @@ pub mod cl {
         >,
         cha_by_method: Option<&std::sync::Arc<crate::runtime::engine::ChaMap>>,
         deopt_state: Option<(&HashSet<ValueId>, &[MirType])>,
+        // The instruction's own value, in the body being compiled.
+        dst: Option<ValueId>,
     ) -> Result<Option<Value>, String> {
         // Investigation mode — convert undefined-value to a graceful
         // Err so the broker thread survives, letting other functions
@@ -5302,6 +5368,7 @@ pub mod cl {
                                                 None,
                                                 None,
                                                 None,
+                                                None,
                                             )?;
                                             if let Some(v) = res {
                                                 callee_vals.insert(*vid, v);
@@ -5791,6 +5858,7 @@ pub mod cl {
                                     f64_self_id,
                                     Some(callee_args[0]),
                                     aot_config,
+                                    None,
                                     None,
                                     None,
                                     None,
@@ -7269,14 +7337,23 @@ pub mod cl {
                 let Some((raw_bools, value_types)) = deopt_state else {
                     return Err("mid-body guard inside an inlined body".into());
                 };
-                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
-                let masked = builder.ins().band(v, qnan);
-                let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                use crate::mir::opt::field_kinds::KindGuard;
+                let fails = match dst.and_then(jit_kind_guard) {
+                    Some(KindGuard::Covered) => return Ok(Some(v)),
+                    Some(KindGuard::Check { class, fields }) => {
+                        emit_kind_check(builder, class, fields)
+                    }
+                    None => {
+                        let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                        let masked = builder.ins().band(v, qnan);
+                        builder.ins().icmp(IntCC::Equal, masked, qnan)
+                    }
+                };
                 emit_guard_deopt_at(
                     builder,
                     module,
                     get_runtime_fn,
-                    is_box,
+                    fails,
                     jit_func_id(),
                     *pc,
                     live,
