@@ -6836,3 +6836,30 @@ System.print(total)
 "#;
     assert_output(source, "5174001");
 }
+
+/// A loop-carried variable that starts null and is rebound to a fresh
+/// instance every trip is not scalar-replaced: the null reaches the
+/// loop through a parameter of its own, and the loop's parameter is fed
+/// by it.
+#[test]
+fn e2e_a_loop_object_first_bound_to_null_keeps_its_allocation() {
+    let source = r#"
+class Point {
+  construct new(x) { _x = x }
+  x { _x }
+}
+class Bench {
+  static builds() {
+    var p = null
+    var i = 0
+    while (i < 400000) {
+      p = Point.new(i)
+      i = i + 1
+    }
+    return p.x
+  }
+}
+System.print(Bench.builds())
+"#;
+    assert_output(source, "399999");
+}

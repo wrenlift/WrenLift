@@ -454,19 +454,23 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
                 }
                 _ => {}
             }
-            // Branch args into a non-scalar param are escapes.
+            // Branch args into a non-scalar param are escapes, and a
+            // scalar param fed a non-scalar (a param dropped for its own
+            // feed, say) cannot be one.
             let mut visit = |target: BlockId, args: &[ValueId]| {
                 let params = &func.blocks[target.0 as usize].params;
                 for (i, arg) in args.iter().enumerate() {
                     let r = root(*arg, &moves);
-                    if !round.contains_key(&r) {
-                        continue;
-                    }
-                    match params.get(i) {
-                        Some(&(p, _)) if round.contains_key(&p) => {}
-                        _ => {
+                    let p = params.get(i).map(|&(p, _)| p);
+                    match (round.contains_key(&r), p) {
+                        (true, Some(p)) if round.contains_key(&p) => {}
+                        (true, _) => {
                             escaped.insert(r);
                         }
+                        (false, Some(p)) if round.contains_key(&p) => {
+                            escaped.insert(p);
+                        }
+                        (false, _) => {}
                     }
                 }
             };
