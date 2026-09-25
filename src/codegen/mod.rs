@@ -2453,7 +2453,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     mir: &MirFunction,
     target: Target,
     interner: &crate::intern::Interner,
-    #[cfg_attr(feature = "cranelift", allow(unused_variables))] compile_tier: CompileTier,
+    compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
     #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] callsite_ic_live_ptrs: Option<
         Vec<usize>,
@@ -2534,6 +2534,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 jit_code_base,
                 inline_bodies.clone(),
                 cha_by_method.clone(),
+                compile_tier == CompileTier::Baseline,
             )?;
             let code = CompiledFunction::CraneliftOwned(compiled);
             Ok(CompiledArtifact {

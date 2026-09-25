@@ -1318,6 +1318,13 @@ pub mod cl {
     // functions during warmup with hundreds of call sites between them.
     // Cache once into a `OnceLock<bool>`.
 
+    /// `WLIFT_BASELINE_CODEGEN=full` compiles baseline bodies with
+    /// the optimised tier's codegen settings; safe to run with.
+    fn full_baseline_codegen() -> bool {
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FULL.get_or_init(|| std::env::var("WLIFT_BASELINE_CODEGEN").is_ok_and(|v| v == "full"))
+    }
+
     #[inline]
     pub(crate) fn env_jit_callsite_ic() -> bool {
         use std::sync::OnceLock;
@@ -1859,59 +1866,8 @@ pub mod cl {
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
         cha_by_method: crate::runtime::engine::SharedCha,
+        baseline: bool,
     ) -> Result<CraneliftCompiledCode, String> {
-        // 1. Create Cranelift ISA for the host
-        let mut flag_builder = settings::builder();
-        flag_builder
-            .set("opt_level", "speed")
-            .map_err(|e| e.to_string())?;
-        flag_builder
-            .set("is_pic", "false")
-            .map_err(|e| e.to_string())?;
-
-        flag_builder
-            .set("preserve_frame_pointers", "true")
-            .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
-
-        // Disable probestack — macOS aarch64 inline probestack can cause
-        // false SIGSEGV (interpreted as stack overflow by the Rust runtime).
-        flag_builder
-            .set("enable_probestack", "false")
-            .map_err(|e| format!("Failed to set enable_probestack: {}", e))?;
-
-        // The verifier is a third of a compile; a release build runs it
-        // only under `WLIFT_CL_VERIFY` (safe to run with).
-        let verify = cfg!(debug_assertions) || std::env::var_os("WLIFT_CL_VERIFY").is_some();
-        flag_builder
-            .set("enable_verifier", if verify { "true" } else { "false" })
-            .map_err(|e| e.to_string())?;
-        let isa = cranelift_native::builder()
-            .map_err(|e| e.to_string())?
-            .finish(settings::Flags::new(flag_builder))
-            .map_err(|e| e.to_string())?;
-
-        // 2. Create JIT module with runtime symbol resolution
-        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        // One reservation holds the body's code and its data (the loop
-        // entry request word, f64 constants): the code reaches them
-        // pc-relative, which has a 2 GB reach, so they must not be
-        // mapped on the far side of whatever the host reserved. Not on
-        // Windows, where a reservation is committed up front.
-        #[cfg(not(windows))]
-        {
-            let arena = cranelift_jit::ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES)
-                .map_err(|e| e.to_string())?;
-            jit_builder.memory_provider(Box::new(arena));
-        }
-
-        // Register all runtime function symbols
-        for (name, addr) in runtime_symbols() {
-            jit_builder.symbol(name, addr as *const u8);
-        }
-
-        let mut module = JITModule::new(jit_builder);
-
-        // 3. Build the function signature: all args are i64 (NaN-boxed values)
         // Use mir.arity (total params INCLUDING receiver) to match the caller's ABI.
         // BlockParam instructions may be fewer (dead receiver eliminated by DCE),
         // but the function must still accept all args the caller passes.
@@ -1968,6 +1924,72 @@ pub mod cl {
             && !has_other_calls
             && value_params_carry_nums(mir);
 
+        // 1. Create Cranelift ISA for the host
+        let mut flag_builder = settings::builder();
+        // A baseline body the top tier will replace once it is hot
+        // (one that carries the counter for it) trades code quality for
+        // compile time: no mid-end optimisation, the single-pass
+        // register allocator. A body the top tier never takes stays in
+        // baseline for good and is compiled in full, and so is one with
+        // an f64 inner function: its recursion runs there, which counts
+        // toward no tier above.
+        let replaced = jit_tier_hook().is_some_and(|h| h.cell != 0 && h.generation == 0);
+        let cheap = baseline && replaced && !use_f64_inner && !full_baseline_codegen();
+        flag_builder
+            .set("opt_level", if cheap { "none" } else { "speed" })
+            .map_err(|e| e.to_string())?;
+        if cheap {
+            flag_builder
+                .set("regalloc_algorithm", "single_pass")
+                .map_err(|e| e.to_string())?;
+        }
+        flag_builder
+            .set("is_pic", "false")
+            .map_err(|e| e.to_string())?;
+
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
+
+        // Disable probestack — macOS aarch64 inline probestack can cause
+        // false SIGSEGV (interpreted as stack overflow by the Rust runtime).
+        flag_builder
+            .set("enable_probestack", "false")
+            .map_err(|e| format!("Failed to set enable_probestack: {}", e))?;
+
+        // The verifier is a third of a compile; a release build runs it
+        // only under `WLIFT_CL_VERIFY` (safe to run with).
+        let verify = cfg!(debug_assertions) || std::env::var_os("WLIFT_CL_VERIFY").is_some();
+        flag_builder
+            .set("enable_verifier", if verify { "true" } else { "false" })
+            .map_err(|e| e.to_string())?;
+        let isa = cranelift_native::builder()
+            .map_err(|e| e.to_string())?
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|e| e.to_string())?;
+
+        // 2. Create JIT module with runtime symbol resolution
+        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // One reservation holds the body's code and its data (the loop
+        // entry request word, f64 constants): the code reaches them
+        // pc-relative, which has a 2 GB reach, so they must not be
+        // mapped on the far side of whatever the host reserved. Not on
+        // Windows, where a reservation is committed up front.
+        #[cfg(not(windows))]
+        {
+            let arena = cranelift_jit::ArenaMemoryProvider::new_with_size(JIT_ARENA_BYTES)
+                .map_err(|e| e.to_string())?;
+            jit_builder.memory_provider(Box::new(arena));
+        }
+
+        // Register all runtime function symbols
+        for (name, addr) in runtime_symbols() {
+            jit_builder.symbol(name, addr as *const u8);
+        }
+
+        let mut module = JITModule::new(jit_builder);
+
+        // 3. Build the function signature: all args are i64 (NaN-boxed values)
         let mut sig = module.make_signature();
         for _ in 0..param_count {
             sig.params.push(AbiParam::new(types::I64));
