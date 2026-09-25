@@ -143,7 +143,10 @@ impl MirPass for UnboxParams {
                         }
                     }
                     if let Instruction::Unbox(a) = inst {
-                        let a = alias.get(a).copied().unwrap_or(*a);
+                        let mut a = alias.get(a).copied().unwrap_or(*a);
+                        while let Some(Instruction::Move(s)) = defs.get(&a) {
+                            a = alias.get(s).copied().unwrap_or(*s);
+                        }
                         if let Some(Instruction::Box(f)) = defs.get(&a) {
                             alias.insert(*v, alias.get(f).copied().unwrap_or(*f));
                             grew = true;
@@ -340,5 +343,42 @@ fn rewrite_term_boxed(
             fix(false_args, chosen_targets[1]);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intern::Interner;
+
+    #[test]
+    fn an_unbox_of_a_copied_box_is_the_boxed_f64() {
+        let mut interner = Interner::new();
+        let mut f = MirFunction::new(interner.intern("test"), 0);
+        let bb = f.new_block();
+        let x = f.new_value();
+        let boxed = f.new_value();
+        let copy = f.new_value();
+        let unboxed = f.new_value();
+        let sum = f.new_value();
+        let out = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((x, Instruction::ConstF64(2.0)));
+            b.instructions.push((boxed, Instruction::Box(x)));
+            b.instructions.push((copy, Instruction::Move(boxed)));
+            b.instructions.push((unboxed, Instruction::Unbox(copy)));
+            b.instructions.push((sum, Instruction::AddF64(unboxed, x)));
+            b.instructions.push((out, Instruction::Box(sum)));
+            b.terminator = Terminator::Return(out);
+        }
+        UnboxParams.run(&mut f);
+        let insts = &f.block(bb).instructions;
+        assert!(!insts.iter().any(|(v, _)| *v == unboxed));
+        assert!(
+            insts
+                .iter()
+                .any(|(v, i)| *v == sum && matches!(i, Instruction::AddF64(a, _) if *a == x))
+        );
     }
 }

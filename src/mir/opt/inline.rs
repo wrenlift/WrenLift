@@ -105,6 +105,26 @@ impl MirPass for TypeSpecialize {
             }
         }
         let mut changed = false;
+        // Values a box or a Num constant makes, through copies.
+        let mut boxed_nums: HashSet<ValueId> = HashSet::new();
+        loop {
+            let before = boxed_nums.len();
+            for b in &func.blocks {
+                for (v, inst) in &b.instructions {
+                    let num = match inst {
+                        Instruction::Box(_) | Instruction::ConstNum(_) => true,
+                        Instruction::Move(a) => boxed_nums.contains(a),
+                        _ => false,
+                    };
+                    if num {
+                        boxed_nums.insert(*v);
+                    }
+                }
+            }
+            if boxed_nums.len() == before {
+                break;
+            }
+        }
 
         // Pre-pass: if this function has GuardNum on any parameter,
         // assume CallStaticSelf (recursive calls) also return Num.
@@ -264,6 +284,11 @@ impl MirPass for TypeSpecialize {
                         new_instructions.push((result_f, Instruction::MathBinaryF64(op, ua, ub)));
                         new_instructions.push((*val_id, Instruction::Box(result_f)));
                         known_nums.insert(*val_id);
+                        changed = true;
+                    }
+
+                    Instruction::IsNum(a) if boxed_nums.contains(a) => {
+                        new_instructions.push((*val_id, Instruction::ConstBool(true)));
                         changed = true;
                     }
 
@@ -481,6 +506,28 @@ mod tests {
         assert_eq!(after, InterpValue::Boxed(Value::num(30.0)));
         let last = f.block(bb).instructions.iter().find(|(v, _)| *v == v2);
         assert!(matches!(last, Some((_, Instruction::Box(_)))));
+    }
+
+    #[test]
+    fn a_num_test_on_a_boxed_value_is_true() {
+        let mut interner = Interner::new();
+        let mut f = make_func(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        let v3 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(2.0)));
+            b.instructions.push((v1, Instruction::Box(v0)));
+            b.instructions.push((v2, Instruction::Move(v1)));
+            b.instructions.push((v3, Instruction::IsNum(v2)));
+            b.terminator = Terminator::Return(v3);
+        }
+        assert!(TypeSpecialize::new().run(&mut f));
+        let test = f.block(bb).instructions.iter().find(|(v, _)| *v == v3);
+        assert!(matches!(test, Some((_, Instruction::ConstBool(true)))));
     }
 
     #[test]
