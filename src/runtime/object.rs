@@ -1452,6 +1452,9 @@ pub struct ObjClass {
     /// lets compiled code read the field as a number after checking
     /// the byte instead of the value.
     pub field_kinds: Vec<u8>,
+    /// Arrays a redefinition replaced, all `FIELD_OTHER`: compiled code
+    /// may still hold their address, and a check of them must fail.
+    retired_field_kinds: Vec<Vec<u8>>,
 }
 
 /// A store of a Num into the field has been seen.
@@ -1715,12 +1718,27 @@ impl ObjClass {
             attributes: Vec::new(),
             method_attributes: HashMap::new(),
             field_kinds: Vec::new(),
+            retired_field_kinds: Vec::new(),
         }
     }
 
     /// Install the field kinds; `kinds` must have one byte per field.
+    /// Compiled code holds the array's address and trusts a byte never
+    /// to lose a kind, so a class defined again with as many fields ors
+    /// the new bytes into its array, and one with another count keeps
+    /// the old array alive with every byte saying another kind.
     pub fn set_field_kinds(&mut self, kinds: Vec<u8>) {
-        self.field_kinds = kinds;
+        if !self.field_kinds.is_empty() && self.field_kinds.len() == kinds.len() {
+            for (old, new) in self.field_kinds.iter_mut().zip(kinds) {
+                *old |= new;
+            }
+            return;
+        }
+        let mut old = std::mem::replace(&mut self.field_kinds, kinds);
+        if !old.is_empty() {
+            old.fill(FIELD_OTHER);
+            self.retired_field_kinds.push(old);
+        }
         self.field_kinds_ptr = if self.field_kinds.is_empty() {
             std::ptr::null_mut()
         } else {
@@ -2256,6 +2274,26 @@ mod tests {
         assert_eq!(class.name, name);
         assert!(class.superclass.is_null());
         assert!(class.methods.is_empty());
+    }
+
+    #[test]
+    fn a_class_defined_again_keeps_its_field_kind_bytes() {
+        let mut interner = test_interner();
+        let name = sym(&mut interner, "Body");
+        let mut class = ObjClass::new(name, std::ptr::null_mut());
+        class.set_field_kinds(vec![0, 0]);
+        class.field_kinds[0] = FIELD_NUM;
+        class.field_kinds[1] = FIELD_OTHER;
+        let first = class.field_kinds_ptr;
+        // As many fields: same array, and no byte loses a kind.
+        class.set_field_kinds(vec![0, FIELD_OTHER]);
+        assert_eq!(class.field_kinds_ptr, first);
+        assert_eq!(class.field_kinds, vec![FIELD_NUM, FIELD_OTHER]);
+        // Another count: the old array stays alive and fails any check.
+        class.set_field_kinds(vec![0, 0, 0]);
+        assert_ne!(class.field_kinds_ptr, first);
+        let old = unsafe { std::slice::from_raw_parts(first, 2) };
+        assert_eq!(old, &[FIELD_OTHER, FIELD_OTHER]);
     }
 
     #[test]
