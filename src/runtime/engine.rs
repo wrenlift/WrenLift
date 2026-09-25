@@ -284,6 +284,83 @@ pub fn top_tier_ceiling(mir: &MirFunction, inline_site: &dyn Fn(usize) -> bool) 
     }
 }
 
+/// Whether the LLVM tier could win over the Cranelift optimised body
+/// compiled from `mir`, a compile clone with calls already spliced in:
+/// not when every loop only calls out and counts iterations, as the
+/// time there goes to the callees. A body without loops keeps it.
+pub fn llvm_gains(mir: &MirFunction) -> bool {
+    use crate::mir::Instruction as I;
+    use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
+    if mir.blocks.is_empty() {
+        return false;
+    }
+    let mut with_preds = mir.clone();
+    with_preds.compute_predecessors();
+    let rpo = compute_rpo(&with_preds);
+    let idom = compute_dominators(&with_preds, &rpo);
+    let loops = detect_loops(&with_preds, &idom);
+    if loops.is_empty() {
+        return true;
+    }
+    loops.iter().any(|l| {
+        let mut calls = 0usize;
+        let mut work = 0usize;
+        let insts = l
+            .body
+            .iter()
+            .filter_map(|b| mir.blocks.get(b.0 as usize))
+            .flat_map(|b| b.instructions.iter().map(|(_, i)| i));
+        for inst in insts {
+            match inst {
+                I::Call { .. }
+                | I::SuperCall { .. }
+                | I::CallStaticSelf { .. }
+                | I::CallKnownFunc {
+                    inline_getter_field: None,
+                    ..
+                } => calls += 1,
+                I::Add(..)
+                | I::Sub(..)
+                | I::Mul(..)
+                | I::Div(..)
+                | I::Mod(..)
+                | I::Neg(..)
+                | I::AddF64(..)
+                | I::SubF64(..)
+                | I::MulF64(..)
+                | I::DivF64(..)
+                | I::ModF64(..)
+                | I::NegF64(..)
+                | I::MathUnaryF64(..)
+                | I::MathBinaryF64(..)
+                | I::CmpLt(..)
+                | I::CmpGt(..)
+                | I::CmpLe(..)
+                | I::CmpGe(..)
+                | I::CmpEq(..)
+                | I::CmpNe(..)
+                | I::CmpLtF64(..)
+                | I::CmpGtF64(..)
+                | I::CmpLeF64(..)
+                | I::CmpGeF64(..)
+                | I::BitAnd(..)
+                | I::BitOr(..)
+                | I::BitXor(..)
+                | I::BitNot(..)
+                | I::Shl(..)
+                | I::Shr(..)
+                | I::GetField(..)
+                | I::SetField(..)
+                | I::SubscriptGet { .. }
+                | I::SubscriptSet { .. }
+                | I::ListCount(..) => work += 1,
+                _ => {}
+            }
+        }
+        calls == 0 || work > 0
+    })
+}
+
 /// Optional shared CHA snapshot threaded through codegen.
 pub type SharedCha = Option<Arc<ChaMap>>;
 
@@ -475,6 +552,8 @@ enum CompilationResult {
         tier: CompileTier,
         executable: ExecutableFunction,
         inline_safe: bool,
+        /// The LLVM tier could win over this body; see [`llvm_gains`].
+        llvm_gain: bool,
     },
     Failed {
         id: FuncId,
@@ -1053,6 +1132,9 @@ pub struct ExecutionEngine {
     optimized_gen: Vec<u32>,
     /// Whether the installed optimised body is the LLVM tier's.
     optimized_llvm: Vec<bool>,
+    /// Whether the LLVM tier could win over the installed Cranelift
+    /// optimised body; the LLVM tier is proposed only when it could.
+    llvm_gain: Vec<bool>,
     /// Functions a speculative guard failed in; their compiles carry
     /// no speculation from then on.
     speculation_failed: Vec<bool>,
@@ -1345,6 +1427,7 @@ impl ExecutionEngine {
             promote_refused: Vec::new(),
             optimized_gen: Vec::new(),
             optimized_llvm: Vec::new(),
+            llvm_gain: Vec::new(),
             speculation_failed: Vec::new(),
             compile_serial: Vec::new(),
             method_binding: Vec::new(),
@@ -1419,6 +1502,7 @@ impl ExecutionEngine {
         self.promote_refused.push(false);
         self.optimized_gen.push(0);
         self.optimized_llvm.push(false);
+        self.llvm_gain.push(true);
         self.speculation_failed.push(false);
         self.compile_serial.push(0);
         self.method_binding
@@ -3757,6 +3841,7 @@ impl ExecutionEngine {
         tier: CompileTier,
         executable: ExecutableFunction,
         inline_safe: bool,
+        llvm_gain: bool,
     ) {
         let native_ptr = if executable.is_native() {
             executable.native_ptr()
@@ -3862,6 +3947,9 @@ impl ExecutionEngine {
                 self.tier_states[idx] = TierState::OptimizedNative;
                 self.optimized_gen[idx] += 1;
                 self.optimized_llvm[idx] = llvm;
+                if !llvm {
+                    self.llvm_gain[idx] = llvm_gain;
+                }
                 let cell = &self.tier_cells[idx];
                 if !native_ptr.is_null() && !osr_entries.is_empty() {
                     cell.retier.store(1, std::sync::atomic::Ordering::Release);
@@ -3870,7 +3958,7 @@ impl ExecutionEngine {
                             .store(1, std::sync::atomic::Ordering::Release);
                     }
                 }
-                if !llvm && crate::codegen::top_tier_is_llvm() {
+                if !llvm && llvm_gain && crate::codegen::top_tier_is_llvm() {
                     let total = cell.total.load(std::sync::atomic::Ordering::Relaxed);
                     cell.tick_after(self.llvm_queue_at().saturating_sub(total).max(1));
                 }
@@ -4000,6 +4088,7 @@ impl ExecutionEngine {
         let wanted = crate::codegen::top_tier_is_llvm()
             && self.tier_states.get(idx).copied() == Some(TierState::OptimizedNative)
             && !self.optimized_llvm.get(idx).copied().unwrap_or(true)
+            && self.llvm_gain.get(idx).copied().unwrap_or(false)
             && !self.promote_refused.get(idx).copied().unwrap_or(true);
         // A loop compiled cold recompiles the body from its caches once
         // it runs; the LLVM tier waits for that body, unless the loop
@@ -4492,7 +4581,7 @@ impl ExecutionEngine {
             Ok(executable) => executable,
             Err(_) => return false,
         };
-        self.install_compiled_tier(idx, tier, executable, inline_safe);
+        self.install_compiled_tier(idx, tier, executable, inline_safe, true);
         true
     }
 
@@ -4845,6 +4934,16 @@ impl ExecutionEngine {
                 .and_then(|artifact| {
                     let inline_safe =
                         is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
+                    let llvm_gain = !(tier == CompileTier::Optimized
+                        && !use_llvm
+                        && crate::codegen::top_tier_is_llvm())
+                        || llvm_gains(&compile_mir);
+                    if !llvm_gain && tier_trace_enabled() {
+                        eprintln!(
+                            "tier-trace: FuncId({}) {} keeps its Cranelift body: its loops only call",
+                            id.0, trace_name_clone
+                        );
+                    }
                     artifact
                         .code
                         .into_executable()
@@ -4861,6 +4960,7 @@ impl ExecutionEngine {
                             tier,
                             executable,
                             inline_safe,
+                            llvm_gain,
                         })
                 });
             if tier_trace_enabled() {
@@ -5056,10 +5156,11 @@ impl ExecutionEngine {
                     tier,
                     executable,
                     inline_safe,
+                    llvm_gain,
                     ..
                 } = result
                 {
-                    self.install_compiled_tier(idx, tier, executable, inline_safe);
+                    self.install_compiled_tier(idx, tier, executable, inline_safe, llvm_gain);
                     // Stash callees for predictive pre-compile. The
                     // actual submits happen later in `drain_compile_queue`
                     // where we have interner access for env-var filtering.
@@ -5238,6 +5339,75 @@ mod tests {
         // Second call returns the same Arc (cached)
         let bc2 = engine.get_bytecode(id);
         assert!(Arc::ptr_eq(bc1.as_ref().unwrap(), bc2.as_ref().unwrap()));
+    }
+
+    /// A loop counting to ten whose body makes one call and, with
+    /// `work`, multiplies its result.
+    fn calling_loop(work: bool) -> MirFunction {
+        use crate::mir::{Instruction as I, MirType, Terminator as T};
+        let mut interner = Interner::new();
+        let name = interner.intern("test");
+        let method = interner.intern("step()");
+        let mut f = MirFunction::new(name, 0);
+        let entry = f.new_block();
+        let header = f.new_block();
+        let body = f.new_block();
+        let exit = f.new_block();
+        let zero = f.new_value();
+        let one = f.new_value();
+        let ten = f.new_value();
+        let recv = f.new_value();
+        f.block_mut(entry).instructions = vec![
+            (zero, I::ConstI64(0)),
+            (one, I::ConstI64(1)),
+            (ten, I::ConstI64(10)),
+            (recv, I::ConstNull),
+        ];
+        f.block_mut(entry).terminator = T::Branch {
+            target: header,
+            args: vec![zero],
+        };
+        let i = f.new_value();
+        let more = f.new_value();
+        f.block_mut(header).params = vec![(i, MirType::I64)];
+        f.block_mut(header).instructions = vec![(more, I::CmpLtI64(i, ten))];
+        f.block_mut(header).terminator = T::CondBranch {
+            condition: more,
+            true_target: body,
+            true_args: vec![],
+            false_target: exit,
+            false_args: vec![],
+        };
+        let r = f.new_value();
+        let mut insts = vec![(
+            r,
+            I::Call {
+                receiver: recv,
+                method,
+                args: vec![],
+                pure_call: false,
+            },
+        )];
+        if work {
+            let w = f.new_value();
+            insts.push((w, I::Mul(r, r)));
+        }
+        let next = f.new_value();
+        insts.push((next, I::AddI64(i, one)));
+        f.block_mut(body).instructions = insts;
+        f.block_mut(body).terminator = T::Branch {
+            target: header,
+            args: vec![next],
+        };
+        f.block_mut(exit).terminator = T::ReturnNull;
+        f
+    }
+
+    #[test]
+    fn the_llvm_tier_passes_over_a_body_whose_loops_only_call() {
+        assert!(!llvm_gains(&calling_loop(false)));
+        assert!(llvm_gains(&calling_loop(true)));
+        assert!(llvm_gains(&make_mir()));
     }
 
     #[test]
