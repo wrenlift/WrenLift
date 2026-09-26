@@ -3000,6 +3000,8 @@ pub mod cl {
         /// check.
         pub class_modvars_symbol: String,
         pub class_slot: u32,
+        /// Called on the class object itself rather than an instance.
+        pub is_static: bool,
     }
 
     /// Per-emit defining-class context for static-field
@@ -5117,16 +5119,24 @@ pub mod cl {
                                 modvars_addr,
                                 (impl_.class_slot as i32) * 8,
                             );
-                            let cls_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                            let expected_cls = builder.ins().band(boxed_cls, cls_mask);
-                            let eq =
+                            // A static method's receiver is the class
+                            // itself; an instance method's, an instance
+                            // of it.
+                            let eq = if impl_.is_static {
+                                builder.ins().icmp(IntCC::Equal, r, boxed_cls)
+                            } else {
+                                let cls_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                                let expected_cls = builder.ins().band(boxed_cls, cls_mask);
                                 builder
                                     .ins()
-                                    .icmp(IntCC::Equal, recv_class_field, expected_cls);
+                                    .icmp(IntCC::Equal, recv_class_field, expected_cls)
+                            };
                             builder.ins().brif(eq, fast_block, &[], next_check, &[]);
 
                             builder.switch_to_block(fast_block);
-                            let fast_result = if let Some(field_idx) = impl_.trivial_getter_field {
+                            let fast_result = if let Some(field_idx) =
+                                impl_.trivial_getter_field.filter(|_| !impl_.is_static)
+                            {
                                 // Inline trivial getter: load
                                 // recv.fields[field_idx].
                                 let fields_ptr =

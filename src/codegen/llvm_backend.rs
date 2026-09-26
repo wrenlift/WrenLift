@@ -725,6 +725,8 @@ pub mod llvm {
         /// Wasm locals are invisible to the conservative scan, so a
         /// wasm body keeps what it allocated rooted until it returns.
         pub wasm: bool,
+        /// The program's methods by signature, for direct calls.
+        pub cha: std::rc::Rc<crate::codegen::cranelift_backend::cl::AotCha>,
     }
 
     impl AotEnv<'_> {
@@ -757,7 +759,10 @@ pub mod llvm {
         let i64t = ctx.i64_type();
         let params: Vec<BasicMetadataTypeEnum> =
             (0..mir.arity as usize).map(|_| i64t.into()).collect();
-        let f = module.add_function(symbol, i64t.fn_type(&params, false), None);
+        // A direct call lowered earlier may have declared it already.
+        let f = module
+            .get_function(symbol)
+            .unwrap_or_else(|| module.add_function(symbol, i64t.fn_type(&params, false), None));
         stamp_target(ctx, machine, f);
         let shared = Shared {
             ctx,
@@ -4976,6 +4981,94 @@ pub mod llvm {
             result
         }
 
+        /// An AOT call to a signature the program's classes implement:
+        /// per implementation, a class check and a direct call (a field
+        /// load for a trivial getter); `wren_call_N` for any other
+        /// receiver.
+        fn aot_direct_call(
+            &mut self,
+            impls: &[crate::codegen::cranelift_backend::cl::AotMethodImpl],
+            method: crate::intern::SymbolId,
+            r: IntValue<'ctx>,
+            args: &[IntValue<'ctx>],
+        ) -> Result<IntValue<'ctx>, String> {
+            let merge = self.new_block("dcm");
+            let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
+            let (is_obj, ptr, recv_class) = self.class_of(r)?;
+            for imp in impls {
+                let Some(modvars) = self.sh.module.get_global(&imp.class_modvars_symbol) else {
+                    continue;
+                };
+                let class = self.table_load(modvars, imp.class_slot as usize)?;
+                // A static method's receiver is the class itself; an
+                // instance method's, an instance of it.
+                let same = if imp.is_static {
+                    self.icmp(IntPredicate::EQ, r, class)?
+                } else {
+                    let expected = self.and(class, self.c64(PTR_MASK))?;
+                    self.icmp(IntPredicate::EQ, recv_class, expected)?
+                };
+                let hit = self
+                    .b
+                    .build_and(is_obj, same, "hit")
+                    .map_err(|e| e.to_string())?;
+                let fast = self.new_block("dcf");
+                let next = self.new_block("dcn");
+                self.cbr(hit, fast, next)?;
+                self.b.position_at_end(fast);
+                let v = match imp.trivial_getter_field.filter(|_| !imp.is_static) {
+                    Some(idx) => {
+                        let fields = self
+                            .b
+                            .build_int_add(
+                                ptr,
+                                self.c64(self.sh.layout.instance_size as u64),
+                                "fields",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        self.field_load(fields, idx)?
+                    }
+                    None => {
+                        let arity = imp.arity as usize;
+                        let callee = match self.sh.module.get_function(&imp.fn_symbol) {
+                            Some(f) => f,
+                            None => self.sh.module.add_function(
+                                &imp.fn_symbol,
+                                self.helper_type(arity),
+                                None,
+                            ),
+                        };
+                        let null = self.c64(TAG_NULL);
+                        let a: Vec<BasicMetadataValueEnum> = std::iter::once(r)
+                            .chain(args.iter().copied())
+                            .chain(std::iter::repeat(null))
+                            .take(arity)
+                            .map(Into::into)
+                            .collect();
+                        let v = self
+                            .b
+                            .build_call(callee, &a, "direct")
+                            .map_err(|e| e.to_string())?
+                            .try_as_basic_value()
+                            .basic()
+                            .ok_or("a method body returns a value")?
+                            .into_int_value();
+                        self.error_poll()?;
+                        v
+                    }
+                };
+                incoming.push((v.into(), self.b.get_insert_block().unwrap()));
+                self.br(merge)?;
+                self.b.position_at_end(next);
+            }
+            let m = self.sym_arg(method)?;
+            let sv = self.wren_call(r, m, args)?;
+            incoming.push((sv.into(), self.b.get_insert_block().unwrap()));
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self.phi(self.i64t().into(), &incoming)?.into_int_value())
+        }
+
         fn lower_call(
             &mut self,
             receiver: &ValueId,
@@ -4986,6 +5079,13 @@ pub mod llvm {
             let mut arg_vals = Vec::with_capacity(args.len());
             for a in args {
                 arg_vals.push(self.boxed(a)?);
+            }
+            if let Some(env) = self.sh.aot
+                && args.len() <= 8
+                && let Some(impls) = env.cha.by_sig.get(self.sh.interner.resolve(method))
+                && !impls.is_empty()
+            {
+                return self.aot_direct_call(impls, method, r, &arg_vals);
             }
             if args.len() > 8 || self.sh.aot.is_some() {
                 let m = self.sym_arg(method)?;

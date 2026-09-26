@@ -1698,7 +1698,7 @@ fn method_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
 /// `Vec<AotMethodImpl>`) pair across all walked modules — once
 /// up front. The lowering threads a borrow of this into
 /// `AotLoweringConfig` so each Call site can devirtualize.
-fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
+pub(crate) fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
     let mut by_sig: HashMap<String, Vec<AotMethodImpl>> = HashMap::new();
 
     for (idx, aot_mod) in modules.iter().enumerate() {
@@ -1736,6 +1736,11 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                 if method_uses_defining_class(&method.mir) {
                     continue;
                 }
+                // A constructor's body is its initializer, which only
+                // the constructor call runs on a fresh instance.
+                if method.is_constructor {
+                    continue;
+                }
                 let fn_symbol = format!("{}__method_{}_{}", fn_prefix, c_idx, m_idx);
                 let trivial =
                     crate::runtime::engine::ExecutionEngine::mir_trivial_getter_field(&method.mir);
@@ -1751,10 +1756,11 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                 // `group(name)` shape, where the second body
                 // unwraps the named-groups map and the first
                 // does a list-index lookup, ran the wrong arm).
-                if let Some(existing) = entry
-                    .iter_mut()
-                    .find(|impl_| impl_.class_name == class_name)
-                {
+                if let Some(existing) = entry.iter_mut().find(|impl_| {
+                    impl_.class_modvars_symbol == modvars_symbol
+                        && impl_.class_slot == class_slot as u32
+                        && impl_.is_static == method.is_static
+                }) {
                     *existing = AotMethodImpl {
                         class_name: class_name.clone(),
                         fn_symbol,
@@ -1762,6 +1768,7 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         trivial_getter_field: trivial,
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
+                        is_static: method.is_static,
                     };
                 } else {
                     entry.push(AotMethodImpl {
@@ -1771,6 +1778,7 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         trivial_getter_field: trivial,
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
+                        is_static: method.is_static,
                     });
                 }
             }

@@ -270,6 +270,57 @@ System.print(keep[199])
     );
 }
 
+/// Calls go straight to the implementation for the receiver's class, or
+/// the class itself for a static method; any other receiver, a subclass
+/// that inherits, or a class from another module goes through dispatch.
+#[test]
+fn direct_calls_pick_the_receivers_implementation() {
+    expect(
+        &[
+            (
+                "main",
+                r#"
+import "other" for Box
+class Crate {
+  construct new(v) { _v = v }
+  v { _v }
+  name { "crate" }
+  static make(v) { Crate.new(v + 1) }
+  static fib(n) { n < 2 ? n : fib(n - 1) + fib(n - 2) }
+}
+class Sub is Crate {
+  construct new(v) { super(v) }
+  name { "sub" }
+}
+class Plain is Crate {
+  construct new(v) { super(v) }
+}
+var items = [Crate.new(1), Sub.new(2), Plain.new(3), Box.new(4)]
+for (item in items) System.print("%(item.name) %(item.v)")
+var f = Fiber.new { items[0].make(1) }
+f.try()
+System.print(f.error)
+System.print(Crate.make(1).v)
+System.print(Box.make(1).v)
+System.print(Crate.fib(15))
+"#,
+            ),
+            (
+                "other",
+                r#"
+class Box {
+  construct new(v) { _v = v }
+  v { "box %(_v)" }
+  name { "box" }
+  static make(v) { Box.new(v * 10) }
+}
+"#,
+            ),
+        ],
+        "crate 1\nsub 2\ncrate 3\nbox box 4\nCrate does not implement 'make(_)'\n2\nbox 10\n610\n",
+    );
+}
+
 /// Compiled frames keep their values in the shadow stack, where the
 /// collector finds them: collecting at every allocation loses none.
 #[test]

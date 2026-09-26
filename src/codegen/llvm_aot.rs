@@ -24,7 +24,7 @@ use inkwell::values::{
 };
 
 use crate::codegen::aot::{
-    AotBundleMeta, AotClosureManifest, AotError, AotManifest, AotModule, module_symbols,
+    AotBundleMeta, AotClosureManifest, AotError, AotManifest, AotModule, build_cha, module_symbols,
     plan_classes, resolve_manifest_imports,
 };
 use crate::codegen::llvm_backend::llvm::{AotEnv, lower_aot_function, stamp_target};
@@ -150,13 +150,28 @@ pub fn compile_modules_to_llvm_object(
 
     let module_err = |e: String| AotError::Module(e);
     let last = modules.len() - 1;
+    // A direct call checks its receiver against a class in any module,
+    // so every module's variables exist before the first body.
+    let modvars: Vec<GlobalValue> = modules
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            table(
+                &ctx,
+                &module,
+                &module_symbols(idx, last).1,
+                m.module_var_count,
+            )
+        })
+        .collect();
+    let cha = std::rc::Rc::new(build_cha(modules, last));
     let mut manifests = Vec::with_capacity(modules.len());
     let mut tables = Vec::with_capacity(modules.len());
     for (idx, m) in modules.iter().enumerate() {
         let (fn_symbol, modvars_symbol, consts_symbol, symbols_symbol) = module_symbols(idx, last);
         let closures_symbol = format!("{fn_symbol}__closures_data");
         let env = AotEnv {
-            modvars: table(&ctx, &module, &modvars_symbol, m.module_var_count),
+            modvars: modvars[idx],
             consts: placeholder(&ctx, &module, &consts_symbol),
             symbols: placeholder(&ctx, &module, &symbols_symbol),
             closures: placeholder(&ctx, &module, &closures_symbol),
@@ -164,6 +179,7 @@ pub fn compile_modules_to_llvm_object(
             symbol_remap: RefCell::new(Vec::new()),
             defining_slot: Cell::new(None),
             wasm: target.is_wasm(),
+            cha: cha.clone(),
         };
         let lower = |mir: &crate::mir::MirFunction, symbol: &str| {
             let f = lower_aot_function(
