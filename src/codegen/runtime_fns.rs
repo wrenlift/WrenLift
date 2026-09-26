@@ -6179,149 +6179,217 @@ pub const JIT_ONLY_FN_NAMES: &[&str] = &[
     "wren_deopt_at",
 ];
 
-/// Every other name [`resolve`] answers: what a JIT module registers up
-/// front, so a body links without a symbol lookup in the process, and
-/// what an AOT program's runtime object must export.
+/// A runtime helper's parameter or return type, as compiled code
+/// declares it: a pointer is 32 bits wide on wasm32, a Value never is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperTy {
+    I64,
+    Ptr,
+}
+
+/// A runtime helper's signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperSig {
+    pub params: &'static [HelperTy],
+    pub ret: Option<HelperTy>,
+}
+
+pub trait HelperArg {
+    const TY: HelperTy;
+}
+impl HelperArg for u64 {
+    const TY: HelperTy = HelperTy::I64;
+}
+impl HelperArg for *const u64 {
+    const TY: HelperTy = HelperTy::Ptr;
+}
+impl HelperArg for *mut u64 {
+    const TY: HelperTy = HelperTy::Ptr;
+}
+
 #[cfg(any(feature = "host", feature = "aot_runtime"))]
-pub const RUNTIME_FN_NAMES: &[&str] = &[
-    "wren_get_module_var",
-    "wren_set_module_var",
-    "wren_call_0",
-    "wren_call_1",
-    "wren_call_2",
-    "wren_call_3",
-    "wren_call_4",
-    "wren_call_5",
-    "wren_call_6",
-    "wren_call_7",
-    "wren_call_8",
-    "wren_call_dynamic",
-    "wren_call_static_self_0",
-    "wren_call_static_self_1",
-    "wren_call_static_self_2",
-    "wren_call_static_self_3",
-    "wren_call_static_self_4",
-    "wren_super_call_0",
-    "wren_super_call_1",
-    "wren_super_call_2",
-    "wren_super_call_3",
-    "wren_super_call_4",
-    "wren_super_call_from_1",
-    "wren_super_call_from_2",
-    "wren_super_call_from_3",
-    "wren_super_call_from_4",
-    "wren_load_jit_ptr",
-    "wren_load_jit_closure",
-    "wren_aot_check_error",
-    "wren_jit_roots_snapshot",
-    "wren_jit_roots_restore",
-    "wren_known_call_0",
-    "wren_known_call_1",
-    "wren_known_call_2",
-    "wren_known_call_3",
-    "wren_known_call_0_nocheck",
-    "wren_known_call_1_nocheck",
-    "wren_known_call_2_nocheck",
-    "wren_known_call_3_nocheck",
-    "wren_construct_0",
-    "wren_construct_1",
-    "wren_construct_2",
-    "wren_construct_3",
-    "wren_ic_call_0",
-    "wren_ic_call_1",
-    "wren_ic_call_2",
-    "wren_ic_call_3",
-    "wren_make_list",
-    "wren_make_list_1",
-    "wren_make_list_2",
-    "wren_make_list_3",
-    "wren_make_list_4",
-    "wren_list_add",
-    "wren_make_map",
-    "wren_map_set",
-    "wren_make_range",
-    "wren_make_closure_0",
-    "wren_make_closure_1",
-    "wren_make_closure_2",
-    "wren_make_closure_3",
-    "wren_make_closure_4",
-    "wren_make_closure_5",
-    "wren_make_closure_6",
-    "wren_make_closure_7",
-    "wren_make_closure_8",
-    "wren_make_closure_n",
-    "wren_string_concat",
-    "wren_osr_post",
-    "wren_osr_take",
-    "wren_to_string",
-    "wren_const_string",
-    "wren_is_type",
-    "wren_guard_class",
-    "wren_guard_protocol",
-    "wren_subscript_get",
-    "wren_subscript_set",
-    "wren_num_add",
-    "wren_num_sub",
-    "wren_num_mul",
-    "wren_num_div",
-    "wren_num_mod",
-    "wren_num_neg",
-    "wren_bit_and",
-    "wren_bit_or",
-    "wren_bit_xor",
-    "wren_bit_not",
-    "wren_bit_shl",
-    "wren_bit_shr",
-    "wren_alloc_simd4f",
-    "wren_alloc_simd4i",
-    "wren_cmp_lt",
-    "wren_cmp_gt",
-    "wren_cmp_le",
-    "wren_cmp_ge",
-    "wren_cmp_eq",
-    "wren_cmp_ne",
-    "wren_not",
-    "wren_is_truthy",
-    "wren_get_upvalue",
-    "wren_set_upvalue",
-    "wren_shadow_store",
-    "wren_shadow_load",
-    "wren_enter_shadow_frame",
-    "wren_exit_shadow_frame",
-    "wren_get_static_field",
-    "wren_set_static_field",
-    "wren_fp_sin",
-    "wren_fp_cos",
-    "wren_fp_tan",
-    "wren_fp_asin",
-    "wren_fp_acos",
-    "wren_fp_atan",
-    "wren_fp_log",
-    "wren_fp_log2",
-    "wren_fp_exp",
-    "wren_fp_cbrt",
-    "wren_fp_atan2",
-    "wren_fp_pow",
-    "wren_fp_min",
-    "wren_fp_max",
-    "wren_jit_frame_push",
-    "wren_jit_frame_pop",
-    "wren_ic_enter",
-    "wren_ic_leave",
-    "wren_alloc_instance",
-    "wren_ic_ctor_0",
-    "wren_ic_ctor_1",
-    "wren_ic_ctor_2",
-    "wren_ic_ctor_3",
-    "wren_ic_native_0",
-    "wren_ic_native_1",
-    "wren_ic_native_2",
-    "wren_ic_native_3",
-    "wren_ic_host_0",
-    "wren_ic_host_1",
-    "wren_ic_host_2",
-    "wren_ic_host_3",
-];
+macro_rules! helper_ret {
+    () => {
+        None
+    };
+    ($r:ty) => {
+        Some(<$r as HelperArg>::TY)
+    };
+}
+
+/// Declares the helpers compiled code may import. Each entry is
+/// coerced to its function pointer type at compile time, so the
+/// table cannot drift from the definitions.
+#[cfg(any(feature = "host", feature = "aot_runtime"))]
+macro_rules! runtime_helpers {
+    ($($name:ident($($p:ty),*) $(-> $r:ty)?;)*) => {
+        /// Every other name [`resolve`] answers: what a JIT module
+        /// registers up front, so a body links without a symbol lookup
+        /// in the process, and what an AOT program's runtime object
+        /// must export.
+        pub const RUNTIME_FN_NAMES: &[&str] = &[$(stringify!($name)),*];
+
+        /// The signature of each of [`RUNTIME_FN_NAMES`], in order.
+        pub const RUNTIME_FN_SIGS: &[HelperSig] = &[$(HelperSig {
+            params: &[$(<$p as HelperArg>::TY),*],
+            ret: helper_ret!($($r)?),
+        }),*];
+
+        const _: () = {
+            $(let _: unsafe extern "C" fn($($p),*) $(-> $r)? = $name;)*
+        };
+    };
+}
+
+#[cfg(any(feature = "host", feature = "aot_runtime"))]
+runtime_helpers! {
+    wren_get_module_var(u64) -> u64;
+    wren_set_module_var(u64, u64) -> u64;
+    wren_call_0(u64, u64) -> u64;
+    wren_call_1(u64, u64, u64) -> u64;
+    wren_call_2(u64, u64, u64, u64) -> u64;
+    wren_call_3(u64, u64, u64, u64, u64) -> u64;
+    wren_call_4(u64, u64, u64, u64, u64, u64) -> u64;
+    wren_call_5(u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_call_6(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_call_7(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_call_8(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_call_dynamic(u64, u64, u64, *const u64) -> u64;
+    wren_call_static_self_0() -> u64;
+    wren_call_static_self_1(u64) -> u64;
+    wren_call_static_self_2(u64, u64) -> u64;
+    wren_call_static_self_3(u64, u64, u64) -> u64;
+    wren_call_static_self_4(u64, u64, u64, u64) -> u64;
+    wren_super_call_0(u64) -> u64;
+    wren_super_call_1(u64, u64) -> u64;
+    wren_super_call_2(u64, u64, u64) -> u64;
+    wren_super_call_3(u64, u64, u64, u64) -> u64;
+    wren_super_call_4(u64, u64, u64, u64, u64) -> u64;
+    wren_super_call_from_1(u64, u64, u64) -> u64;
+    wren_super_call_from_2(u64, u64, u64, u64) -> u64;
+    wren_super_call_from_3(u64, u64, u64, u64, u64) -> u64;
+    wren_super_call_from_4(u64, u64, u64, u64, u64, u64) -> u64;
+    wren_load_jit_ptr(u64) -> u64;
+    wren_load_jit_closure() -> u64;
+    wren_aot_check_error() -> u64;
+    wren_jit_roots_snapshot() -> u64;
+    wren_jit_roots_restore(u64);
+    wren_known_call_0(u64, u64) -> u64;
+    wren_known_call_1(u64, u64, u64) -> u64;
+    wren_known_call_2(u64, u64, u64, u64) -> u64;
+    wren_known_call_3(u64, u64, u64, u64, u64) -> u64;
+    wren_known_call_0_nocheck(u64, u64) -> u64;
+    wren_known_call_1_nocheck(u64, u64, u64) -> u64;
+    wren_known_call_2_nocheck(u64, u64, u64, u64) -> u64;
+    wren_known_call_3_nocheck(u64, u64, u64, u64, u64) -> u64;
+    wren_construct_0(u64, u64) -> u64;
+    wren_construct_1(u64, u64, u64) -> u64;
+    wren_construct_2(u64, u64, u64, u64) -> u64;
+    wren_construct_3(u64, u64, u64, u64, u64) -> u64;
+    wren_ic_call_0(u64, u64) -> u64;
+    wren_ic_call_1(u64, u64, u64) -> u64;
+    wren_ic_call_2(u64, u64, u64, u64) -> u64;
+    wren_ic_call_3(u64, u64, u64, u64, u64) -> u64;
+    wren_make_list() -> u64;
+    wren_make_list_1(u64) -> u64;
+    wren_make_list_2(u64, u64) -> u64;
+    wren_make_list_3(u64, u64, u64) -> u64;
+    wren_make_list_4(u64, u64, u64, u64) -> u64;
+    wren_list_add(u64, u64);
+    wren_make_map() -> u64;
+    wren_map_set(u64, u64, u64);
+    wren_make_range(u64, u64, u64) -> u64;
+    wren_make_closure_0(u64) -> u64;
+    wren_make_closure_1(u64, u64) -> u64;
+    wren_make_closure_2(u64, u64, u64) -> u64;
+    wren_make_closure_3(u64, u64, u64, u64) -> u64;
+    wren_make_closure_4(u64, u64, u64, u64, u64) -> u64;
+    wren_make_closure_5(u64, u64, u64, u64, u64, u64) -> u64;
+    wren_make_closure_6(u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_make_closure_7(u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_make_closure_8(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+    wren_make_closure_n(u64, u64, *const u64) -> u64;
+    wren_string_concat(u64, u64) -> u64;
+    wren_osr_post(*mut u64, u64) -> u64;
+    wren_osr_take(*mut u64) -> u64;
+    wren_to_string(u64) -> u64;
+    wren_const_string(u64) -> u64;
+    wren_is_type(u64, u64) -> u64;
+    wren_guard_class(u64, u64) -> u64;
+    wren_guard_protocol(u64, u64) -> u64;
+    wren_subscript_get(u64, u64) -> u64;
+    wren_subscript_set(u64, u64, u64) -> u64;
+    wren_num_add(u64, u64) -> u64;
+    wren_num_sub(u64, u64) -> u64;
+    wren_num_mul(u64, u64) -> u64;
+    wren_num_div(u64, u64) -> u64;
+    wren_num_mod(u64, u64) -> u64;
+    wren_num_neg(u64) -> u64;
+    wren_bit_and(u64, u64) -> u64;
+    wren_bit_or(u64, u64) -> u64;
+    wren_bit_xor(u64, u64) -> u64;
+    wren_bit_not(u64) -> u64;
+    wren_bit_shl(u64, u64) -> u64;
+    wren_bit_shr(u64, u64) -> u64;
+    wren_alloc_simd4f(u64, u64, u64, u64) -> u64;
+    wren_alloc_simd4i(u64, u64, u64, u64) -> u64;
+    wren_cmp_lt(u64, u64) -> u64;
+    wren_cmp_gt(u64, u64) -> u64;
+    wren_cmp_le(u64, u64) -> u64;
+    wren_cmp_ge(u64, u64) -> u64;
+    wren_cmp_eq(u64, u64) -> u64;
+    wren_cmp_ne(u64, u64) -> u64;
+    wren_not(u64) -> u64;
+    wren_is_truthy(u64) -> u64;
+    wren_get_upvalue(u64) -> u64;
+    wren_set_upvalue(u64, u64) -> u64;
+    wren_shadow_store(u64, u64) -> u64;
+    wren_shadow_load(u64) -> u64;
+    wren_enter_shadow_frame(u64);
+    wren_exit_shadow_frame();
+    wren_get_static_field(u64) -> u64;
+    wren_set_static_field(u64, u64) -> u64;
+    wren_fp_sin(u64) -> u64;
+    wren_fp_cos(u64) -> u64;
+    wren_fp_tan(u64) -> u64;
+    wren_fp_asin(u64) -> u64;
+    wren_fp_acos(u64) -> u64;
+    wren_fp_atan(u64) -> u64;
+    wren_fp_log(u64) -> u64;
+    wren_fp_log2(u64) -> u64;
+    wren_fp_exp(u64) -> u64;
+    wren_fp_cbrt(u64) -> u64;
+    wren_fp_atan2(u64, u64) -> u64;
+    wren_fp_pow(u64, u64) -> u64;
+    wren_fp_min(u64, u64) -> u64;
+    wren_fp_max(u64, u64) -> u64;
+    wren_jit_frame_push(u64, u64);
+    wren_jit_frame_pop();
+    wren_ic_enter(u64, u64) -> u64;
+    wren_ic_leave(u64);
+    wren_alloc_instance(u64) -> u64;
+    wren_ic_ctor_0(u64, u64) -> u64;
+    wren_ic_ctor_1(u64, u64, u64) -> u64;
+    wren_ic_ctor_2(u64, u64, u64, u64) -> u64;
+    wren_ic_ctor_3(u64, u64, u64, u64, u64) -> u64;
+    wren_ic_native_0(u64, u64) -> u64;
+    wren_ic_native_1(u64, u64, u64) -> u64;
+    wren_ic_native_2(u64, u64, u64, u64) -> u64;
+    wren_ic_native_3(u64, u64, u64, u64, u64) -> u64;
+    wren_ic_host_0(u64, u64, u64) -> u64;
+    wren_ic_host_1(u64, u64, u64, u64) -> u64;
+    wren_ic_host_2(u64, u64, u64, u64, u64) -> u64;
+    wren_ic_host_3(u64, u64, u64, u64, u64, u64) -> u64;
+}
+
+/// The signature of runtime helper `name`.
+#[cfg(any(feature = "host", feature = "aot_runtime"))]
+pub fn helper_sig(name: &str) -> Option<HelperSig> {
+    RUNTIME_FN_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .map(|i| RUNTIME_FN_SIGS[i])
+}
 
 /// Resolve a runtime function name to its address.
 /// Returns `None` if the name is unknown.
