@@ -248,13 +248,61 @@ pub fn verify_plugin_abi(_library: &Library, _name: &str) -> Result<(), ForeignL
     Ok(())
 }
 
+/// A WASI program's way to the side modules its host loaded beside it:
+/// forwards to Ash's `ash_host_dlopen` / `ash_host_dlsym` imports, which
+/// a program with foreign classes installs through
+/// `wlift_aot_set_native_loader`. Pointers rather than imports, so the
+/// runtime links on its own and a program without plugins imports
+/// nothing beyond WASI.
+pub struct NativeLoader {
+    /// `(name, len) -> 1` when a library of that name is loaded.
+    pub open: unsafe extern "C" fn(*const u8, usize) -> i32,
+    /// `(lib, len, symbol, len) ->` the symbol's table index, or 0.
+    pub sym: unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> i32,
+}
+
+static NATIVE_LOADER: OnceLock<NativeLoader> = OnceLock::new();
+
+/// Install the side-module loader; the first one stands.
+pub fn set_native_loader(loader: NativeLoader) {
+    let _ = NATIVE_LOADER.set(loader);
+}
+
+fn host_has_library(name: &str) -> bool {
+    NATIVE_LOADER
+        .get()
+        .is_some_and(|l| unsafe { (l.open)(name.as_ptr(), name.len()) } != 0)
+}
+
+/// `symbol` from the side module `library`: a table index, which is what
+/// a function pointer is in wasm, so it is called like a static plugin's.
+fn host_symbol(library: &str, symbol: &str) -> Option<ResolvedSymbol> {
+    let loader = NATIVE_LOADER.get()?;
+    let index = unsafe {
+        (loader.sym)(
+            library.as_ptr(),
+            library.len(),
+            symbol.as_ptr(),
+            symbol.len(),
+        )
+    };
+    if index == 0 {
+        return None;
+    }
+    // SAFETY: a nonzero answer is a table slot holding the side module's
+    // export, an `extern "C" fn(*mut VM)` by the plugin ABI.
+    Some(ResolvedSymbol::Static(unsafe {
+        std::mem::transmute::<usize, ForeignCFn>(index as usize)
+    }))
+}
+
 pub fn load_library(
     name: &str,
     _search_paths: &[PathBuf],
     _name_overrides: &HashMap<String, PathBuf>,
 ) -> Result<Library, ForeignLoadError> {
     let reg = registry().lock().expect("foreign registry poisoned");
-    if reg.contains_key(name) {
+    if reg.contains_key(name) || host_has_library(name) {
         Ok(Library {
             name: name.to_string(),
         })
@@ -284,6 +332,7 @@ pub fn resolve_symbol(
     };
     reg.get(key)
         .and_then(|syms| syms.get(symbol).copied())
+        .or_else(|| host_symbol(key, symbol))
         .ok_or_else(|| ForeignLoadError::SymbolNotFound {
             library: library_name.to_string(),
             symbol: symbol.to_string(),
@@ -298,7 +347,7 @@ pub fn resolve_symbol(
 /// import would land in the `env` namespace and wren_lift's
 /// own wasm cdylib couldn't link — wasm-bindgen folds it into
 /// the standard import set the loader populates.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(
@@ -307,12 +356,6 @@ extern "C" {
     )]
     fn wlift_dispatch_dynamic_plugin(idx: u32, vm: *mut VM);
 }
-
-/// How a WASI program reaches its plugins: set by a program with foreign
-/// classes to a forward to its harness's import, null otherwise. A
-/// pointer rather than a symbol, so the runtime links on its own and a
-/// program without plugins imports nothing beyond WASI.
-pub static PLUGIN_DISPATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Drive a dynamic-plugin call. Same shape as `dispatch_foreign_c`
 /// but goes through the JS-side dispatcher because the plugin's
@@ -324,23 +367,12 @@ pub fn dispatch_dynamic(vm: &mut VM, idx: u32, args: &[Value]) -> Value {
     let vm_ptr = vm as *mut VM;
     vm.api_stack.clear();
     vm.api_stack.extend_from_slice(args);
-    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+    #[cfg(target_arch = "wasm32")]
     {
         // wasm-bindgen-generated import: the JS host shim is safe
         // by construction (it only validates and forwards), so no
         // `unsafe` block needed.
         wlift_dispatch_dynamic_plugin(idx, vm_ptr);
-    }
-    #[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
-    match PLUGIN_DISPATCH.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => crate::runtime::object::NativeContext::runtime_error(
-            vm,
-            "no plugin module is loaded".to_string(),
-        ),
-        f => {
-            let f: unsafe extern "C" fn(u32, *mut VM) = unsafe { std::mem::transmute(f) };
-            unsafe { f(idx, vm_ptr) };
-        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

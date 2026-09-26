@@ -246,17 +246,18 @@ fn entry_hatchfile(entry_path: &Path) -> Option<std::path::PathBuf> {
         .find(|p| p.exists())
 }
 
-/// The wasm plugin modules a program built for `triple`, a wasm target,
-/// loads, by library name: a `.hatch` archive's wasm `NativeLib`
-/// sections, or for a source tree the wasm variant of each
-/// `native_libs` entry in the entry's hatchfile and its path deps'.
-/// A library with no wasm build is left out; binding it then fails
-/// when the program starts, naming it.
+/// The native libraries a program built for `triple`, a wasm target,
+/// loads, by library name: each a side module or a PIC archive of one
+/// (see `llvm_aot::place_wasm_libraries`). They come from a `.hatch`
+/// archive's `NativeLib` sections, or for a source tree from the wasm
+/// variant of each `native_libs` entry in the entry's hatchfile and its
+/// path deps'. A library with no wasm build is left out; binding it then
+/// fails when the program starts, naming it.
 pub fn collect_wasm_plugins(
     entry_path: &Path,
     triple: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, AotError> {
-    let is_module = |bytes: &[u8]| bytes.starts_with(b"\0asm");
+    let is_module = |bytes: &[u8]| bytes.starts_with(b"\0asm") || bytes.starts_with(b"!<arch>\n");
     let bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
     if crate::hatch::looks_like_hatch(&bytes) {
         let hatch = crate::hatch::load(&bytes)

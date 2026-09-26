@@ -441,82 +441,20 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_invoke_module_body",
     "wlift_aot_take_error",
     "wlift_aot_stack_top",
-    "wlift_aot_set_plugin_dispatch",
+    "wlift_aot_set_native_loader",
     "wlift_error_pending",
 ];
 
-/// What the harness running a wasm AOT program with plugins calls on
-/// it: the plugin-registration and buffer entries below, and the two C
-/// API functions its string bridges go through. The linker exports
-/// these beside whatever the plugins import.
-pub const WASM_HARNESS_EXPORTS: &[&str] = &[
-    "wlift_aot_host_alloc",
-    "wlift_aot_host_free",
-    "wlift_aot_register_plugin_export",
-    "wrenGetSlotString",
-    "wrenSetSlotString",
-];
-
-/// `len` bytes in the program's memory, for a harness copying a
-/// plugin's bytes in; returned with [`wlift_aot_host_free`].
+/// Let a wasm program reach the side modules its host loaded beside
+/// it, through forwards to the host's `ash_host_dlopen` and
+/// `ash_host_dlsym`. Only a program with foreign classes calls this.
 #[unsafe(no_mangle)]
 #[cfg(all(feature = "aot_runtime", not(feature = "host")))]
-pub extern "C" fn wlift_aot_host_alloc(len: usize) -> *mut u8 {
-    let mut buf = vec![0u8; len];
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
-}
-
-/// # Safety
-///
-/// `ptr` and `len` must come from one [`wlift_aot_host_alloc`] call.
-#[unsafe(no_mangle)]
-#[cfg(all(feature = "aot_runtime", not(feature = "host")))]
-pub unsafe extern "C" fn wlift_aot_host_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len != 0 {
-        drop(unsafe { Vec::from_raw_parts(ptr, len, len) });
-    }
-}
-
-/// Route calls to plugin-bound methods through `dispatch`, a wasm
-/// program's forward to its harness.
-///
-/// # Safety
-///
-/// `dispatch` must be callable as `(idx, vm)` for the program's life.
-#[unsafe(no_mangle)]
-#[cfg(all(feature = "aot_runtime", not(feature = "host")))]
-pub unsafe extern "C" fn wlift_aot_set_plugin_dispatch(
-    dispatch: unsafe extern "C" fn(u32, *mut crate::runtime::vm::VM),
+pub extern "C" fn wlift_aot_set_native_loader(
+    open: unsafe extern "C" fn(*const u8, usize) -> i32,
+    sym: unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> i32,
 ) {
-    crate::runtime::foreign::PLUGIN_DISPATCH
-        .store(dispatch as usize, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Register `symbol`, an export of the plugin module the harness
-/// loaded for `library`, as a foreign-method target; the index the
-/// harness's `env.ash_host_wlift_plugin_dispatch` import is later
-/// called with.
-///
-/// # Safety
-///
-/// Both name pointers must be valid for their lengths.
-#[unsafe(no_mangle)]
-#[cfg(all(feature = "aot_runtime", not(feature = "host")))]
-pub unsafe extern "C" fn wlift_aot_register_plugin_export(
-    library: *const u8,
-    library_len: usize,
-    symbol: *const u8,
-    symbol_len: usize,
-) -> u32 {
-    let name = |p: *const u8, n: usize| {
-        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, n) }).into_owned()
-    };
-    crate::runtime::foreign::register_plugin_dynamic(
-        &name(library, library_len),
-        &name(symbol, symbol_len),
-    )
+    crate::runtime::foreign::set_native_loader(crate::runtime::foreign::NativeLoader { open, sym });
 }
 
 /// The signature of an entry point compiled AOT bodies call directly

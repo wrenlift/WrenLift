@@ -11,7 +11,9 @@ use std::path::Path;
 use std::process::Command;
 
 use wren_lift::codegen::aot::{AotBundleMeta, walk_imports};
-use wren_lift::codegen::llvm_aot::{LlvmTarget, compile_modules_to_llvm_object, link_wasm};
+use wren_lift::codegen::llvm_aot::{
+    LlvmTarget, compile_modules_to_llvm_object, link_wasm, place_wasm_libraries,
+};
 
 /// How the program object and the runtime object become one module.
 #[derive(Clone, Copy)]
@@ -46,7 +48,7 @@ fn run_linked(files: &[(&str, &str)], how: Link, env: &[(&str, &str)]) -> Option
 
     let wasm = dir.path().join("program.wasm");
     match how {
-        Link::Wlift => link_wasm(&object, &runtime, &[], &wasm).expect("linking"),
+        Link::Wlift => link_wasm(&object, &runtime, &wasm).expect("linking"),
         Link::Lld => {
             let Some(lld) = common::rust_lld() else {
                 eprintln!("no rust-lld; skipping");
@@ -111,14 +113,13 @@ fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
     (code, text)
 }
 
-/// Compile `files` for wasm32 with `plugins` (library name, module text)
-/// bundled, and run the result the way a harness runs one: instantiate
-/// the program, instantiate each plugin against its exports plus the
-/// string bridges, register the plugins' `wlift_*` exports, then start.
-fn run_with_plugins(files: &[(&str, &str)], plugins: &[(&str, &str)]) -> Option<(i32, String)> {
+/// Compile `files` for wasm32 with `libraries` (name, side module text)
+/// placed beside the output, and run it the way an Ash host does: load
+/// each side module into the program's memory and table, then start.
+fn run_with_libraries(files: &[(&str, &str)], libraries: &[(&str, &str)]) -> Option<(i32, String)> {
     let runtime = common::runtime_object()?;
     let dir = tempfile::Builder::new()
-        .prefix("wlift_wasm_plugins_")
+        .prefix("wlift_wasm_libs_")
         .tempdir()
         .expect("tempdir");
     for (name, source) in files {
@@ -129,74 +130,154 @@ fn run_with_plugins(files: &[(&str, &str)], plugins: &[(&str, &str)]) -> Option<
     let target = LlvmTarget::new("wasm32-wasip1", None, None);
     compile_modules_to_llvm_object(&walk.modules, &AotBundleMeta::default(), &target, &object)
         .expect("compile to a wasm32 object");
-    let modules: Vec<(String, Vec<u8>)> = plugins
+    let out = dir.path().join("out").join("program.wasm");
+    std::fs::create_dir(out.parent().unwrap()).expect("output dir");
+    let modules: Vec<(String, Vec<u8>)> = libraries
         .iter()
-        .map(|(lib, text)| (lib.to_string(), wat::parse_str(text).expect("plugin text")))
+        .map(|(lib, text)| {
+            (
+                lib.to_string(),
+                wat::parse_str(text).expect("side module text"),
+            )
+        })
         .collect();
-    let wasm = dir.path().join("program.wasm");
-    link_wasm(&object, &runtime, &modules, &wasm).expect("linking");
-    Some(harness::run(&std::fs::read(&wasm).expect("read program")))
+    place_wasm_libraries(&modules, &Default::default(), &out).expect("placing libraries");
+    link_wasm(&object, &runtime, &out).expect("linking");
+    Some(host::run(&out))
 }
 
-/// A minimal harness for a wasm AOT program with plugins.
-mod harness {
-    use wasmtime::{Caller, Engine, Extern, Func, Instance, Linker, Memory, Module, Store};
+/// A host for a wasm AOT program with native libraries, after Ash's
+/// (`ash_wasm_runtime`'s `native/dylink.rs`): side modules beside the
+/// program are loaded into its memory and table before it starts, and it
+/// reaches them through `ash_host_dlopen` / `ash_host_dlsym`.
+mod host {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use wasmtime::{
+        Caller, Engine, Extern, Global, GlobalType, Instance, Linker, Module, Mutability, Ref,
+        Store, Table, Val, ValType,
+    };
     use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-    use wren_lift::codegen::llvm_aot::PLUGIN_SECTION_PREFIX;
 
     struct Host {
         wasi: WasiP1Ctx,
-        program: Option<Instance>,
-        /// Plugin exports by the index the program registered them under.
-        dispatch: Vec<Option<Func>>,
+        libraries: HashMap<String, Instance>,
+        table: Option<Table>,
+        /// `(library, symbol)` to the table slot handed out for it.
+        resolved: HashMap<(String, String), i32>,
     }
 
-    fn program_memory(caller: &mut Caller<'_, Host>) -> Memory {
-        let program = caller.data().program.expect("program instance");
-        program
-            .get_memory(&mut *caller, "memory")
-            .expect("program memory")
+    fn guest_str(caller: &mut Caller<'_, Host>, ptr: i32, len: i32) -> String {
+        let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
+            return String::new();
+        };
+        let bytes = &memory.data(&caller)[ptr as usize..(ptr + len) as usize];
+        String::from_utf8_lossy(bytes).into_owned()
     }
 
-    fn program_func(caller: &mut Caller<'_, Host>, name: &str) -> Func {
-        let program = caller.data().program.expect("program instance");
-        program.get_func(&mut *caller, name).expect(name)
+    /// A table slot holding `f`.
+    fn slot(store: &mut Store<Host>, table: Table, f: wasmtime::Func) -> i32 {
+        let index = table.size(&mut *store) as i32;
+        table
+            .grow(&mut *store, 1, Ref::Func(Some(f)))
+            .expect("growing the table");
+        index
     }
 
-    fn call_i32(caller: &mut Caller<'_, Host>, name: &str, args: &[i32]) -> i32 {
-        let f = program_func(caller, name);
-        let args: Vec<wasmtime::Val> = args.iter().map(|a| (*a).into()).collect();
-        let mut out = [wasmtime::Val::I32(0)];
-        let n = f.ty(&*caller).results().len();
-        f.call(&mut *caller, &args, &mut out[..n]).expect(name);
-        out[0].unwrap_i32()
-    }
-
-    /// `bytes` copied into the program's memory; the address and length.
-    fn put(store: &mut Store<Host>, program: Instance, bytes: &[u8]) -> (i32, i32) {
-        let alloc = program
-            .get_typed_func::<i32, i32>(&mut *store, "wlift_aot_host_alloc")
-            .expect("wlift_aot_host_alloc");
-        let p = alloc.call(&mut *store, bytes.len() as i32).expect("alloc");
-        let memory = program.get_memory(&mut *store, "memory").expect("memory");
-        memory.write(&mut *store, p as usize, bytes).expect("write");
-        (p, bytes.len() as i32)
-    }
-
-    /// The plugin modules a program carries, by library name.
-    fn plugins(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
-        for payload in wasmparser_aot::Parser::new(0).parse_all(bytes) {
-            if let Ok(wasmparser_aot::Payload::CustomSection(section)) = payload
-                && let Some(lib) = section.name().strip_prefix(PLUGIN_SECTION_PREFIX)
-            {
-                out.push((lib.to_string(), section.data().to_vec()));
+    fn load(
+        store: &mut Store<Host>,
+        linker: &Linker<Host>,
+        main: Instance,
+        lib: &str,
+        bytes: &[u8],
+    ) {
+        let side = ash_wasm_link::read_side_module(bytes)
+            .expect("reading dylink.0")
+            .expect("a side module");
+        let module = Module::new(store.engine(), bytes).expect("compiling a side module");
+        let memory = main
+            .get_export(&mut *store, "memory")
+            .expect("program memory");
+        let table = main
+            .get_table(&mut *store, "__indirect_function_table")
+            .expect("the program exports its table to host libraries");
+        let memory_base = if side.memory_size > 0 {
+            let malloc = main
+                .get_typed_func::<i32, i32>(&mut *store, "malloc")
+                .expect("the program exports malloc");
+            malloc
+                .call(&mut *store, side.memory_size as i32)
+                .expect("malloc")
+        } else {
+            0
+        };
+        let table_base = table.size(&mut *store) as i32;
+        table
+            .grow(&mut *store, side.table_size as u64, Ref::Func(None))
+            .expect("table");
+        let constant = |store: &mut Store<Host>, v: i32| {
+            Global::new(
+                &mut *store,
+                GlobalType::new(ValType::I32, Mutability::Const),
+                Val::I32(v),
+            )
+            .expect("global")
+        };
+        let memory_base = constant(store, memory_base);
+        let table_base = constant(store, table_base);
+        let mut imports = Vec::new();
+        let mut got = Vec::new();
+        for import in module.imports() {
+            if import.module() == "GOT.mem" || import.module() == "GOT.func" {
+                let g = Global::new(
+                    &mut *store,
+                    GlobalType::new(ValType::I32, Mutability::Var),
+                    Val::I32(0),
+                )
+                .expect("global");
+                got.push((import.module() == "GOT.func", import.name().to_string(), g));
+                imports.push(Extern::Global(g));
+                continue;
+            }
+            let found = match (import.module(), import.name()) {
+                ("env", "memory") => Some(memory.clone()),
+                ("env", "__indirect_function_table") => Some(Extern::Table(table)),
+                ("env", "__memory_base") => Some(Extern::Global(memory_base)),
+                ("env", "__table_base") => Some(Extern::Global(table_base)),
+                ("env", name) => main
+                    .get_export(&mut *store, name)
+                    .or_else(|| linker.get(&mut *store, "env", name)),
+                (module, name) => linker.get(&mut *store, module, name),
+            };
+            imports.push(
+                found.unwrap_or_else(|| {
+                    panic!("{lib} imports {}::{}", import.module(), import.name())
+                }),
+            );
+        }
+        let instance = Instance::new(&mut *store, &module, &imports).expect("instantiating");
+        for (function, name, g) in got {
+            let value = [instance, main].iter().find_map(|owner| {
+                match owner.get_export(&mut *store, &name)? {
+                    Extern::Global(a) if !function => a.get(&mut *store).i32(),
+                    Extern::Func(f) if function => Some(slot(store, table, f)),
+                    _ => None,
+                }
+            });
+            g.set(&mut *store, Val::I32(value.expect("a GOT entry")))
+                .expect("GOT");
+        }
+        for init in ["__wasm_apply_data_relocs", "__wasm_call_ctors"] {
+            if let Ok(f) = instance.get_typed_func::<(), ()>(&mut *store, init) {
+                f.call(&mut *store, ()).expect(init);
             }
         }
-        out
+        store.data_mut().table = Some(table);
+        store.data_mut().libraries.insert(lib.to_string(), instance);
     }
 
-    pub fn run(bytes: &[u8]) -> (i32, String) {
+    pub fn run(program: &Path) -> (i32, String) {
         let engine = Engine::default();
         let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 20);
         let wasi = wasmtime_wasi::WasiCtxBuilder::new()
@@ -207,8 +288,9 @@ mod harness {
             &engine,
             Host {
                 wasi,
-                program: None,
-                dispatch: Vec::new(),
+                libraries: HashMap::new(),
+                table: None,
+                resolved: HashMap::new(),
             },
         );
         let mut linker: Linker<Host> = Linker::new(&engine);
@@ -216,136 +298,66 @@ mod harness {
         linker
             .func_wrap(
                 "env",
-                "ash_host_wlift_plugin_dispatch",
-                |mut caller: Caller<'_, Host>, idx: i32, vm: i32| {
-                    let f = caller.data().dispatch[idx as usize].expect("a registered export");
-                    f.call(&mut caller, &[vm.into()], &mut [])
+                "ash_host_dlopen",
+                |mut caller: Caller<'_, Host>, name: i32, len: i32| -> i32 {
+                    let name = guest_str(&mut caller, name, len);
+                    caller.data().libraries.contains_key(&name) as i32
                 },
             )
-            .expect("dispatch import");
-        let module = Module::new(&engine, bytes).expect("loading the program");
-        let program = linker
+            .expect("dlopen");
+        linker
+            .func_wrap(
+                "env",
+                "ash_host_dlsym",
+                |mut caller: Caller<'_, Host>,
+                 lib: i32,
+                 lib_len: i32,
+                 sym: i32,
+                 sym_len: i32|
+                 -> i32 {
+                    let key = (
+                        guest_str(&mut caller, lib, lib_len),
+                        guest_str(&mut caller, sym, sym_len),
+                    );
+                    if let Some(&index) = caller.data().resolved.get(&key) {
+                        return index;
+                    }
+                    let (Some(instance), Some(table)) = (
+                        caller.data().libraries.get(&key.0).copied(),
+                        caller.data().table,
+                    ) else {
+                        return 0;
+                    };
+                    let Some(f) = instance.get_func(&mut caller, &key.1) else {
+                        return 0;
+                    };
+                    let index = table.size(&caller) as i32;
+                    table
+                        .grow(&mut caller, 1, Ref::Func(Some(f)))
+                        .expect("growing the table");
+                    caller.data_mut().resolved.insert(key, index);
+                    index
+                },
+            )
+            .expect("dlsym");
+        let module = Module::from_file(&engine, program).expect("loading the program");
+        let main = linker
             .instantiate(&mut store, &module)
             .expect("instantiating the program");
-        store.data_mut().program = Some(program);
-
-        for (lib, plugin_bytes) in plugins(bytes) {
-            let plugin = Module::new(&engine, &plugin_bytes).expect("loading a plugin");
-            let mut plugin_linker: Linker<Host> = Linker::new(&engine);
-            for import in plugin.imports() {
-                let name = import.name();
-                match name {
-                    "wlift_get_slot_str" => {
-                        plugin_linker
-                            .func_wrap(
-                                "env",
-                                name,
-                                |mut caller: Caller<'_, Host>,
-                                 vm: i32,
-                                 slot: i32,
-                                 out: i32,
-                                 max: i32|
-                                 -> i32 {
-                                    let p = call_i32(&mut caller, "wrenGetSlotString", &[vm, slot]);
-                                    if p == 0 {
-                                        return -1;
-                                    }
-                                    let host = program_memory(&mut caller);
-                                    let text: Vec<u8> = host.data(&caller)[p as usize..]
-                                        .iter()
-                                        .take(max as usize)
-                                        .take_while(|b| **b != 0)
-                                        .copied()
-                                        .collect();
-                                    let Some(Extern::Memory(own)) = caller.get_export("memory")
-                                    else {
-                                        return -1;
-                                    };
-                                    own.write(&mut caller, out as usize, &text)
-                                        .expect("copy in");
-                                    text.len() as i32
-                                },
-                            )
-                            .expect("bridge");
-                    }
-                    "wlift_set_slot_str" => {
-                        plugin_linker
-                            .func_wrap(
-                                "env",
-                                name,
-                                |mut caller: Caller<'_, Host>,
-                                 vm: i32,
-                                 slot: i32,
-                                 ptr: i32,
-                                 len: i32| {
-                                    let Some(Extern::Memory(own)) = caller.get_export("memory")
-                                    else {
-                                        return;
-                                    };
-                                    let mut text = own.data(&caller)
-                                        [ptr as usize..(ptr + len) as usize]
-                                        .to_vec();
-                                    text.push(0);
-                                    let p = call_i32(
-                                        &mut caller,
-                                        "wlift_aot_host_alloc",
-                                        &[text.len() as i32],
-                                    );
-                                    let host = program_memory(&mut caller);
-                                    host.write(&mut caller, p as usize, &text)
-                                        .expect("copy out");
-                                    call_i32(&mut caller, "wrenSetSlotString", &[vm, slot, p]);
-                                    call_i32(
-                                        &mut caller,
-                                        "wlift_aot_host_free",
-                                        &[p, text.len() as i32],
-                                    );
-                                },
-                            )
-                            .expect("bridge");
-                    }
-                    _ => {
-                        let export = program
-                            .get_export(&mut store, name)
-                            .unwrap_or_else(|| panic!("the program does not export {name}"));
-                        plugin_linker
-                            .define(&store, import.module(), name, export)
-                            .expect("plugin import");
-                    }
-                }
-            }
-            let instance = plugin_linker
-                .instantiate(&mut store, &plugin)
-                .expect("instantiating a plugin");
-            let exports: Vec<(String, Func)> = instance
-                .exports(&mut store)
-                .filter_map(|e| {
-                    let name = e.name().to_string();
-                    e.into_func().map(|f| (name, f))
-                })
-                .filter(|(name, _)| name.starts_with("wlift_"))
-                .collect();
-            let register = program
-                .get_typed_func::<(i32, i32, i32, i32), i32>(
-                    &mut store,
-                    "wlift_aot_register_plugin_export",
-                )
-                .expect("wlift_aot_register_plugin_export");
-            for (name, f) in exports {
-                let (lp, ll) = put(&mut store, program, lib.as_bytes());
-                let (sp, sl) = put(&mut store, program, name.as_bytes());
-                let idx = register
-                    .call(&mut store, (lp, ll, sp, sl))
-                    .expect("register") as usize;
-                let dispatch = &mut store.data_mut().dispatch;
-                if dispatch.len() <= idx {
-                    dispatch.resize(idx + 1, None);
-                }
-                dispatch[idx] = Some(f);
-            }
+        let dir = program.parent().expect("program dir");
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .expect("program dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p != program && p.extension().is_some_and(|e| e == "wasm"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let bytes = std::fs::read(&path).expect("reading a library");
+            let lib = path.file_stem().unwrap().to_string_lossy().into_owned();
+            load(&mut store, &linker, main, &lib, &bytes);
         }
-
-        let start = program
+        let start = main
             .get_typed_func::<(), ()>(&mut store, "_start")
             .expect("_start");
         let code = match start.call(&mut store, ()) {
@@ -570,24 +582,30 @@ class Box {
     );
 }
 
-/// A plugin in the shape hatch ships for wasm: its own memory, the
-/// host's C API and the string bridges imported from `env`.
-const CALC_PLUGIN: &str = r#"
+/// A native library as a `dylink.0` side module, the shape an Ash host
+/// loads: it imports the program's memory and table and the C API it
+/// calls, and works on the program's heap directly.
+const CALC_LIBRARY: &str = r#"
 (module
+  (@custom "dylink.0" (before first) "\01\04\10\00\00\00")
+  (import "env" "memory" (memory 0))
+  (import "env" "__indirect_function_table" (table 0 funcref))
+  (import "env" "__memory_base" (global $base i32))
+  (import "env" "__table_base" (global $table_base i32))
   (import "env" "wrenGetSlotDouble" (func $get (param i32 i32) (result f64)))
   (import "env" "wrenSetSlotDouble" (func $set (param i32 i32 f64)))
-  (import "env" "wlift_get_slot_str" (func $gets (param i32 i32 i32 i32) (result i32)))
-  (import "env" "wlift_set_slot_str" (func $sets (param i32 i32 i32 i32)))
-  (memory (export "memory") 1)
-  (data (i32.const 0) "hello, ")
+  (import "env" "wrenGetSlotString" (func $get_str (param i32 i32) (result i32)))
+  (import "env" "wrenSetSlotString" (func $set_str (param i32 i32 i32)))
+  (data (global.get $base) "hello, library\00")
   (func (export "wlift_calc_add") (param $vm i32)
     (call $set (local.get $vm) (i32.const 0)
       (f64.add (call $get (local.get $vm) (i32.const 1))
                (call $get (local.get $vm) (i32.const 2)))))
-  (func (export "wlift_calc_greet") (param $vm i32) (local $n i32)
-    (local.set $n (call $gets (local.get $vm) (i32.const 1) (i32.const 7) (i32.const 100)))
-    (call $sets (local.get $vm) (i32.const 0) (i32.const 0)
-      (i32.add (local.get $n) (i32.const 7)))))
+  (func (export "wlift_calc_greet") (param $vm i32)
+    (call $set_str (local.get $vm) (i32.const 0) (global.get $base)))
+  (func (export "wlift_calc_echo") (param $vm i32)
+    (call $set_str (local.get $vm) (i32.const 0)
+      (call $get_str (local.get $vm) (i32.const 1)))))
 "#;
 
 const CALC_PROGRAM: &str = r#"
@@ -596,27 +614,31 @@ foreign class Calc {
   #!symbol = "wlift_calc_add"
   foreign static add(a, b)
   #!symbol = "wlift_calc_greet"
-  foreign static greet(name)
+  foreign static greet
+  #!symbol = "wlift_calc_echo"
+  foreign static echo(text)
 }
 System.print(Calc.add(2, 3))
-System.print(Calc.greet("wren"))
+System.print(Calc.greet)
+System.print(Calc.echo("wren"))
 "#;
 
-/// A foreign class binds to the plugin module the program carries, and
-/// its methods reach the plugin through the harness.
+/// A foreign class binds to the side module loaded beside the program,
+/// whose functions read and write the program's own memory.
 #[test]
-fn a_foreign_class_calls_its_wasm_plugin() {
-    let Some(result) = run_with_plugins(&[("main", CALC_PROGRAM)], &[("wlift_calc", CALC_PLUGIN)])
+fn a_foreign_class_calls_the_library_beside_it() {
+    let Some(result) =
+        run_with_libraries(&[("main", CALC_PROGRAM)], &[("wlift_calc", CALC_LIBRARY)])
     else {
         return;
     };
-    assert_eq!(result, (0, "5\nhello, wren\n".to_string()));
+    assert_eq!(result, (0, "5\nhello, library\nwren\n".to_string()));
 }
 
-/// Without the plugin, the program stops before running any code.
+/// Without the library, the program stops before running any code.
 #[test]
-fn a_foreign_class_without_its_plugin_ends_the_program() {
-    let Some((code, out)) = run_with_plugins(&[("main", CALC_PROGRAM)], &[]) else {
+fn a_foreign_class_without_its_library_ends_the_program() {
+    let Some((code, out)) = run_with_libraries(&[("main", CALC_PROGRAM)], &[]) else {
         return;
     };
     assert_eq!((code, out.as_str()), (70, ""));

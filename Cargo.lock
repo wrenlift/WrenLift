@@ -6940,7 +6940,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-encoder 0.245.1",
  "wasmparser 0.226.0",
- "wasmparser 0.258.0",
  "wasmprinter",
  "wasmtime",
  "wasmtime-wasi",

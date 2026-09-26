@@ -989,6 +989,7 @@ fn aot_build_for_target(
 ) {
     use wren_lift::codegen::llvm_aot::{
         LlvmTarget, compile_modules_to_llvm_object, link_wasm, locate_wasm_runtime,
+        place_wasm_libraries,
     };
     let target = LlvmTarget::new(triple, cpu, features);
     if !target.is_wasm() {
@@ -1011,13 +1012,34 @@ fn aot_build_for_target(
         .tempdir()
         .unwrap_or_else(|e| fail("tempdir", &e));
     let object = work.path().join("program.o");
-    compile_modules_to_llvm_object(&walk.modules, &walk.bundle, &target, &object)
+    let manifests = compile_modules_to_llvm_object(&walk.modules, &walk.bundle, &target, &object)
         .unwrap_or_else(|e| fail("AOT object emit failed", &e));
-    let plugins =
+    // Native libraries go beside the output as side modules, which the
+    // host loads at start-up; the program then links against their imports.
+    let libraries =
         wren_lift::codegen::aot::collect_wasm_plugins(std::path::Path::new(input), triple)
-            .unwrap_or_else(|e| fail("reading wasm plugins", &e));
-    link_wasm(&object, &runtime, &plugins, std::path::Path::new(out_path))
-        .unwrap_or_else(|e| fail("link failed", &e));
+            .unwrap_or_else(|e| fail("reading native libraries", &e));
+    let mut exports: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for class in manifests.iter().flat_map(|m| &m.classes) {
+        let Some(lib) = &class.foreign_library else {
+            continue;
+        };
+        exports
+            .entry(lib.clone())
+            .or_default()
+            .extend(class.foreign_methods.iter().map(|fm| {
+                fm.symbol.clone().unwrap_or_else(|| {
+                    wren_lift::runtime::foreign::base_name_of_signature(&fm.signature).to_string()
+                })
+            }));
+    }
+    let out = std::path::Path::new(out_path);
+    for placed in place_wasm_libraries(&libraries, &exports, out)
+        .unwrap_or_else(|e| fail("placing native libraries", &e))
+    {
+        eprintln!("wlift: native library {}", placed.display());
+    }
+    link_wasm(&object, &runtime, out).unwrap_or_else(|e| fail("link failed", &e));
     eprintln!("wlift: produced {out_path}");
 }
 

@@ -7,7 +7,7 @@
 //! features, and the object layout the lowering and the bootstrap read.
 
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use inkwell::AddressSpace;
 use inkwell::OptimizationLevel;
@@ -406,24 +406,15 @@ pub fn locate_wasm_runtime() -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Custom section of a wasm AOT program carrying the plugin module for
-/// the library named by the rest of the section's name.
-pub const PLUGIN_SECTION_PREFIX: &str = "wlift.plugin.";
-
 /// Link a wasm32 program object against the prelinked runtime object
 /// (`tools/build_wasm_runtime.sh`) into one WASI command module at
 /// `output`, in process.
 ///
-/// `plugins` are finished wasm modules by library name, which a harness
-/// instantiates beside the program: the program exports what each one
-/// imports and what the harness calls, and carries each in a
-/// [`PLUGIN_SECTION_PREFIX`] custom section.
-pub fn link_wasm(
-    program: &Path,
-    runtime: &Path,
-    plugins: &[(String, Vec<u8>)],
-    output: &Path,
-) -> Result<(), AotError> {
+/// Side modules already beside `output` (see [`place_wasm_libraries`])
+/// are native libraries its host loads at start-up, as Ash's does: the
+/// program exports its memory, table, `malloc` and exactly the runtime
+/// functions and data they import.
+pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
     let read = |path: &Path| -> Result<ash_wasm_link::Object, AotError> {
         let bytes = std::fs::read(path).map_err(AotError::Io)?;
         let name = path.display().to_string();
@@ -431,62 +422,163 @@ pub fn link_wasm(
     };
     let objects = vec![read(program)?, read(runtime)?];
     let mut options = ash_wasm_link::LinkOptions::default();
-    if !plugins.is_empty() {
-        options.roots.extend(
-            crate::capi::WASM_HARNESS_EXPORTS
-                .iter()
-                .map(|s| s.to_string()),
-        );
-        for (lib, bytes) in plugins {
-            options.roots.extend(plugin_imports(lib, bytes)?);
-        }
+    for side in side_modules_beside(output) {
+        options.hdll_imports.extend(side.functions);
+        options.hdll_data.extend(side.data);
     }
-    let mut module = ash_wasm_link::link(objects, &options)
+    if !options.hdll_imports.is_empty() {
+        // A side module's data is placed with the program's allocator.
+        options.hdll_imports.push("malloc".to_string());
+    }
+    options.hdll_imports.sort();
+    options.hdll_imports.dedup();
+    options.hdll_data.sort();
+    options.hdll_data.dedup();
+    let module = ash_wasm_link::link(objects, &options)
         .map_err(|e| AotError::Module(format!("link: {e:#}")))?;
-    for (lib, bytes) in plugins {
-        push_custom_section(&mut module, &format!("{PLUGIN_SECTION_PREFIX}{lib}"), bytes);
-    }
     std::fs::write(output, module).map_err(AotError::Io)
 }
 
-/// The functions `bytes`, the plugin module for `lib`, imports from
-/// `env`: the host's C API, and bridges the harness itself provides.
-fn plugin_imports(lib: &str, bytes: &[u8]) -> Result<Vec<String>, AotError> {
-    let bad = |e: wasmparser_aot::BinaryReaderError| AotError::Module(format!("plugin {lib}: {e}"));
-    let mut names = Vec::new();
-    for payload in wasmparser_aot::Parser::new(0).parse_all(bytes) {
-        if let wasmparser_aot::Payload::ImportSection(reader) = payload.map_err(bad)? {
-            for import in reader.into_imports() {
-                let import = import.map_err(bad)?;
-                if import.module == "env" && matches!(import.ty, wasmparser_aot::TypeRef::Func(_)) {
-                    names.push(import.name.to_string());
-                }
-            }
-        }
-    }
-    Ok(names)
+/// The side modules in `output`'s directory, other than `output`.
+fn side_modules_beside(output: &Path) -> Vec<ash_wasm_link::SideModule> {
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name() != output.file_name())
+        .filter(|p| p.extension().is_some_and(|e| e == "wasm"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .filter_map(|p| std::fs::read(p).ok())
+        .filter_map(|bytes| ash_wasm_link::read_side_module(&bytes).ok().flatten())
+        .collect()
 }
 
-/// Append a custom section `name` holding `payload` to a module.
-fn push_custom_section(module: &mut Vec<u8>, name: &str, payload: &[u8]) {
-    fn leb(out: &mut Vec<u8>, mut v: usize) {
-        loop {
-            let byte = (v & 0x7f) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(byte);
-                return;
-            }
-            out.push(byte | 0x80);
+/// Put each of `libraries` (name, bytes) beside `output` as
+/// `<name>.wasm`, where the host looks for it. A side module is copied;
+/// a PIC archive (`-C relocation-model=pic`, `-Z build-std`) is linked
+/// into one first with the toolchain's rust-lld, exporting the
+/// `exports` the program's foreign classes name for it.
+pub fn place_wasm_libraries(
+    libraries: &[(String, Vec<u8>)],
+    exports: &std::collections::HashMap<String, Vec<String>>,
+    output: &Path,
+) -> Result<Vec<PathBuf>, AotError> {
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let mut placed = Vec::with_capacity(libraries.len());
+    for (lib, bytes) in libraries {
+        let path = dir.join(format!("{lib}.wasm"));
+        if bytes.starts_with(b"!<arch>\n") {
+            link_side_module(
+                lib,
+                bytes,
+                exports.get(lib).map_or(&[][..], Vec::as_slice),
+                &path,
+            )?;
+        } else if matches!(ash_wasm_link::read_side_module(bytes), Ok(Some(_))) {
+            std::fs::write(&path, bytes).map_err(AotError::Io)?;
+        } else {
+            return Err(AotError::Module(format!(
+                "native library {lib}: its wasm build is neither a side module nor an \
+                 archive of one"
+            )));
         }
+        placed.push(path);
     }
-    let mut body = Vec::with_capacity(name.len() + payload.len() + 5);
-    leb(&mut body, name.len());
-    body.extend_from_slice(name.as_bytes());
-    body.extend_from_slice(payload);
-    module.push(0);
-    leb(module, body.len());
-    module.extend_from_slice(&body);
+    Ok(placed)
+}
+
+/// Link the archive `bytes` into the side module `output`.
+fn link_side_module(
+    lib: &str,
+    bytes: &[u8],
+    exports: &[String],
+    output: &Path,
+) -> Result<(), AotError> {
+    let lld = wasm_linker().ok_or_else(|| {
+        AotError::Module(format!(
+            "native library {lib} ships an archive, and linking it into a side module needs \
+             rust-lld (the Rust toolchain's) or wasm-ld; set WLIFT_WASM_LD to one"
+        ))
+    })?;
+    let work = tempfile::Builder::new()
+        .prefix("wlift_side_")
+        .tempdir()
+        .map_err(AotError::Io)?;
+    let archive = work.path().join(format!("lib{lib}.a"));
+    std::fs::write(&archive, bytes).map_err(AotError::Io)?;
+    let mut cmd = std::process::Command::new(&lld);
+    if lld.file_stem().is_some_and(|s| s == "rust-lld") {
+        cmd.args(["-flavor", "wasm"]);
+    }
+    // Undefined data as well as functions are imported: Rust's std takes
+    // the address of `errno`.
+    cmd.args([
+        "--experimental-pic",
+        "-shared",
+        "--no-entry",
+        "--gc-sections",
+        "--unresolved-symbols=import-dynamic",
+    ]);
+    cmd.args(exports.iter().map(|e| format!("--export={e}")));
+    cmd.arg("--whole-archive")
+        .arg(&archive)
+        .arg("--no-whole-archive")
+        .arg("-o")
+        .arg(output);
+    let out = cmd.output().map_err(AotError::Io)?;
+    if !out.status.success() {
+        return Err(AotError::Module(format!(
+            "linking native library {lib} into a side module:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// `WLIFT_WASM_LD`, else the toolchain's rust-lld, else wasm-ld on PATH.
+fn wasm_linker() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("WLIFT_WASM_LD") {
+        return Some(PathBuf::from(p));
+    }
+    let run = |args: &[&str]| {
+        std::process::Command::new("rustc")
+            .args(args)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+    };
+    let lld = run(&["--print", "sysroot"])
+        .zip(run(&["-vV"]))
+        .and_then(|(sysroot, info)| {
+            let host = info
+                .lines()
+                .find_map(|l| l.strip_prefix("host: "))?
+                .to_string();
+            let p = Path::new(sysroot.trim())
+                .join("lib/rustlib")
+                .join(host)
+                .join("bin/rust-lld");
+            p.is_file().then_some(p)
+        });
+    lld.or_else(|| {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join("wasm-ld"))
+                .find(|p| p.is_file())
+        })
+    })
 }
 
 /// What the bootstrap reaches of one lowered module.
@@ -804,16 +896,22 @@ impl<'ctx> Bootstrap<'ctx, '_> {
 
         self.b.position_at_end(body);
         let vmv: BasicValueEnum = vm.into();
-        // Only a program with foreign classes reaches plugins, and only
-        // it imports the harness's dispatcher.
+        // Only a program with foreign classes reaches the side modules its
+        // host loaded, and only it imports Ash's dlopen and dlsym.
         if wasm
             && manifests
                 .iter()
                 .any(|m| m.classes.iter().any(|c| c.foreign_library.is_some()))
         {
-            let set = self.import("wlift_aot_set_plugin_dispatch", &[Ptr], None);
-            let forward = self.plugin_forward()?;
-            self.call(set, &[forward.as_global_value().as_pointer_value().into()])?;
+            let set = self.import("wlift_aot_set_native_loader", &[Ptr, Ptr], None);
+            let open = self.forward("wlift_native_open", "ash_host_dlopen", &[Ptr, Word])?;
+            let sym = self.forward(
+                "wlift_native_sym",
+                "ash_host_dlsym",
+                &[Ptr, Word, Ptr, Word],
+            )?;
+            let fp = |f: FunctionValue<'ctx>| f.as_global_value().as_pointer_value().into();
+            self.call(set, &[fp(open), fp(sym)])?;
         }
         for (m, t) in manifests.iter().zip(tables) {
             let modvars: BasicValueEnum = t.modvars.as_pointer_value().into();
@@ -1015,25 +1113,28 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         Ok(())
     }
 
-    /// A forward from the runtime's plugin dispatch to the harness's
-    /// `env.ash_host_wlift_plugin_dispatch(idx, vm)` import.
-    fn plugin_forward(&self) -> Result<FunctionValue<'ctx>, String> {
-        let params = [P::I32, P::Ptr];
+    /// An internal function `name` forwarding its arguments to the host
+    /// import `import`, both taking `params` and answering an i32.
+    fn forward(
+        &self,
+        name: &str,
+        import: &str,
+        params: &[P],
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let tys: Vec<BasicMetadataTypeEnum> = params.iter().map(|p| self.ty(*p).into()).collect();
         let f = self.module.add_function(
-            "wlift_plugin_forward",
-            self.ctx
-                .void_type()
-                .fn_type(&[self.ty(P::I32).into(), self.ty(P::Ptr).into()], false),
+            name,
+            self.ctx.i32_type().fn_type(&tys, false),
             Some(Linkage::Internal),
         );
         stamp_target(self.ctx, self.machine, f);
         let resume = self.b.get_insert_block();
-        let entry = self.ctx.append_basic_block(f, "entry");
-        self.b.position_at_end(entry);
-        let host = self.import("ash_host_wlift_plugin_dispatch", &params, None);
+        self.b
+            .position_at_end(self.ctx.append_basic_block(f, "entry"));
+        let host = self.import(import, params, Some(P::I32));
         let args: Vec<BasicValueEnum> = f.get_param_iter().collect();
-        self.call(host, &args)?;
-        self.b.build_return(None).map_err(|e| e.to_string())?;
+        let v = self.call(host, &args)?.ok_or(import.to_string())?;
+        self.b.build_return(Some(&v)).map_err(|e| e.to_string())?;
         if let Some(block) = resume {
             self.b.position_at_end(block);
         }
