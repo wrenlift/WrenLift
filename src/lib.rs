@@ -148,3 +148,5 @@ pub mod hatch_registry;
 pub mod hatch_runner;
 #[cfg(feature = "host")]
 pub mod hatch_service;
+#[cfg(feature = "host")]
+pub mod side_module;

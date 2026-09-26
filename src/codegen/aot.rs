@@ -260,11 +260,7 @@ pub fn collect_wasm_plugins(
     // Only a side module or an archive of one: a browser build of the
     // same library is a finished module with its own memory.
     let is_module = |bytes: &[u8]| {
-        bytes.starts_with(b"!<arch>\n")
-            || (bytes.starts_with(b"\0asm")
-                && ash_wasm_link::looks_like_side_module(
-                    &bytes[..bytes.len().min(ash_wasm_link::SIDE_MODULE_PREFIX)],
-                ))
+        crate::side_module::is_archive(bytes) || crate::side_module::is_side_module(bytes)
     };
     let bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
     if crate::hatch::looks_like_hatch(&bytes) {

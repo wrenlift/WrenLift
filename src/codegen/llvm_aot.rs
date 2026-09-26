@@ -407,7 +407,7 @@ pub fn locate_wasm_runtime() -> Option<std::path::PathBuf> {
 }
 
 /// Link a wasm32 program object against the prelinked runtime object
-/// (`tools/build_wasm_runtime.sh`) into one WASI command module at
+/// (releases ship it beside `wlift`) into one WASI command module at
 /// `output`, in process.
 ///
 /// Side modules already beside `output` (see [`place_wasm_libraries`])
@@ -464,14 +464,14 @@ fn side_modules_beside(output: &Path) -> Vec<ash_wasm_link::SideModule> {
 
 /// Put each of `libraries` (name, bytes) beside `output` as
 /// `<name>.wasm`, where the host looks for it. A side module is copied;
-/// a PIC archive (`-C relocation-model=pic`, `-Z build-std`) is linked
-/// into one first with the toolchain's rust-lld, exporting the
-/// `exports` the program's foreign classes name for it.
+/// a position-independent archive is linked into one first, exporting
+/// the `exports` the program's foreign classes name for it.
 pub fn place_wasm_libraries(
     libraries: &[(String, Vec<u8>)],
     exports: &std::collections::HashMap<String, Vec<String>>,
     output: &Path,
 ) -> Result<Vec<PathBuf>, AotError> {
+    use crate::side_module;
     let dir = match output.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -479,14 +479,20 @@ pub fn place_wasm_libraries(
     let mut placed = Vec::with_capacity(libraries.len());
     for (lib, bytes) in libraries {
         let path = dir.join(format!("{lib}.wasm"));
-        if bytes.starts_with(b"!<arch>\n") {
-            link_side_module(
-                lib,
-                bytes,
-                exports.get(lib).map_or(&[][..], Vec::as_slice),
-                &path,
-            )?;
-        } else if matches!(ash_wasm_link::read_side_module(bytes), Ok(Some(_))) {
+        if side_module::is_archive(bytes) {
+            let work = tempfile::Builder::new()
+                .prefix("wlift_side_")
+                .tempdir()
+                .map_err(AotError::Io)?;
+            let archive = work.path().join(format!("lib{lib}.a"));
+            std::fs::write(&archive, bytes).map_err(AotError::Io)?;
+            let wanted = exports.get(lib).map_or(&[][..], Vec::as_slice);
+            side_module::link(&archive, wanted, &path).map_err(|e| {
+                AotError::Module(format!(
+                    "linking native library {lib} into a side module: {e}"
+                ))
+            })?;
+        } else if side_module::is_side_module(bytes) {
             std::fs::write(&path, bytes).map_err(AotError::Io)?;
         } else {
             return Err(AotError::Module(format!(
@@ -497,88 +503,6 @@ pub fn place_wasm_libraries(
         placed.push(path);
     }
     Ok(placed)
-}
-
-/// Link the archive `bytes` into the side module `output`.
-fn link_side_module(
-    lib: &str,
-    bytes: &[u8],
-    exports: &[String],
-    output: &Path,
-) -> Result<(), AotError> {
-    let lld = wasm_linker().ok_or_else(|| {
-        AotError::Module(format!(
-            "native library {lib} ships an archive, and linking it into a side module needs \
-             rust-lld (the Rust toolchain's) or wasm-ld; set WLIFT_WASM_LD to one"
-        ))
-    })?;
-    let work = tempfile::Builder::new()
-        .prefix("wlift_side_")
-        .tempdir()
-        .map_err(AotError::Io)?;
-    let archive = work.path().join(format!("lib{lib}.a"));
-    std::fs::write(&archive, bytes).map_err(AotError::Io)?;
-    let mut cmd = std::process::Command::new(&lld);
-    if lld.file_stem().is_some_and(|s| s == "rust-lld") {
-        cmd.args(["-flavor", "wasm"]);
-    }
-    // Undefined data as well as functions are imported: Rust's std takes
-    // the address of `errno`.
-    cmd.args([
-        "--experimental-pic",
-        "-shared",
-        "--no-entry",
-        "--gc-sections",
-        "--unresolved-symbols=import-dynamic",
-    ]);
-    cmd.args(exports.iter().map(|e| format!("--export={e}")));
-    cmd.arg("--whole-archive")
-        .arg(&archive)
-        .arg("--no-whole-archive")
-        .arg("-o")
-        .arg(output);
-    let out = cmd.output().map_err(AotError::Io)?;
-    if !out.status.success() {
-        return Err(AotError::Module(format!(
-            "linking native library {lib} into a side module:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    Ok(())
-}
-
-/// `WLIFT_WASM_LD`, else the toolchain's rust-lld, else wasm-ld on PATH.
-fn wasm_linker() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("WLIFT_WASM_LD") {
-        return Some(PathBuf::from(p));
-    }
-    let run = |args: &[&str]| {
-        std::process::Command::new("rustc")
-            .args(args)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-    };
-    let lld = run(&["--print", "sysroot"])
-        .zip(run(&["-vV"]))
-        .and_then(|(sysroot, info)| {
-            let host = info
-                .lines()
-                .find_map(|l| l.strip_prefix("host: "))?
-                .to_string();
-            let p = Path::new(sysroot.trim())
-                .join("lib/rustlib")
-                .join(host)
-                .join("bin/rust-lld");
-            p.is_file().then_some(p)
-        });
-    lld.or_else(|| {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|d| d.join("wasm-ld"))
-                .find(|p| p.is_file())
-        })
-    })
 }
 
 /// What the bootstrap reaches of one lowered module.

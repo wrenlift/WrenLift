@@ -266,6 +266,10 @@ pub struct PluginSource {
     /// so existing hatchfiles round-trip.
     #[serde(rename = "library", alias = "crate")]
     pub library: String,
+    /// The crate built as a `wasm32-wasip1` side module for wasm AOT
+    /// programs, when the plugin has one; usually `library` itself.
+    #[serde(default)]
+    pub wasi_crate: Option<String>,
     /// Optional direct download URL for a pre-built plugin
     /// artifact. When set, CI / runtimes that can fetch HTTP
     /// pull the bytes verbatim instead of cloning `repo` and

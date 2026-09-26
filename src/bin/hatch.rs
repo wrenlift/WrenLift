@@ -94,6 +94,11 @@ enum Command {
         #[arg(short, long, value_name = "OUT")]
         out: Option<PathBuf>,
     },
+    /// Native plugin commands for a package with a `[plugin_source]`.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     /// Print a hatch's manifest + section listing without running.
     Inspect {
         #[arg(value_name = "PACKAGE")]
@@ -222,6 +227,37 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum PluginCommand {
+    /// Build the package's plugin crate for a target and put the
+    /// library where the hatchfile's `[native_libs]` entry names it.
+    ///
+    /// Without `--target`, the host's native library. With
+    /// `--target wasm32-wasip1`, a side module for wasm AOT programs,
+    /// exporting the functions the package's `#!symbol` attributes
+    /// name; it builds `wasi_crate` (else the plugin crate) and needs a
+    /// nightly toolchain with rust-src.
+    ///
+    /// Examples:
+    ///   hatch plugin build --source ../my-plugin
+    ///   hatch plugin build --target wasm32-wasip1 --source ../my-plugin
+    Build {
+        /// Package directory. Defaults to the current directory.
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
+        /// Target to build for: omitted for the host, or `wasm32-wasip1`.
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<String>,
+        /// The cargo workspace holding the plugin crate. Defaults to
+        /// `[plugin_source] repo` when that is a local directory.
+        #[arg(long, value_name = "DIR")]
+        source: Option<PathBuf>,
+        /// Write the library here instead of the hatchfile's path.
+        #[arg(short, long, value_name = "OUT")]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum WebCommand {
     /// Watch the workspace and re-run the entry on every save.
     ///
@@ -263,6 +299,14 @@ fn main() {
             WebCommand::Generate { kind, name, dir } => cmd_web_generate(&kind, &name, &dir),
         },
         Command::Build { dir, out } => cmd_build(&dir, out.as_deref()),
+        Command::Plugin { command } => match command {
+            PluginCommand::Build {
+                dir,
+                target,
+                source,
+                out,
+            } => cmd_plugin_build(&dir, target.as_deref(), source.as_deref(), out.as_deref()),
+        },
         Command::Inspect { path } => cmd_inspect(&path),
         Command::Docs { target, out } => cmd_docs(&target, out.as_deref()),
         Command::Run { target, withs } => cmd_run(&target, &withs),
@@ -792,6 +836,125 @@ fn cmd_docs(target: &Path, out: Option<&Path>) {
     } else {
         println!("{}", json);
     }
+}
+
+fn cmd_plugin_build(dir: &Path, target: Option<&str>, source: Option<&Path>, out: Option<&Path>) {
+    use wren_lift::side_module;
+    let fail = |msg: String| -> ! {
+        eprintln!("error: {msg}");
+        process::exit(1);
+    };
+    let hatchfile = dir.join(HATCHFILE);
+    let text = std::fs::read_to_string(&hatchfile)
+        .unwrap_or_else(|e| fail(format!("reading {}: {e}", hatchfile.display())));
+    let manifest: wren_lift::hatch::Manifest = toml::from_str(&text)
+        .unwrap_or_else(|e| fail(format!("parsing {}: {e}", hatchfile.display())));
+    let Some(plugin) = &manifest.plugin_source else {
+        fail(format!("{} has no [plugin_source]", hatchfile.display()));
+    };
+    let wasm = match target {
+        None => false,
+        Some(t) if t == side_module::TRIPLE => true,
+        Some(t) => fail(format!(
+            "hatch plugin build targets the host or {}, not {t}",
+            side_module::TRIPLE
+        )),
+    };
+    let source = match source {
+        Some(s) => s.to_path_buf(),
+        None => match plugin
+            .repo
+            .as_deref()
+            .map(|r| dir.join(r.trim_start_matches("file://")))
+        {
+            Some(p) if p.is_dir() => p,
+            _ => fail(
+                "pass --source, the cargo workspace holding the plugin crate \
+                 ([plugin_source] repo is not a local directory)"
+                    .to_string(),
+            ),
+        },
+    };
+    let krate = if wasm {
+        plugin.wasi_crate.as_deref().unwrap_or(&plugin.library)
+    } else {
+        &plugin.library
+    };
+    // The library's native_libs entry: the one named after the plugin
+    // crate, else the only one.
+    let lib_entry = manifest
+        .native_libs
+        .get_key_value(&plugin.library)
+        .or_else(|| {
+            (manifest.native_libs.len() == 1)
+                .then(|| manifest.native_libs.iter().next())
+                .flatten()
+        });
+    let lib = lib_entry.map_or(plugin.library.as_str(), |(k, _)| k.as_str());
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let declared = lib_entry.and_then(|(_, e)| {
+        if wasm {
+            e.resolve_for_target(target)
+        } else {
+            e.resolve_for(os, arch)
+        }
+    });
+    let native_file = match os {
+        "macos" => format!("lib{krate}.dylib"),
+        "windows" => format!("{krate}.dll"),
+        _ => format!("lib{krate}.so"),
+    }
+    .replace('-', "_");
+    let dest = match (out, declared) {
+        (Some(o), _) => o.to_path_buf(),
+        (None, Some(rel)) => dir.join(rel),
+        (None, None) => {
+            let rel = if wasm {
+                format!("libs/{}/{lib}.wasm", side_module::TRIPLE)
+            } else {
+                format!("libs/{}", native_file)
+            };
+            eprintln!(
+                "note: [native_libs.{lib}] names no path for {}; writing {rel}. Add \
+                 \"{}\" = \"{rel}\" to it.",
+                target.unwrap_or("this host"),
+                target.unwrap_or(os),
+            );
+            dir.join(rel)
+        }
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| fail(format!("creating {}: {e}", parent.display())));
+    }
+
+    if wasm {
+        let exports = side_module::wren_symbols(dir);
+        if exports.is_empty() {
+            fail(format!(
+                "{} names no #!symbol, so the side module would export nothing",
+                dir.display()
+            ));
+        }
+        let archive = side_module::build_archive(&source, krate).unwrap_or_else(|e| fail(e));
+        side_module::link(&archive, &exports, &dest).unwrap_or_else(|e| fail(e));
+    } else {
+        let status = process::Command::new("cargo")
+            .args(["build", "-p", krate, "--release"])
+            .current_dir(&source)
+            .status()
+            .unwrap_or_else(|e| fail(format!("running cargo: {e}")));
+        if !status.success() {
+            fail(format!("building {krate} failed"));
+        }
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.join("target"));
+        let built = target_dir.join("release").join(&native_file);
+        std::fs::copy(&built, &dest)
+            .unwrap_or_else(|e| fail(format!("copying {}: {e}", built.display())));
+    }
+    eprintln!("hatch: wrote {}", dest.display());
 }
 
 fn cmd_inspect(path: &Path) {
