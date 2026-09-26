@@ -2946,8 +2946,10 @@ pub mod cl {
     /// Every runtime function name with its address, for the JIT
     /// module's symbol table.
     fn runtime_symbols() -> Vec<(&'static str, usize)> {
-        crate::codegen::runtime_fns::RUNTIME_FN_NAMES
+        use crate::codegen::runtime_fns::{JIT_ONLY_FN_NAMES, RUNTIME_FN_NAMES};
+        RUNTIME_FN_NAMES
             .iter()
+            .chain(JIT_ONLY_FN_NAMES)
             .filter_map(|name| crate::codegen::runtime_fns::resolve(name).map(|a| (*name, a)))
             .collect()
     }

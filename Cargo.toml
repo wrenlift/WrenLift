@@ -106,7 +106,11 @@ cranelift = [
 # (writes a `.o` to disk). Off by default so the production
 # JIT path stays untouched; flip on with `--features aot`
 # when driving `wlift build hello.wren -o hello`.
+# The runtime half of AOT: the entry points and helpers a compiled
+# program links against, with no JIT. Builds for wasm32-wasip1.
+aot_runtime = []
 aot = [
+    "aot_runtime",
     "cranelift",
     "dep:cranelift-object",
     "dep:target-lexicon",

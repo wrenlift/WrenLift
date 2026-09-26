@@ -123,6 +123,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --release --test wasm_smoke -- --nocapture
 
+      - name: Wasm runtime object
+        # Builds the prelinked runtime a wasm AOT program links against
+        # and checks it defines every entry point and helper such a
+        # program calls. WASI_SYSROOT comes from the SDK step above.
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --lib --target wasm32-wasip1 --no-default-features \
+            --features aot_runtime -- -D warnings
+          tools/build_wasm_runtime.sh
+          cargo test --release --test wasm_runtime_fresh
+
       - name: Format check
         run: cargo fmt -- --check
 
