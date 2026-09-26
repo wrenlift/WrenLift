@@ -2102,13 +2102,14 @@ pub(crate) fn resolve_manifest_imports(modules: &[AotModule], manifests: &mut [A
     }
 }
 
-/// Locate `libwren_lift.a` (or `wren_lift.lib` on Windows) for
-/// the linker step that turns an AOT-emitted `.o` into a
-/// runnable executable. Lookup order:
+/// Locate the runtime staticlib for the linker step that turns an
+/// AOT-emitted `.o` into a runnable executable. Lookup order:
 ///
 /// 1. `WLIFT_STATICLIB` env var pointing at an explicit path.
-/// 2. Sibling of the running executable (CLI install case).
-/// 3. `target/{release,debug}/` from the current working
+/// 2. `libwrenlift_rt.a` beside the running executable, the
+///    runtime half releases ship (`host` + `aot_runtime`).
+/// 3. `libwren_lift.a` (`wren_lift.lib` on Windows) beside it or
+///    in `target/{release,debug}/` from the current working
 ///    directory (developer checkout case).
 ///
 /// Returns `None` if no candidate file exists; callers should
@@ -2130,9 +2131,11 @@ pub fn locate_runtime_staticlib() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join(staticlib_name);
-        if candidate.is_file() {
-            return Some(candidate);
+        for name in ["libwrenlift_rt.a", staticlib_name] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
 

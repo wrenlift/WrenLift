@@ -24,7 +24,9 @@ for bin in wlift hatch wlift-lsp; do
   test -x "${BIN_DIR}/${bin}" || { echo "error: ${BIN_DIR}/${bin} not built" >&2; exit 1; }
   cp "${BIN_DIR}/${bin}" "$DIST/"
 done
-# The runtime wasm AOT programs link against, where wlift looks for it.
+# The runtimes AOT programs link against, where wlift looks for them.
+test -f "${BIN_DIR}/libwrenlift_rt.a" || { echo "error: ${BIN_DIR}/libwrenlift_rt.a not built" >&2; exit 1; }
+cp "${BIN_DIR}/libwrenlift_rt.a" "$DIST/"
 RUNTIME="${BIN_DIR}/wasm32-wasip1/wlift_runtime.o"
 test -f "$RUNTIME" || { echo "error: $RUNTIME not built" >&2; exit 1; }
 mkdir -p "$DIST/wasm32-wasip1"

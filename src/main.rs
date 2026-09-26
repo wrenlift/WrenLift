@@ -102,7 +102,8 @@ struct Cli {
     /// Requires the `aot` cargo feature at WrenLift build time. The
     /// runtime staticlib path is read from `WLIFT_STATICLIB`, or
     /// auto-discovered next to the running `wlift` binary
-    /// (`<exe_dir>/libwren_lift.a` / `target/<profile>/libwren_lift.a`).
+    /// (`<exe_dir>/libwrenlift_rt.a`, which releases ship, or a
+    /// checkout's `target/<profile>/libwren_lift.a`).
     #[arg(long, value_name = "OUT_PATH")]
     aot: Option<String>,
 
@@ -823,11 +824,8 @@ fn build_bytecode_cache(source: &str, filename: &str, out_path: &str, cli: &Cli)
 /// content survives the C-string escape rules.
 ///
 /// Locates the runtime staticlib via the `WLIFT_STATICLIB` env
-/// var first; falls back to `<wlift's exe dir>/libwren_lift.a`
-/// and then `target/{release,debug}/libwren_lift.a` relative to
-/// the current working directory. Documents both options in the
-/// error path so a fresh `cargo install`-installed user knows how
-/// to point at one.
+/// var first; falls back to `<wlift's exe dir>/libwrenlift_rt.a`,
+/// then a checkout's `target/{release,debug}/libwren_lift.a`.
 #[cfg(feature = "aot")]
 fn aot_build_executable(input: &str, out_path: &str) {
     let entry_path = std::path::PathBuf::from(input);
@@ -928,9 +926,8 @@ fn aot_build_executable(input: &str, out_path: &str) {
     let staticlib_path = match wren_lift::codegen::aot::locate_runtime_staticlib() {
         Some(p) => p,
         None => {
-            eprintln!("error: could not locate libwren_lift.a — set WLIFT_STATICLIB to its");
-            eprintln!("       full path, or run `wlift --aot` from a checkout where");
-            eprintln!("       `cargo build --release --features aot` has been executed.");
+            eprintln!("error: no libwrenlift_rt.a beside wlift, which releases ship;");
+            eprintln!("       reinstall wlift, or set WLIFT_STATICLIB to a runtime staticlib");
             process::exit(1);
         }
     };

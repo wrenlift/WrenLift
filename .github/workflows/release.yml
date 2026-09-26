@@ -191,6 +191,16 @@ jobs:
           WLIFT_TIER_TRACE=1 "$bin/wlift" bench/ash/method_call.wren 2>&1 | grep -q "llvm " \
             || { echo "::error::the top tier did not compile with LLVM"; exit 1; }
 
+      # The runtime half native `wlift --aot` links programs against,
+      # without the JIT or the compiler. Built last: any later build of
+      # the crate rewrites libwren_lift.a with the full library.
+      - name: Build the runtime staticlib
+        run: |
+          cargo rustc --release --lib --target ${{ matrix.target }} \
+            --no-default-features --features host,aot_runtime --crate-type staticlib
+          cp "target/${{ matrix.target }}/release/libwren_lift.a" \
+            "target/${{ matrix.target }}/release/libwrenlift_rt.a"
+
       - name: Package tarball + checksum
         run: |
           tools/package_release.sh "${{ needs.resolve.outputs.tag }}" \
@@ -204,6 +214,8 @@ jobs:
           "$RUNNER_TEMP/${stage}/wlift" bench/ash/nbody.wren
           "$RUNNER_TEMP/${stage}/wlift" --aot "$RUNNER_TEMP/fib.wasm" \
             --aot-target wasm32-wasip1 bench/fib.wren
+          "$RUNNER_TEMP/${stage}/wlift" --aot "$RUNNER_TEMP/fib" bench/fib.wren
+          "$RUNNER_TEMP/fib"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
