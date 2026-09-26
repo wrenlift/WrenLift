@@ -10,8 +10,8 @@
 <link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
 <!-- wrenlift-seo:start -->
-<meta name="description" content="Embed Wrenlift in a webpage. The wlift.js harness exports createWlift, runProject, prefetchHatchDeps, makeCachedFetcher, plus worker / SIMD detection." />
-<meta name="keywords" content="Wrenlift WebAssembly, wlift.js, runProject, prefetchHatchDeps, makeCachedFetcher, WebGPU, worker, SIMD" />
+<meta name="description" content="Embed Wrenlift in a webpage with the wlift.js harness (createWlift, runProject, prefetchHatchDeps, worker and SIMD detection), or compile a program ahead of time into its own WASI module." />
+<meta name="keywords" content="Wrenlift WebAssembly, wlift.js, runProject, prefetchHatchDeps, makeCachedFetcher, WebGPU, worker, SIMD, ahead-of-time, WASI, side module" />
 <meta name="robots" content="index, follow" />
 <meta name="author" content="Wrenlift" />
 
@@ -19,7 +19,7 @@
 <meta property="og:type" content="article" />
 <meta property="og:site_name" content="Wrenlift" />
 <meta property="og:title" content="Wrenlift on the web — wlift.js harness API for WebAssembly" />
-<meta property="og:description" content="Embed Wrenlift in a webpage. The wlift.js harness exports createWlift, runProject, prefetchHatchDeps, makeCachedFetcher, plus worker / SIMD detection." />
+<meta property="og:description" content="Embed Wrenlift in a webpage with the wlift.js harness (createWlift, runProject, prefetchHatchDeps, worker and SIMD detection), or compile a program ahead of time into its own WASI module." />
 <meta property="og:url" content="https://wrenlift.com/docs/platform/wasm.html" />
 <meta property="og:image" content="https://wrenlift.com/assets/og-image.png" />
 <meta property="og:image:width" content="1200" />
@@ -29,7 +29,7 @@
 <!-- Twitter card -->
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="Wrenlift on the web — wlift.js harness API for WebAssembly" />
-<meta name="twitter:description" content="Embed Wrenlift in a webpage. The wlift.js harness exports createWlift, runProject, prefetchHatchDeps, makeCachedFetcher, plus worker / SIMD detection." />
+<meta name="twitter:description" content="Embed Wrenlift in a webpage with the wlift.js harness (createWlift, runProject, prefetchHatchDeps, worker and SIMD detection), or compile a program ahead of time into its own WASI module." />
 <meta name="twitter:image" content="https://wrenlift.com/assets/og-image.png" />
 
 <!-- Structured data — TechArticle for docs pages, WebSite for landing -->
@@ -43,9 +43,9 @@
   "mainEntityOfPage": "https://wrenlift.com/docs/platform/wasm.html",
   "image": "https://wrenlift.com/assets/og-image.png",
   "datePublished": "2026-05-29",
-  "dateModified": "2026-05-29",
+  "dateModified": "2026-09-26",
   "articleSection": "Platform guides",
-  "keywords": "Wrenlift WebAssembly, wlift.js, runProject, prefetchHatchDeps, makeCachedFetcher, WebGPU, worker, SIMD",
+  "keywords": "Wrenlift WebAssembly, wlift.js, runProject, prefetchHatchDeps, makeCachedFetcher, WebGPU, worker, SIMD, ahead-of-time, WASI, side module",
   "inLanguage": "en",
   "isPartOf": {
     "@type": "WebSite",
@@ -150,7 +150,7 @@
     </nav>
 
     <h1 class="pkg-title">WebAssembly</h1>
-    <p class="pkg-lede">The same runtime that compiles native ELF and Mach-O binaries also compiles to a self-contained <code>.wasm</code> module. <code>wlift.js</code> is the JavaScript harness you import to run Wren code in a browser — used by the playground and ready for any embedder.</p>
+    <p class="pkg-lede">The same runtime that compiles native ELF and Mach-O binaries also compiles to a self-contained <code>.wasm</code> module. <code>wlift.js</code> is the JavaScript harness you import to run Wren code in a browser — used by the playground and ready for any embedder. A program can also be <a href="#aot">compiled ahead of time</a> into its own module.</p>
 
     <div class="pkg-readme">
       <h2 id="install">Add <code>wlift.js</code> to your page</h2>
@@ -302,6 +302,110 @@ const wlift = await createWlift();   // picks the right binary</code></pre>
         who want to surface the choice (analytics, opt-in flags,
         etc.).
       </p>
+
+      <h2 id="aot">Compile ahead of time</h2>
+      <p>
+        <code>wlift.js</code> runs Wren in a page with the whole
+        runtime. A program can also be compiled ahead of time into
+        its own <code>.wasm</code>. The module holds the compiled
+        program and the parts of the runtime it calls, with no
+        compiler inside. It is a WASI command, so a WASI runtime
+        such as wasmtime runs it. This is another way to ship a
+        program; the harness stays the way to run Wren in a page.
+      </p>
+
+      <h3 id="aot-setup">What you need</h3>
+      <p>
+        A <code>wlift</code> built from source with the
+        <code>aot</code> and <code>llvm</code> features, and the
+        runtime object programs link against. From a checkout:
+      </p>
+<pre><code>rustup target add wasm32-wasip1
+cargo build --release --features aot,llvm
+tools/build_wasm_runtime.sh</code></pre>
+      <p>
+        The build needs LLVM 21: <code>llvm-config</code> on the
+        <code>PATH</code>, or <code>LLVM_SYS_211_PREFIX</code>
+        pointing at it. The runtime script needs wasi-libc 33 or
+        later. Homebrew's <code>wasi-libc</code> and a WASI SDK
+        under <code>/opt/wasi-sdk</code> are found on their own;
+        <code>WASI_SYSROOT</code> names any other sysroot. The
+        script writes
+        <code>target/release/wasm32-wasip1/wlift_runtime.o</code>,
+        where <code>wlift</code> looks for it.
+        <code>WLIFT_WASM_RUNTIME</code> names another copy.
+      </p>
+
+      <h3 id="aot-build">Build and run</h3>
+<pre><code>wlift --aot hello.wasm --aot-target wasm32-wasip1 hello.wren
+wasmtime hello.wasm</code></pre>
+      <p>
+        Everything the program imports is compiled in with it: its
+        own modules and the path dependencies in its hatchfile. A
+        <code>.hatch</code> bundle works as the input too.
+        <code>System.print</code> writes to stdout. An error the
+        program doesn't catch is printed, and the program exits
+        with code 70.
+      </p>
+      <p>
+        Code is generated for the target the command names.
+        <code>--aot-cpu</code> and <code>--aot-features</code> take
+        an LLVM CPU name and feature list. The default features are
+        sign extension, mutable globals, bulk memory, non-trapping
+        float conversion, multivalue and reference types. Add
+        <code>+simd128</code> for a runtime with SIMD:
+      </p>
+<pre><code>wlift --aot hello.wasm --aot-target wasm32-wasip1 \
+  --aot-features +sign-ext,+mutable-globals,+bulk-memory,+nontrapping-fptoint,+multivalue,+reference-types,+simd128 \
+  hello.wren</code></pre>
+      <p>
+        Fibers that run to completion work as they do everywhere
+        else. Suspending a fiber from inside compiled code comes
+        later; for now it raises an error.
+      </p>
+
+      <h3 id="aot-native">Native libraries</h3>
+      <p>
+        A native library for a compiled module is a side module: a
+        <code>.wasm</code> that shares the program's memory and
+        function table, so it works on the program's heap the way
+        the native build does. Its package names it under the
+        target triple:
+      </p>
+<pre><code>[native_libs.wlift_noise]
+"wasm32-wasip1" = "libs/wasm32-wasip1/wlift_noise.wasm"</code></pre>
+      <p>
+        The <code>wasm</code> key stays the build the page harness
+        loads; the two sit side by side.
+      </p>
+      <p>
+        An ahead-of-time build puts each library beside the output
+        as <code>&lt;name&gt;.wasm</code> and links the program to
+        host it. A package can ship a position-independent static
+        archive (<code>.a</code>) instead; the build links it into a
+        side module with the Rust toolchain's <code>rust-lld</code>.
+        <code>WLIFT_WASM_LD</code> names another linker.
+      </p>
+      <p>
+        A Rust plugin builds that archive with nightly, since the
+        standard library has to be rebuilt position-independent:
+      </p>
+<pre><code>RUSTFLAGS="-C relocation-model=pic -C target-feature=+mutable-globals" \
+  cargo +nightly rustc -p wlift_noise --release --lib \
+    --target wasm32-wasip1 --crate-type staticlib \
+    -Z build-std=std,panic_abort</code></pre>
+      <p>
+        Plain wasmtime runs a program without native libraries. A
+        program with them needs a host that loads each side module
+        beside it before starting it, and answers two imports:
+      </p>
+      <ul>
+        <li><code>env.ash_host_dlopen(name, len)</code>: 1 when a library of that name is loaded, else 0.</li>
+        <li><code>env.ash_host_dlsym(lib, lib_len, symbol, symbol_len)</code>: the function table index of that export, or 0.</li>
+      </ul>
+      <p>
+        A program without native libraries doesn't import either.
+      </p>
     </div>
   </main>
 
@@ -315,6 +419,8 @@ const wlift = await createWlift();   // picks the right binary</code></pre>
       <li><a href="#prefetch">Prefetching deps</a></li>
       <li><a href="#threading">Worker vs main</a></li>
       <li><a href="#simd">SIMD detection</a></li>
+      <li><a href="#aot">Compile ahead of time</a></li>
+      <li><a href="#aot-native">Native libraries</a></li>
     </ul>
   </aside>
 
