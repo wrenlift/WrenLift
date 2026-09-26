@@ -45,6 +45,8 @@ pub mod llvm {
         osr_rematerializable_defs,
     };
     use crate::runtime::object_layout::*;
+    use inkwell::values::GlobalValue;
+    use std::cell::{Cell, RefCell};
 
     /// Compiled output of the LLVM tier. The engine owns the code; the
     /// context outlives it (fields drop in order).
@@ -439,6 +441,9 @@ pub mod llvm {
             module: &module,
             machine: &machine,
             mir,
+            interner,
+            layout: Layout::HOST,
+            aot: None,
             callsite_ic_ptrs,
             callsite_ic_live_ptrs,
             jit_code_base,
@@ -680,6 +685,12 @@ pub mod llvm {
             AttributeLoc::Function,
             ctx.create_string_attribute("frame-pointer", "all"),
         );
+        stamp_target(ctx, machine, f);
+    }
+
+    /// The machine's CPU and features on `f`, so each function is
+    /// compiled for the target it runs on.
+    pub fn stamp_target(ctx: &Context, machine: &TargetMachine, f: FunctionValue) {
         f.add_attribute(
             AttributeLoc::Function,
             ctx.create_string_attribute("target-cpu", &machine.get_cpu().to_string()),
@@ -693,6 +704,85 @@ pub mod llvm {
         );
     }
 
+    /// What an AOT body reads in place of the live process a JIT body
+    /// is compiled against: its module's tables, by symbol, and the
+    /// slots it has handed out in them.
+    pub struct AotEnv<'ctx> {
+        /// `[i64; n]`, the module's variables.
+        pub modvars: GlobalValue<'ctx>,
+        /// Slot tables sized after the module is lowered: string
+        /// constants, method symbols in the VM's interner, and the
+        /// runtime ids of the module's closures.
+        pub consts: GlobalValue<'ctx>,
+        pub symbols: GlobalValue<'ctx>,
+        pub closures: GlobalValue<'ctx>,
+        /// `(source symbol, text)` per slot of `consts` and `symbols`.
+        pub const_strings: RefCell<Vec<(u32, String)>>,
+        pub symbol_remap: RefCell<Vec<(u32, String)>>,
+        /// For a method body: its class's slot in `modvars`, which
+        /// static fields and the closures it makes are keyed by.
+        pub defining_slot: Cell<Option<u32>>,
+        /// Wasm locals are invisible to the conservative scan, so a
+        /// wasm body keeps what it allocated rooted until it returns.
+        pub wasm: bool,
+    }
+
+    impl AotEnv<'_> {
+        fn slot(tbl: &RefCell<Vec<(u32, String)>>, sym: u32, interner: &Interner) -> usize {
+            let mut tbl = tbl.borrow_mut();
+            if let Some(i) = tbl.iter().position(|(s, _)| *s == sym) {
+                return i;
+            }
+            let text = interner
+                .resolve(crate::intern::SymbolId::from_raw(sym))
+                .to_string();
+            tbl.push((sym, text));
+            tbl.len() - 1
+        }
+    }
+
+    /// Lower `mir` into `module` as the exported function `symbol`, for
+    /// an AOT object: `(i64 x arity) -> i64`, reading `env`'s tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lower_aot_function<'ctx>(
+        ctx: &'ctx Context,
+        module: &Module<'ctx>,
+        machine: &TargetMachine,
+        mir: &MirFunction,
+        interner: &Interner,
+        layout: Layout,
+        env: &AotEnv<'ctx>,
+        symbol: &str,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let i64t = ctx.i64_type();
+        let params: Vec<BasicMetadataTypeEnum> =
+            (0..mir.arity as usize).map(|_| i64t.into()).collect();
+        let f = module.add_function(symbol, i64t.fn_type(&params, false), None);
+        stamp_target(ctx, machine, f);
+        let shared = Shared {
+            ctx,
+            module,
+            machine,
+            mir,
+            interner,
+            layout,
+            aot: Some(env),
+            callsite_ic_ptrs: None,
+            callsite_ic_live_ptrs: None,
+            jit_code_base: None,
+            inline_bodies: None,
+            cha_by_method: None,
+            main_fn: f,
+            iterate_sym: interner.lookup("iterate(_)"),
+            iter_value_sym: interner.lookup("iteratorValue(_)"),
+            add_sym: interner.lookup("add(_)"),
+            globals: std::cell::RefCell::new(Vec::new()),
+            record_cell: 0,
+        };
+        Lower::new(&shared, f, &[]).run()?;
+        Ok(f)
+    }
+
     /// Inputs shared by the main body and every OSR entry of one compile.
     struct Shared<'ctx, 'a> {
         ctx: &'ctx Context,
@@ -700,6 +790,12 @@ pub mod llvm {
         #[allow(dead_code)]
         machine: &'a TargetMachine,
         mir: &'a MirFunction,
+        interner: &'a Interner,
+        /// Field offsets for the target's pointer width.
+        layout: Layout,
+        /// Set when lowering for an AOT object: the module's tables by
+        /// symbol replace every address the JIT would bake in.
+        aot: Option<&'a AotEnv<'ctx>>,
         callsite_ic_ptrs: Option<&'a [crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&'a [usize]>,
         jit_code_base: Option<*const *const u8>,
@@ -805,6 +901,9 @@ pub mod llvm {
         /// receiver, and no inline caches.
         inline_depth: u32,
         tmp: u32,
+        /// An AOT body's root-store length at entry, restored on the
+        /// way out.
+        roots_snap: Option<IntValue<'ctx>>,
     }
 
     macro_rules! bail {
@@ -852,6 +951,7 @@ pub mod llvm {
                 param_regs: Vec::new(),
                 inline_depth: 0,
                 tmp: 0,
+                roots_snap: None,
             }
         }
 
@@ -875,6 +975,226 @@ pub mod llvm {
         fn cf64(&self, v: f64) -> FloatValue<'ctx> {
             self.f64t().const_float(v)
         }
+
+        // ── Target words and AOT tables ────────────────────────────────
+
+        /// An integer as wide as the target's pointers.
+        fn wordt(&self) -> inkwell::types::IntType<'ctx> {
+            self.sh
+                .ctx
+                .custom_width_int_type(self.sh.layout.ptr_size as u32 * 8)
+        }
+
+        /// A pointer-sized object word at `base + off`, as an i64.
+        fn load_word(&mut self, base: IntValue<'ctx>, off: i64) -> Result<IntValue<'ctx>, String> {
+            if self.sh.layout.ptr_size == 8 {
+                return self.load64(base, off);
+            }
+            let p = self.addr(base, off)?;
+            let w = self
+                .b
+                .build_load(self.wordt(), p, "w")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            self.b
+                .build_int_z_extend(w, self.i64t(), "w64")
+                .map_err(|e| e.to_string())
+        }
+
+        /// [`Self::load_word`] of a word fixed for the object's life.
+        fn load_word_stable(
+            &mut self,
+            base: IntValue<'ctx>,
+            off: i64,
+        ) -> Result<IntValue<'ctx>, String> {
+            if self.sh.layout.ptr_size == 8 {
+                return self.load64_stable(base, off);
+            }
+            self.load_word(base, off)
+        }
+
+        /// Store the low pointer-width bits of `v` at `base + off`.
+        fn store_word(
+            &mut self,
+            base: IntValue<'ctx>,
+            off: i64,
+            v: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            if self.sh.layout.ptr_size == 8 {
+                return self.store64(base, off, v);
+            }
+            let p = self.addr(base, off)?;
+            let w = self
+                .b
+                .build_int_truncate(v, self.wordt(), "w")
+                .map_err(|e| e.to_string())?;
+            self.b.build_store(p, w).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// Slot `slot` of an AOT table, a u64.
+        fn table_load(
+            &mut self,
+            table: GlobalValue<'ctx>,
+            slot: usize,
+        ) -> Result<IntValue<'ctx>, String> {
+            let p = unsafe {
+                self.b.build_in_bounds_gep(
+                    self.i64t(),
+                    table.as_pointer_value(),
+                    &[self.c64(slot as u64)],
+                    "slotp",
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            self.b
+                .build_load(self.i64t(), p, "slot")
+                .map(|v| v.into_int_value())
+                .map_err(|e| e.to_string())
+        }
+
+        /// Store `v` into slot `slot` of an AOT table.
+        fn table_store(
+            &mut self,
+            table: GlobalValue<'ctx>,
+            slot: usize,
+            v: IntValue<'ctx>,
+        ) -> Result<(), String> {
+            let p = unsafe {
+                self.b.build_in_bounds_gep(
+                    self.i64t(),
+                    table.as_pointer_value(),
+                    &[self.c64(slot as u64)],
+                    "slotp",
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            self.b.build_store(p, v).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// A symbol as a runtime helper takes it: the MIR's id in the
+        /// JIT, the VM's id for the same name from the symbol table in
+        /// an AOT body.
+        fn sym_arg(&mut self, sym: crate::intern::SymbolId) -> Result<IntValue<'ctx>, String> {
+            match self.sh.aot {
+                None => Ok(self.c64(sym.index() as u64)),
+                Some(env) => {
+                    let slot = AotEnv::slot(&env.symbol_remap, sym.index(), self.sh.interner);
+                    self.table_load(env.symbols, slot)
+                }
+            }
+        }
+
+        /// Zero words read in place of an object header when a value is
+        /// not an object: the runtime's in the JIT, the program's own in
+        /// an AOT object.
+        fn null_object(&mut self) -> Result<IntValue<'ctx>, String> {
+            if self.sh.aot.is_none() {
+                return Ok(self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64));
+            }
+            let g = match self.sh.module.get_global("wlift_null_object") {
+                Some(g) => g,
+                None => {
+                    let ty = self.i64t().array_type(8);
+                    let g = self.sh.module.add_global(ty, None, "wlift_null_object");
+                    g.set_linkage(inkwell::module::Linkage::Internal);
+                    g.set_constant(true);
+                    g.set_initializer(&ty.const_zero());
+                    g.set_alignment(8);
+                    g
+                }
+            };
+            self.b
+                .build_ptr_to_int(g.as_pointer_value(), self.i64t(), "nullobj")
+                .map_err(|e| e.to_string())
+        }
+
+        /// The bump region inline allocation draws from; none in an AOT
+        /// body, whose heap is not the compiling process's.
+        fn bump_region(&self) -> usize {
+            if self.sh.aot.is_some() {
+                0
+            } else {
+                crate::codegen::jit_bump_region()
+            }
+        }
+
+        /// In an AOT method body, its class, read from the module's
+        /// variables.
+        fn aot_defining_class(&mut self) -> Result<Option<IntValue<'ctx>>, String> {
+            match self.sh.aot {
+                Some(env) => match env.defining_slot.get() {
+                    Some(slot) => Ok(Some(self.table_load(env.modvars, slot as usize)?)),
+                    None => Ok(None),
+                },
+                None => Ok(None),
+            }
+        }
+
+        /// An imported function of an AOT object, declared once by name.
+        fn aot_import(
+            &self,
+            name: &str,
+            sig: crate::codegen::runtime_fns::HelperSig,
+        ) -> FunctionValue<'ctx> {
+            use crate::codegen::runtime_fns::HelperTy;
+            if let Some(f) = self.sh.module.get_function(name) {
+                return f;
+            }
+            let ty_of = |t: HelperTy| -> BasicMetadataTypeEnum<'ctx> {
+                match t {
+                    HelperTy::I64 => self.i64t().into(),
+                    HelperTy::Ptr => self.ptrt().into(),
+                }
+            };
+            let params: Vec<BasicMetadataTypeEnum> = sig.params.iter().map(|t| ty_of(*t)).collect();
+            let fty = match sig.ret {
+                Some(HelperTy::I64) => self.i64t().fn_type(&params, false),
+                Some(HelperTy::Ptr) => self.ptrt().fn_type(&params, false),
+                None => self.sh.ctx.void_type().fn_type(&params, false),
+            };
+            self.sh.module.add_function(name, fty, None)
+        }
+
+        /// Call an imported helper with i64 arguments, converting to its
+        /// declared types; a void helper answers 0.
+        fn aot_call(
+            &mut self,
+            name: &str,
+            sig: crate::codegen::runtime_fns::HelperSig,
+            args: &[IntValue<'ctx>],
+        ) -> Result<IntValue<'ctx>, String> {
+            use crate::codegen::runtime_fns::HelperTy;
+            if args.len() != sig.params.len() {
+                bail!(
+                    "{name} takes {} arguments, not {}",
+                    sig.params.len(),
+                    args.len()
+                );
+            }
+            let f = self.aot_import(name, sig);
+            let mut a: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
+            for (v, t) in args.iter().zip(sig.params) {
+                a.push(match t {
+                    HelperTy::I64 => (*v).into(),
+                    HelperTy::Ptr => self
+                        .b
+                        .build_int_to_ptr(*v, self.ptrt(), "pa")
+                        .map_err(|e| e.to_string())?
+                        .into(),
+                });
+            }
+            let call = self.b.build_call(f, &a, name).map_err(|e| e.to_string())?;
+            Ok(match call.try_as_basic_value().basic() {
+                Some(BasicValueEnum::IntValue(v)) => v,
+                Some(BasicValueEnum::PointerValue(p)) => self
+                    .b
+                    .build_ptr_to_int(p, self.i64t(), "pr")
+                    .map_err(|e| e.to_string())?,
+                _ => self.c64(0),
+            })
+        }
         fn name(&mut self, base: &str) -> String {
             self.tmp += 1;
             format!("{base}{}", self.tmp)
@@ -891,6 +1211,16 @@ pub mod llvm {
             name: &str,
             args: &[IntValue<'ctx>],
         ) -> Result<IntValue<'ctx>, String> {
+            if self.sh.aot.is_some() {
+                let sig = crate::codegen::runtime_fns::helper_sig(name)
+                    .or_else(|| crate::capi::aot_body_sig(name))
+                    .ok_or_else(|| format!("unknown runtime helper {name}"))?;
+                let v = self.aot_call(name, sig, args)?;
+                if crate::codegen::runtime_fns::helper_can_raise(name) {
+                    self.error_poll()?;
+                }
+                return Ok(v);
+            }
             let Some(addr) = crate::codegen::runtime_fns::resolve(name) else {
                 bail!("unknown runtime helper {name}");
             };
@@ -1092,8 +1422,8 @@ pub mod llvm {
             v: IntValue<'ctx>,
         ) -> Result<(), String> {
             use crate::runtime::object::{FIELD_NUM, FIELD_OTHER};
-            let class = self.load64_stable(obj, HEADER_CLASS as i64)?;
-            let kinds = self.load64_stable(class, CLASS_FIELD_KINDS as i64)?;
+            let class = self.load_word_stable(obj, self.sh.layout.header_class as i64)?;
+            let kinds = self.load_word_stable(class, self.sh.layout.class_field_kinds as i64)?;
             let has = self.icmp(IntPredicate::NE, kinds, self.c64(0))?;
             let note = self.new_block("fkn");
             let done = self.new_block("fkd");
@@ -1165,7 +1495,7 @@ pub mod llvm {
         /// header.
         fn instance_fields(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
             self.b
-                .build_int_add(obj, self.c64(INSTANCE_SIZE as u64), "fields")
+                .build_int_add(obj, self.c64(self.sh.layout.instance_size as u64), "fields")
                 .map_err(|e| e.to_string())
         }
 
@@ -1408,7 +1738,7 @@ pub mod llvm {
 
         /// An object's type byte: written once at allocation.
         fn load_obj_type(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
-            let p = self.addr(obj, HEADER_OBJ_TYPE as i64)?;
+            let p = self.addr(obj, self.sh.layout.header_obj_type as i64)?;
             let ld = self
                 .b
                 .build_load(self.sh.ctx.i8_type(), p, "ty")
@@ -1443,7 +1773,7 @@ pub mod llvm {
 
         /// A List's count, tagged.
         fn load_list_count(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
-            let p = self.addr(obj, LIST_COUNT as i64)?;
+            let p = self.addr(obj, self.sh.layout.list_count as i64)?;
             let ld = self
                 .b
                 .build_load(self.sh.ctx.i32_type(), p, "count")
@@ -1469,17 +1799,9 @@ pub mod llvm {
             if values.is_empty() {
                 return Ok(());
             }
-            let p = self.addr(obj, LIST_ELEM_CLASS as i64)?;
-            let ld = self
-                .b
-                .build_load(self.i64t(), p, "eclass")
-                .map_err(|e| e.to_string())?;
+            let p = self.addr(obj, self.sh.layout.list_elem_class as i64)?;
             let tag = self.list_tag();
-            ld.as_instruction_value()
-                .ok_or("load is not an instruction")?
-                .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
-                .map_err(|e| e.to_string())?;
-            let mut cur = ld.into_int_value();
+            let mut cur = self.load_tagged_word(p, tag, "eclass")?;
             let mixed = self.c64(ELEM_CLASS_MIXED as u64);
             for v in values {
                 let (_, _, class) = self.class_of(*v)?;
@@ -1501,25 +1823,48 @@ pub mod llvm {
                     .map_err(|e| e.to_string())?
                     .into_int_value();
             }
-            let st = self.b.build_store(p, cur).map_err(|e| e.to_string())?;
+            let w = if self.sh.layout.ptr_size == 8 {
+                cur
+            } else {
+                self.b
+                    .build_int_truncate(cur, self.wordt(), "eclassw")
+                    .map_err(|e| e.to_string())?
+            };
+            let st = self.b.build_store(p, w).map_err(|e| e.to_string())?;
             st.set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
                 .map_err(|e| e.to_string())?;
             Ok(())
         }
 
-        /// A List's elements pointer, tagged.
-        fn load_list_elements(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
-            let p = self.addr(obj, LIST_ELEMENTS as i64)?;
+        /// A pointer-sized word at `p` under TBAA `tag`, as an i64.
+        fn load_tagged_word(
+            &mut self,
+            p: PointerValue<'ctx>,
+            tag: MetadataValue<'ctx>,
+            name: &str,
+        ) -> Result<IntValue<'ctx>, String> {
             let ld = self
                 .b
-                .build_load(self.i64t(), p, "elements")
+                .build_load(self.wordt(), p, name)
                 .map_err(|e| e.to_string())?;
-            let tag = self.list_tag();
             ld.as_instruction_value()
                 .ok_or("load is not an instruction")?
                 .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
                 .map_err(|e| e.to_string())?;
-            Ok(ld.into_int_value())
+            let w = ld.into_int_value();
+            if self.sh.layout.ptr_size == 8 {
+                return Ok(w);
+            }
+            self.b
+                .build_int_z_extend(w, self.i64t(), name)
+                .map_err(|e| e.to_string())
+        }
+
+        /// A List's elements pointer, tagged.
+        fn load_list_elements(&mut self, obj: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let p = self.addr(obj, self.sh.layout.list_elements as i64)?;
+            let tag = self.list_tag();
+            self.load_tagged_word(p, tag, "elements")
         }
 
         fn store64(
@@ -1680,7 +2025,11 @@ pub mod llvm {
         /// A trace walks up from here; a direct call needs only the
         /// mark after it.
         fn cur_frame(&mut self) -> Result<(), String> {
-            let cell = jit_cur_cell();
+            let cell = if self.sh.aot.is_some() {
+                0
+            } else {
+                jit_cur_cell()
+            };
             if cell == 0 {
                 return Ok(());
             }
@@ -1717,7 +2066,7 @@ pub mod llvm {
         /// to be turned into the record.
         fn plant_record(&mut self) -> Result<(), String> {
             let cell = self.sh.record_cell;
-            if cell == 0 || jit_cur_cell() == 0 {
+            if cell == 0 || self.sh.aot.is_some() || jit_cur_cell() == 0 {
                 return Ok(());
             }
             let rec = self
@@ -1821,7 +2170,7 @@ pub mod llvm {
         /// at this point, keyed by the site, so the call's return
         /// address names the site.
         fn site_mark(&mut self) -> Result<(), String> {
-            if jit_cur_cell() == 0 {
+            if self.sh.aot.is_some() || jit_cur_cell() == 0 {
                 return Ok(());
             }
             let f = match self.sh.module.get_function("llvm.experimental.stackmap") {
@@ -1862,11 +2211,19 @@ pub mod llvm {
         /// path — so an inline fast path never pays for it: the pending
         /// word first, the helper only when it is set.
         fn error_poll(&mut self) -> Result<(), String> {
-            let addr = crate::codegen::runtime_fns::ERROR_PENDING.0.as_ptr() as u64;
-            let p = self
-                .b
-                .build_int_to_ptr(self.c64(addr), self.ptrt(), "epp")
-                .map_err(|e| e.to_string())?;
+            let p = if self.sh.aot.is_some() {
+                let i32t = self.sh.ctx.i32_type();
+                self.sh
+                    .module
+                    .get_global("wlift_error_pending")
+                    .unwrap_or_else(|| self.sh.module.add_global(i32t, None, "wlift_error_pending"))
+                    .as_pointer_value()
+            } else {
+                let addr = crate::codegen::runtime_fns::ERROR_PENDING.0.as_ptr() as u64;
+                self.b
+                    .build_int_to_ptr(self.c64(addr), self.ptrt(), "epp")
+                    .map_err(|e| e.to_string())?
+            };
             let pending = self
                 .b
                 .build_load(self.sh.ctx.i32_type(), p, "ep")
@@ -1883,18 +2240,27 @@ pub mod llvm {
             self.cbr(set, check, cont)?;
             self.b.position_at_end(check);
             // The helper only reads: a loop keeps what it hoisted.
-            let Some(addr) = crate::codegen::runtime_fns::resolve("wren_aot_check_error") else {
-                bail!("unknown runtime helper wren_aot_check_error");
+            let call = if self.sh.aot.is_some() {
+                let sig = crate::codegen::runtime_fns::helper_sig("wren_aot_check_error")
+                    .ok_or("unknown runtime helper wren_aot_check_error")?;
+                let f = self.aot_import("wren_aot_check_error", sig);
+                self.b
+                    .build_call(f, &[], "err")
+                    .map_err(|e| e.to_string())?
+            } else {
+                let Some(addr) = crate::codegen::runtime_fns::resolve("wren_aot_check_error")
+                else {
+                    bail!("unknown runtime helper wren_aot_check_error");
+                };
+                let ty = self.helper_type(0);
+                let fp = self
+                    .b
+                    .build_int_to_ptr(self.c64(addr as u64), self.ptrt(), "fp")
+                    .map_err(|e| e.to_string())?;
+                self.b
+                    .build_indirect_call(ty, fp, &[], "err")
+                    .map_err(|e| e.to_string())?
             };
-            let ty = self.helper_type(0);
-            let fp = self
-                .b
-                .build_int_to_ptr(self.c64(addr as u64), self.ptrt(), "fp")
-                .map_err(|e| e.to_string())?;
-            let call = self
-                .b
-                .build_indirect_call(ty, fp, &[], "err")
-                .map_err(|e| e.to_string())?;
             // memory(read): every location may be read, none written.
             for (name, v) in [("memory", 0b010101), ("nounwind", 0)] {
                 let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
@@ -1911,9 +2277,7 @@ pub mod llvm {
             let raised = self.icmp(IntPredicate::NE, err, self.c64(0))?;
             self.cbr(raised, leave, cont)?;
             self.b.position_at_end(leave);
-            self.b
-                .build_return(Some(&self.c64(TAG_NULL)))
-                .map_err(|e| e.to_string())?;
+            self.ret(self.c64(TAG_NULL))?;
             self.b.position_at_end(cont);
             Ok(())
         }
@@ -1984,7 +2348,7 @@ pub mod llvm {
             self.cbr(is_obj, obj, not_object)?;
             self.b.position_at_end(obj);
             let ptr = self.and(recv, self.c64(PTR_MASK))?;
-            let class = self.load64_stable(ptr, HEADER_CLASS as i64)?;
+            let class = self.load_word_stable(ptr, self.sh.layout.header_class as i64)?;
             Ok((ptr, class))
         }
 
@@ -1999,13 +2363,13 @@ pub mod llvm {
             let high = self.and(r, self.c64(TAG_OBJ))?;
             let is_obj = self.icmp(IntPredicate::EQ, high, self.c64(TAG_OBJ))?;
             let masked = self.and(r, self.c64(PTR_MASK))?;
-            let null_obj = self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
+            let null_obj = self.null_object()?;
             let ptr = self
                 .b
                 .build_select(is_obj, masked, null_obj, "optr")
                 .map_err(|e| e.to_string())?
                 .into_int_value();
-            let class = self.load64_stable(ptr, HEADER_CLASS as i64)?;
+            let class = self.load_word_stable(ptr, self.sh.layout.header_class as i64)?;
             Ok((is_obj, ptr, class))
         }
 
@@ -2022,7 +2386,7 @@ pub mod llvm {
                 .b
                 .build_and(is_obj, same, "hit")
                 .map_err(|e| e.to_string())?;
-            let null_obj = self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
+            let null_obj = self.null_object()?;
             let safe = self
                 .b
                 .build_select(hit, ptr, null_obj, "iptr")
@@ -2030,7 +2394,11 @@ pub mod llvm {
                 .into_int_value();
             let fields = self
                 .b
-                .build_int_add(safe, self.c64(INSTANCE_SIZE as u64), "fields")
+                .build_int_add(
+                    safe,
+                    self.c64(self.sh.layout.instance_size as u64),
+                    "fields",
+                )
                 .map_err(|e| e.to_string())?;
             Ok((hit, fields))
         }
@@ -2087,6 +2455,9 @@ pub mod llvm {
                 }
             }
             self.plant_record()?;
+            if self.sh.aot.is_some() {
+                self.roots_snap = Some(self.call_helper("wren_jit_roots_snapshot", &[])?);
+            }
 
             if self.entries.is_empty() {
                 let entry = &mir.blocks[0];
@@ -2224,7 +2595,13 @@ pub mod llvm {
                 self.cur_block = bi;
                 self.num_in_block.clear();
                 if loop_headers.contains(&bi) {
-                    self.safepoint_poll()?;
+                    match (self.sh.aot, self.roots_snap) {
+                        (None, _) => self.safepoint_poll()?,
+                        (Some(env), Some(snap)) if !env.wasm => {
+                            self.call_helper("wren_jit_roots_restore", &[snap])?;
+                        }
+                        _ => {}
+                    }
                 }
 
                 self.lower_block(bi)?;
@@ -2389,15 +2766,24 @@ pub mod llvm {
             }
         }
 
+        /// Return `r`, releasing what an AOT body rooted.
+        fn ret(&mut self, r: IntValue<'ctx>) -> Result<(), String> {
+            if let Some(snap) = self.roots_snap {
+                self.call_helper("wren_jit_roots_restore", &[snap])?;
+            }
+            self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
         fn lower_terminator(&mut self, term: &Terminator) -> Result<(), String> {
             match term {
                 Terminator::Return(v) => {
                     let r = self.boxed(v)?;
-                    self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                    self.ret(r)?;
                 }
                 Terminator::ReturnNull => {
                     let r = self.c64(TAG_NULL);
-                    self.b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                    self.ret(r)?;
                 }
                 Terminator::Branch { target, args } => {
                     self.pass_args(*target, args)?;
@@ -2446,6 +2832,11 @@ pub mod llvm {
             inst: &Instruction,
         ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
             use Instruction as I;
+            if self.sh.aot.is_some()
+                && matches!(inst, I::ClassIs(..) | I::ClosureFnIs(..) | I::ObjectIs(..))
+            {
+                bail!("{inst:?} names a host address; AOT code cannot carry it");
+            }
             let v: BasicValueEnum<'ctx> = match inst {
                 I::ConstNum(n) => {
                     let c = self.c64(n.to_bits());
@@ -2564,6 +2955,10 @@ pub mod llvm {
                     }
                     v.into()
                 }
+                I::GetModuleVar(idx) if self.sh.aot.is_some() => {
+                    let env = self.sh.aot.unwrap();
+                    self.table_load(env.modvars, *idx as usize)?.into()
+                }
                 I::GetModuleVar(idx) => {
                     let cell = jit_modvars_cell();
                     if jit_modvar_in_range(*idx) {
@@ -2590,6 +2985,12 @@ pub mod llvm {
                         self.call_helper("wren_get_module_var", &[self.c64(*idx as u64)])?
                             .into()
                     }
+                }
+                I::SetModuleVar(idx, val) if self.sh.aot.is_some() => {
+                    let env = self.sh.aot.unwrap();
+                    let v = self.boxed(val)?;
+                    self.table_store(env.modvars, *idx as usize, v)?;
+                    v.into()
                 }
                 I::SetModuleVar(idx, val) => {
                     let v = self.boxed(val)?;
@@ -2653,7 +3054,11 @@ pub mod llvm {
                     }
                     // The method's class, known at compile time: the
                     // context's may be a direct caller's.
-                    let defining = crate::codegen::jit_defining_class();
+                    let defining = if self.sh.aot.is_some() {
+                        0
+                    } else {
+                        crate::codegen::jit_defining_class()
+                    };
                     let mut call_args = Vec::with_capacity(2 + args.len());
                     let name = if defining != 0 && !args.is_empty() {
                         call_args.push(self.c64(defining as u64));
@@ -2672,7 +3077,7 @@ pub mod llvm {
                             "wren_super_call_4",
                         ][args.len()]
                     };
-                    call_args.push(self.c64(method.index() as u64));
+                    call_args.push(self.sym_arg(*method)?);
                     for a in args {
                         call_args.push(self.boxed(a)?);
                     }
@@ -2746,24 +3151,48 @@ pub mod llvm {
                     self.call_helper("wren_set_upvalue", &[self.c64(*idx as u64), v])?
                         .into()
                 }
-                I::GetStaticField(sym) => self
-                    .call_helper("wren_get_static_field", &[self.c64(sym.index() as u64)])?
-                    .into(),
+                I::GetStaticField(sym) => match self.aot_defining_class()? {
+                    Some(class) => self
+                        .call_helper(
+                            "wlift_aot_get_static_field",
+                            &[class, self.c64(sym.index() as u64)],
+                        )?
+                        .into(),
+                    None => self
+                        .call_helper("wren_get_static_field", &[self.c64(sym.index() as u64)])?
+                        .into(),
+                },
                 I::SetStaticField(sym, val) => {
                     let v = self.boxed(val)?;
-                    self.call_helper("wren_set_static_field", &[self.c64(sym.index() as u64), v])?
-                        .into()
+                    match self.aot_defining_class()? {
+                        Some(class) => self
+                            .call_helper(
+                                "wlift_aot_set_static_field",
+                                &[class, self.c64(sym.index() as u64), v],
+                            )?
+                            .into(),
+                        None => self
+                            .call_helper(
+                                "wren_set_static_field",
+                                &[self.c64(sym.index() as u64), v],
+                            )?
+                            .into(),
+                    }
                 }
                 I::MakeClosure { fn_id, upvalues } => {
                     let n = upvalues.len();
-                    let fid = self.c64(*fn_id as u64);
-                    if n <= 8 {
+                    let fid = match self.sh.aot {
+                        Some(env) => self.table_load(env.closures, *fn_id as usize)?,
+                        None => self.c64(*fn_id as u64),
+                    };
+                    let stamp = self.aot_defining_class()?;
+                    let closure = if n <= 8 {
                         let name = format!("wren_make_closure_{n}");
                         let mut a = vec![fid];
                         for uv in upvalues {
                             a.push(self.boxed(uv)?);
                         }
-                        self.call_helper(&name, &a)?.into()
+                        self.call_helper(&name, &a)?
                     } else {
                         let (_, buf) = self.stack_buf(n)?;
                         for (i, uv) in upvalues.iter().enumerate() {
@@ -2771,7 +3200,14 @@ pub mod llvm {
                             self.store64(buf, (i * 8) as i64, v)?;
                         }
                         self.call_helper("wren_make_closure_n", &[fid, self.c64(n as u64), buf])?
-                            .into()
+                    };
+                    // A method's closure carries its class: the static
+                    // fields its body names are that class's.
+                    match stamp {
+                        Some(class) => self
+                            .call_helper("wlift_aot_set_closure_class", &[closure, class])?
+                            .into(),
+                        None => closure.into(),
                     }
                 }
                 I::SubscriptGet { receiver, args } if args.len() == 1 => {
@@ -2824,12 +3260,18 @@ pub mod llvm {
                 }
                 I::IsType(a, class_sym) => {
                     let v = self.boxed(a)?;
-                    self.call_helper("wren_is_type", &[v, self.c64(class_sym.index() as u64)])?
-                        .into()
+                    let c = self.sym_arg(*class_sym)?;
+                    self.call_helper("wren_is_type", &[v, c])?.into()
                 }
-                I::ConstString(idx) => self
-                    .call_helper("wren_const_string", &[self.c64(*idx as u64)])?
-                    .into(),
+                I::ConstString(idx) => match self.sh.aot {
+                    Some(env) => {
+                        let slot = AotEnv::slot(&env.const_strings, *idx, self.sh.interner);
+                        self.table_load(env.consts, slot)?.into()
+                    }
+                    None => self
+                        .call_helper("wren_const_string", &[self.c64(*idx as u64)])?
+                        .into(),
+                },
 
                 I::ClassIs(a, class_ptr) => {
                     let v = self.boxed(a)?;
@@ -2889,7 +3331,7 @@ pub mod llvm {
                     let inst = self.alloc_instance(class_val, Some((nf, *assigned)))?;
                     // The slow path allocates the same layout: fields
                     // follow the header whenever a bump region exists.
-                    if crate::codegen::jit_bump_region() != 0 {
+                    if self.bump_region() != 0 {
                         self.fresh.insert(inst, *class);
                     }
                     inst.into()
@@ -2905,7 +3347,7 @@ pub mod llvm {
                     self.cbr(is_obj, obj, merge)?;
                     self.b.position_at_end(obj);
                     let ptr = self.and(v, self.c64(PTR_MASK))?;
-                    let ty = self.load8(ptr, HEADER_OBJ_TYPE as i64)?;
+                    let ty = self.load8(ptr, self.sh.layout.header_obj_type as i64)?;
                     let is_clo = self.icmp(
                         IntPredicate::EQ,
                         ty,
@@ -2913,7 +3355,7 @@ pub mod llvm {
                     )?;
                     self.cbr(is_clo, clo, merge)?;
                     self.b.position_at_end(clo);
-                    let function = self.load64(ptr, CLOSURE_FUNCTION as i64)?;
+                    let function = self.load_word(ptr, self.sh.layout.closure_function as i64)?;
                     let hit = self.icmp(IntPredicate::EQ, function, self.c64(*fn_ptr as u64))?;
                     self.br(merge)?;
                     self.b.position_at_end(merge);
@@ -3083,7 +3525,7 @@ pub mod llvm {
                 // body finishes its call on this code; there is no
                 // transfer out of it.
                 I::ColdLoopExit { .. } => {
-                    if self.inline_depth == 0 {
+                    if self.inline_depth == 0 && self.sh.aot.is_none() {
                         let (slot, counter) = self.stack_buf(1)?;
                         self.zero_at_entry(slot)?;
                         let c = self.load64(counter, 0)?;
@@ -3275,9 +3717,9 @@ pub mod llvm {
             let ta_bb = self.new_block("ta");
             self.cbr(is_ta, ta_bb, slow)?;
             self.b.position_at_end(ta_bb);
-            let idx_i = self.int_index(idx, obj, TYPED_ARRAY_COUNT as i64, slow)?;
-            let data = self.load64(obj, TYPED_ARRAY_DATA as i64)?;
-            let kind = self.load8(obj, TYPED_ARRAY_KIND as i64)?;
+            let idx_i = self.int_index(idx, obj, self.sh.layout.typed_array_count as i64, slow)?;
+            let data = self.load_word(obj, self.sh.layout.typed_array_data as i64)?;
+            let kind = self.load8(obj, self.sh.layout.typed_array_kind as i64)?;
             Ok((obj, idx_i, data, kind))
         }
 
@@ -3305,7 +3747,7 @@ pub mod llvm {
             obj: IntValue<'ctx>,
             count_off: i64,
         ) -> Result<IntValue<'ctx>, String> {
-            if count_off == LIST_COUNT as i64 {
+            if count_off == self.sh.layout.list_count as i64 {
                 return self.load_list_count(obj);
             }
             let count_p = self.addr(obj, count_off)?;
@@ -3382,8 +3824,8 @@ pub mod llvm {
             self.cbr(is_list, list_bb, other)?;
             self.b.position_at_end(list_bb);
             let i = match int {
-                Some(i) => self.bounded_index(i, obj, LIST_COUNT as i64, other)?,
-                None => self.int_index(idx, obj, LIST_COUNT as i64, other)?,
+                Some(i) => self.bounded_index(i, obj, self.sh.layout.list_count as i64, other)?,
+                None => self.int_index(idx, obj, self.sh.layout.list_count as i64, other)?,
             };
             let elements = self.load_list_elements(obj)?;
             self.element_addr(elements, i, VALUE_SIZE as u64)
@@ -3443,21 +3885,10 @@ pub mod llvm {
                 .into_int_value();
             if let Some(class) = want_class {
                 let obj = self.and(r, self.c64(PTR_MASK))?;
-                let ep = self.addr(obj, LIST_ELEM_CLASS as i64)?;
-                let ld = self
-                    .b
-                    .build_load(self.i64t(), ep, "eclass")
-                    .map_err(|e| e.to_string())?;
+                let ep = self.addr(obj, self.sh.layout.list_elem_class as i64)?;
                 let tag = self.list_tag();
-                ld.as_instruction_value()
-                    .ok_or("load is not an instruction")?
-                    .set_metadata(tag, self.sh.ctx.get_kind_id("tbaa"))
-                    .map_err(|e| e.to_string())?;
-                let ok = self.icmp(
-                    IntPredicate::EQ,
-                    ld.into_int_value(),
-                    self.c64(class as u64),
-                )?;
+                let eclass = self.load_tagged_word(ep, tag, "eclass")?;
+                let ok = self.icmp(IntPredicate::EQ, eclass, self.c64(class as u64))?;
                 oks.push((ok.into(), self.b.get_insert_block().unwrap()));
             }
             incoming.push((v.into(), self.b.get_insert_block().unwrap()));
@@ -3778,12 +4209,17 @@ pub mod llvm {
         /// region, takes the helper.
         fn alloc_list(&mut self, elems: &[IntValue<'ctx>]) -> Result<IntValue<'ctx>, String> {
             use crate::runtime::object::{FLAG_HEAP_BUFFER, ObjType};
-            let bump = crate::codegen::jit_bump_region();
-            let list_class = crate::codegen::jit_list_class();
+            let bump = self.bump_region();
+            let list_class = if self.sh.aot.is_some() {
+                0
+            } else {
+                crate::codegen::jit_list_class()
+            };
             let n = elems.len();
             // An empty literal starts with the room the runtime gives it.
             let cap = if n == 0 { 8 } else { n };
-            let size = (LIST_SIZE as u64 + VALUE_SIZE as u64 * cap as u64 + 15) & !15;
+            let size =
+                (self.sh.layout.list_size as u64 + VALUE_SIZE as u64 * cap as u64 + 15) & !15;
             if bump == 0 || list_class == 0 || size > 128 || n > 4 {
                 return self.make_list_helper(elems);
             }
@@ -3793,21 +4229,25 @@ pub mod llvm {
             // Header: list type with the heap-buffer flag, the list
             // class; count and capacity share a word; the elements
             // follow.
-            let type_word =
-                ObjType::List as u64 | ((FLAG_HEAP_BUFFER as u64) << (HEADER_FLAGS * 8));
+            let type_word = ObjType::List as u64
+                | ((FLAG_HEAP_BUFFER as u64) << (self.sh.layout.header_flags * 8));
             self.store64(p, 0, self.c64(type_word))?;
-            self.store64(p, HEADER_CLASS as i64, self.c64(list_class as u64))?;
+            self.store_word(
+                p,
+                self.sh.layout.header_class as i64,
+                self.c64(list_class as u64),
+            )?;
             self.store64(
                 p,
-                LIST_COUNT as i64,
+                self.sh.layout.list_count as i64,
                 self.c64(n as u64 | ((cap as u64) << 32)),
             )?;
             let elements = self
                 .b
-                .build_int_add(p, self.c64(LIST_SIZE as u64), "elements")
+                .build_int_add(p, self.c64(self.sh.layout.list_size as u64), "elements")
                 .map_err(|e| e.to_string())?;
-            self.store64(p, LIST_ELEMENTS as i64, elements)?;
-            self.store64(p, LIST_ELEM_CLASS as i64, self.c64(0))?;
+            self.store_word(p, self.sh.layout.list_elements as i64, elements)?;
+            self.store_word(p, self.sh.layout.list_elem_class as i64, self.c64(0))?;
             self.note_list_elements(p, elems)?;
             for (i, v) in elems.iter().enumerate() {
                 self.store64(elements, i as i64 * VALUE_SIZE as i64, *v)?;
@@ -3857,9 +4297,10 @@ pub mod llvm {
             class_val: IntValue<'ctx>,
             known: Option<(u16, u64)>,
         ) -> Result<IntValue<'ctx>, String> {
-            let bump = crate::codegen::jit_bump_region();
-            let known_size = known
-                .map(|(nf, _)| (INSTANCE_SIZE as u64 + VALUE_SIZE as u64 * nf as u64 + 15) & !15);
+            let bump = self.bump_region();
+            let known_size = known.map(|(nf, _)| {
+                (self.sh.layout.instance_size as u64 + VALUE_SIZE as u64 * nf as u64 + 15) & !15
+            });
             if bump == 0 || known_size.is_some_and(|s| s > 128) {
                 return self.call_helper("wren_alloc_instance", &[class_val]);
             }
@@ -3870,7 +4311,7 @@ pub mod llvm {
             let (nf, size) = match known {
                 Some((nf, _)) => (self.c64(nf as u64), self.c64(known_size.unwrap())),
                 None => {
-                    let nf_p = self.addr(class, CLASS_NUM_FIELDS as i64)?;
+                    let nf_p = self.addr(class, self.sh.layout.class_num_fields as i64)?;
                     let nf16 = self
                         .b
                         .build_load(self.sh.ctx.i16_type(), nf_p, "nf16")
@@ -3887,7 +4328,7 @@ pub mod llvm {
                             self.b
                                 .build_int_mul(nf, self.c64(VALUE_SIZE as u64), "fb")
                                 .map_err(|e| e.to_string())?,
-                            self.c64(INSTANCE_SIZE as u64 + 15),
+                            self.c64(self.sh.layout.instance_size as u64 + 15),
                             "raw",
                         )
                         .map_err(|e| e.to_string())?;
@@ -3904,11 +4345,11 @@ pub mod llvm {
             // field count, no owned fields, the fields right after the
             // header.
             self.store64(p, 0, self.c64(OBJ_TYPE_INSTANCE as u64))?;
-            self.store64(p, HEADER_CLASS as i64, class)?;
-            self.store64(p, INSTANCE_NUM_FIELDS as i64, nf)?;
+            self.store_word(p, self.sh.layout.header_class as i64, class)?;
+            self.store64(p, self.sh.layout.instance_num_fields as i64, nf)?;
             let fields = self
                 .b
-                .build_int_add(p, self.c64(INSTANCE_SIZE as u64), "fields")
+                .build_int_add(p, self.c64(self.sh.layout.instance_size as u64), "fields")
                 .map_err(|e| e.to_string())?;
             let has_fields = self.icmp(IntPredicate::NE, nf, self.c64(0))?;
             let fields_or_null = self
@@ -3916,7 +4357,7 @@ pub mod llvm {
                 .build_select(has_fields, fields, self.c64(0), "fp")
                 .map_err(|e| e.to_string())?
                 .into_int_value();
-            self.store64(p, INSTANCE_FIELDS as i64, fields_or_null)?;
+            self.store_word(p, self.sh.layout.instance_fields as i64, fields_or_null)?;
             if let Some((count, assigned)) = known {
                 // Null the fields nothing stores before the object can
                 // be seen.
@@ -4169,14 +4610,13 @@ pub mod llvm {
                 let same = self.icmp(IntPredicate::EQ, la, lb)?;
                 let (is_obj, _, class) = self.class_of(la)?;
                 // A non-object reads the null object's flags: none.
-                let null_obj =
-                    self.c64(crate::codegen::runtime_fns::JIT_NULL_OBJECT.as_ptr() as u64);
+                let null_obj = self.null_object()?;
                 let src = self
                     .b
                     .build_select(is_obj, class, null_obj, "flagsrc")
                     .map_err(|e| e.to_string())?
                     .into_int_value();
-                let flags = self.load8(src, CLASS_FLAGS as i64)?;
+                let flags = self.load8(src, self.sh.layout.class_flags as i64)?;
                 let has_eq = self.icmp(
                     IntPredicate::NE,
                     self.and(flags, self.c64(CLASS_FLAG_EQ as u64))?,
@@ -4406,8 +4846,8 @@ pub mod llvm {
             for a in args {
                 arg_vals.push(self.boxed(a)?);
             }
-            if args.len() > 8 {
-                let m = self.c64(method.index() as u64);
+            if args.len() > 8 || self.sh.aot.is_some() {
+                let m = self.sym_arg(method)?;
                 return self.wren_call(r, m, &arg_vals);
             }
             if args.len() == 1 && Some(method) == self.sh.iterate_sym {
@@ -4649,7 +5089,7 @@ pub mod llvm {
             let list_bb = self.new_block("ll");
             self.cbr(is_list, list_bb, slow)?;
             self.b.position_at_end(list_bb);
-            let count_p = self.addr(obj, LIST_COUNT as i64)?;
+            let count_p = self.addr(obj, self.sh.layout.list_count as i64)?;
             let count32 = self
                 .b
                 .build_load(self.sh.ctx.i32_type(), count_p, "count")
@@ -4744,7 +5184,7 @@ pub mod llvm {
             let slow = self.new_block("las");
             let merge = self.new_block("lam");
             let (obj, count) = self.list_probe(r, slow)?;
-            let cap_p = self.addr(obj, LIST_CAPACITY as i64)?;
+            let cap_p = self.addr(obj, self.sh.layout.list_capacity as i64)?;
             let cap32 = self
                 .b
                 .build_load(self.sh.ctx.i32_type(), cap_p, "cap")
@@ -4765,7 +5205,7 @@ pub mod llvm {
             self.br(merge)?;
             self.b.position_at_end(store_bb);
             self.note_list_elements(obj, &[v])?;
-            let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
+            let elements = self.load_word(obj, self.sh.layout.list_elements as i64)?;
             let p = self.element_addr(elements, count, 8)?;
             self.b.build_store(p, v).map_err(|e| e.to_string())?;
             let next = self
@@ -4776,7 +5216,7 @@ pub mod llvm {
                 .b
                 .build_int_truncate(next, self.sh.ctx.i32_type(), "count32")
                 .map_err(|e| e.to_string())?;
-            let count_p = self.addr(obj, LIST_COUNT as i64)?;
+            let count_p = self.addr(obj, self.sh.layout.list_count as i64)?;
             self.b
                 .build_store(count_p, next32)
                 .map_err(|e| e.to_string())?;
@@ -4826,7 +5266,7 @@ pub mod llvm {
             let load_bb = self.new_block("ivl");
             self.cbr(in_range, load_bb, slow)?;
             self.b.position_at_end(load_bb);
-            let elements = self.load64(obj, LIST_ELEMENTS as i64)?;
+            let elements = self.load_word(obj, self.sh.layout.list_elements as i64)?;
             let p = self.element_addr(elements, idx, 8)?;
             let v = self
                 .b
@@ -4863,6 +5303,9 @@ pub mod llvm {
             receiver: &ValueId,
             args: &[ValueId],
         ) -> Result<IntValue<'ctx>, String> {
+            if self.sh.aot.is_some() {
+                return self.lower_call(receiver, method, args);
+            }
             let r = self.boxed(receiver)?;
             let mut arg_vals = Vec::with_capacity(args.len());
             for a in args {

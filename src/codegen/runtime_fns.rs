@@ -537,8 +537,28 @@ unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Va
     result
 }
 
+/// Enter compiled code on wasm, where every indirect call's signature
+/// is checked: an AOT program registers each body through a wrapper
+/// `entry(args, n)` that takes the first `arity` of the `n` values, as
+/// a native callee reads only the registers it declares.
+///
+/// # Safety
+/// `fn_ptr` must be such a wrapper; `args` stays valid for the call.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub unsafe fn call_entry(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    let f: extern "C" fn(*const u64, usize) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
+    f(args.as_ptr() as *const u64, args.len())
+}
+
 #[inline(always)]
 unsafe fn call_jit_cached_inner(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ctx;
+        return unsafe { call_entry(fn_ptr, args) };
+    }
+    #[allow(unreachable_code)]
     unsafe {
         #[cfg(not(target_arch = "aarch64"))]
         let _ = ctx;
@@ -2312,6 +2332,10 @@ pub struct PendingWord(pub std::sync::atomic::AtomicU32);
 /// and the helper answers for the VM in hand. Raised with every error,
 /// lowered when one is drained; a stale raise costs a call, a missed
 /// one is a poll that goes on.
+#[cfg_attr(
+    any(not(target_arch = "wasm32"), feature = "aot_runtime"),
+    unsafe(export_name = "wlift_error_pending")
+)]
 pub static ERROR_PENDING: PendingWord = PendingWord(std::sync::atomic::AtomicU32::new(0));
 
 #[inline]
@@ -2854,10 +2878,23 @@ fn handle_jit_fiber_action(
                 }
             }
         }
+        // Without fiber stacks a compiled frame cannot be suspended:
+        // raise rather than run on past the yield.
+        #[cfg(not(feature = "host"))]
+        FiberAction::Yield { .. } | FiberAction::Suspend => {
+            vm.has_error = true;
+            note_error_pending();
+            vm.note_raise();
+            vm.last_error =
+                Some("a fiber cannot suspend inside compiled code on this target yet".to_string());
+            Value::null().to_bits()
+        }
+        #[cfg(feature = "host")]
         FiberAction::Yield { value } => {
             // Yield from JIT context — the fiber should return the value.
             value.to_bits()
         }
+        #[cfg(feature = "host")]
         FiberAction::Suspend => {
             // Suspend from JIT context — just return null.
             Value::null().to_bits()
@@ -4207,6 +4244,9 @@ unsafe fn call_jit_with_shadow_raw(fn_ptr: *const u8, args: &[Value]) -> u64 {
 
 #[inline(always)]
 unsafe fn call_jit_with_shadow_raw_inner(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { call_entry(fn_ptr, args) };
+    #[allow(unreachable_code)]
     unsafe {
         match args.len() {
             0 => {

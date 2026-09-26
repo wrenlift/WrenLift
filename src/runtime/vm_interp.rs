@@ -1413,11 +1413,20 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     }
                 }
                 let return_val = unsafe {
-                    let f: extern "C" fn(u64) -> u64 = std::mem::transmute(aot_fn);
                     let recv_bits = closure
                         .map(|c| Value::object(c as *mut u8).to_bits())
                         .unwrap_or_else(|| Value::null().to_bits());
-                    Value::from_bits(f(recv_bits))
+                    #[cfg(target_arch = "wasm32")]
+                    let r = crate::codegen::runtime_fns::call_entry(
+                        aot_fn,
+                        &[Value::from_bits(recv_bits)],
+                    );
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let r = {
+                        let f: extern "C" fn(u64) -> u64 = std::mem::transmute(aot_fn);
+                        f(recv_bits)
+                    };
+                    Value::from_bits(r)
                 };
                 if closure.is_some() {
                     crate::codegen::runtime_fns::set_jit_context(saved_ctx);
@@ -2859,6 +2868,19 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                         let r0 =
                                             crate::codegen::runtime_fns::jit_root_at(root_base)
                                                 .to_bits();
+                                        #[cfg(target_arch = "wasm32")]
+                                        let result = {
+                                            let _ = r0;
+                                            let args: Vec<Value> = (0..=argc.min(3))
+                                                .map(|i| {
+                                                    crate::codegen::runtime_fns::jit_root_at(
+                                                        root_base + i,
+                                                    )
+                                                })
+                                                .collect();
+                                            crate::codegen::runtime_fns::call_entry(jit_ptr, &args)
+                                        };
+                                        #[cfg(not(target_arch = "wasm32"))]
                                         let result = match argc {
                                             0 => {
                                                 let f: extern "C" fn(u64) -> u64 =
@@ -4920,6 +4942,9 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
 
 #[inline(always)]
 unsafe fn call_jit_fn_inner(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return unsafe { crate::codegen::runtime_fns::call_entry(fn_ptr, args) };
+    #[allow(unreachable_code)]
     unsafe {
         ensure_ctx_reg();
         let b = |i: usize| args[i].to_bits();

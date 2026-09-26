@@ -23,6 +23,8 @@ pub mod aot;
 pub mod cfg;
 #[cfg(feature = "cranelift")]
 pub mod cranelift_backend;
+#[cfg(all(feature = "aot", feature = "llvm"))]
+pub mod llvm_aot;
 #[cfg(feature = "llvm")]
 pub mod llvm_backend;
 pub mod regalloc;

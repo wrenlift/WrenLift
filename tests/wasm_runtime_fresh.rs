@@ -14,26 +14,15 @@
 //! wasm runtime is not broken. `WLIFT_RUNTIME` names one explicitly.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod common;
+use common::{runtime_object, rust_lld, wasi_lib_dir};
 
 use wasmparser::{KnownCustom, Linking, Parser, Payload, SymbolFlags, SymbolInfo};
 use wren_lift::capi::AOT_ENTRY_NAMES;
 use wren_lift::codegen::runtime_fns::RUNTIME_FN_NAMES;
 use wren_lift::runtime::object_layout::{Layout, layout_mismatches};
-
-fn runtime_object() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("WLIFT_RUNTIME") {
-        let p = PathBuf::from(explicit);
-        return p.is_file().then_some(p);
-    }
-    // The test binary sits under target/<profile>/deps; the object sits
-    // under target/<profile>/wasm32-wasip1.
-    let exe = std::env::current_exe().ok()?;
-    exe.ancestors()
-        .map(|dir| dir.join("wasm32-wasip1").join("wlift_runtime.o"))
-        .find(|p| p.is_file())
-}
 
 /// The global symbols the object defines.
 fn defined_symbols(bytes: &[u8]) -> HashSet<String> {
@@ -91,44 +80,6 @@ fn the_wasm_runtime_defines_what_aot_code_calls() {
         missing.join(", "),
         missing[0],
     );
-}
-
-/// rust-lld from the toolchain building this test.
-fn rust_lld() -> Option<PathBuf> {
-    let out = |args: &[&str]| {
-        let o = Command::new("rustc").args(args).output().ok()?;
-        String::from_utf8(o.stdout).ok()
-    };
-    let sysroot = out(&["--print", "sysroot"])?;
-    let host = out(&["-vV"])?
-        .lines()
-        .find_map(|l| l.strip_prefix("host: ").map(str::to_string))?;
-    let lld = Path::new(sysroot.trim())
-        .join("lib/rustlib")
-        .join(host)
-        .join("bin/rust-lld");
-    lld.is_file().then_some(lld)
-}
-
-/// The wasi-libc library directory the object was prelinked against.
-fn wasi_lib_dir() -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = std::env::var_os("WASI_SYSROOT")
-        .map(PathBuf::from)
-        .into_iter()
-        .collect();
-    roots.extend(
-        [
-            "/opt/homebrew/opt/wasi-libc/share/wasi-sysroot",
-            "/usr/local/opt/wasi-libc/share/wasi-sysroot",
-            "/opt/wasi-sdk/share/wasi-sysroot",
-            "/usr/share/wasi-sysroot",
-        ]
-        .map(PathBuf::from),
-    );
-    roots
-        .into_iter()
-        .map(|r| r.join("lib/wasm32-wasip1"))
-        .find(|d| d.join("crt1-reactor.o").is_file())
 }
 
 /// The runtime object linked alone into a reactor module, instantiated

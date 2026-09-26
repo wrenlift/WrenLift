@@ -206,9 +206,10 @@ cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", r
 target-lexicon = { version = "0.13", optional = true }
 # LLVM 21, the same pin as Ash so its lowering patterns carry over;
 # linked against the shared library where one is installed.
-# Only the host targets: inkwell's default `target-all` references every
-# backend's registration, and the linker keeps each one it references.
-inkwell = { version = "0.8.0", default-features = false, features = ["llvm21-1", "target-x86", "target-aarch64"], optional = true }
+# The host targets and WebAssembly, for AOT to wasm32: inkwell's default
+# `target-all` references every backend's registration, and the linker
+# keeps each one it references.
+inkwell = { version = "0.8.0", default-features = false, features = ["llvm21-1", "target-x86", "target-aarch64", "target-webassembly"], optional = true }
 # Tier-up / promotion broker. Pinned to 0.3 — version 0.3 brought in
 # the OsrEntry / swap_compiled_with_osr APIs that `src/runtime/tier.rs`
 # relies on for OSR-aware installs. Pulls in `std::thread` so it sits

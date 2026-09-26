@@ -418,8 +418,8 @@ pub unsafe extern "C" fn wlift_run_aot_program(
 // drive an AOT-compiled program directly, no `vm.interpret` round-trip.
 // ---------------------------------------------------------------------------
 
-/// Every entry point an AOT program's bootstrap or bodies call, beside
-/// the helpers in `RUNTIME_FN_NAMES`. The wasm runtime object must
+/// Every entry point an AOT program's bootstrap or bodies call, and the
+/// data its bodies read, beside the helpers in `RUNTIME_FN_NAMES`. The wasm runtime object must
 /// define each; `tests/wasm_runtime_fresh.rs` checks it.
 pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_new_vm",
@@ -440,7 +440,32 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_resolve_runtime_import",
     "wlift_aot_invoke_module_body",
     "wlift_aot_take_error",
+    "wlift_error_pending",
 ];
+
+/// The signature of an entry point compiled AOT bodies call directly
+/// (the rest are the bootstrap's).
+pub fn aot_body_sig(name: &str) -> Option<crate::codegen::runtime_fns::HelperSig> {
+    use crate::codegen::runtime_fns::{HelperSig, HelperTy::I64};
+    Some(match name {
+        "wlift_aot_get_static_field" | "wlift_aot_set_closure_class" => HelperSig {
+            params: &[I64, I64],
+            ret: Some(I64),
+        },
+        "wlift_aot_set_static_field" => HelperSig {
+            params: &[I64, I64, I64],
+            ret: Some(I64),
+        },
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "aot_runtime")]
+const _: () = {
+    let _: unsafe extern "C" fn(u64, u64) -> u64 = wlift_aot_get_static_field;
+    let _: unsafe extern "C" fn(u64, u64) -> u64 = wlift_aot_set_closure_class;
+    let _: unsafe extern "C" fn(u64, u64, u64) -> u64 = wlift_aot_set_static_field;
+};
 
 /// Populate the first slots of a per-module `wlift_modvars_<n>`
 /// array with the VM's core class values, in the same order

@@ -1234,70 +1234,23 @@ fn emit_aot_module(
     // dispatch as the JIT install path, but the method bodies
     // are AOT-emitted symbols instead of JIT-tier-up MIR.
     let mut classes_manifest: Vec<AotClassManifest> = Vec::with_capacity(aot_mod.mir.classes.len());
-    for (class_idx, class) in aot_mod.mir.classes.iter().enumerate() {
-        let class_name = aot_mod.interner.resolve(class.name).to_string();
-        let parent_slot = class.superclass.and_then(|sym| {
-            let parent_name = aot_mod.interner.resolve(sym);
-            aot_mod
-                .module_var_names
-                .iter()
-                .position(|n| n == parent_name)
-                .map(|s| s as u32)
+    for plan in plan_classes(aot_mod, fn_symbol) {
+        let defining_class_for_methods = plan.slot.map(|slot| AotDefiningClass {
+            modvars_symbol: modvars_symbol.to_string(),
+            slot,
         });
-        let slot = aot_mod
-            .module_var_names
-            .iter()
-            .position(|n| n == &class_name)
-            .unwrap_or(usize::MAX);
-
-        let mut methods_manifest: Vec<AotMethodManifest> = Vec::with_capacity(class.methods.len());
-        let defining_class_for_methods = if slot != usize::MAX {
-            Some(AotDefiningClass {
-                modvars_symbol: modvars_symbol.to_string(),
-                slot: slot as u32,
-            })
-        } else {
-            None
-        };
-        for (method_idx, method) in class.methods.iter().enumerate() {
-            let sym = format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx);
+        for (sym, method) in plan.methods.iter().zip(plan.class.methods.iter()) {
             emit_aot_function(
                 module,
                 &aot_mod.interner,
                 &method.mir,
                 &aot_cfg,
-                &sym,
+                sym,
                 defining_class_for_methods.clone(),
             )?;
-            methods_manifest.push(AotMethodManifest {
-                signature: method.signature.clone(),
-                fn_symbol: sym,
-                arity: method.mir.arity,
-                is_static: method.is_static,
-                is_constructor: method.is_constructor,
-            });
         }
-
-        let foreign_methods: Vec<AotForeignMethodManifest> = class
-            .foreign_methods
-            .iter()
-            .map(|fm| AotForeignMethodManifest {
-                signature: fm.signature.clone(),
-                symbol: fm.symbol.clone(),
-                is_static: fm.is_static,
-            })
-            .collect();
-
-        if slot != usize::MAX {
-            classes_manifest.push(AotClassManifest {
-                name: class_name,
-                parent_slot,
-                num_fields: class.num_fields,
-                slot: slot as u32,
-                methods: methods_manifest,
-                foreign_library: class.native_library.clone(),
-                foreign_methods,
-            });
+        if let Some(manifest) = plan.manifest {
+            classes_manifest.push(manifest);
         }
     }
 
@@ -1353,6 +1306,78 @@ fn emit_aot_module(
         classes: classes_manifest,
         closures: closure_manifest,
     })
+}
+
+/// One class of a module as the AOT emitters lay it out.
+pub(crate) struct ClassPlan<'m> {
+    pub class: &'m crate::mir::ClassMir,
+    /// Its slot in the module's variables; `None` when the resolver
+    /// gave it none, and then it is emitted but not installed.
+    pub slot: Option<u32>,
+    /// The symbol of each method body, in `class.methods` order.
+    pub methods: Vec<String>,
+    /// What the bootstrap installs, when the class has a slot.
+    pub manifest: Option<AotClassManifest>,
+}
+
+/// Plan every class of `aot_mod`, naming method bodies after
+/// `fn_symbol`.
+pub(crate) fn plan_classes<'m>(aot_mod: &'m AotModule, fn_symbol: &str) -> Vec<ClassPlan<'m>> {
+    let mut plans = Vec::with_capacity(aot_mod.mir.classes.len());
+    for (class_idx, class) in aot_mod.mir.classes.iter().enumerate() {
+        let class_name = aot_mod.interner.resolve(class.name).to_string();
+        let parent_slot = class.superclass.and_then(|sym| {
+            let parent_name = aot_mod.interner.resolve(sym);
+            aot_mod
+                .module_var_names
+                .iter()
+                .position(|n| n == parent_name)
+                .map(|s| s as u32)
+        });
+        let slot = aot_mod
+            .module_var_names
+            .iter()
+            .position(|n| n == &class_name)
+            .map(|s| s as u32);
+        let methods: Vec<String> = (0..class.methods.len())
+            .map(|method_idx| format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx))
+            .collect();
+        let manifest = slot.map(|slot| AotClassManifest {
+            name: class_name,
+            parent_slot,
+            num_fields: class.num_fields,
+            slot,
+            methods: class
+                .methods
+                .iter()
+                .zip(&methods)
+                .map(|(method, sym)| AotMethodManifest {
+                    signature: method.signature.clone(),
+                    fn_symbol: sym.clone(),
+                    arity: method.mir.arity,
+                    is_static: method.is_static,
+                    is_constructor: method.is_constructor,
+                })
+                .collect(),
+            foreign_library: class.native_library.clone(),
+            foreign_methods: class
+                .foreign_methods
+                .iter()
+                .map(|fm| AotForeignMethodManifest {
+                    signature: fm.signature.clone(),
+                    symbol: fm.symbol.clone(),
+                    is_static: fm.is_static,
+                })
+                .collect(),
+        });
+        plans.push(ClassPlan {
+            class,
+            slot,
+            methods,
+            manifest,
+        });
+    }
+    plans
 }
 
 /// Run an `AotModule` straight from a single in-memory source —
@@ -1780,21 +1805,8 @@ pub fn compile_walk_to_object_with_manifest(
 
     let mut manifests: Vec<AotManifest> = Vec::with_capacity(modules.len());
     for (idx, aot_mod) in modules.iter().enumerate() {
-        let (fn_symbol, modvars_symbol, consts_symbol, symbols_symbol) = if idx == last_idx {
-            (
-                "wlift_aot_main".to_string(),
-                "wlift_modvars_main".to_string(),
-                "wlift_consts_main".to_string(),
-                "wlift_symbols_main".to_string(),
-            )
-        } else {
-            (
-                format!("wlift_aot_mod_{}", idx),
-                format!("wlift_modvars_{}", idx),
-                format!("wlift_consts_{}", idx),
-                format!("wlift_symbols_{}", idx),
-            )
-        };
+        let (fn_symbol, modvars_symbol, consts_symbol, symbols_symbol) =
+            module_symbols(idx, last_idx);
         let emitted = emit_aot_module(
             &mut module,
             aot_mod,
@@ -1823,6 +1835,42 @@ pub fn compile_walk_to_object_with_manifest(
         });
     }
 
+    resolve_manifest_imports(modules, &mut manifests);
+
+    emit_aot_bootstrap_main(&mut module, &manifests, bundle)?;
+
+    let product = module.finish();
+    let bytes = product
+        .emit()
+        .map_err(|e| AotError::Module(e.to_string()))?;
+    std::fs::write(output, &bytes).map_err(AotError::Io)?;
+    Ok(manifests)
+}
+
+/// The symbols of module `idx` of `last_idx + 1`: its top-level body,
+/// variables, string constants and symbol table. The entry module is
+/// `main`, the others are numbered.
+pub(crate) fn module_symbols(idx: usize, last_idx: usize) -> (String, String, String, String) {
+    if idx == last_idx {
+        (
+            "wlift_aot_main".to_string(),
+            "wlift_modvars_main".to_string(),
+            "wlift_consts_main".to_string(),
+            "wlift_symbols_main".to_string(),
+        )
+    } else {
+        (
+            format!("wlift_aot_mod_{}", idx),
+            format!("wlift_modvars_{}", idx),
+            format!("wlift_consts_{}", idx),
+            format!("wlift_symbols_{}", idx),
+        )
+    }
+}
+
+/// Fill each manifest's `imports` and `runtime_imports` from its
+/// module's resolved variable sources, once every manifest exists.
+pub(crate) fn resolve_manifest_imports(modules: &[AotModule], manifests: &mut [AotManifest]) {
     // Resolve cross-module imports: each module's resolver gave us
     // a per-slot `Option<source_path>`. Walk those once we have
     // every manifest in hand so a `Some(path)` can resolve to the
@@ -1940,15 +1988,6 @@ pub fn compile_walk_to_object_with_manifest(
         manifests[idx].imports = bindings;
         manifests[idx].runtime_imports = runtime_imports;
     }
-
-    emit_aot_bootstrap_main(&mut module, &manifests, bundle)?;
-
-    let product = module.finish();
-    let bytes = product
-        .emit()
-        .map_err(|e| AotError::Module(e.to_string()))?;
-    std::fs::write(output, &bytes).map_err(AotError::Io)?;
-    Ok(manifests)
 }
 
 /// Locate `libwren_lift.a` (or `wren_lift.lib` on Windows) for
