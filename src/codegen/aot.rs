@@ -257,27 +257,44 @@ pub fn collect_wasm_plugins(
     entry_path: &Path,
     triple: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, AotError> {
-    let is_module = |bytes: &[u8]| bytes.starts_with(b"\0asm") || bytes.starts_with(b"!<arch>\n");
+    // Only a side module or an archive of one: a browser build of the
+    // same library is a finished module with its own memory.
+    let is_module = |bytes: &[u8]| {
+        bytes.starts_with(b"!<arch>\n")
+            || (bytes.starts_with(b"\0asm")
+                && ash_wasm_link::looks_like_side_module(
+                    &bytes[..bytes.len().min(ash_wasm_link::SIDE_MODULE_PREFIX)],
+                ))
+    };
     let bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
     if crate::hatch::looks_like_hatch(&bytes) {
         let hatch = crate::hatch::load(&bytes)
             .map_err(|e| AotError::Frontend(format!("loading hatch archive: {e}")))?;
-        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        // Per library, the variant keyed by `triple` over any other.
+        let mut out: Vec<(String, Vec<u8>, bool)> = Vec::new();
         for section in &hatch.sections {
             if !matches!(section.kind, crate::hatch::SectionKind::NativeLib)
                 || !is_module(&section.data)
             {
                 continue;
             }
-            let lib = section
+            let (lib, key) = section
                 .name
                 .split_once(crate::hatch::NATIVE_LIB_PLATFORM_SEP)
-                .map_or(section.name.as_str(), |(lib, _)| lib);
-            if !out.iter().any(|(l, _)| l == lib) {
-                out.push((lib.to_string(), section.data.clone()));
+                .unwrap_or((section.name.as_str(), ""));
+            let exact = key == triple;
+            match out.iter_mut().find(|(l, _, _)| l == lib) {
+                Some(entry) if exact && !entry.2 => {
+                    *entry = (lib.to_string(), section.data.clone(), true)
+                }
+                Some(_) => {}
+                None => out.push((lib.to_string(), section.data.clone(), exact)),
             }
         }
-        return Ok(out);
+        return Ok(out
+            .into_iter()
+            .map(|(lib, bytes, _)| (lib, bytes))
+            .collect());
     }
 
     let Some(hatchfile) = entry_hatchfile(entry_path) else {

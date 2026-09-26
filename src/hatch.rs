@@ -526,8 +526,11 @@ impl NativeLibEntry {
                     None
                 }
             }
+            // The exact triple first: a `wasm32-wasip1` side module and a
+            // browser `wasm` module are different builds of one library.
             NativeLibEntry::Map(map) => map
-                .get("wasm")
+                .get(t)
+                .or_else(|| map.get("wasm"))
                 .or_else(|| map.get("wasm32"))
                 .or_else(|| map.get("unknown-wasm32"))
                 .or_else(|| map.get("any"))
@@ -3222,6 +3225,26 @@ openssl = "libs/openssl.dylib"
         assert!(
             !has_native,
             "wasm target should not pack host-native dylib bytes"
+        );
+    }
+
+    #[test]
+    fn a_wasm_target_takes_the_variant_keyed_by_its_own_triple() {
+        let entry: NativeLibEntry = toml::from_str::<
+            std::collections::BTreeMap<String, NativeLibEntry>,
+        >(
+            r#"lib = { wasm = "libs/web.wasm", "wasm32-wasip1" = "libs/wasm32-wasip1/lib.wasm" }"#,
+        )
+        .expect("entry")
+        .remove("lib")
+        .expect("lib");
+        assert_eq!(
+            entry.resolve_for_target(Some("wasm32-wasip1")),
+            Some("libs/wasm32-wasip1/lib.wasm")
+        );
+        assert_eq!(
+            entry.resolve_for_target(Some("wasm32-unknown-unknown")),
+            Some("libs/web.wasm")
         );
     }
 

@@ -1033,6 +1033,14 @@ fn aot_build_for_target(
                 })
             }));
     }
+    for lib in exports.keys() {
+        if !libraries.iter().any(|(l, _)| l == lib) {
+            eprintln!(
+                "wlift: no {triple} side module for native library {lib}; \
+                 a class bound to it stops the program when it starts"
+            );
+        }
+    }
     let out = std::path::Path::new(out_path);
     for placed in place_wasm_libraries(&libraries, &exports, out)
         .unwrap_or_else(|e| fail("placing native libraries", &e))
