@@ -390,6 +390,79 @@ pub fn llvm_gains(mir: &MirFunction) -> bool {
     })
 }
 
+/// The class a call's receiver is an instance of, when the MIR says:
+/// a module variable only ever given instances of one class, or the
+/// result of a call on such a receiver to a method that returns its
+/// receiver. Used to fill caches a loop that has not run leaves empty.
+struct ReceiverClasses<'a> {
+    engine: &'a ExecutionEngine,
+    cha: &'a ChaMap,
+    defs: HashMap<crate::mir::ValueId, &'a crate::mir::Instruction>,
+    vars: std::cell::OnceCell<HashMap<u32, usize>>,
+    id: FuncId,
+    interner: &'a crate::intern::Interner,
+}
+
+impl ReceiverClasses<'_> {
+    fn class_of(&self, v: crate::mir::ValueId, depth: u32) -> Option<usize> {
+        use crate::mir::Instruction;
+        if depth > 8 {
+            return None;
+        }
+        let mut v = v;
+        while let Some(Instruction::Move(a)) = self.defs.get(&v) {
+            v = *a;
+        }
+        match self.defs.get(&v)? {
+            Instruction::GetModuleVar(slot) => self
+                .vars
+                .get_or_init(|| {
+                    self.engine
+                        .module_var_instance_classes(self.id, self.interner)
+                })
+                .get(&(*slot as u32))
+                .copied(),
+            Instruction::Call {
+                receiver, method, ..
+            } => {
+                let class = self.class_of(*receiver, depth + 1)?;
+                let one = self.cha.get(method)?.iter().find(|i| i.class == class)?;
+                let body = self.engine.get_mir(FuncId(one.fid))?;
+                returns_receiver(&body).then_some(class)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether every return of `mir` gives back its receiver.
+fn returns_receiver(mir: &MirFunction) -> bool {
+    use crate::mir::{Instruction, Terminator};
+    let defs: HashMap<crate::mir::ValueId, &Instruction> = mir
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter().map(|(v, inst)| (*v, inst)))
+        .collect();
+    let mut returns = 0;
+    for block in &mir.blocks {
+        match &block.terminator {
+            Terminator::Return(v) => {
+                let mut v = *v;
+                while let Some(Instruction::Move(a)) = defs.get(&v) {
+                    v = *a;
+                }
+                if !matches!(defs.get(&v), Some(Instruction::BlockParam(0))) {
+                    return false;
+                }
+                returns += 1;
+            }
+            Terminator::ReturnNull => return false,
+            _ => {}
+        }
+    }
+    returns > 0
+}
+
 /// Optional shared CHA snapshot threaded through codegen.
 pub type SharedCha = Option<Arc<ChaMap>>;
 
@@ -2094,6 +2167,7 @@ impl ExecutionEngine {
         ic_snapshot: &mut [CallSiteIC],
         cha: &ChaMap,
         interner: &crate::intern::Interner,
+        tier: CompileTier,
     ) {
         use crate::mir::Instruction;
         use crate::runtime::object::{Method, ObjClass, ObjHeader, ObjType};
@@ -2138,6 +2212,18 @@ impl ExecutionEngine {
                     _ => None,
                 }
             };
+        let receiver_class = ReceiverClasses {
+            engine: self,
+            cha,
+            defs: mir
+                .blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter().map(|(v, inst)| (*v, inst)))
+                .collect(),
+            vars: std::cell::OnceCell::new(),
+            id,
+            interner,
+        };
         let sites = mir.ic_site_numbering();
         for block in &mir.blocks {
             for (dst, inst) in &block.instructions {
@@ -2171,8 +2257,94 @@ impl ExecutionEngine {
                     slot.closure = closure as *const u8;
                     slot.kind = 3;
                 }
+                // Only the top tier: a baseline inlining the bodies would
+                // take longer to compile than the interpreter runs.
+                if slot.kind == 0
+                    && tier == CompileTier::Optimized
+                    && let Some(class) = receiver_class.class_of(*receiver, 0)
+                    && let Some(one) = cha
+                        .get(method)
+                        .and_then(|impls| impls.iter().find(|i| i.class == class))
+                {
+                    slot.class = one.class;
+                    slot.func_id = one.fid as u64;
+                    slot.closure = one.closure as *const u8;
+                    slot.kind = 1;
+                }
             }
         }
+    }
+
+    /// The class each variable of `id`'s module holds an instance of,
+    /// when every store to it in any function of the module is null or
+    /// a constructor call on that one class.
+    fn module_var_instance_classes(
+        &self,
+        id: FuncId,
+        interner: &crate::intern::Interner,
+    ) -> HashMap<u32, usize> {
+        use crate::mir::Instruction;
+        use crate::runtime::object::{Method, ObjClass, ObjHeader, ObjType};
+        let Some(module) = self.func_module(id).cloned() else {
+            return HashMap::new();
+        };
+        let Some(vars) = self.modules.get(module.as_str()).map(|e| &e.vars) else {
+            return HashMap::new();
+        };
+        let class_at = |slot: u16| -> Option<*const ObjClass> {
+            let ptr = vars.get(slot as usize)?.as_object()?;
+            (unsafe { (*(ptr as *const ObjHeader)).obj_type } == ObjType::Class)
+                .then_some(ptr as *const ObjClass)
+        };
+        // None: some store is not a constructor of the one class.
+        let mut seen: HashMap<u32, Option<usize>> = HashMap::new();
+        for i in 0..self.functions.len() {
+            let fid = FuncId(i as u32);
+            if self.func_module(fid).map(|m| m.as_str()) != Some(module.as_str()) {
+                continue;
+            }
+            let Some(mir) = self.get_mir(fid) else {
+                continue;
+            };
+            let defs: HashMap<crate::mir::ValueId, &Instruction> = mir
+                .blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter().map(|(v, inst)| (*v, inst)))
+                .collect();
+            let root = |mut v: crate::mir::ValueId| {
+                while let Some(Instruction::Move(a)) = defs.get(&v) {
+                    v = *a;
+                }
+                v
+            };
+            for (_, inst) in mir.blocks.iter().flat_map(|b| b.instructions.iter()) {
+                let Instruction::SetModuleVar(slot, value) = inst else {
+                    continue;
+                };
+                let made = match defs.get(&root(*value)) {
+                    Some(Instruction::ConstNull) => continue,
+                    Some(Instruction::Call {
+                        receiver, method, ..
+                    }) => match defs.get(&root(*receiver)) {
+                        Some(Instruction::GetModuleVar(cslot)) => class_at(*cslot).filter(|c| {
+                            interner
+                                .lookup(&format!("static:{}", interner.resolve(*method)))
+                                .and_then(|sym| unsafe { (**c).find_method(sym) })
+                                .is_some_and(|m| matches!(m, Method::Constructor(_)))
+                        }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let entry = seen.entry(*slot as u32).or_insert(made.map(|c| c as usize));
+                if *entry != made.map(|c| c as usize) {
+                    *entry = None;
+                }
+            }
+        }
+        seen.into_iter()
+            .filter_map(|(slot, class)| class.map(|c| (slot, c)))
+            .collect()
     }
 
     /// Compute a per-function "no observable side effects" map keyed
@@ -4532,7 +4704,7 @@ impl ExecutionEngine {
         } else {
             let cha = self.build_jit_cha(id);
             if let Some(ref mut ics) = callsite_ic_ptrs {
-                self.fill_ic_with_cha(id, &mir, ics, &cha, interner);
+                self.fill_ic_with_cha(id, &mir, ics, &cha, interner, tier);
             }
             Some(Arc::new(cha))
         };
@@ -4790,7 +4962,7 @@ impl ExecutionEngine {
         } else {
             let cha = self.build_jit_cha(id);
             if let Some(ref mut ics) = callsite_ic_ptrs {
-                self.fill_ic_with_cha(id, &mir, ics, &cha, interner);
+                self.fill_ic_with_cha(id, &mir, ics, &cha, interner, tier);
             }
             Some(Arc::new(cha))
         };
@@ -5367,6 +5539,45 @@ mod tests {
         let engine = ExecutionEngine::new(ExecutionMode::Tiered);
         assert_eq!(engine.mode, ExecutionMode::Tiered);
         assert!(engine.functions.is_empty());
+    }
+
+    /// A variable its module only ever gives one class's instances (or
+    /// null) types the calls on it, and on what a method returning its
+    /// receiver gives back; one given two classes types nothing.
+    #[test]
+    fn a_module_variable_given_one_class_types_its_receivers() {
+        let mut vm = crate::runtime::vm::VM::new(crate::runtime::vm::VMConfig {
+            execution_mode: ExecutionMode::Interpreter,
+            ..Default::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let src = "class A {\n  construct new() {}\n  step { this }\n  other { 1 }\n}\nclass B {\n  construct new() {}\n}\nvar a = null\na = A.new()\nvar mixed = A.new()\nmixed = B.new()\n";
+        assert!(matches!(
+            vm.interpret("main", src),
+            InterpretResult::Success
+        ));
+        let entry = &vm.engine.modules["main"];
+        let slot = |name: &str| entry.var_names.iter().position(|n| n == name).unwrap() as u32;
+        let class_a = entry.vars[slot("A") as usize].as_object().unwrap() as usize;
+        let (a, mixed) = (slot("a"), slot("mixed"));
+        let top = entry.top_level;
+        let classes = vm.engine.module_var_instance_classes(top, &vm.interner);
+        assert_eq!(classes.get(&a), Some(&class_a));
+        assert_eq!(classes.get(&mixed), None);
+        let method = |name: &str| {
+            let sym = vm.interner.lookup(name).unwrap();
+            let Some(crate::runtime::object::Method::Closure(c)) = (unsafe {
+                (*(class_a as *const crate::runtime::object::ObjClass)).find_method(sym)
+            })
+            .copied() else {
+                panic!("{name}");
+            };
+            vm.engine
+                .get_mir(FuncId(unsafe { (*(*c).function).fn_id }))
+                .unwrap()
+        };
+        assert!(returns_receiver(&method("step")));
+        assert!(!returns_receiver(&method("other")));
     }
 
     #[test]
