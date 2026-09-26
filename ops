@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1790431968,"nonce":"Pgu3/XrT/f25/pv6zpbLkVnmo7o=","message":"Fixed in c966ce4: the bootstrap calls wlift_aot_take_error after each module body.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1790431968,"nonce":"fVyXreX5gy5GJqB3RAimwmJZvZQ=","status":2}]}
