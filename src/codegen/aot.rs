@@ -608,8 +608,9 @@ fn build_aot_module_from_source(
         .map(|sym| interner.resolve(*sym).to_string())
         .collect();
     let module_var_sources = resolved.module_var_sources.clone();
-    let (module_mir, new_layouts) =
+    let (mut module_mir, new_layouts) =
         lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, field_layouts);
+    optimize_module(&mut module_mir, &interner);
     for (k, v) in new_layouts {
         field_layouts.insert(k, v);
     }
@@ -625,6 +626,30 @@ fn build_aot_module_from_source(
         mir: module_mir,
         interner,
     })
+}
+
+/// The passes the VM runs on a module before it runs it, so AOT code
+/// gets the same specialisation: what an `#export` declares a Num is
+/// unboxed.
+fn optimize_module(module_mir: &mut ModuleMir, interner: &Interner) {
+    use crate::mir::opt::{
+        self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
+        licm::Licm, sra::Sra,
+    };
+    let cse = Cse::default();
+    let type_spec = TypeSpecialize::with_math(interner);
+    let passes: Vec<&dyn MirPass> = vec![
+        &ConstFold, &Dce, &cse, &type_spec, &ConstFold, &Dce, &Licm, &Sra, &Dce,
+    ];
+    opt::run_to_fixpoint(&mut module_mir.top_level, &passes, 10);
+    for class in &mut module_mir.classes {
+        for method in &mut class.methods {
+            opt::run_to_fixpoint(&mut method.mir, &passes, 10);
+        }
+    }
+    for closure in &mut module_mir.closures {
+        opt::run_to_fixpoint(closure, &passes, 10);
+    }
 }
 
 /// Map from scoped import name (e.g. `"@hatch:fmt"`) to the
@@ -919,8 +944,9 @@ fn walk_module(
         .map(|sym| interner.resolve(*sym).to_string())
         .collect();
     let module_var_sources = resolved.module_var_sources.clone();
-    let (module_mir, new_layouts) =
+    let (mut module_mir, new_layouts) =
         lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, field_layouts);
+    optimize_module(&mut module_mir, &interner);
     for (k, v) in new_layouts {
         field_layouts.insert(k, v);
     }
@@ -1415,8 +1441,9 @@ fn build_single_aot_module(source: &str, name: &str) -> Result<AotModule, AotErr
     }
 
     let field_layouts = std::collections::HashMap::new();
-    let (module_mir, _new_layouts) =
+    let (mut module_mir, _new_layouts) =
         lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, &field_layouts);
+    optimize_module(&mut module_mir, &interner);
 
     let module_var_names: Vec<String> = resolved
         .module_vars
