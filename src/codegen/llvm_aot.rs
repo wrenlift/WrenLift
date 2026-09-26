@@ -128,7 +128,12 @@ pub fn compile_modules_to_llvm_object(
     if modules.is_empty() {
         return Err(AotError::Frontend("no modules to emit".into()));
     }
-    if !bundle.native_search_paths.is_empty() || !bundle.native_libs.is_empty() {
+    // A wasm program's plugins are modules the harness loads beside it
+    // (see `link_wasm`); anywhere else, a native library is dlopened,
+    // which this build does not do yet.
+    if !target.is_wasm()
+        && (!bundle.native_search_paths.is_empty() || !bundle.native_libs.is_empty())
+    {
         return Err(AotError::UnsupportedTarget(format!(
             "{}: native libraries in an LLVM AOT build",
             target.triple
@@ -201,7 +206,7 @@ pub fn compile_modules_to_llvm_object(
         let mut classes = Vec::new();
         let mut method_fns = Vec::new();
         for plan in plan_classes(m, &fn_symbol) {
-            if plan.class.native_library.is_some() {
+            if plan.class.native_library.is_some() && !target.is_wasm() {
                 return Err(AotError::UnsupportedTarget(format!(
                     "{}: foreign classes in an LLVM AOT build",
                     target.triple
@@ -401,19 +406,87 @@ pub fn locate_wasm_runtime() -> Option<std::path::PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Custom section of a wasm AOT program carrying the plugin module for
+/// the library named by the rest of the section's name.
+pub const PLUGIN_SECTION_PREFIX: &str = "wlift.plugin.";
+
 /// Link a wasm32 program object against the prelinked runtime object
 /// (`tools/build_wasm_runtime.sh`) into one WASI command module at
 /// `output`, in process.
-pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
+///
+/// `plugins` are finished wasm modules by library name, which a harness
+/// instantiates beside the program: the program exports what each one
+/// imports and what the harness calls, and carries each in a
+/// [`PLUGIN_SECTION_PREFIX`] custom section.
+pub fn link_wasm(
+    program: &Path,
+    runtime: &Path,
+    plugins: &[(String, Vec<u8>)],
+    output: &Path,
+) -> Result<(), AotError> {
     let read = |path: &Path| -> Result<ash_wasm_link::Object, AotError> {
         let bytes = std::fs::read(path).map_err(AotError::Io)?;
         let name = path.display().to_string();
         ash_wasm_link::read(&name, &bytes).map_err(|e| AotError::Module(format!("{name}: {e:#}")))
     };
     let objects = vec![read(program)?, read(runtime)?];
-    let module = ash_wasm_link::link(objects, &ash_wasm_link::LinkOptions::default())
+    let mut options = ash_wasm_link::LinkOptions::default();
+    if !plugins.is_empty() {
+        options.roots.extend(
+            crate::capi::WASM_HARNESS_EXPORTS
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        for (lib, bytes) in plugins {
+            options.roots.extend(plugin_imports(lib, bytes)?);
+        }
+    }
+    let mut module = ash_wasm_link::link(objects, &options)
         .map_err(|e| AotError::Module(format!("link: {e:#}")))?;
+    for (lib, bytes) in plugins {
+        push_custom_section(&mut module, &format!("{PLUGIN_SECTION_PREFIX}{lib}"), bytes);
+    }
     std::fs::write(output, module).map_err(AotError::Io)
+}
+
+/// The functions `bytes`, the plugin module for `lib`, imports from
+/// `env`: the host's C API, and bridges the harness itself provides.
+fn plugin_imports(lib: &str, bytes: &[u8]) -> Result<Vec<String>, AotError> {
+    let bad = |e: wasmparser_aot::BinaryReaderError| AotError::Module(format!("plugin {lib}: {e}"));
+    let mut names = Vec::new();
+    for payload in wasmparser_aot::Parser::new(0).parse_all(bytes) {
+        if let wasmparser_aot::Payload::ImportSection(reader) = payload.map_err(bad)? {
+            for import in reader.into_imports() {
+                let import = import.map_err(bad)?;
+                if import.module == "env" && matches!(import.ty, wasmparser_aot::TypeRef::Func(_)) {
+                    names.push(import.name.to_string());
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Append a custom section `name` holding `payload` to a module.
+fn push_custom_section(module: &mut Vec<u8>, name: &str, payload: &[u8]) {
+    fn leb(out: &mut Vec<u8>, mut v: usize) {
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    let mut body = Vec::with_capacity(name.len() + payload.len() + 5);
+    leb(&mut body, name.len());
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(payload);
+    module.push(0);
+    leb(module, body.len());
+    module.extend_from_slice(&body);
 }
 
 /// What the bootstrap reaches of one lowered module.
@@ -660,7 +733,24 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         let exit = self.import("wlift_aot_exit", &[Ptr], None);
         let invoke = self.import("wlift_aot_invoke_module_body", &[Ptr], Some(I64));
         let take_error = self.import("wlift_aot_take_error", &[Ptr], Some(I32));
+        let bind_foreign = self.import(
+            "wlift_aot_bind_foreign_class",
+            &[Ptr, Ptr, Word, Ptr, Word, Ptr, Word],
+            Some(I32),
+        );
         let desc_ty = self.method_desc_type()?;
+        // `WliftAotForeignMethodDesc`: repr(C), so the target's natural
+        // struct layout.
+        let foreign_desc_ty = self.ctx.struct_type(
+            &[
+                self.ptr().into(),
+                self.word().into(),
+                self.ptr().into(),
+                self.word().into(),
+                self.ctx.i8_type().into(),
+            ],
+            false,
+        );
 
         // wasi-libc's startup calls `__main_void` when main takes no
         // arguments.
@@ -714,6 +804,17 @@ impl<'ctx> Bootstrap<'ctx, '_> {
 
         self.b.position_at_end(body);
         let vmv: BasicValueEnum = vm.into();
+        // Only a program with foreign classes reaches plugins, and only
+        // it imports the harness's dispatcher.
+        if wasm
+            && manifests
+                .iter()
+                .any(|m| m.classes.iter().any(|c| c.foreign_library.is_some()))
+        {
+            let set = self.import("wlift_aot_set_plugin_dispatch", &[Ptr], None);
+            let forward = self.plugin_forward()?;
+            self.call(set, &[forward.as_global_value().as_pointer_value().into()])?;
+        }
         for (m, t) in manifests.iter().zip(tables) {
             let modvars: BasicValueEnum = t.modvars.as_pointer_value().into();
             let consts: BasicValueEnum = t.consts.as_pointer_value().into();
@@ -811,6 +912,72 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                         self.wordc(class.methods.len() as u64),
                     ],
                 )?;
+                if let Some(lib) = &class.foreign_library {
+                    let mut descs = Vec::with_capacity(class.foreign_methods.len());
+                    for fm in &class.foreign_methods {
+                        let (sig, sig_len) = self.string(&fm.signature);
+                        let (sym, sym_len) = match &fm.symbol {
+                            Some(s) => self.string(s),
+                            None => (self.ptr().const_null().into(), self.wordc(0)),
+                        };
+                        descs.push(
+                            foreign_desc_ty.const_named_struct(&[
+                                sig,
+                                sig_len,
+                                sym,
+                                sym_len,
+                                self.ctx
+                                    .i8_type()
+                                    .const_int(fm.is_static as u64, false)
+                                    .into(),
+                            ]),
+                        );
+                    }
+                    let arr = foreign_desc_ty.const_array(&descs);
+                    let g = self.module.add_global(
+                        arr.get_type(),
+                        None,
+                        &format!("{}__foreign_{}", m.fn_symbol, class.slot),
+                    );
+                    g.set_linkage(Linkage::Private);
+                    g.set_constant(true);
+                    g.set_initializer(&arr);
+                    let (lp, ll) = self.string(lib);
+                    let rc = self
+                        .call(
+                            bind_foreign,
+                            &[
+                                vmv,
+                                modvars,
+                                self.wordc(class.slot as u64),
+                                lp,
+                                ll,
+                                g.as_pointer_value().into(),
+                                self.wordc(class.foreign_methods.len() as u64),
+                            ],
+                        )?
+                        .ok_or("bind_foreign_class")?
+                        .into_int_value();
+                    // A plugin the harness did not load ends the program
+                    // here, with the loader's error already reported.
+                    let failed = self
+                        .b
+                        .build_int_compare(
+                            inkwell::IntPredicate::NE,
+                            rc,
+                            i32t.const_zero(),
+                            "unbound",
+                        )
+                        .map_err(e)?;
+                    let bail = self.ctx.append_basic_block(main, "unbound");
+                    let next = self.ctx.append_basic_block(main, "bound");
+                    self.b
+                        .build_conditional_branch(failed, bail, next)
+                        .map_err(e)?;
+                    self.b.position_at_end(bail);
+                    self.b.build_return(Some(&rc)).map_err(e)?;
+                    self.b.position_at_end(next);
+                }
             }
             let (mname, mlen) = self.string(&m.module_name);
             self.call(enter, &[vmv, modvars, count, mname, mlen, saved.into()])?;
@@ -846,6 +1013,31 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             self.emit_start(main)?;
         }
         Ok(())
+    }
+
+    /// A forward from the runtime's plugin dispatch to the harness's
+    /// `env.ash_host_wlift_plugin_dispatch(idx, vm)` import.
+    fn plugin_forward(&self) -> Result<FunctionValue<'ctx>, String> {
+        let params = [P::I32, P::Ptr];
+        let f = self.module.add_function(
+            "wlift_plugin_forward",
+            self.ctx
+                .void_type()
+                .fn_type(&[self.ty(P::I32).into(), self.ty(P::Ptr).into()], false),
+            Some(Linkage::Internal),
+        );
+        stamp_target(self.ctx, self.machine, f);
+        let resume = self.b.get_insert_block();
+        let entry = self.ctx.append_basic_block(f, "entry");
+        self.b.position_at_end(entry);
+        let host = self.import("ash_host_wlift_plugin_dispatch", &params, None);
+        let args: Vec<BasicValueEnum> = f.get_param_iter().collect();
+        self.call(host, &args)?;
+        self.b.build_return(None).map_err(|e| e.to_string())?;
+        if let Some(block) = resume {
+            self.b.position_at_end(block);
+        }
+        Ok(f)
     }
 
     /// A WASI command's `_start`: the bootstrap, then `exit` with its code

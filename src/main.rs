@@ -1013,7 +1013,10 @@ fn aot_build_for_target(
     let object = work.path().join("program.o");
     compile_modules_to_llvm_object(&walk.modules, &walk.bundle, &target, &object)
         .unwrap_or_else(|e| fail("AOT object emit failed", &e));
-    link_wasm(&object, &runtime, std::path::Path::new(out_path))
+    let plugins =
+        wren_lift::codegen::aot::collect_wasm_plugins(std::path::Path::new(input), triple)
+            .unwrap_or_else(|e| fail("reading wasm plugins", &e));
+    link_wasm(&object, &runtime, &plugins, std::path::Path::new(out_path))
         .unwrap_or_else(|e| fail("link failed", &e));
     eprintln!("wlift: produced {out_path}");
 }

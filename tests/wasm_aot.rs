@@ -46,7 +46,7 @@ fn run_linked(files: &[(&str, &str)], how: Link, env: &[(&str, &str)]) -> Option
 
     let wasm = dir.path().join("program.wasm");
     match how {
-        Link::Wlift => link_wasm(&object, &runtime, &wasm).expect("linking"),
+        Link::Wlift => link_wasm(&object, &runtime, &[], &wasm).expect("linking"),
         Link::Lld => {
             let Some(lld) = common::rust_lld() else {
                 eprintln!("no rust-lld; skipping");
@@ -109,6 +109,255 @@ fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
     };
     let text = String::from_utf8(stdout.contents().to_vec()).expect("utf-8 output");
     (code, text)
+}
+
+/// Compile `files` for wasm32 with `plugins` (library name, module text)
+/// bundled, and run the result the way a harness runs one: instantiate
+/// the program, instantiate each plugin against its exports plus the
+/// string bridges, register the plugins' `wlift_*` exports, then start.
+fn run_with_plugins(files: &[(&str, &str)], plugins: &[(&str, &str)]) -> Option<(i32, String)> {
+    let runtime = common::runtime_object()?;
+    let dir = tempfile::Builder::new()
+        .prefix("wlift_wasm_plugins_")
+        .tempdir()
+        .expect("tempdir");
+    for (name, source) in files {
+        std::fs::write(dir.path().join(format!("{name}.wren")), source).expect("write source");
+    }
+    let walk = walk_imports(&dir.path().join(format!("{}.wren", files[0].0))).expect("walk");
+    let object = dir.path().join("program.o");
+    let target = LlvmTarget::new("wasm32-wasip1", None, None);
+    compile_modules_to_llvm_object(&walk.modules, &AotBundleMeta::default(), &target, &object)
+        .expect("compile to a wasm32 object");
+    let modules: Vec<(String, Vec<u8>)> = plugins
+        .iter()
+        .map(|(lib, text)| (lib.to_string(), wat::parse_str(text).expect("plugin text")))
+        .collect();
+    let wasm = dir.path().join("program.wasm");
+    link_wasm(&object, &runtime, &modules, &wasm).expect("linking");
+    Some(harness::run(&std::fs::read(&wasm).expect("read program")))
+}
+
+/// A minimal harness for a wasm AOT program with plugins.
+mod harness {
+    use wasmtime::{Caller, Engine, Extern, Func, Instance, Linker, Memory, Module, Store};
+    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+    use wren_lift::codegen::llvm_aot::PLUGIN_SECTION_PREFIX;
+
+    struct Host {
+        wasi: WasiP1Ctx,
+        program: Option<Instance>,
+        /// Plugin exports by the index the program registered them under.
+        dispatch: Vec<Option<Func>>,
+    }
+
+    fn program_memory(caller: &mut Caller<'_, Host>) -> Memory {
+        let program = caller.data().program.expect("program instance");
+        program
+            .get_memory(&mut *caller, "memory")
+            .expect("program memory")
+    }
+
+    fn program_func(caller: &mut Caller<'_, Host>, name: &str) -> Func {
+        let program = caller.data().program.expect("program instance");
+        program.get_func(&mut *caller, name).expect(name)
+    }
+
+    fn call_i32(caller: &mut Caller<'_, Host>, name: &str, args: &[i32]) -> i32 {
+        let f = program_func(caller, name);
+        let args: Vec<wasmtime::Val> = args.iter().map(|a| (*a).into()).collect();
+        let mut out = [wasmtime::Val::I32(0)];
+        let n = f.ty(&*caller).results().len();
+        f.call(&mut *caller, &args, &mut out[..n]).expect(name);
+        out[0].unwrap_i32()
+    }
+
+    /// `bytes` copied into the program's memory; the address and length.
+    fn put(store: &mut Store<Host>, program: Instance, bytes: &[u8]) -> (i32, i32) {
+        let alloc = program
+            .get_typed_func::<i32, i32>(&mut *store, "wlift_aot_host_alloc")
+            .expect("wlift_aot_host_alloc");
+        let p = alloc.call(&mut *store, bytes.len() as i32).expect("alloc");
+        let memory = program.get_memory(&mut *store, "memory").expect("memory");
+        memory.write(&mut *store, p as usize, bytes).expect("write");
+        (p, bytes.len() as i32)
+    }
+
+    /// The plugin modules a program carries, by library name.
+    fn plugins(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for payload in wasmparser_aot::Parser::new(0).parse_all(bytes) {
+            if let Ok(wasmparser_aot::Payload::CustomSection(section)) = payload
+                && let Some(lib) = section.name().strip_prefix(PLUGIN_SECTION_PREFIX)
+            {
+                out.push((lib.to_string(), section.data().to_vec()));
+            }
+        }
+        out
+    }
+
+    pub fn run(bytes: &[u8]) -> (i32, String) {
+        let engine = Engine::default();
+        let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 20);
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .stdout(stdout.clone())
+            .inherit_stderr()
+            .build_p1();
+        let mut store = Store::new(
+            &engine,
+            Host {
+                wasi,
+                program: None,
+                dispatch: Vec::new(),
+            },
+        );
+        let mut linker: Linker<Host> = Linker::new(&engine);
+        preview1::add_to_linker_sync(&mut linker, |h| &mut h.wasi).expect("wasi imports");
+        linker
+            .func_wrap(
+                "env",
+                "ash_host_wlift_plugin_dispatch",
+                |mut caller: Caller<'_, Host>, idx: i32, vm: i32| {
+                    let f = caller.data().dispatch[idx as usize].expect("a registered export");
+                    f.call(&mut caller, &[vm.into()], &mut [])
+                },
+            )
+            .expect("dispatch import");
+        let module = Module::new(&engine, bytes).expect("loading the program");
+        let program = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiating the program");
+        store.data_mut().program = Some(program);
+
+        for (lib, plugin_bytes) in plugins(bytes) {
+            let plugin = Module::new(&engine, &plugin_bytes).expect("loading a plugin");
+            let mut plugin_linker: Linker<Host> = Linker::new(&engine);
+            for import in plugin.imports() {
+                let name = import.name();
+                match name {
+                    "wlift_get_slot_str" => {
+                        plugin_linker
+                            .func_wrap(
+                                "env",
+                                name,
+                                |mut caller: Caller<'_, Host>,
+                                 vm: i32,
+                                 slot: i32,
+                                 out: i32,
+                                 max: i32|
+                                 -> i32 {
+                                    let p = call_i32(&mut caller, "wrenGetSlotString", &[vm, slot]);
+                                    if p == 0 {
+                                        return -1;
+                                    }
+                                    let host = program_memory(&mut caller);
+                                    let text: Vec<u8> = host.data(&caller)[p as usize..]
+                                        .iter()
+                                        .take(max as usize)
+                                        .take_while(|b| **b != 0)
+                                        .copied()
+                                        .collect();
+                                    let Some(Extern::Memory(own)) = caller.get_export("memory")
+                                    else {
+                                        return -1;
+                                    };
+                                    own.write(&mut caller, out as usize, &text)
+                                        .expect("copy in");
+                                    text.len() as i32
+                                },
+                            )
+                            .expect("bridge");
+                    }
+                    "wlift_set_slot_str" => {
+                        plugin_linker
+                            .func_wrap(
+                                "env",
+                                name,
+                                |mut caller: Caller<'_, Host>,
+                                 vm: i32,
+                                 slot: i32,
+                                 ptr: i32,
+                                 len: i32| {
+                                    let Some(Extern::Memory(own)) = caller.get_export("memory")
+                                    else {
+                                        return;
+                                    };
+                                    let mut text = own.data(&caller)
+                                        [ptr as usize..(ptr + len) as usize]
+                                        .to_vec();
+                                    text.push(0);
+                                    let p = call_i32(
+                                        &mut caller,
+                                        "wlift_aot_host_alloc",
+                                        &[text.len() as i32],
+                                    );
+                                    let host = program_memory(&mut caller);
+                                    host.write(&mut caller, p as usize, &text)
+                                        .expect("copy out");
+                                    call_i32(&mut caller, "wrenSetSlotString", &[vm, slot, p]);
+                                    call_i32(
+                                        &mut caller,
+                                        "wlift_aot_host_free",
+                                        &[p, text.len() as i32],
+                                    );
+                                },
+                            )
+                            .expect("bridge");
+                    }
+                    _ => {
+                        let export = program
+                            .get_export(&mut store, name)
+                            .unwrap_or_else(|| panic!("the program does not export {name}"));
+                        plugin_linker
+                            .define(&store, import.module(), name, export)
+                            .expect("plugin import");
+                    }
+                }
+            }
+            let instance = plugin_linker
+                .instantiate(&mut store, &plugin)
+                .expect("instantiating a plugin");
+            let exports: Vec<(String, Func)> = instance
+                .exports(&mut store)
+                .filter_map(|e| {
+                    let name = e.name().to_string();
+                    e.into_func().map(|f| (name, f))
+                })
+                .filter(|(name, _)| name.starts_with("wlift_"))
+                .collect();
+            let register = program
+                .get_typed_func::<(i32, i32, i32, i32), i32>(
+                    &mut store,
+                    "wlift_aot_register_plugin_export",
+                )
+                .expect("wlift_aot_register_plugin_export");
+            for (name, f) in exports {
+                let (lp, ll) = put(&mut store, program, lib.as_bytes());
+                let (sp, sl) = put(&mut store, program, name.as_bytes());
+                let idx = register
+                    .call(&mut store, (lp, ll, sp, sl))
+                    .expect("register") as usize;
+                let dispatch = &mut store.data_mut().dispatch;
+                if dispatch.len() <= idx {
+                    dispatch.resize(idx + 1, None);
+                }
+                dispatch[idx] = Some(f);
+            }
+        }
+
+        let start = program
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .expect("_start");
+        let code = match start.call(&mut store, ()) {
+            Ok(()) => 0,
+            Err(err) => match err.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                Some(exit) => exit.0,
+                None => panic!("the program trapped: {err:?}"),
+            },
+        };
+        let text = String::from_utf8(stdout.contents().to_vec()).expect("utf-8 output");
+        (code, text)
+    }
 }
 
 fn run_wasm(files: &[(&str, &str)]) -> Option<(i32, String)> {
@@ -319,6 +568,58 @@ class Box {
         ],
         "crate 1\nsub 2\ncrate 3\nbox box 4\nCrate does not implement 'make(_)'\n2\nbox 10\n610\n",
     );
+}
+
+/// A plugin in the shape hatch ships for wasm: its own memory, the
+/// host's C API and the string bridges imported from `env`.
+const CALC_PLUGIN: &str = r#"
+(module
+  (import "env" "wrenGetSlotDouble" (func $get (param i32 i32) (result f64)))
+  (import "env" "wrenSetSlotDouble" (func $set (param i32 i32 f64)))
+  (import "env" "wlift_get_slot_str" (func $gets (param i32 i32 i32 i32) (result i32)))
+  (import "env" "wlift_set_slot_str" (func $sets (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "hello, ")
+  (func (export "wlift_calc_add") (param $vm i32)
+    (call $set (local.get $vm) (i32.const 0)
+      (f64.add (call $get (local.get $vm) (i32.const 1))
+               (call $get (local.get $vm) (i32.const 2)))))
+  (func (export "wlift_calc_greet") (param $vm i32) (local $n i32)
+    (local.set $n (call $gets (local.get $vm) (i32.const 1) (i32.const 7) (i32.const 100)))
+    (call $sets (local.get $vm) (i32.const 0) (i32.const 0)
+      (i32.add (local.get $n) (i32.const 7)))))
+"#;
+
+const CALC_PROGRAM: &str = r#"
+#!native = "wlift_calc"
+foreign class Calc {
+  #!symbol = "wlift_calc_add"
+  foreign static add(a, b)
+  #!symbol = "wlift_calc_greet"
+  foreign static greet(name)
+}
+System.print(Calc.add(2, 3))
+System.print(Calc.greet("wren"))
+"#;
+
+/// A foreign class binds to the plugin module the program carries, and
+/// its methods reach the plugin through the harness.
+#[test]
+fn a_foreign_class_calls_its_wasm_plugin() {
+    let Some(result) = run_with_plugins(&[("main", CALC_PROGRAM)], &[("wlift_calc", CALC_PLUGIN)])
+    else {
+        return;
+    };
+    assert_eq!(result, (0, "5\nhello, wren\n".to_string()));
+}
+
+/// Without the plugin, the program stops before running any code.
+#[test]
+fn a_foreign_class_without_its_plugin_ends_the_program() {
+    let Some((code, out)) = run_with_plugins(&[("main", CALC_PROGRAM)], &[]) else {
+        return;
+    };
+    assert_eq!((code, out.as_str()), (70, ""));
 }
 
 /// Compiled frames keep their values in the shadow stack, where the

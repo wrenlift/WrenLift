@@ -115,6 +115,7 @@ aot = [
     "dep:cranelift-object",
     "dep:target-lexicon",
     "dep:ash_wasm_link",
+    "dep:wasmparser_aot",
 ]
 # LLVM top tier above Cranelift. Needs LLVM 21 on the build machine
 # (llvm-config on PATH or LLVM_SYS_211_PREFIX); off by default. The
@@ -208,6 +209,8 @@ target-lexicon = { version = "0.13", optional = true }
 # Links a wasm AOT program against the prelinked runtime object in
 # process, so building one needs no wasm-ld. Ash's linker, pinned by rev.
 ash_wasm_link = { git = "https://github.com/rayzor-blade/ash", rev = "312b4a4f0da6cf3f26807aa3d3d6b2dd01da3f56", optional = true }
+# Reads a wasm plugin's imports, so the program exports what it needs.
+wasmparser_aot = { package = "wasmparser", version = "0.258", optional = true }
 # LLVM 21, the same pin as Ash so its lowering patterns carry over;
 # linked against the shared library where one is installed.
 # The host targets and WebAssembly, for AOT to wasm32: inkwell's default
@@ -283,6 +286,8 @@ wasmtime = "31"
 wasmtime-wasi = "31"
 wasmprinter = "0.226"
 wasmparser = "0.226"
+# Test plugins for wasm AOT are written as text.
+wat = "1.245"
 # AOT phase-1 test re-parses the emitted `.o` to verify the
 # symbol table; pinned alongside cranelift-object's transitive
 # version so the parser handles whatever container shape the

@@ -235,26 +235,98 @@ pub fn walk_imports(entry_path: &Path) -> Result<AotWalkResult, AotError> {
     })
 }
 
-fn collect_native_search_paths(entry_path: &Path) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let entry_dir = entry_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+/// The hatchfile of the package `entry_path` belongs to: the nearest
+/// one in its directory or above.
+fn entry_hatchfile(entry_path: &Path) -> Option<std::path::PathBuf> {
+    entry_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .ancestors()
+        .map(|d| d.join("hatchfile"))
+        .find(|p| p.exists())
+}
 
-    // Find the entry's hatchfile (walk up).
-    let hatchfile = {
-        let mut cursor = Some(entry_dir.clone());
-        loop {
-            match cursor {
-                Some(d) => {
-                    let candidate = d.join("hatchfile");
-                    if candidate.exists() {
-                        break Some(candidate);
-                    }
-                    cursor = d.parent().map(Path::to_path_buf);
-                }
-                None => break None,
+/// The wasm plugin modules a program built for `triple`, a wasm target,
+/// loads, by library name: a `.hatch` archive's wasm `NativeLib`
+/// sections, or for a source tree the wasm variant of each
+/// `native_libs` entry in the entry's hatchfile and its path deps'.
+/// A library with no wasm build is left out; binding it then fails
+/// when the program starts, naming it.
+pub fn collect_wasm_plugins(
+    entry_path: &Path,
+    triple: &str,
+) -> Result<Vec<(String, Vec<u8>)>, AotError> {
+    let is_module = |bytes: &[u8]| bytes.starts_with(b"\0asm");
+    let bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
+    if crate::hatch::looks_like_hatch(&bytes) {
+        let hatch = crate::hatch::load(&bytes)
+            .map_err(|e| AotError::Frontend(format!("loading hatch archive: {e}")))?;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        for section in &hatch.sections {
+            if !matches!(section.kind, crate::hatch::SectionKind::NativeLib)
+                || !is_module(&section.data)
+            {
+                continue;
+            }
+            let lib = section
+                .name
+                .split_once(crate::hatch::NATIVE_LIB_PLATFORM_SEP)
+                .map_or(section.name.as_str(), |(lib, _)| lib);
+            if !out.iter().any(|(l, _)| l == lib) {
+                out.push((lib.to_string(), section.data.clone()));
             }
         }
+        return Ok(out);
+    }
+
+    let Some(hatchfile) = entry_hatchfile(entry_path) else {
+        return Ok(Vec::new());
     };
+    let root = hatchfile.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let read_manifest = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<crate::hatch::Manifest>(&text).ok())
+    };
+    let Some(manifest) = read_manifest(&hatchfile) else {
+        return Ok(Vec::new());
+    };
+    let mut packages = vec![(root.clone(), manifest.clone())];
+    for dep in manifest
+        .dependencies
+        .values()
+        .chain(manifest.spec_dependencies.values())
+    {
+        if let crate::hatch::Dependency::Path { path, .. } = dep {
+            let dir = root.join(path);
+            if let Some(m) = read_manifest(&dir.join("hatchfile")) {
+                packages.push((dir, m));
+            }
+        }
+    }
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    for (dir, m) in packages {
+        for (lib, entry) in &m.native_libs {
+            if out.iter().any(|(l, _)| l == lib) {
+                continue;
+            }
+            let Some(rel) = entry.resolve_for_target(Some(triple)) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(dir.join(rel)) else {
+                continue;
+            };
+            if is_module(&bytes) {
+                out.push((lib.clone(), bytes));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn collect_native_search_paths(entry_path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let hatchfile = entry_hatchfile(entry_path);
 
     let push_resolved = |out: &mut Vec<String>, root: &Path, rel: &str| {
         let p = if Path::new(rel).is_absolute() {

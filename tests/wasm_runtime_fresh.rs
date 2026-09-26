@@ -20,7 +20,7 @@ mod common;
 use common::{runtime_object, rust_lld, wasi_lib_dir};
 
 use wasmparser::{KnownCustom, Linking, Parser, Payload, SymbolFlags, SymbolInfo};
-use wren_lift::capi::AOT_ENTRY_NAMES;
+use wren_lift::capi::{AOT_ENTRY_NAMES, WASM_HARNESS_EXPORTS};
 use wren_lift::codegen::runtime_fns::RUNTIME_FN_NAMES;
 use wren_lift::runtime::object_layout::{Layout, layout_mismatches};
 
@@ -57,6 +57,81 @@ fn defined_symbols(bytes: &[u8]) -> HashSet<String> {
     out
 }
 
+/// The functions the object leaves undefined, by name.
+fn undefined_functions(bytes: &[u8]) -> Vec<String> {
+    let mut imports: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.expect("parsing the runtime object") {
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import.expect("reading an import");
+                    if matches!(import.ty, wasmparser::TypeRef::Func(_)) {
+                        imports.push(import.name.to_string());
+                    }
+                }
+            }
+            Payload::CustomSection(section) => {
+                let KnownCustom::Linking(linking) = section.as_known() else {
+                    continue;
+                };
+                for sub in linking {
+                    let Linking::SymbolTable(symbols) = sub.expect("reading the linking section")
+                    else {
+                        continue;
+                    };
+                    for symbol in symbols {
+                        if let SymbolInfo::Func { flags, index, name } =
+                            symbol.expect("reading a symbol")
+                            && flags.contains(SymbolFlags::UNDEFINED)
+                        {
+                            let name = name
+                                .map(str::to_string)
+                                .or_else(|| imports.get(index as usize).cloned());
+                            out.extend(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The runtime links on its own: a host embedding it with no WrenLift
+/// program (a cdylib build, another language's program) has nothing to
+/// define a `wlift_*` symbol, and only Ash's `ash_host_*` names are the
+/// host's to supply.
+#[test]
+fn the_wasm_runtime_leaves_nothing_for_a_program_to_define() {
+    let Some(path) = runtime_object() else {
+        eprintln!("no wasm32-wasip1/wlift_runtime.o beside the test binary; skipping");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("reading the runtime object");
+    let undefined = undefined_functions(&bytes);
+    // The object does import WASI, so an empty list means the reader
+    // is broken, not the object clean.
+    assert!(
+        undefined
+            .iter()
+            .any(|n| n.contains("wasi_snapshot_preview1")),
+        "read no WASI imports from {}",
+        path.display()
+    );
+    let owed: Vec<String> = undefined
+        .into_iter()
+        .filter(|n| n.starts_with("wlift_") || n.starts_with("wren") || n.starts_with("ash_host_"))
+        .collect();
+    assert!(
+        owed.is_empty(),
+        "{} leaves {} undefined",
+        path.display(),
+        owed.join(", ")
+    );
+}
+
 #[test]
 fn the_wasm_runtime_defines_what_aot_code_calls() {
     let Some(path) = runtime_object() else {
@@ -68,6 +143,7 @@ fn the_wasm_runtime_defines_what_aot_code_calls() {
     let missing: Vec<&str> = AOT_ENTRY_NAMES
         .iter()
         .chain(RUNTIME_FN_NAMES)
+        .chain(WASM_HARNESS_EXPORTS)
         .copied()
         .filter(|n| !defined.contains(*n))
         .collect();

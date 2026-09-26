@@ -298,7 +298,7 @@ pub fn resolve_symbol(
 /// import would land in the `env` namespace and wren_lift's
 /// own wasm cdylib couldn't link — wasm-bindgen folds it into
 /// the standard import set the loader populates.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(
@@ -307,6 +307,12 @@ extern "C" {
     )]
     fn wlift_dispatch_dynamic_plugin(idx: u32, vm: *mut VM);
 }
+
+/// How a WASI program reaches its plugins: set by a program with foreign
+/// classes to a forward to its harness's import, null otherwise. A
+/// pointer rather than a symbol, so the runtime links on its own and a
+/// program without plugins imports nothing beyond WASI.
+pub static PLUGIN_DISPATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Drive a dynamic-plugin call. Same shape as `dispatch_foreign_c`
 /// but goes through the JS-side dispatcher because the plugin's
@@ -318,12 +324,23 @@ pub fn dispatch_dynamic(vm: &mut VM, idx: u32, args: &[Value]) -> Value {
     let vm_ptr = vm as *mut VM;
     vm.api_stack.clear();
     vm.api_stack.extend_from_slice(args);
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
     {
         // wasm-bindgen-generated import: the JS host shim is safe
         // by construction (it only validates and forwards), so no
         // `unsafe` block needed.
         wlift_dispatch_dynamic_plugin(idx, vm_ptr);
+    }
+    #[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+    match PLUGIN_DISPATCH.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::runtime::object::NativeContext::runtime_error(
+            vm,
+            "no plugin module is loaded".to_string(),
+        ),
+        f => {
+            let f: unsafe extern "C" fn(u32, *mut VM) = unsafe { std::mem::transmute(f) };
+            unsafe { f(idx, vm_ptr) };
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
