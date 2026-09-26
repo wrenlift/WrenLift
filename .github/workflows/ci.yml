@@ -200,15 +200,16 @@ jobs:
 
       # Wren compiled to wasm32 through LLVM, linked against the
       # prelinked runtime object and run under wasmtime. wasi-libc
-      # comes from the WASI SDK, as in the Tests job.
+      # comes from the WASI SDK; it must define the pthread stubs the
+      # toolchain's wasip1 std calls.
       - name: Wasm AOT through LLVM
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz" \
+          curl -sSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz" \
             | sudo tar -xzC /opt
-          export WASI_SYSROOT=/opt/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot
+          export WASI_SYSROOT=/opt/wasi-sdk-33.0-x86_64-linux/share/wasi-sysroot
           tools/build_wasm_runtime.sh
           cargo clippy --release --features aot,llvm --all-targets -- -D warnings
           cargo test --release --features aot,llvm --test wasm_aot
