@@ -1453,58 +1453,6 @@ pub mod cl {
         JIT_KIND_PLAN.with(|p| p.borrow().get(&v).copied())
     }
 
-    /// The most implementations a call site whose cache is empty is
-    /// dispatched over; one with more makes the generic call.
-    const COLD_SITE_IMPLS: usize = 4;
-
-    /// Record the target of a class check at the live cache `ic_addr`
-    /// unless it already names this class or has gone polymorphic.
-    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
-    fn emit_ic_note(
-        builder: &mut FunctionBuilder,
-        module: &mut dyn Module,
-        get_runtime_fn: &mut dyn FnMut(
-            &mut dyn Module,
-            &mut FunctionBuilder,
-            &str,
-            usize,
-        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
-        ic_addr: usize,
-        class: usize,
-        closure: usize,
-    ) -> Result<(), String> {
-        use crate::mir::bytecode::{CALLSITE_IC_CLASS, CALLSITE_IC_KIND, IC_POLYMORPHIC};
-        let ic = builder.ins().iconst(types::I64, ic_addr as i64);
-        let kind = builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), ic, CALLSITE_IC_KIND);
-        let seen = builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), ic, CALLSITE_IC_CLASS);
-        let class_val = builder.ins().iconst(types::I64, class as i64);
-        let other = builder.ins().icmp(IntCC::NotEqual, seen, class_val);
-        let mask = builder.ins().iconst(types::I64, 0xFF);
-        let k = builder.ins().band(kind, mask);
-        let zero = builder.ins().iconst(types::I64, 0);
-        let empty = builder.ins().icmp(IntCC::Equal, k, zero);
-        let poly_bit = builder.ins().iconst(types::I64, IC_POLYMORPHIC as i64);
-        let poly = builder.ins().band(k, poly_bit);
-        let mono = builder.ins().icmp(IntCC::Equal, poly, zero);
-        let moved = builder.ins().band(other, mono);
-        let record = builder.ins().bor(empty, moved);
-        let note_block = builder.create_block();
-        let cont = builder.create_block();
-        builder.set_cold_block(note_block);
-        builder.ins().brif(record, note_block, &[], cont, &[]);
-        builder.switch_to_block(note_block);
-        let f = get_runtime_fn(module, builder, "wren_ic_note_seen", 3)?;
-        let closure_val = builder.ins().iconst(types::I64, closure as i64);
-        builder.ins().call(f, &[ic, class_val, closure_val]);
-        builder.ins().jump(cont, &[]);
-        builder.switch_to_block(cont);
-        Ok(())
-    }
-
     /// An i8 that is set when a byte of the class's field kinds for
     /// `fields`, a bit per index, says anything but Num.
     fn emit_kind_check(builder: &mut FunctionBuilder, class: usize, fields: u64) -> Value {
@@ -5332,29 +5280,20 @@ pub mod cl {
                 // fast path while extending coverage to call sites
                 // that see multiple receiver classes (where the IC
                 // alone keeps thrashing).
-                // A site whose cache was empty at this compile is
-                // dispatched over a few implementations too, but each
-                // class hit records itself in the live cache, and a miss
-                // takes the generic call with the cache's index: the
-                // cache fills for the next compile to inline from.
+                // A site whose cache was empty at this compile makes
+                // the generic call, which fills the cache for the next
+                // compile to inline from; the class hierarchy would
+                // dispatch it without ever recording what it sees.
                 let cold_site = ic_site
                     .and_then(|i| callsite_ic_ptrs.and_then(|ics| ics.get(i)))
                     .is_some_and(|ic| ic.kind == 0);
-                let note_ic = if cold_site {
-                    ic_site
-                        .and_then(|i| callsite_ic_live_ptrs.and_then(|p| p.get(i)))
-                        .copied()
-                        .filter(|p| *p != 0)
-                } else {
-                    None
-                };
                 if let Some(cha) = cha_by_method
                     && args.len() <= 4
-                    && (!cold_site || note_ic.is_some())
+                    && !cold_site
                 {
                     let impls: Vec<crate::runtime::engine::ChaImpl> =
                         cha.get(method).cloned().unwrap_or_default();
-                    if !impls.is_empty() && (!cold_site || impls.len() <= COLD_SITE_IMPLS) {
+                    if !impls.is_empty() {
                         let merge_block = builder.create_block();
                         builder.append_block_param(merge_block, types::I64);
 
@@ -5372,7 +5311,6 @@ pub mod cl {
                         for crate::runtime::engine::ChaImpl {
                             class: class_ptr,
                             fid,
-                            closure: closure_ptr,
                             ..
                         } in &impls
                         {
@@ -5386,16 +5324,6 @@ pub mod cl {
                                 .brif(class_match, fast_block, &[], next_check, &[]);
 
                             builder.switch_to_block(fast_block);
-                            if let Some(ic_addr) = note_ic {
-                                emit_ic_note(
-                                    builder,
-                                    module,
-                                    get_runtime_fn,
-                                    ic_addr,
-                                    *class_ptr,
-                                    *closure_ptr,
-                                )?;
-                            }
                             let inlinable_body =
                                 inline_bodies.as_ref().and_then(|b| b.get(fid)).cloned();
                             let mut emitted_inline = false;
@@ -5517,12 +5445,7 @@ pub mod cl {
                         // through `emit_wren_call`, which picks
                         // the right `wren_call_N` (0..=8) or
                         // routes 9+ through `wren_call_dynamic`.
-                        let method_bits = crate::codegen::runtime_fns::pack_method_word(
-                            method.index(),
-                            ic_site
-                                .filter(|_| note_ic.is_some())
-                                .map(|i| (i, jit_func_id())),
-                        );
+                        let method_bits = method.index() as u64;
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                         let arg_vals: Vec<_> = args.iter().map(&get).collect();
                         let slow_result = emit_wren_call(
