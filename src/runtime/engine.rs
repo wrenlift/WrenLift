@@ -463,6 +463,21 @@ fn returns_receiver(mir: &MirFunction) -> bool {
     returns > 0
 }
 
+/// Set in the serial of an early top-tier compile only.
+const EARLY_TOP_BIT: u32 = 1 << 31;
+
+/// `WLIFT_EARLY_TOP_TIER=0` queues a loop's top-tier compile only after
+/// its baseline is installed; unset queues both together. Safe to run
+/// with either way.
+fn early_top_tier_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("WLIFT_EARLY_TOP_TIER")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Optional shared CHA snapshot threaded through codegen.
 pub type SharedCha = Option<Arc<ChaMap>>;
 
@@ -1206,6 +1221,22 @@ pub struct ExecutionEngine {
     pub cold_osr_blocks: Vec<std::collections::HashSet<crate::mir::BlockId>>,
     /// Cold sets of compiles in flight, applied at install.
     pending_cold_osr: HashMap<usize, std::collections::HashSet<crate::mir::BlockId>>,
+    /// Serial of a top-tier compile queued beside the function's first
+    /// baseline compile, or 0: see `request_tier_up_from_loop`.
+    early_top_serial: Vec<u32>,
+    /// Source of `early_top_serial` values, apart from `compile_serial`.
+    early_top_next: u32,
+    /// An early top-tier result that finished before its baseline was
+    /// installed, with its cold set; installed right after the baseline.
+    held_top: HashMap<
+        usize,
+        (
+            CompilationResult,
+            std::collections::HashSet<crate::mir::BlockId>,
+        ),
+    >,
+    /// Cold sets of early top-tier compiles in flight.
+    early_cold_osr: HashMap<usize, std::collections::HashSet<crate::mir::BlockId>>,
     /// Probes of a cold entry per (function, block), for pacing recompile requests.
     cold_osr_probes: HashMap<(u32, u32), u32>,
     /// Whether baseline-native code can use the direct fast path.
@@ -1519,6 +1550,10 @@ impl ExecutionEngine {
             baseline_worker: None,
             cold_osr_blocks: Vec::new(),
             pending_cold_osr: HashMap::new(),
+            early_top_serial: Vec::new(),
+            early_top_next: 0,
+            held_top: HashMap::new(),
+            early_cold_osr: HashMap::new(),
             cold_osr_probes: HashMap::new(),
             baseline_leaf: Vec::new(),
             optimized_code: Vec::new(),
@@ -1607,6 +1642,7 @@ impl ExecutionEngine {
         self.llvm_gain.push(true);
         self.speculation_failed.push(false);
         self.compile_serial.push(0);
+        self.early_top_serial.push(0);
         self.method_binding
             .push((std::ptr::null_mut(), std::ptr::null_mut()));
         self.bc_cache.push(std::ptr::null());
@@ -2847,6 +2883,8 @@ impl ExecutionEngine {
         // stale from here and the baseline compile goes out now.
         self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1);
         self.compiling_tier[idx] = None;
+        self.early_top_serial[idx] = 0;
+        self.held_top.remove(&idx);
         self.request_compile(id, CompileTier::Baseline, interner);
     }
 
@@ -3545,6 +3583,8 @@ impl ExecutionEngine {
         // A compile in flight was made from the same empty caches.
         self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1);
         self.compiling_tier[idx] = None;
+        self.early_top_serial[idx] = 0;
+        self.held_top.remove(&idx);
         if let Some(tier) = self.next_compile_tier(idx) {
             self.request_compile(id, tier, interner);
         }
@@ -4334,6 +4374,10 @@ impl ExecutionEngine {
         if self.promote_refused.get(idx).copied().unwrap_or(true) {
             return false;
         }
+        // An early top-tier compile is already on its way.
+        if self.early_top_serial.get(idx).copied().unwrap_or(0) != 0 {
+            return false;
+        }
         if self.tier_states.get(idx).copied() != Some(TierState::BaselineNative)
             || self.compiling_tier.get(idx).copied().flatten().is_some()
         {
@@ -4811,6 +4855,46 @@ impl ExecutionEngine {
         tier: CompileTier,
         interner: &crate::intern::Interner,
     ) {
+        self.request_compile_as(id, tier, interner, false);
+    }
+
+    /// A loop in the interpreter asked for `id`'s first compile. A
+    /// module's top-level code runs once, so its loops reach the top
+    /// tier only by OSR and all of its compile time is warm-up: its top
+    /// tier is queued beside the baseline rather than after it, and the
+    /// result waits for the baseline's install if it is first. Other
+    /// functions wait for the profile their baseline code gathers.
+    #[cfg(feature = "cranelift")]
+    pub fn request_tier_up_from_loop(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        self.request_tier_up(id, interner);
+        let idx = id.0 as usize;
+        if early_top_tier_enabled()
+            && self.modules.values().any(|m| m.top_level == id)
+            && self.compiling_tier.get(idx).copied().flatten() == Some(CompileTier::Baseline)
+            && self.early_top_serial.get(idx).copied() == Some(0)
+            && !self.promote_refused.get(idx).copied().unwrap_or(true)
+        {
+            let _guard = self.tier_guard();
+            self.request_compile_as(id, CompileTier::Optimized, interner, true);
+        }
+    }
+
+    #[cfg(not(feature = "cranelift"))]
+    pub fn request_tier_up_from_loop(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        self.request_tier_up(id, interner);
+    }
+
+    /// `request_compile`, or with `early` the top-tier compile queued
+    /// beside a baseline one: its own serial, and the function's
+    /// in-flight slot left to the baseline.
+    #[cfg(feature = "cranelift")]
+    fn request_compile_as(
+        &mut self,
+        id: FuncId,
+        tier: CompileTier,
+        interner: &crate::intern::Interner,
+        early: bool,
+    ) {
         if self.mode != ExecutionMode::Tiered {
             return;
         }
@@ -4858,7 +4942,7 @@ impl ExecutionEngine {
                 return;
             }
         }
-        if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
+        if idx >= self.compiling_tier.len() || (!early && self.compiling_tier[idx].is_some()) {
             return;
         }
         let Some(body) = self.functions.get(idx) else {
@@ -4932,8 +5016,15 @@ impl ExecutionEngine {
         Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
         let profile = self.get_type_profile(id).cloned();
         let speculate = !self.speculation_failed[idx];
-        self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1);
-        let serial = self.compile_serial[idx];
+        let serial = if early {
+            // The high bit keeps it apart from `compile_serial` values.
+            self.early_top_next = self.early_top_next.wrapping_add(1) & !EARLY_TOP_BIT;
+            self.early_top_serial[idx] = self.early_top_next | EARLY_TOP_BIT;
+            self.early_top_serial[idx]
+        } else {
+            self.compile_serial[idx] = self.compile_serial[idx].wrapping_add(1) & !EARLY_TOP_BIT;
+            self.compile_serial[idx]
+        };
         let trace_name = self
             .functions
             .get(idx)
@@ -4945,7 +5036,9 @@ impl ExecutionEngine {
             stats.compile_attempts += 1;
         }
 
-        self.compiling_tier[idx] = Some(tier);
+        if !early {
+            self.compiling_tier[idx] = Some(tier);
+        }
         self.pending_count += 1;
         let tx = self.compilation_tx.clone();
         let results_ready = Arc::clone(&self.results_ready);
@@ -4981,8 +5074,20 @@ impl ExecutionEngine {
                 cold.keys().collect::<Vec<_>>()
             );
         }
-        self.pending_cold_osr
-            .insert(idx, cold.keys().copied().collect());
+        if early && !cold.is_empty() {
+            // A loop that has not run would be compiled blind; the top
+            // tier waits for the baseline's profile instead.
+            self.early_top_serial[idx] = 0;
+            self.pending_count = self.pending_count.saturating_sub(1);
+            return;
+        }
+        if early {
+            self.early_cold_osr
+                .insert(idx, cold.keys().copied().collect());
+        } else {
+            self.pending_cold_osr
+                .insert(idx, cold.keys().copied().collect());
+        }
         let speculating =
             tier == CompileTier::Optimized && speculate && result_speculation_enabled();
         let exits = if speculating {
@@ -5273,6 +5378,11 @@ impl ExecutionEngine {
             if !worker.submit(Box::new(move || {
                 let _ = compile_fn();
             })) {
+                if early {
+                    self.early_top_serial[idx] = 0;
+                    self.pending_count = self.pending_count.saturating_sub(1);
+                    return;
+                }
                 // Nothing is in flight; propose again at double the count.
                 self.compiling_tier[idx] = None;
                 self.pending_count = self.pending_count.saturating_sub(1);
@@ -5343,6 +5453,21 @@ impl ExecutionEngine {
                 CompilationResult::Compiled { serial, .. }
                 | CompilationResult::Failed { serial, .. } => *serial,
             };
+            if serial & EARLY_TOP_BIT != 0 {
+                self.pending_count = self.pending_count.saturating_sub(1);
+                if self.early_top_serial.get(idx).copied() != Some(serial) {
+                    continue;
+                }
+                let cold = self.early_cold_osr.remove(&idx).unwrap_or_default();
+                if matches!(result, CompilationResult::Failed { .. }) {
+                    self.early_top_serial[idx] = 0;
+                } else if self.tier_states.get(idx).copied() == Some(TierState::Interpreted) {
+                    self.held_top.insert(idx, (result, cold));
+                } else {
+                    self.install_early_top(idx, result, cold);
+                }
+                continue;
+            }
             // Requested before a newer compile or a speculation failure:
             // the newer request owns the function's slot.
             if self.compile_serial.get(idx).copied() != Some(serial) {
@@ -5402,7 +5527,44 @@ impl ExecutionEngine {
                 self.compiling_tier[idx] = None;
             }
             self.pending_count = self.pending_count.saturating_sub(1);
+            if self.tier_states.get(idx).copied() == Some(TierState::BaselineNative)
+                && let Some((held, cold)) = self.held_top.remove(&idx)
+            {
+                self.install_early_top(idx, held, cold);
+            }
         }
+    }
+
+    /// Install an early top-tier result over the installed baseline.
+    #[cfg(feature = "host")]
+    fn install_early_top(
+        &mut self,
+        idx: usize,
+        result: CompilationResult,
+        cold: std::collections::HashSet<crate::mir::BlockId>,
+    ) {
+        self.early_top_serial[idx] = 0;
+        let CompilationResult::Compiled {
+            tier,
+            executable,
+            inline_safe,
+            llvm_gain,
+            ..
+        } = result
+        else {
+            return;
+        };
+        if tier_trace_enabled() {
+            eprintln!(
+                "tier-trace: [{:.2}ms] install early {:?} FuncId({})",
+                trace_clock_ms(),
+                tier,
+                idx
+            );
+        }
+        self.pending_cold_osr.insert(idx, cold);
+        self.install_compiled_tier(idx, tier, executable, inline_safe, llvm_gain);
+        self.record_pending_callees(FuncId(idx as u32));
     }
 
     /// Walk the caller's IC table and stash any uncompiled callees

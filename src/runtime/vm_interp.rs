@@ -4028,7 +4028,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             );
                         }
                         if should_tier_up {
-                            vm.request_tier_up(func_id);
+                            vm.request_tier_up_from_loop(func_id);
                         }
                         if should_tier_up
                             || vm.engine.has_pending_compilations()
@@ -4171,7 +4171,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             );
                         }
                         if should_tier_up {
-                            vm.request_tier_up(func_id);
+                            vm.request_tier_up_from_loop(func_id);
                         }
                         if should_tier_up
                             || vm.engine.has_pending_compilations()

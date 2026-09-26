@@ -584,6 +584,10 @@ impl Shared {
     pub fn request_tier_up(&mut self, id: super::engine::FuncId) {
         self.engine.request_tier_up(id, &self.interner);
     }
+    /// `request_tier_up` from a loop's back edge in the interpreter.
+    pub fn request_tier_up_from_loop(&mut self, id: super::engine::FuncId) {
+        self.engine.request_tier_up_from_loop(id, &self.interner);
+    }
     pub fn tier_up(&mut self, id: super::engine::FuncId) -> bool {
         self.engine.tier_up(id, &self.interner)
     }
