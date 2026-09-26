@@ -628,27 +628,18 @@ fn build_aot_module_from_source(
     })
 }
 
-/// The passes the VM runs on a module before it runs it, so AOT code
-/// gets the same specialisation: what an `#export` declares a Num is
-/// unboxed.
+/// The passes the JIT runs before it emits native code, less what needs
+/// deoptimisation, so AOT code is specialised as the JIT's is.
 fn optimize_module(module_mir: &mut ModuleMir, interner: &Interner) {
-    use crate::mir::opt::{
-        self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
-        licm::Licm, sra::Sra,
-    };
-    let cse = Cse::default();
-    let type_spec = TypeSpecialize::with_math(interner);
-    let passes: Vec<&dyn MirPass> = vec![
-        &ConstFold, &Dce, &cse, &type_spec, &ConstFold, &Dce, &Licm, &Sra, &Dce,
-    ];
-    opt::run_to_fixpoint(&mut module_mir.top_level, &passes, 10);
+    use crate::mir::opt::run_native_pipeline;
+    run_native_pipeline(&mut module_mir.top_level, interner, true);
     for class in &mut module_mir.classes {
         for method in &mut class.methods {
-            opt::run_to_fixpoint(&mut method.mir, &passes, 10);
+            run_native_pipeline(&mut method.mir, interner, true);
         }
     }
     for closure in &mut module_mir.closures {
-        opt::run_to_fixpoint(closure, &passes, 10);
+        run_native_pipeline(closure, interner, true);
     }
 }
 

@@ -354,3 +354,41 @@ System.print(t.total)
         "20000\nhi!\nbump(_) expects Num for `x`\nnew(_) expects Num for `t`\nname(_) expects String for `s`\nbad returns Num\n20000\n",
     );
 }
+
+#[test]
+fn ranges_count_in_their_own_direction() {
+    expect(
+        &[(
+            "main",
+            r#"var c = 0
+for (i in 100000...0) c = c + 1
+System.print(c)
+var n = 0
+var d = 0
+for (i in 300000...n) d = d + i
+System.print(d)
+var up = 0
+var m = 200000
+for (i in 0...m) up = up + i
+System.print(up)
+var e = 0
+for (i in 5...5) e = e + 1
+System.print(e)
+var f = 0
+for (i in 0.5...100000) f = f + 1
+System.print(f)
+var g = 0
+for (i in 100000...0.5) g = g + 1
+System.print(g)
+var nest = 0
+for (a in 0...300) for (b in 300...a) nest = nest + 1
+System.print(nest)
+var neg = 0
+var lim = -50000
+for (i in 0...lim) neg = neg + i
+System.print(neg)
+"#,
+        )],
+        "100000\n45000150000\n19999900000\n0\n100000\n100000\n45150\n-1249975000\n",
+    );
+}

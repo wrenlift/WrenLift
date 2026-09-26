@@ -771,63 +771,8 @@ impl DeoptSources {
 }
 
 /// Run the optimization pipeline on MIR for JIT compilation.
-/// Same passes as the AOT pipeline: ConstFold, DCE, CSE, TypeSpecialize, LICM, SRA.
 fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interner) {
-    use crate::mir::opt::{
-        self, MirPass, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
-        licm::Licm, range_loop::RangeLoop, sra::Sra,
-    };
-    let range_loop = RangeLoop { interner };
-    // WLIFT_DISABLE_MATH_GUARD=1 leaves math methods on unknown
-    // receivers as calls; safe to run with.
-    if std::env::var_os("WLIFT_DISABLE_MATH_GUARD").is_none() {
-        crate::mir::opt::math_guard::MathGuard::new(interner).run(mir);
-    }
-    // A module variable a loop writes is carried around it as a value,
-    // before the passes that need the loop's numbers known.
-    // WLIFT_DISABLE_MODVAR_PROMOTE keeps the loads and stores; safe to run with.
-    if std::env::var_os("WLIFT_DISABLE_MODVAR_PROMOTE").is_none() {
-        crate::mir::opt::promote_modvars::PromoteModuleVars.run(mir);
-    }
-    let constfold = ConstFold;
-    let dce = Dce;
-    let cse = Cse::default();
-    let type_spec = TypeSpecialize::with_math(interner);
-    let licm = Licm;
-    let hoist_guards = crate::mir::opt::hoist_guards::HoistGuards;
-    // WLIFT_HOIST_GUARDS=1 moves a class guard on a loop-invariant
-    // receiver out of its loop; off, since on x86-64 the wider live
-    // range costs the loop more in spills than the guard did. Safe to
-    // run with.
-    let hoist_off = std::env::var_os("WLIFT_HOIST_GUARDS").is_none();
-    let noop = crate::mir::opt::dce::Dce;
-    let sra = Sra;
-
-    let passes: Vec<&dyn MirPass> = vec![
-        &range_loop,
-        &constfold,
-        &dce,
-        &cse,
-        &type_spec,
-        &constfold,
-        &dce,
-        &licm,
-        if hoist_off { &noop } else { &hoist_guards },
-        &sra,
-        &dce,
-    ];
-    opt::run_to_fixpoint(mir, &passes, 10);
-    // WLIFT_DISABLE_UNBOX_PARAMS keeps loop-carried Nums boxed; safe to run with.
-    if std::env::var_os("WLIFT_DISABLE_UNBOX_PARAMS").is_none() {
-        crate::mir::opt::unbox_params::UnboxParams.run(mir);
-        // WLIFT_DISABLE_INT_SPEC keeps proven-integral values as f64; safe to run with.
-        if std::env::var_os("WLIFT_DISABLE_INT_SPEC").is_none() {
-            crate::mir::opt::int_loop::IntSpecialize.run(mir);
-        }
-        // With the loop's numbers known, a module variable read a loop
-        // never writes can leave it.
-        crate::mir::opt::licm::LicmModuleVars.run(mir);
-    }
+    crate::mir::opt::run_native_pipeline(mir, interner, false);
 }
 
 /// Insert speculative type guards for function parameters based on runtime
@@ -4017,7 +3962,10 @@ impl ExecutionEngine {
         // A counted range loop is recognised from its single body; version
         // the loop only once the protocol calls are gone.
         crate::mir::opt::MirPass::run(
-            &crate::mir::opt::range_loop::RangeLoop { interner },
+            &crate::mir::opt::range_loop::RangeLoop {
+                interner,
+                copy_descending: false,
+            },
             &mut out,
         );
         if crate::mir::opt::inline_calls::inline_known_calls(&mut out, &sites) {
