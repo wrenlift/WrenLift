@@ -1594,6 +1594,29 @@ pub extern "C" fn wren_cold_loop_hot(func_id: u64) -> u64 {
 /// body's result to return.
 pub const RETIER_DECLINED: u64 = crate::runtime::value::TAG_UNDEFINED ^ (1 << 32);
 
+/// Records at the call-site cache `ic` the closure a compiled class
+/// check dispatched to, as the dispatch helpers record a call they make,
+/// so a loop compiled before it ran is recompiled from what it met.
+#[cfg(feature = "host")]
+#[cfg_attr(not(target_arch = "wasm32"), unsafe(no_mangle))]
+pub extern "C" fn wren_ic_note_seen(ic: u64, class: u64, closure: u64) -> u64 {
+    let vm = read_jit_ctx().vm as *const crate::runtime::vm::VM;
+    if vm.is_null() {
+        return 0;
+    }
+    // SAFETY: the context's vm pointer is the running VM, and compiled
+    // code passes the address of a live entry in its function's
+    // inline-cache table, which outlives the code.
+    populate_callsite_ic(
+        unsafe { &*vm },
+        ic as *mut crate::mir::bytecode::CallSiteIC,
+        class as *mut ObjClass,
+        Method::Closure(closure as *mut ObjClosure),
+        std::ptr::null_mut(),
+    );
+    0
+}
+
 /// Baseline code whose tier countdown reached zero: proposes the top
 /// tier when the engine's policy says so and reloads the countdown.
 #[cfg(feature = "host")]
@@ -5858,6 +5881,7 @@ pub const RUNTIME_FN_NAMES: &[&str] = &[
     "wren_cold_loop_hot",
     "wren_osr_take",
     "wren_tier_tick",
+    "wren_ic_note_seen",
     "wren_retier",
     "wren_to_string",
     "wren_const_string",
@@ -6017,6 +6041,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_osr_take" => Some(wren_osr_take as *const () as usize),
         #[cfg(feature = "host")]
         "wren_tier_tick" => Some(wren_tier_tick as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_ic_note_seen" => Some(wren_ic_note_seen as *const () as usize),
         #[cfg(feature = "host")]
         "wren_retier" => Some(wren_retier as *const () as usize),
         "wren_to_string" => Some(wren_to_string as *const () as usize),
