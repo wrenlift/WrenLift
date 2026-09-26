@@ -435,8 +435,43 @@ pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), Ao
     options.hdll_data.sort();
     options.hdll_data.dedup();
     let module = ash_wasm_link::link(objects, &options)
-        .map_err(|e| AotError::Module(format!("link: {e:#}")))?;
+        .map_err(|e| AotError::Module(link_error(&format!("{e:#}"))))?;
     std::fs::write(output, module).map_err(AotError::Io)
+}
+
+/// The linker's error in wlift's terms. Imports nothing can supply mean
+/// the runtime object is out of step with this wlift, and the linker's
+/// own advice there names another project's build script.
+fn link_error(msg: &str) -> String {
+    match msg
+        .split_once("no host can supply: ")
+        .and_then(|(_, rest)| rest.split_once(".\n"))
+    {
+        Some((names, _)) => format!(
+            "the program needs {names}, which the runtime object does not define, so it \
+             does not match this wlift. Reinstall wlift, or set WLIFT_WASM_RUNTIME to a \
+             runtime object built from the same sources"
+        ),
+        None => format!("link: {msg}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_error;
+
+    #[test]
+    fn an_out_of_step_runtime_is_reported_in_wlifts_terms() {
+        let msg = "the linked module would import 3 symbol(s) no host can supply: \
+                   env.pthread_create, env.pthread_join, env.pthread_detach.\nThese come from \
+                   the runtime object, so it is older than the compiler that emitted the calls. \
+                   Rebuild it:\n    scripts/build_wasm_runtime.py";
+        let out = link_error(msg);
+        assert!(out.contains("env.pthread_create, env.pthread_join, env.pthread_detach"));
+        assert!(out.contains("Reinstall wlift"));
+        assert!(!out.contains("scripts/"));
+        assert_eq!(link_error("bad object"), "link: bad object");
+    }
 }
 
 /// The side modules in `output`'s directory, other than `output`.
