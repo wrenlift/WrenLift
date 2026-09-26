@@ -1900,6 +1900,22 @@ impl Drop for CollectSuppressGuard {
     }
 }
 
+/// Where the wasm shadow stack of an AOT program's compiled frames ends,
+/// as its bootstrap declares (`wlift_aot_stack_top`). Zero until then,
+/// and in a wasm build whose compiled frames keep their values in locals.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_STACK_TOP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An address in the current wasm frame, near the shadow stack pointer.
+#[cfg(target_arch = "wasm32")]
+#[inline(never)]
+pub fn wasm_stack_here() -> usize {
+    // Written at run time and borrowed mutably, so it is a slot in this
+    // frame and not a constant the compiler may place anywhere.
+    let mut probe = std::hint::black_box(0u64);
+    std::hint::black_box(&mut probe) as *mut u64 as usize
+}
+
 #[inline(always)]
 fn collect_suppressed() -> bool {
     COLLECT_SUPPRESS.with(|c| c.get() != 0)
@@ -1910,17 +1926,23 @@ fn collect_suppressed() -> bool {
 /// mapped, so the value needs no root entry, and it is pinned in this
 /// frame across the collection.
 ///
-/// wasm32 JIT frames keep values in locals no scan reaches, so
-/// allocation stays a non-safepoint there until the shadow stack
-/// lands.
+/// wasm32 frames keep values in locals no scan reaches: allocation is
+/// a safepoint there only for AOT code, whose frames store what they
+/// hold across a call into linear memory, which the scan reaches.
 ///
 /// # Safety
 /// `vm` must be the current thread's running VM.
 #[inline]
 pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    let frames_spill = WASM_STACK_TOP.load(std::sync::atomic::Ordering::Relaxed) != 0;
     #[cfg(not(target_arch = "wasm32"))]
-    if vm.safepoint_due() && !collect_suppressed() {
+    let frames_spill = true;
+    if frames_spill && vm.safepoint_due() && !collect_suppressed() {
+        // Its address escapes before the collection, so the value sits
+        // in memory the scan reaches, not in a register or wasm local.
         let pinned = std::hint::black_box(val);
+        std::hint::black_box(&pinned);
         vm.safepoint_work(false);
         if vm.gc.take_freed_code_objects() {
             vm.method_cache.invalidate();
@@ -1928,8 +1950,6 @@ pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
         }
         return std::hint::black_box(&pinned).to_bits();
     }
-    #[cfg(target_arch = "wasm32")]
-    let _ = vm;
     val.to_bits()
 }
 

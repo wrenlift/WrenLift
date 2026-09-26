@@ -363,6 +363,43 @@ fn entry_for<'ctx>(
     Ok(f)
 }
 
+/// The prelinked wasm runtime object: `WLIFT_WASM_RUNTIME`, else
+/// `wasm32-wasip1/wlift_runtime.o` beside the running binary or under
+/// `target/{release,debug}` from the working directory.
+pub fn locate_wasm_runtime() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(p) = std::env::var_os("WLIFT_WASM_RUNTIME") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let beside = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .map(|d| d.join("wasm32-wasip1/wlift_runtime.o"))
+    });
+    beside
+        .into_iter()
+        .chain(
+            ["release", "debug"]
+                .map(|p| PathBuf::from(format!("target/{p}/wasm32-wasip1/wlift_runtime.o"))),
+        )
+        .find(|p| p.is_file())
+}
+
+/// Link a wasm32 program object against the prelinked runtime object
+/// (`tools/build_wasm_runtime.sh`) into one WASI command module at
+/// `output`, in process.
+pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
+    let read = |path: &Path| -> Result<ash_wasm_link::Object, AotError> {
+        let bytes = std::fs::read(path).map_err(AotError::Io)?;
+        let name = path.display().to_string();
+        ash_wasm_link::read(&name, &bytes).map_err(|e| AotError::Module(format!("{name}: {e:#}")))
+    };
+    let objects = vec![read(program)?, read(runtime)?];
+    let module = ash_wasm_link::link(objects, &ash_wasm_link::LinkOptions::default())
+        .map_err(|e| AotError::Module(format!("link: {e:#}")))?;
+    std::fs::write(output, module).map_err(AotError::Io)
+}
+
 /// What the bootstrap reaches of one lowered module.
 struct ModuleTables<'ctx> {
     main_fn: FunctionValue<'ctx>,
@@ -635,6 +672,21 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                 "saved",
             )
             .map_err(e)?;
+        if wasm {
+            // Compiled frames all run below this one: the collector scans
+            // the shadow stack up to the end of the context buffer.
+            let stack_top = self.import("wlift_aot_stack_top", &[Ptr], None);
+            let end = unsafe {
+                self.b.build_in_bounds_gep(
+                    self.ctx.i64_type(),
+                    saved,
+                    &[self.ctx.i64_type().const_int(16, false)],
+                    "top",
+                )
+            }
+            .map_err(e)?;
+            self.call(stack_top, &[end.into()])?;
+        }
         let vm = self
             .call(new_vm, &[])?
             .ok_or("new_vm")?
@@ -774,6 +826,41 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         self.b
             .build_return(Some(&i32t.const_int(70, false)))
             .map_err(e)?;
+        if wasm {
+            self.emit_start(main)?;
+        }
+        Ok(())
+    }
+
+    /// A WASI command's `_start`: the bootstrap, then `exit` with its code
+    /// when it failed. Weak, so a libc `crt1` linked in takes its place.
+    /// The linker runs the constructors from the module's start function.
+    fn emit_start(&self, main: FunctionValue<'ctx>) -> Result<(), String> {
+        let e = |e: inkwell::builder::BuilderError| e.to_string();
+        let i32t = self.ctx.i32_type();
+        let exit = self.import("exit", &[P::I32], None);
+        let start =
+            self.module
+                .add_function("_start", self.ctx.void_type().fn_type(&[], false), None);
+        start.set_linkage(Linkage::WeakAny);
+        stamp_target(self.ctx, self.machine, start);
+        let entry = self.ctx.append_basic_block(start, "entry");
+        let fail = self.ctx.append_basic_block(start, "fail");
+        let done = self.ctx.append_basic_block(start, "done");
+        self.b.position_at_end(entry);
+        let code = self.call(main, &[])?.ok_or("main")?.into_int_value();
+        let failed = self
+            .b
+            .build_int_compare(inkwell::IntPredicate::NE, code, i32t.const_zero(), "failed")
+            .map_err(e)?;
+        self.b
+            .build_conditional_branch(failed, fail, done)
+            .map_err(e)?;
+        self.b.position_at_end(fail);
+        self.call(exit, &[code.into()])?;
+        self.b.build_unreachable().map_err(e)?;
+        self.b.position_at_end(done);
+        self.b.build_return(None).map_err(e)?;
         Ok(())
     }
 }

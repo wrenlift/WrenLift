@@ -106,6 +106,25 @@ struct Cli {
     #[arg(long, value_name = "OUT_PATH")]
     aot: Option<String>,
 
+    /// Target triple for `--aot`. A `wasm32-*` triple (`wasm32-wasip1`)
+    /// compiles through LLVM and links, in process, one WASI command
+    /// module against the prelinked runtime object (`wasm32-wasip1/
+    /// wlift_runtime.o` beside `wlift`, or `WLIFT_WASM_RUNTIME`). Needs
+    /// the `aot` and `llvm` features. Omitted, `--aot` builds a native
+    /// executable.
+    #[arg(long, value_name = "TRIPLE", requires = "aot")]
+    aot_target: Option<String>,
+
+    /// CPU for `--aot-target` (default: the target's generic CPU).
+    #[arg(long, value_name = "CPU", requires = "aot_target")]
+    aot_cpu: Option<String>,
+
+    /// Target features for `--aot-target`, LLVM's `+feature,-feature`
+    /// form (default for wasm32: sign-ext, mutable-globals, bulk-memory,
+    /// nontrapping-fptoint, multivalue, reference-types; add `+simd128`).
+    #[arg(long, value_name = "FEATURES", requires = "aot_target")]
+    aot_features: Option<String>,
+
     /// Target triple for `--bundle`. Defaults to host-family
     /// (recorded as `target = "native"` in the manifest). Pass
     /// `wasm32` (family marker) or a concrete `wasm32-*` triple
@@ -958,6 +977,59 @@ fn aot_build_executable(input: &str, out_path: &str) {
     eprintln!("wlift: produced {}", out_path);
 }
 
+/// `--aot` with `--aot-target`: a wasm32 program through LLVM, linked in
+/// process against the prelinked runtime object.
+#[cfg(all(feature = "aot", feature = "llvm"))]
+fn aot_build_for_target(
+    input: &str,
+    out_path: &str,
+    triple: &str,
+    cpu: Option<&str>,
+    features: Option<&str>,
+) {
+    use wren_lift::codegen::llvm_aot::{
+        LlvmTarget, compile_modules_to_llvm_object, link_wasm, locate_wasm_runtime,
+    };
+    let target = LlvmTarget::new(triple, cpu, features);
+    if !target.is_wasm() {
+        eprintln!("error: --aot-target supports wasm32 triples; omit it for a native executable");
+        process::exit(1);
+    }
+    let fail = |what: &str, e: &dyn std::fmt::Display| -> ! {
+        eprintln!("error: {what}: {e}");
+        process::exit(1);
+    };
+    let walk = wren_lift::codegen::aot::walk_imports(std::path::Path::new(input))
+        .unwrap_or_else(|e| fail("AOT import walk failed", &e));
+    let Some(runtime) = locate_wasm_runtime() else {
+        eprintln!("error: no wasm32-wasip1/wlift_runtime.o beside wlift; build it with");
+        eprintln!("       tools/build_wasm_runtime.sh or set WLIFT_WASM_RUNTIME");
+        process::exit(1);
+    };
+    let work = tempfile::Builder::new()
+        .prefix("wlift_aot_")
+        .tempdir()
+        .unwrap_or_else(|e| fail("tempdir", &e));
+    let object = work.path().join("program.o");
+    compile_modules_to_llvm_object(&walk.modules, &walk.bundle, &target, &object)
+        .unwrap_or_else(|e| fail("AOT object emit failed", &e));
+    link_wasm(&object, &runtime, std::path::Path::new(out_path))
+        .unwrap_or_else(|e| fail("link failed", &e));
+    eprintln!("wlift: produced {out_path}");
+}
+
+#[cfg(not(all(feature = "aot", feature = "llvm")))]
+fn aot_build_for_target(
+    _input: &str,
+    _out_path: &str,
+    _triple: &str,
+    _cpu: Option<&str>,
+    _features: Option<&str>,
+) {
+    eprintln!("error: --aot-target requires `wlift` built with `--features aot,llvm`");
+    process::exit(1);
+}
+
 #[cfg(not(feature = "aot"))]
 fn aot_build_executable(_input: &str, _out_path: &str) {
     eprintln!(
@@ -1332,7 +1404,16 @@ fn main() {
             // run_file does (UTF-8) so non-text files surface a
             // sensible error before the AOT pipeline starts.
             if let Some(out_path) = &cli.aot {
-                aot_build_executable(filename, out_path);
+                match cli.aot_target.as_deref() {
+                    Some(triple) => aot_build_for_target(
+                        filename,
+                        out_path,
+                        triple,
+                        cli.aot_cpu.as_deref(),
+                        cli.aot_features.as_deref(),
+                    ),
+                    None => aot_build_executable(filename, out_path),
+                }
                 return;
             }
 

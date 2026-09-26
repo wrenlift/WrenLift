@@ -1,30 +1,33 @@
-//! Wren compiled to wasm32 through LLVM, linked with rust-lld against
-//! the prelinked runtime object and run under wasmtime.
+//! Wren compiled to wasm32 through LLVM, linked in process against the
+//! prelinked runtime object and run under wasmtime.
 //!
-//! Skipped when the runtime object, rust-lld or wasi-libc is absent
-//! (see `tools/build_wasm_runtime.sh`).
+//! Skipped when the runtime object is absent (see
+//! `tools/build_wasm_runtime.sh`).
 #![cfg(all(feature = "aot", feature = "llvm"))]
 
 mod common;
 
+use std::path::Path;
 use std::process::Command;
 
 use wren_lift::codegen::aot::{AotBundleMeta, walk_imports};
-use wren_lift::codegen::llvm_aot::{LlvmTarget, compile_modules_to_llvm_object};
+use wren_lift::codegen::llvm_aot::{LlvmTarget, compile_modules_to_llvm_object, link_wasm};
 
-/// Compile `files` (the first is the entry) for wasm32, link and run
-/// the program; its exit code and stdout. `None` when the tools are
-/// missing.
-fn run_wasm(files: &[(&str, &str)]) -> Option<(i32, String)> {
-    use wasmtime::{Engine, Linker, Module, Store};
-    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+/// How the program object and the runtime object become one module.
+#[derive(Clone, Copy)]
+enum Link {
+    /// wlift's own, in process.
+    Wlift,
+    /// rust-lld, as a reference; `None` when there is none.
+    Lld,
+}
 
-    let (Some(runtime), Some(lld), Some(libs)) = (
-        common::runtime_object(),
-        common::rust_lld(),
-        common::wasi_lib_dir(),
-    ) else {
-        eprintln!("no runtime object, rust-lld or wasi-libc; skipping");
+/// Compile `files` (the first is the entry) for wasm32, link them `how`
+/// and run the program; its exit code and stdout. `None` when the
+/// runtime object, or rust-lld for `Link::Lld`, is missing.
+fn run_linked(files: &[(&str, &str)], how: Link, env: &[(&str, &str)]) -> Option<(i32, String)> {
+    let Some(runtime) = common::runtime_object() else {
+        eprintln!("no runtime object; skipping");
         return None;
     };
     let dir = tempfile::Builder::new()
@@ -42,28 +45,51 @@ fn run_wasm(files: &[(&str, &str)]) -> Option<(i32, String)> {
         .expect("compile to a wasm32 object");
 
     let wasm = dir.path().join("program.wasm");
-    let out = Command::new(&lld)
-        .args(["-flavor", "wasm"])
-        .arg(libs.join("crt1-command.o"))
-        .arg(&object)
-        .arg(&runtime)
-        .arg(format!("-L{}", libs.display()))
-        .args(["-lc", "-o"])
-        .arg(&wasm)
-        .output()
-        .expect("running rust-lld");
-    assert!(
-        out.status.success(),
-        "linking failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    match how {
+        Link::Wlift => link_wasm(&object, &runtime, &wasm).expect("linking"),
+        Link::Lld => {
+            let Some(lld) = common::rust_lld() else {
+                eprintln!("no rust-lld; skipping");
+                return None;
+            };
+            let Some(libs) = common::wasi_lib_dir() else {
+                eprintln!("no wasi-libc; skipping");
+                return None;
+            };
+            // wasm-ld runs the constructors from crt1's `_start`.
+            let out = Command::new(&lld)
+                .args(["-flavor", "wasm"])
+                .arg(libs.join("crt1-command.o"))
+                .arg(&object)
+                .arg(&runtime)
+                .arg(format!("-L{}", libs.display()))
+                .arg("-lc")
+                .arg("-o")
+                .arg(&wasm)
+                .output()
+                .expect("running rust-lld");
+            assert!(
+                out.status.success(),
+                "rust-lld failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    Some(run_module(&wasm, env))
+}
+
+/// Run a WASI command module with `env`; its exit code and stdout.
+fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
+    use wasmtime::{Engine, Linker, Module, Store};
+    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
     let engine = Engine::default();
-    let module = Module::from_file(&engine, &wasm).expect("loading the program");
+    let module = Module::from_file(&engine, wasm).expect("loading the program");
     let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 20);
     let wasi = wasmtime_wasi::WasiCtxBuilder::new()
         .stdout(stdout.clone())
         .inherit_stderr()
+        .envs(env)
         .build_p1();
     let mut store = Store::new(&engine, wasi);
     let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
@@ -82,7 +108,11 @@ fn run_wasm(files: &[(&str, &str)]) -> Option<(i32, String)> {
         },
     };
     let text = String::from_utf8(stdout.contents().to_vec()).expect("utf-8 output");
-    Some((code, text))
+    (code, text)
+}
+
+fn run_wasm(files: &[(&str, &str)]) -> Option<(i32, String)> {
+    run_linked(files, Link::Wlift, &[])
 }
 
 fn expect(files: &[(&str, &str)], want: &str) {
@@ -240,6 +270,45 @@ System.print(keep[199])
     );
 }
 
+/// Compiled frames keep their values in the shadow stack, where the
+/// collector finds them: collecting at every allocation loses none.
+#[test]
+fn a_collection_keeps_what_compiled_frames_hold() {
+    let Some((code, out)) = run_linked(
+        &[(
+            "main",
+            r#"
+class Tree {
+  construct new(left, right) {
+    _left = left
+    _right = right
+  }
+  check { _left == null ? 1 : 1 + _left.check + _right.check }
+  static build(depth) {
+    if (depth == 0) return Tree.new(null, null)
+    return Tree.new(build(depth - 1), build(depth - 1))
+  }
+}
+var label = "tree"
+var tree = Tree.build(6)
+var parts = []
+for (i in 0...50) {
+  var s = "%(label)-%(i)"
+  parts.add(s + "!" + Tree.build(3).check.toString)
+}
+System.print(tree.check)
+System.print(parts[0])
+System.print(parts[49])
+"#,
+        )],
+        Link::Wlift,
+        &[("WLIFT_GC_STRESS", "1")],
+    ) else {
+        return;
+    };
+    assert_eq!((code, out.as_str()), (0, "127\ntree-0!15\ntree-49!15\n"));
+}
+
 #[test]
 fn an_uncaught_error_ends_the_program_with_70() {
     let Some((code, out)) = run_wasm(&[(
@@ -391,4 +460,47 @@ System.print(neg)
         )],
         "100000\n45000150000\n19999900000\n0\n100000\n100000\n45150\n-1249975000\n",
     );
+}
+
+/// wlift's linker and rust-lld make modules that behave the same.
+#[test]
+fn the_linker_agrees_with_rust_lld() {
+    let program: &[(&str, &str)] = &[
+        (
+            "main",
+            r#"
+import "./shapes" for Rect
+var xs = []
+for (i in 0...50) xs.add(Rect.new(i, i + 1))
+var total = 0
+for (r in xs) total = total + r.area
+System.print(total)
+var f = Fiber.new { "fib %(Rect.fib(20))" }
+System.print(f.call())
+System.print({"k": [1, 2, 3]}["k"].count)
+for (i in 3...0) System.print(i)
+"#,
+        ),
+        (
+            "shapes",
+            r#"
+class Rect {
+  construct new(w, h) {
+    _w = w
+    _h = h
+  }
+  area { _w * _h }
+  static fib(n) { n < 2 ? n : fib(n - 1) + fib(n - 2) }
+}
+"#,
+        ),
+    ];
+    let (Some(ours), Some(lld)) = (
+        run_linked(program, Link::Wlift, &[]),
+        run_linked(program, Link::Lld, &[]),
+    ) else {
+        return;
+    };
+    assert_eq!(ours, lld);
+    assert_eq!(ours, (0, "41650\nfib 6765\n3\n3\n2\n1\n".to_string()));
 }

@@ -440,6 +440,7 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_resolve_runtime_import",
     "wlift_aot_invoke_module_body",
     "wlift_aot_take_error",
+    "wlift_aot_stack_top",
     "wlift_error_pending",
 ];
 
@@ -1343,6 +1344,24 @@ pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
     let ptr = saved as *const JitContext;
     let prev = unsafe { *ptr };
     set_jit_context(prev);
+}
+
+/// Where the stack of a wasm program's compiled frames begins: an address
+/// in the bootstrap's frame, above every frame it calls. The collector
+/// scans the shadow stack from the frame it runs in up to here, where
+/// compiled frames store what they hold across calls. Elsewhere a no-op.
+///
+/// # Safety
+/// `top` must be in the calling frame, which must outlive every
+/// compiled frame.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_stack_top(top: *const u8) {
+    #[cfg(target_arch = "wasm32")]
+    crate::codegen::runtime_fns::WASM_STACK_TOP
+        .store(top as usize, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = top;
 }
 
 /// After a module body: report the error it left uncaught, as the

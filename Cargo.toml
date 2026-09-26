@@ -114,6 +114,7 @@ aot = [
     "cranelift",
     "dep:cranelift-object",
     "dep:target-lexicon",
+    "dep:ash_wasm_link",
 ]
 # LLVM top tier above Cranelift. Needs LLVM 21 on the build machine
 # (llvm-config on PATH or LLVM_SYS_211_PREFIX); off by default. The
@@ -204,6 +205,9 @@ cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", r
 # AOT entry point parses target triples at the top of the build
 # pipeline so we depend on it directly behind the `aot` feature.
 target-lexicon = { version = "0.13", optional = true }
+# Links a wasm AOT program against the prelinked runtime object in
+# process, so building one needs no wasm-ld. Ash's linker, pinned by rev.
+ash_wasm_link = { git = "https://github.com/rayzor-blade/ash", rev = "312b4a4f0da6cf3f26807aa3d3d6b2dd01da3f56", optional = true }
 # LLVM 21, the same pin as Ash so its lowering patterns carry over;
 # linked against the shared library where one is installed.
 # The host targets and WebAssembly, for AOT to wasm32: inkwell's default

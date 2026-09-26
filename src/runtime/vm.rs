@@ -4326,8 +4326,20 @@ impl VM {
         ranges
     }
 
+    /// An AOT program on wasm: its shadow stack, from here to the frame
+    /// that made the VM, where compiled frames store what they hold
+    /// across calls.
     #[cfg(not(feature = "host"))]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::codegen::runtime_fns::{WASM_STACK_TOP, wasm_stack_here};
+            let top = WASM_STACK_TOP.load(std::sync::atomic::Ordering::Relaxed);
+            let here = wasm_stack_here();
+            if top > here {
+                return vec![(here, top)];
+            }
+        }
         Vec::new()
     }
 }

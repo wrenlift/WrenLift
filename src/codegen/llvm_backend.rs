@@ -904,6 +904,12 @@ pub mod llvm {
         /// An AOT body's root-store length at entry, restored on the
         /// way out.
         roots_snap: Option<IntValue<'ctx>>,
+        /// A wasm AOT body's slots in linear memory, and per value the
+        /// slot it is stored in before a call it is live across.
+        spill_frame: Option<PointerValue<'ctx>>,
+        spill_slot: HashMap<ValueId, u32>,
+        /// Per `(block, instruction)`, what to store before it.
+        spills: HashMap<(usize, usize), Vec<ValueId>>,
     }
 
     macro_rules! bail {
@@ -952,6 +958,9 @@ pub mod llvm {
                 inline_depth: 0,
                 tmp: 0,
                 roots_snap: None,
+                spill_frame: None,
+                spill_slot: HashMap::new(),
+                spills: HashMap::new(),
             }
         }
 
@@ -2458,6 +2467,9 @@ pub mod llvm {
             if self.sh.aot.is_some() {
                 self.roots_snap = Some(self.call_helper("wren_jit_roots_snapshot", &[])?);
             }
+            if self.sh.aot.is_some_and(|env| env.wasm) {
+                self.plan_spills()?;
+            }
 
             if self.entries.is_empty() {
                 let entry = &mir.blocks[0];
@@ -2597,7 +2609,7 @@ pub mod llvm {
                 if loop_headers.contains(&bi) {
                     match (self.sh.aot, self.roots_snap) {
                         (None, _) => self.safepoint_poll()?,
-                        (Some(env), Some(snap)) if !env.wasm => {
+                        (Some(_), Some(snap)) => {
                             self.call_helper("wren_jit_roots_restore", &[snap])?;
                         }
                         _ => {}
@@ -2697,6 +2709,9 @@ pub mod llvm {
                     .get(&vid)
                     .map(|sp| sp.start as u32 + 1)
                     .unwrap_or(0);
+                if let Some(live) = self.spills.get(&(bi, i)).cloned() {
+                    self.spill(&live)?;
+                }
                 let v = self.lower_instruction(vid, inst)?;
                 self.miss_exit = None;
                 if !matches!(
@@ -2764,6 +2779,94 @@ pub mod llvm {
                     self.and(nf, nn)
                 }
             }
+        }
+
+        /// For a wasm AOT body: the boxed values live across or passed to
+        /// each instruction that can call into the runtime, and a slot for
+        /// each in linear memory. A wasm local is out of the collector's
+        /// reach; a slot is in the shadow stack it scans.
+        fn plan_spills(&mut self) -> Result<(), String> {
+            let mir = self.sh.mir;
+            let live_in = crate::mir::live_in_sets(mir);
+            for (bi, block) in mir.blocks.iter().enumerate() {
+                let mut live: HashSet<ValueId> = block
+                    .terminator
+                    .successors()
+                    .iter()
+                    .flat_map(|s| live_in.iter(s.0 as usize).collect::<Vec<_>>())
+                    .chain(block.terminator.operands())
+                    .collect();
+                for (i, (dst, inst)) in block.instructions.iter().enumerate().rev() {
+                    live.remove(dst);
+                    if may_call_runtime(inst) {
+                        // What the call is handed too: a helper holds its
+                        // arguments in locals while it allocates.
+                        let mut across: Vec<ValueId> = live
+                            .iter()
+                            .copied()
+                            .chain(inst.operands())
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .filter(|v| {
+                                matches!(
+                                    self.value_types.get(v.0 as usize),
+                                    Some(MirType::Value) | None
+                                )
+                            })
+                            .collect();
+                        across.sort_by_key(|v| v.0);
+                        if !across.is_empty() {
+                            for v in &across {
+                                let n = self.spill_slot.len() as u32;
+                                self.spill_slot.entry(*v).or_insert(n);
+                            }
+                            self.spills.insert((bi, i), across);
+                        }
+                    }
+                    live.extend(inst.operands());
+                }
+            }
+            if !self.spill_slot.is_empty() {
+                let ty = self.i64t().array_type(self.spill_slot.len() as u32);
+                let frame = self
+                    .b
+                    .build_alloca(ty, "spills")
+                    .map_err(|e| e.to_string())?;
+                self.spill_frame = Some(frame);
+            }
+            Ok(())
+        }
+
+        /// Store `values` into their slots, where the collector sees them.
+        fn spill(&mut self, values: &[ValueId]) -> Result<(), String> {
+            let Some(frame) = self.spill_frame else {
+                return Ok(());
+            };
+            for v in values {
+                // A raw bool or an unboxed number holds no object.
+                if self.raw_bools.contains(v) || !self.vals.contains_key(v) {
+                    continue;
+                }
+                let BasicValueEnum::IntValue(w) = self.vals[v] else {
+                    continue;
+                };
+                if w.get_type().get_bit_width() != 64 {
+                    continue;
+                }
+                let slot = self.spill_slot[v];
+                let p = unsafe {
+                    self.b.build_in_bounds_gep(
+                        self.i64t(),
+                        frame,
+                        &[self.c64(slot as u64)],
+                        "spillp",
+                    )
+                }
+                .map_err(|e| e.to_string())?;
+                let st = self.b.build_store(p, w).map_err(|e| e.to_string())?;
+                st.set_volatile(true).map_err(|e| e.to_string())?;
+            }
+            Ok(())
         }
 
         /// Return `r`, releasing what an AOT body rooted.
@@ -5656,6 +5759,55 @@ pub mod llvm {
             }
         }
         facts
+    }
+
+    /// Whether lowering `inst` may call into the runtime, where a
+    /// collection can happen: all but constants, moves, field and
+    /// variable reads and unboxed arithmetic.
+    fn may_call_runtime(inst: &Instruction) -> bool {
+        use Instruction as I;
+        !matches!(
+            inst,
+            I::ConstNum(_)
+                | I::ConstBool(_)
+                | I::ConstNull
+                | I::ConstF64(_)
+                | I::ConstI64(_)
+                | I::ConstString(_)
+                | I::Move(_)
+                | I::BlockParam(_)
+                | I::Box(_)
+                | I::Unbox(_)
+                | I::AddF64(..)
+                | I::SubF64(..)
+                | I::MulF64(..)
+                | I::DivF64(..)
+                | I::ModF64(..)
+                | I::NegF64(_)
+                | I::CmpLtF64(..)
+                | I::CmpGtF64(..)
+                | I::CmpLeF64(..)
+                | I::CmpGeF64(..)
+                | I::AddI64(..)
+                | I::SubI64(..)
+                | I::MulI64(..)
+                | I::RemI64(..)
+                | I::BandI64(..)
+                | I::NegI64(_)
+                | I::CmpLtI64(..)
+                | I::CmpGtI64(..)
+                | I::CmpLeI64(..)
+                | I::CmpGeI64(..)
+                | I::I64ToF64(_)
+                | I::F64ToI64(_)
+                | I::IsNum(_)
+                | I::MathUnaryF64(..)
+                | I::MathBinaryF64(..)
+                | I::GetField(..)
+                | I::GetModuleVar(_)
+                | I::SetModuleVar(..)
+                | I::Not(_)
+        )
     }
 
     fn is_raw_bool(inst: &Instruction) -> bool {
