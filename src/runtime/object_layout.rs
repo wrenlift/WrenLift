@@ -133,7 +133,7 @@ impl Layout {
         class_num_fields: 36,
         instance_num_fields: 8,
         instance_fields: 16,
-        instance_size: 20,
+        instance_size: 24,
         list_count: 8,
         list_capacity: 12,
         list_elements: 16,

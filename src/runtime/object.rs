@@ -1829,8 +1829,9 @@ impl fmt::Debug for ObjClass {
 /// code reads field `i` at `INSTANCE_SIZE + 8 * i` from the object
 /// without a load through `fields`, which points there for the
 /// interpreter and the collector. A class has at most 255 fields, so
-/// every instance fits one heap allocation.
-#[repr(C)]
+/// every instance fits one heap allocation. Aligned to 8 so the fields
+/// after it are aligned on 32-bit targets too.
+#[repr(C, align(8))]
 pub struct ObjInstance {
     pub header: ObjHeader,  // offset 0, 16 bytes
     pub num_fields: u32,    // offset 16
