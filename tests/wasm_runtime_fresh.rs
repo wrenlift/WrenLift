@@ -7,11 +7,15 @@
 //! instantiate with `unknown import`. This reads the object's symbol
 //! table and fails naming the first entry point or helper it lacks.
 //!
+//! A second test links the object into a module with rust-lld and runs
+//! a program through its entry points under wasmtime.
+//!
 //! Skipped when the object is absent: a checkout that never built the
 //! wasm runtime is not broken. `WLIFT_RUNTIME` names one explicitly.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use wasmparser::{KnownCustom, Linking, Parser, Payload, SymbolFlags, SymbolInfo};
 use wren_lift::capi::AOT_ENTRY_NAMES;
@@ -86,4 +90,120 @@ fn the_wasm_runtime_defines_what_aot_code_calls() {
         missing.join(", "),
         missing[0],
     );
+}
+
+/// rust-lld from the toolchain building this test.
+fn rust_lld() -> Option<PathBuf> {
+    let out = |args: &[&str]| {
+        let o = Command::new("rustc").args(args).output().ok()?;
+        String::from_utf8(o.stdout).ok()
+    };
+    let sysroot = out(&["--print", "sysroot"])?;
+    let host = out(&["-vV"])?
+        .lines()
+        .find_map(|l| l.strip_prefix("host: ").map(str::to_string))?;
+    let lld = Path::new(sysroot.trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/rust-lld");
+    lld.is_file().then_some(lld)
+}
+
+/// The wasi-libc library directory the object was prelinked against.
+fn wasi_lib_dir() -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = std::env::var_os("WASI_SYSROOT")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    roots.extend(
+        [
+            "/opt/homebrew/opt/wasi-libc/share/wasi-sysroot",
+            "/usr/local/opt/wasi-libc/share/wasi-sysroot",
+            "/opt/wasi-sdk/share/wasi-sysroot",
+            "/usr/share/wasi-sysroot",
+        ]
+        .map(PathBuf::from),
+    );
+    roots
+        .into_iter()
+        .map(|r| r.join("lib/wasm32-wasip1"))
+        .find(|d| d.join("crt1-reactor.o").is_file())
+}
+
+#[test]
+fn the_wasm_runtime_runs_a_program_under_wasmtime() {
+    use wasmtime::{Engine, Linker, Module, Store};
+    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+
+    let (Some(object), Some(lld), Some(libs)) = (runtime_object(), rust_lld(), wasi_lib_dir())
+    else {
+        eprintln!("no runtime object, rust-lld or wasi-libc; skipping");
+        return;
+    };
+    let wasm = object.with_file_name("wlift_runtime_check.wasm");
+    let status = Command::new(&lld)
+        .args(["-flavor", "wasm", "--no-entry"])
+        .arg(libs.join("crt1-reactor.o"))
+        .arg(&object)
+        .arg(format!("-L{}", libs.display()))
+        .args(["-lc", "--export=malloc", "--export=_initialize"])
+        .args(["--export=wlift_aot_new_vm", "--export=wrenInterpret"])
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("running rust-lld");
+    assert!(status.success(), "linking the runtime object failed");
+
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, &wasm).expect("loading the linked module");
+    let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(64 * 1024);
+    let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+        .stdout(stdout.clone())
+        .build_p1();
+    let mut store = Store::new(&engine, wasi);
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    preview1::add_to_linker_sync(&mut linker, |s| s).expect("wasi imports");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiating the linked module");
+
+    instance
+        .get_typed_func::<(), ()>(&mut store, "_initialize")
+        .and_then(|f| f.call(&mut store, ()))
+        .expect("_initialize");
+    let malloc = instance
+        .get_typed_func::<i32, i32>(&mut store, "malloc")
+        .expect("malloc");
+    let memory = instance.get_memory(&mut store, "memory").expect("memory");
+    let c_string = |store: &mut Store<WasiP1Ctx>, text: &str| {
+        let bytes = [text.as_bytes(), &[0]].concat();
+        let at = malloc
+            .call(&mut *store, bytes.len() as i32)
+            .expect("malloc");
+        memory
+            .write(&mut *store, at as usize, &bytes)
+            .expect("writing a string");
+        at
+    };
+    let name = c_string(&mut store, "main");
+    let source = c_string(
+        &mut store,
+        "class P {\n  construct new(x) { _x = x }\n  x { _x }\n}\n\
+         var s = 0\nfor (i in 0...1000) s = s + P.new(i).x\nSystem.print(s)\n\
+         var f = Fiber.new {\n  Fiber.yield(1)\n  return 2\n}\n\
+         System.print([f.call(), f.call()])\n",
+    );
+
+    let vm = instance
+        .get_typed_func::<(), i32>(&mut store, "wlift_aot_new_vm")
+        .and_then(|f| f.call(&mut store, ()))
+        .expect("wlift_aot_new_vm");
+    let result = instance
+        .get_typed_func::<(i32, i32, i32), i32>(&mut store, "wrenInterpret")
+        .and_then(|f| f.call(&mut store, (vm, name, source)))
+        .expect("wrenInterpret");
+
+    let out = String::from_utf8(stdout.contents().to_vec()).expect("utf-8 output");
+    assert_eq!(result, 0, "the program failed:\n{out}");
+    assert_eq!(out, "499500\n[1, 2]\n");
 }
