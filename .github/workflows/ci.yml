@@ -123,16 +123,20 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --release --test wasm_smoke -- --nocapture
 
-      - name: Wasm runtime object
-        # Builds the prelinked runtime a wasm AOT program links against
-        # and checks it defines every entry point and helper such a
-        # program calls. WASI_SYSROOT comes from the SDK step above.
+      - name: Clippy the wasm runtime
         if: runner.os == 'Linux'
         run: |
           cargo clippy --lib --target wasm32-wasip1 --no-default-features \
             --features aot_runtime -- -D warnings
-          tools/build_wasm_runtime.sh
-          cargo test --release --test wasm_runtime_fresh
+
+      # The prelinked runtime a wasm AOT program links against, checked
+      # to define every entry point and helper such a program calls.
+      - uses: ./.github/actions/wasm-runtime
+        if: runner.os == 'Linux'
+
+      - name: Wasm runtime object
+        if: runner.os == 'Linux'
+        run: cargo test --release --test wasm_runtime_fresh
 
       - name: Format check
         run: cargo fmt -- --check
@@ -199,20 +203,22 @@ jobs:
         run: cargo clippy --release --features llvm -- -D warnings
 
       # Wren compiled to wasm32 through LLVM, linked against the
-      # prelinked runtime object and run under wasmtime. wasi-libc
-      # comes from the WASI SDK; it must define the pthread stubs the
-      # toolchain's wasip1 std calls.
+      # prelinked runtime object and run under wasmtime.
+      - uses: ./.github/actions/wasm-runtime
+        if: runner.os == 'Linux'
+
       - name: Wasm AOT through LLVM
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz" \
-            | sudo tar -xzC /opt
-          export WASI_SYSROOT=/opt/wasi-sdk-33.0-x86_64-linux/share/wasi-sysroot
-          tools/build_wasm_runtime.sh
           cargo clippy --release --features aot,llvm --all-targets -- -D warnings
           cargo test --release --features aot,llvm --test wasm_aot
+
+      # Releases build wlift with aot as well; Linux builds it above.
+      - name: Build with aot
+        if: runner.os != 'Linux'
+        run: cargo build --release --features aot,llvm --bin wlift
 
       - name: Benchmarks on the LLVM tier
         if: runner.os != 'Windows'

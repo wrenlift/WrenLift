@@ -187,6 +187,12 @@ main() {
     mv "$staged/wlift-lsp" "$INSTALL_DIR/wlift-lsp"
     chmod +x "$INSTALL_DIR/wlift-lsp"
   fi
+  # The runtime `wlift --aot --aot-target wasm32-wasip1` links against,
+  # which wlift finds beside itself.
+  if [ -f "$staged/wasm32-wasip1/wlift_runtime.o" ]; then
+    mkdir -p "$INSTALL_DIR/wasm32-wasip1"
+    mv "$staged/wasm32-wasip1/wlift_runtime.o" "$INSTALL_DIR/wasm32-wasip1/wlift_runtime.o"
+  fi
   # macOS builds carry the libraries wlift loads from beside itself.
   for lib in "$staged"/*.dylib; do
     [ -f "$lib" ] || continue

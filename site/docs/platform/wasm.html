@@ -314,26 +314,9 @@ const wlift = await createWlift();   // picks the right binary</code></pre>
         program; the harness stays the way to run Wren in a page.
       </p>
 
-      <h3 id="aot-setup">What you need</h3>
       <p>
-        A <code>wlift</code> built from source with the
-        <code>aot</code> and <code>llvm</code> features, and the
-        runtime object programs link against. From a checkout:
-      </p>
-<pre><code>rustup target add wasm32-wasip1
-cargo build --release --features aot,llvm
-tools/build_wasm_runtime.sh</code></pre>
-      <p>
-        The build needs LLVM 21: <code>llvm-config</code> on the
-        <code>PATH</code>, or <code>LLVM_SYS_211_PREFIX</code>
-        pointing at it. The runtime script needs wasi-libc 33 or
-        later. Homebrew's <code>wasi-libc</code> and a WASI SDK
-        under <code>/opt/wasi-sdk</code> are found on their own;
-        <code>WASI_SYSROOT</code> names any other sysroot. The
-        script writes
-        <code>target/release/wasm32-wasip1/wlift_runtime.o</code>,
-        where <code>wlift</code> looks for it.
-        <code>WLIFT_WASM_RUNTIME</code> names another copy.
+        The installed <code>wlift</code> does this on its own: the
+        runtime programs link against ships beside it.
       </p>
 
       <h3 id="aot-build">Build and run</h3>
@@ -379,32 +362,25 @@ wasmtime hello.wasm</code></pre>
         loads; the two sit side by side.
       </p>
       <p>
+        A package author builds it with <code>hatch</code>, from the
+        cargo workspace that holds the plugin crate:
+      </p>
+<pre><code>hatch plugin build --target wasm32-wasip1 --source ../my-plugin</code></pre>
+      <p>
+        It builds <code>[plugin_source] wasi_crate</code>, or the
+        plugin crate, and writes the side module where the hatchfile
+        names it, exporting the functions the package's
+        <code>#!symbol</code> attributes bind. The build needs a
+        nightly Rust toolchain with <code>rust-src</code>. Without
+        <code>--target</code>, the same command builds the host's
+        native library.
+      </p>
+      <p>
         An ahead-of-time build puts each library beside the output
         as <code>&lt;name&gt;.wasm</code> and links the program to
-        host it. A package can ship a position-independent static
-        archive (<code>.a</code>) instead; the build links it into a
-        side module with the Rust toolchain's <code>rust-lld</code>.
-        <code>WLIFT_WASM_LD</code> names another linker.
-      </p>
-      <p>
-        A Rust plugin builds that archive with nightly, since the
-        standard library has to be rebuilt position-independent:
-      </p>
-<pre><code>RUSTFLAGS="-C relocation-model=pic -C target-feature=+mutable-globals" \
-  cargo +nightly rustc -p wlift_noise --release --lib \
-    --target wasm32-wasip1 --crate-type staticlib \
-    -Z build-std=std,panic_abort</code></pre>
-      <p>
-        Plain wasmtime runs a program without native libraries. A
-        program with them needs a host that loads each side module
-        beside it before starting it, and answers two imports:
-      </p>
-      <ul>
-        <li><code>env.ash_host_dlopen(name, len)</code>: 1 when a library of that name is loaded, else 0.</li>
-        <li><code>env.ash_host_dlsym(lib, lib_len, symbol, symbol_len)</code>: the function table index of that export, or 0.</li>
-      </ul>
-      <p>
-        A program without native libraries doesn't import either.
+        host it. The program's host loads the libraries beside it
+        before starting it; plain wasmtime runs a program without
+        native libraries.
       </p>
     </div>
   </main>

@@ -1,0 +1,45 @@
+name: Wasm runtime object
+description: |
+  Build target/release/wasm32-wasip1/wlift_runtime.o, the prelinked
+  runtime a wasm AOT program links against: wren_lift for wasm32-wasip1
+  with the portable aot_runtime feature (the AOT entry points and every
+  runtime helper, no JIT), joined once with wasi-libc into one
+  relocatable object. Releases ship it beside wlift, which looks for it
+  in wasm32-wasip1/ next to its own executable.
+
+  wasi-libc must be version 33 or later: the toolchain's wasip1 std calls
+  pthread stubs earlier ones don't define. Linux runners only.
+inputs:
+  sysroot:
+    description: A WASI sysroot with lib/wasm32-wasip1/libc.a. Empty installs WASI SDK 33.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+  - name: Install WASI SDK 33
+    if: inputs.sysroot == ''
+    shell: bash
+    run: |
+      set -euo pipefail
+      curl -sSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz" \
+        | sudo tar -xzC /opt
+  - name: Build and prelink the runtime
+    shell: bash
+    env:
+      SYSROOT: ${{ inputs.sysroot || '/opt/wasi-sdk-33.0-x86_64-linux/share/wasi-sysroot' }}
+    run: |
+      set -euo pipefail
+      rustup target add wasm32-wasip1
+      cargo rustc --lib --release --target wasm32-wasip1 --no-default-features \
+        --features aot_runtime --crate-type staticlib
+      host="$(rustc -vV | sed -n 's/^host: //p')"
+      lld="$(rustc --print sysroot)/lib/rustlib/$host/bin/rust-lld"
+      mkdir -p target/release/wasm32-wasip1
+      # --no-whole-archive before libc keeps crt1 and the long-double
+      # printf out: whole-archived, they import __main_argc_argv and
+      # __multc3, which nothing provides.
+      "$lld" -flavor wasm -r -o target/release/wasm32-wasip1/wlift_runtime.o \
+        --whole-archive target/wasm32-wasip1/release/libwren_lift.a --no-whole-archive \
+        -L"$SYSROOT/lib/wasm32-wasip1" -lc
+      ls -la target/release/wasm32-wasip1/wlift_runtime.o

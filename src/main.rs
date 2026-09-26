@@ -1003,8 +1003,8 @@ fn aot_build_for_target(
     let walk = wren_lift::codegen::aot::walk_imports(std::path::Path::new(input))
         .unwrap_or_else(|e| fail("AOT import walk failed", &e));
     let Some(runtime) = locate_wasm_runtime() else {
-        eprintln!("error: no wasm32-wasip1/wlift_runtime.o beside wlift; build it with");
-        eprintln!("       tools/build_wasm_runtime.sh or set WLIFT_WASM_RUNTIME");
+        eprintln!("error: no wasm32-wasip1/wlift_runtime.o beside wlift, which releases ship;");
+        eprintln!("       reinstall wlift, or set WLIFT_WASM_RUNTIME to one");
         process::exit(1);
     };
     let work = tempfile::Builder::new()

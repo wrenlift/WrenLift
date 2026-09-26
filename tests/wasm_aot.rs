@@ -2,7 +2,7 @@
 //! prelinked runtime object and run under wasmtime.
 //!
 //! Skipped when the runtime object is absent (see
-//! `tools/build_wasm_runtime.sh`).
+//! the README's "From source").
 #![cfg(all(feature = "aot", feature = "llvm"))]
 
 mod common;

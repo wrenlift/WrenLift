@@ -58,6 +58,21 @@ That build runs hot code on the Cranelift tier. The prebuilt binaries
 carry an LLVM tier above it; to build that, install LLVM 21 and run
 `LLVM_SYS_211_PREFIX=<llvm prefix> cargo build --release --features llvm`.
 
+Compiling to WebAssembly from a source build takes `--features llvm,aot`
+and the runtime object programs link against, which releases ship beside
+`wlift`. Build it with wasi-libc 33 or later (Homebrew's `wasi-libc`, or
+a WASI SDK's `share/wasi-sysroot`):
+
+```sh
+rustup target add wasm32-wasip1
+cargo rustc --lib --release --target wasm32-wasip1 --no-default-features \
+  --features aot_runtime --crate-type staticlib
+"$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/rust-lld" \
+  -flavor wasm -r -o target/release/wasm32-wasip1/wlift_runtime.o \
+  --whole-archive target/wasm32-wasip1/release/libwren_lift.a --no-whole-archive \
+  -L<wasi-sysroot>/lib/wasm32-wasip1 -lc
+```
+
 ## Getting started
 
 Try it without installing → [wrenlift.com/playground](https://wrenlift.com/playground/web/).
@@ -77,8 +92,13 @@ wlift
 ### Compile to WebAssembly
 
 ```sh
-wlift --target=wasm script.wren -o output.wasm
+wlift --aot program.wasm --aot-target wasm32-wasip1 script.wren
+wasmtime program.wasm
 ```
+
+The result is a WASI module holding the compiled program and the runtime
+it calls. The [WebAssembly guide](https://wrenlift.com/docs/platform/wasm.html#aot)
+covers native libraries; running Wren in a page goes through `wlift.js`.
 
 ### Execution modes
 

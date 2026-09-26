@@ -1,9 +1,9 @@
 //! The prelinked wasm runtime must define what an AOT program calls.
 //!
 //! `wlift_runtime.o` is wren_lift built with `aot_runtime` for
-//! wasm32-wasip1 and joined with wasi-libc by
-//! `tools/build_wasm_runtime.sh`. Nothing rebuilds it when a helper is
-//! added, so a stale object would let a program link and then fail at
+//! wasm32-wasip1 and joined with wasi-libc (the README's "From source"
+//! has the steps). Nothing rebuilds it when a helper is added, so a
+//! stale object would let a program link and then fail at
 //! instantiate with `unknown import`. This reads the object's symbol
 //! table and fails naming the first entry point or helper it lacks.
 //!
@@ -150,7 +150,7 @@ fn the_wasm_runtime_defines_what_aot_code_calls() {
         missing.is_empty(),
         "{} is stale or incomplete: it does not define {}.\n\
          A wasm program would link and then fail at instantiate with\n\
-         `unknown import: env::{}`. Rebuild it with tools/build_wasm_runtime.sh.",
+         `unknown import: env::{}`. Rebuild it as the README's \"From source\" says.",
         path.display(),
         missing.join(", "),
         missing[0],

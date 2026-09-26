@@ -70,15 +70,47 @@ jobs:
           sparse-checkout: |
             tools/package_release.sh
             .github/actions/llvm21/action.yml
+            .github/actions/wasm-runtime/action.yml
           sparse-checkout-cone-mode: false
       - name: Check the tag carries the release tooling
         shell: bash
         run: |
           set -eu
           if [ ! -x tools/package_release.sh ] \
-             || ! grep -q "Install LLVM 21 (macOS)" .github/actions/llvm21/action.yml; then
+             || ! grep -q "Install LLVM 21 (macOS)" .github/actions/llvm21/action.yml \
+             || [ ! -f .github/actions/wasm-runtime/action.yml ]; then
             echo "::error::tag ${{ steps.out.outputs.tag }} predates the release tooling; tag a commit at or after the one that added tools/package_release.sh" && exit 1
           fi
+
+  # ---------------------------------------------------------------
+  # Wasm runtime: the prelinked object `wlift --aot --aot-target
+  # wasm32-wasip1` links programs against. It is target-independent,
+  # so it is built once and every archive carries it in
+  # `wasm32-wasip1/` beside wlift.
+  # ---------------------------------------------------------------
+  wasm-runtime:
+    name: Build the wasm runtime object
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-wasip1
+
+      - uses: ./.github/actions/wasm-runtime
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-runtime
+          path: target/release/wasm32-wasip1/wlift_runtime.o
+          if-no-files-found: error
 
   # ---------------------------------------------------------------
   # Build: one matrix entry per supported target. Each job emits a
@@ -87,7 +119,7 @@ jobs:
   # ---------------------------------------------------------------
   build:
     name: Build ${{ matrix.label }}
-    needs: resolve
+    needs: [resolve, wasm-runtime]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -128,7 +160,13 @@ jobs:
       - uses: ./.github/actions/llvm21
 
       - name: Build wlift
-        run: cargo build --release --features llvm --bin wlift --target ${{ matrix.target }}
+        run: cargo build --release --features llvm,aot --bin wlift --target ${{ matrix.target }}
+
+      - name: Fetch the wasm runtime object
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-runtime
+          path: target/${{ matrix.target }}/release/wasm32-wasip1
 
       # Without the llvm feature: the package tool and the language
       # server run no top tier, and the feature would put LLVM in
@@ -164,6 +202,8 @@ jobs:
           stage="wlift-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}"
           tar xzf "dist/${stage}.tar.gz" -C "$RUNNER_TEMP"
           "$RUNNER_TEMP/${stage}/wlift" bench/ash/nbody.wren
+          "$RUNNER_TEMP/${stage}/wlift" --aot "$RUNNER_TEMP/fib.wasm" \
+            --aot-target wasm32-wasip1 bench/fib.wren
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -182,7 +222,7 @@ jobs:
   # ---------------------------------------------------------------
   windows:
     name: Build windows-x86_64
-    needs: resolve
+    needs: [resolve, wasm-runtime]
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -202,7 +242,13 @@ jobs:
       - uses: ./.github/actions/llvm21
 
       - name: Build wlift
-        run: cargo build --release --features llvm --bin wlift --target x86_64-pc-windows-msvc
+        run: cargo build --release --features llvm,aot --bin wlift --target x86_64-pc-windows-msvc
+
+      - name: Fetch the wasm runtime object
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-runtime
+          path: target/x86_64-pc-windows-msvc/release/wasm32-wasip1
 
       - name: Build hatch
         run: cargo build --release --bin hatch --target x86_64-pc-windows-msvc
@@ -232,6 +278,8 @@ jobs:
           $trace = & "$bin\wlift.exe" bench\ash\method_call.wren 2>&1 | Out-String
           Remove-Item Env:WLIFT_TIER_TRACE
           if ($trace -notmatch "llvm ") { throw "the top tier did not compile with LLVM" }
+          & "$bin\wlift.exe" --aot "$env:RUNNER_TEMP\fib.wasm" --aot-target wasm32-wasip1 bench\fib.wren
+          if ($LASTEXITCODE -ne 0) { throw "wlift --aot-target wasm32-wasip1 failed" }
 
       - name: Package zip + checksum
         shell: pwsh
@@ -244,6 +292,8 @@ jobs:
           Copy-Item "$bin\wlift.exe", "$bin\hatch.exe", "$bin\wlift-lsp.exe" "dist\$stage\"
           # The DLLs LLVM imports; wlift.exe does not start without them.
           Copy-Item "$bin\*.dll" "dist\$stage\"
+          # The runtime wasm AOT programs link against, where wlift looks.
+          Copy-Item -Recurse "$bin\wasm32-wasip1" "dist\$stage\"
           @"
           wlift $tag     - Wren runtime (JIT + interpreter)
           hatch $tag     - Package + build tool for Wren

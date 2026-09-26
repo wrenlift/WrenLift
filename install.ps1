@@ -92,6 +92,14 @@ try {
     foreach ($dll in Get-ChildItem -Path $staged -Filter *.dll) {
         Move-Item -Force $dll.FullName (Join-Path $InstallDir $dll.Name)
     }
+    # The runtime wasm AOT programs link against, which wlift.exe finds
+    # beside itself.
+    $runtime = Join-Path $staged "wasm32-wasip1\wlift_runtime.o"
+    if (Test-Path $runtime) {
+        $dest = Join-Path $InstallDir "wasm32-wasip1"
+        New-Item -ItemType Directory -Force -Path $dest | Out-Null
+        Move-Item -Force $runtime (Join-Path $dest "wlift_runtime.o")
+    }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

@@ -24,6 +24,11 @@ for bin in wlift hatch wlift-lsp; do
   test -x "${BIN_DIR}/${bin}" || { echo "error: ${BIN_DIR}/${bin} not built" >&2; exit 1; }
   cp "${BIN_DIR}/${bin}" "$DIST/"
 done
+# The runtime wasm AOT programs link against, where wlift looks for it.
+RUNTIME="${BIN_DIR}/wasm32-wasip1/wlift_runtime.o"
+test -f "$RUNTIME" || { echo "error: $RUNTIME not built" >&2; exit 1; }
+mkdir -p "$DIST/wasm32-wasip1"
+cp "$RUNTIME" "$DIST/wasm32-wasip1/"
 cat > "$DIST/README.txt" <<TXT
 wlift ${TAG}     — Wren runtime (JIT + interpreter)
 hatch ${TAG}     — Package + build tool for Wren
