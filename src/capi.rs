@@ -588,8 +588,8 @@ pub unsafe extern "C" fn wlift_aot_enter(
 /// arity, flags)`. Flags bit-0 = `is_static`, bit-1 = `is_constructor`.
 /// The bootstrap emits one of these per AOT-lowered method as a
 /// `Linkage::Local` `Data` blob, then hands the pointer + count to
-/// `wlift_aot_install_class`.
-#[cfg(feature = "aot_runtime")]
+/// `wlift_aot_install_class`. Its layout per pointer width is in
+/// `object_layout::Layout`.
 #[repr(C)]
 pub struct WliftAotMethodDesc {
     pub sig: *const c_char,

@@ -2409,7 +2409,7 @@ fn emit_aot_bootstrap_main(
         // Per-class metadata: class name, parent name, method
         // signatures + body function ids. The bootstrap builds
         // per-class descriptor arrays on the stack at startup
-        // (each `WliftAotMethodDesc` is 32 bytes) and hands the
+        // (`WliftAotMethodDesc`, laid out by `object_layout`) and hands the
         // pointer to `wlift_aot_install_class`.
         let mut classes = Vec::with_capacity(m.classes.len());
         for (c_idx, class) in m.classes.iter().enumerate() {
@@ -2837,8 +2837,9 @@ fn emit_aot_bootstrap_main(
             // body via `register_aot_function`, and writes the
             // class pointer into modvars[slot] so AOT bodies'
             // `GetModuleVar` reads it directly.
+            let desc = crate::runtime::object_layout::Layout::for_pointer_bytes(ptr_ty.bytes());
             for class in &m.classes {
-                let descs_size = (class.methods.len() * 32).max(8) as u32;
+                let descs_size = (class.methods.len() as i32 * desc.method_desc_size).max(8) as u32;
                 let descs_slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     descs_size,
@@ -2854,25 +2855,37 @@ fn emit_aot_bootstrap_main(
                     let body_ref = module.declare_func_in_func(*body_id, builder.func);
                     let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
 
-                    let off = (m_idx * 32) as i32;
+                    let off = m_idx as i32 * desc.method_desc_size;
                     builder
                         .ins()
                         .store(MemFlags::trusted(), sig_addr, descs_addr, off);
                     let len_val = builder.ins().iconst(ptr_ty, *sig_len as i64);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), len_val, descs_addr, off + 8);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), body_addr, descs_addr, off + 16);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        len_val,
+                        descs_addr,
+                        off + desc.method_desc_sig_len,
+                    );
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        body_addr,
+                        descs_addr,
+                        off + desc.method_desc_fn_ptr,
+                    );
                     let arity_val = builder.ins().iconst(types::I8, *arity as i64);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), arity_val, descs_addr, off + 24);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        arity_val,
+                        descs_addr,
+                        off + desc.method_desc_arity,
+                    );
                     let flags_val = builder.ins().iconst(types::I8, *flags as i64);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), flags_val, descs_addr, off + 25);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        flags_val,
+                        descs_addr,
+                        off + desc.method_desc_flags,
+                    );
                 }
 
                 let class_name_gv = module.declare_data_in_func(class.name_id, builder.func);
