@@ -130,26 +130,49 @@ pub fn inlinable_body(mir: &MirFunction) -> bool {
 /// arithmetic; a body of loads, stores and calls gains nothing over the
 /// backend's own guarded splice.
 pub fn body_has_arithmetic(mir: &MirFunction) -> bool {
+    // A body whose types are declared is specialised before it is ever a
+    // callee: its f64 arithmetic meets the caller's boxes when spliced.
+    let declared = mir.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|(_, i)| matches!(i, Instruction::CheckType { .. }))
+    });
     mir.blocks.iter().any(|b| {
         b.instructions.iter().any(|(_, i)| {
-            matches!(
+            let specialised = matches!(
                 i,
-                Instruction::Add(..)
-                    | Instruction::Sub(..)
-                    | Instruction::Mul(..)
-                    | Instruction::Div(..)
-                    | Instruction::Mod(..)
-                    | Instruction::Neg(_)
-                    | Instruction::CmpLt(..)
-                    | Instruction::CmpGt(..)
-                    | Instruction::CmpLe(..)
-                    | Instruction::CmpGe(..)
-                    | Instruction::BitAnd(..)
-                    | Instruction::BitOr(..)
-                    | Instruction::BitXor(..)
-                    | Instruction::Shl(..)
-                    | Instruction::Shr(..)
-            )
+                Instruction::AddF64(..)
+                    | Instruction::SubF64(..)
+                    | Instruction::MulF64(..)
+                    | Instruction::DivF64(..)
+                    | Instruction::ModF64(..)
+                    | Instruction::NegF64(_)
+                    | Instruction::CmpLtF64(..)
+                    | Instruction::CmpGtF64(..)
+                    | Instruction::CmpLeF64(..)
+                    | Instruction::CmpGeF64(..)
+                    | Instruction::MathUnaryF64(..)
+                    | Instruction::MathBinaryF64(..)
+            );
+            declared && specialised
+                || matches!(
+                    i,
+                    Instruction::Add(..)
+                        | Instruction::Sub(..)
+                        | Instruction::Mul(..)
+                        | Instruction::Div(..)
+                        | Instruction::Mod(..)
+                        | Instruction::Neg(_)
+                        | Instruction::CmpLt(..)
+                        | Instruction::CmpGt(..)
+                        | Instruction::CmpLe(..)
+                        | Instruction::CmpGe(..)
+                        | Instruction::BitAnd(..)
+                        | Instruction::BitOr(..)
+                        | Instruction::BitXor(..)
+                        | Instruction::Shl(..)
+                        | Instruction::Shr(..)
+                )
         })
     })
 }

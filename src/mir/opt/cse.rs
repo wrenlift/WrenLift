@@ -317,6 +317,10 @@ fn make_key(
         Instruction::GuardClass(_, sym) | Instruction::IsType(_, sym) => {
             key.push(sym.index() as u64);
         }
+        Instruction::CheckType { class, message, .. } => {
+            key.push(class.index() as u64);
+            key.push(*message as u64);
+        }
         Instruction::ClassIs(_, p)
         | Instruction::ObjectIs(_, p)
         | Instruction::ClosureFnIs(_, p) => key.push(*p as u64),
@@ -373,6 +377,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         Shl(..) => 33,
         Shr(..) => 34,
         GuardNum(..) => 35,
+        CheckType { .. } => 84,
         GuardBool(..) => 36,
         GuardClass(..) => 37,
         Unbox(..) => 38,

@@ -19,6 +19,8 @@ pub struct TypeSpecialize {
     math_unary: HashMap<SymbolId, MathUnaryOp>,
     /// Maps method SymbolId → binary math intrinsic for known-Num receivers.
     math_binary: HashMap<SymbolId, MathBinaryOp>,
+    /// `Num`, the class a declared-type check names for a number.
+    num_class: Option<SymbolId>,
 }
 
 impl Default for TypeSpecialize {
@@ -33,6 +35,7 @@ impl TypeSpecialize {
         Self {
             math_unary: HashMap::new(),
             math_binary: HashMap::new(),
+            num_class: None,
         }
     }
 
@@ -84,6 +87,7 @@ impl TypeSpecialize {
         Self {
             math_unary,
             math_binary,
+            num_class: interner.lookup("Num"),
         }
     }
 }
@@ -135,7 +139,7 @@ impl MirPass for TypeSpecialize {
                 .iter()
                 .any(|(_, inst)| matches!(inst, Instruction::GuardNum(_)))
         });
-        let self_call_returns_num = has_num_guard;
+        let self_call_returns_num = has_num_guard || func.declares_num_result;
         // A constant or a box is a Num wherever it is read, and a
         // block may read one a later block defines.
         for b in &func.blocks {
@@ -164,6 +168,20 @@ impl MirPass for TypeSpecialize {
                         known_nums.insert(*val_id);
                         known_nums.insert(*src);
                         new_instructions.push((*val_id, inst.clone()));
+                    }
+                    // A declared Num: what passes the check is one. The
+                    // source is not, before the check; a check of a value
+                    // already known to be a Num cannot fail.
+                    Instruction::CheckType { value, class, .. }
+                        if Some(*class) == self.num_class =>
+                    {
+                        known_nums.insert(*val_id);
+                        if known_nums.contains(value) {
+                            new_instructions.push((*val_id, Instruction::Move(*value)));
+                            changed = true;
+                        } else {
+                            new_instructions.push((*val_id, inst.clone()));
+                        }
                     }
                     // A mid-body guard on a value already known to be
                     // Num (its call became an intrinsic) cannot fail.

@@ -493,6 +493,15 @@ pub enum Instruction {
         class: usize,
         assigned: u64,
     },
+    /// The value, checked to be an instance of `class`: when it is not,
+    /// the function raises the string constant `message` instead. What
+    /// an `#export` declares, so it holds in every tier alike. Last, so
+    /// serialised bundles keep their variant indices.
+    CheckType {
+        value: ValueId,
+        class: SymbolId,
+        message: u32,
+    },
 }
 
 /// What a register holds when compiled code hands a function back to
@@ -600,6 +609,7 @@ impl Instruction {
             Instruction::SetField(..)
                 | Instruction::SetModuleVar(..)
                 | Instruction::GuardNum(..)
+                | Instruction::CheckType { .. }
                 | Instruction::GuardNumAt { .. }
                 | Instruction::GuardClassAt { .. }
                 | Instruction::ColdLoopExit { .. }
@@ -689,6 +699,7 @@ impl Instruction {
             | Instruction::Not(a)
             | Instruction::BitNot(a)
             | Instruction::GuardNum(a)
+            | Instruction::CheckType { value: a, .. }
             | Instruction::GuardBool(a)
             | Instruction::Unbox(a)
             | Instruction::Box(a)
@@ -1008,6 +1019,10 @@ pub struct MirFunction {
     /// Compile-time only; never part of a serialised bundle.
     #[serde(skip)]
     pub speculated_num_params: Vec<ValueId>,
+    /// An `#export` declares the result Num and every return checks it.
+    /// Compile-time only; a bundle-loaded body forgoes what it enables.
+    #[serde(skip)]
+    pub declares_num_result: bool,
     /// Block parameters introduced by scalar replacement, mapped to the
     /// object parameter they split and the field they carry. Lets an
     /// OSR entry rebuild them from the object the interpreter holds.
@@ -1073,6 +1088,7 @@ impl MirFunction {
             next_block: 0,
             span_map: std::collections::HashMap::new(),
             speculated_num_params: Vec::new(),
+            declares_num_result: false,
             scalar_param_sources: std::collections::HashMap::new(),
             promoted_modvar_params: std::collections::HashMap::new(),
             loop_entries: std::collections::HashMap::new(),
@@ -1212,6 +1228,10 @@ impl MirFunction {
                     }
                     Instruction::IsType(_, ty) => {
                         *ty = remap(*ty);
+                    }
+                    Instruction::CheckType { class, message, .. } => {
+                        *class = remap(*class);
+                        *message = remap(SymbolId::from_raw(*message)).index();
                     }
                     _ => {}
                 }
@@ -1680,6 +1700,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::Shr(a, b) => format!("sshr {}, {}", a, b),
 
         Instruction::GuardNum(a) => format!("guard.num {}", a),
+        Instruction::CheckType { value, class, .. } => {
+            format!("check.type {}, %{}", value, interner.resolve(*class))
+        }
         Instruction::GuardBool(a) => format!("guard.bool {}", a),
         Instruction::GuardClass(a, sym) => {
             format!("guard.class {}, %{}", a, interner.resolve(*sym))
@@ -1978,6 +2001,7 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 }
                 Instruction::NewInstance { .. } => MirType::Value,
                 Instruction::GuardNum(src)
+                | Instruction::CheckType { value: src, .. }
                 | Instruction::GuardBool(src)
                 | Instruction::Move(src)
                 | Instruction::SetField(_, _, src)

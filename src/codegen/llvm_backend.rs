@@ -3498,6 +3498,44 @@ pub mod llvm {
                     .into(),
                 I::Unbox(a) => self.getf(a)?.into(),
                 I::Box(a) => self.boxed(a)?.into(),
+                I::CheckType {
+                    value,
+                    class,
+                    message,
+                } => {
+                    let v = self.boxed(value)?;
+                    let is_num = self.sh.interner.resolve(*class) == "Num";
+                    let ok = if is_num {
+                        let boxed = self.is_nan_boxed(v)?;
+                        self.b
+                            .build_not(boxed, "isnum")
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        let c = self.sym_arg(*class)?;
+                        let r = self.call_helper("wren_is_type", &[v, c])?;
+                        self.icmp(IntPredicate::EQ, r, self.c64(TAG_TRUE))?
+                    };
+                    let fail = self.new_block("chkf");
+                    let cont = self.new_block("chkc");
+                    self.cbr(ok, cont, fail)?;
+                    self.b.position_at_end(fail);
+                    let msg = match self.sh.aot {
+                        Some(env) => {
+                            let slot = AotEnv::slot(&env.const_strings, *message, self.sh.interner);
+                            self.table_load(env.consts, slot)?
+                        }
+                        None => {
+                            self.call_helper("wren_const_string", &[self.c64(*message as u64)])?
+                        }
+                    };
+                    self.call_helper("wren_raise", &[msg])?;
+                    self.ret(self.c64(TAG_NULL))?;
+                    self.b.position_at_end(cont);
+                    if is_num {
+                        self.num_values.insert(v);
+                    }
+                    v.into()
+                }
                 I::GuardNum(s) => {
                     let v = self.boxed(s)?;
                     let fails = self.is_nan_boxed(v)?;

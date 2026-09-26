@@ -2372,7 +2372,7 @@ pub fn helper_can_raise(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
         || matches!(
             name,
-            "wren_to_string" | "wren_subscript_get" | "wren_subscript_set"
+            "wren_to_string" | "wren_subscript_get" | "wren_subscript_set" | "wren_raise"
         )
 }
 
@@ -5063,6 +5063,31 @@ pub extern "C" fn wren_const_string(sym_idx: u64) -> u64 {
     unsafe(no_mangle)
 )]
 pub extern "C" fn wren_is_type(val: u64, class_sym: u64) -> u64 {
+    wren_is_type_inner(val, class_sym)
+}
+
+/// Raise the string `message`, as `Fiber.abort` does: what a declared
+/// type raises when its check fails. Answers null.
+#[cfg(any(feature = "host", feature = "aot_runtime"))]
+#[cfg_attr(
+    any(not(target_arch = "wasm32"), feature = "aot_runtime"),
+    unsafe(no_mangle)
+)]
+pub extern "C" fn wren_raise(message: u64) -> u64 {
+    use crate::runtime::object::NativeContext;
+    if let Some(vm) = unsafe { vm_ref() } {
+        let v = Value::from_bits(message);
+        let text = if v.is_object() && vm.get_class_name_of(v) == "String" {
+            crate::runtime::core::as_string(v).to_string()
+        } else {
+            "Runtime error.".to_string()
+        };
+        vm.runtime_error(text);
+    }
+    Value::null().to_bits()
+}
+
+fn wren_is_type_inner(val: u64, class_sym: u64) -> u64 {
     let v = Value::from_bits(val);
     let target_sym = crate::intern::SymbolId::from_raw(class_sym as u32);
 
@@ -6355,6 +6380,7 @@ runtime_helpers! {
     wren_to_string(u64) -> u64;
     wren_const_string(u64) -> u64;
     wren_is_type(u64, u64) -> u64;
+    wren_raise(u64) -> u64;
     wren_guard_class(u64, u64) -> u64;
     wren_guard_protocol(u64, u64) -> u64;
     wren_subscript_get(u64, u64) -> u64;
@@ -6522,6 +6548,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_const_string" => Some(wren_const_string as *const () as usize),
         // Type checks & guards
         "wren_is_type" => Some(wren_is_type as *const () as usize),
+        "wren_raise" => Some(wren_raise as *const () as usize),
         "wren_guard_class" => Some(wren_guard_class as *const () as usize),
         "wren_guard_protocol" => Some(wren_guard_protocol as *const () as usize),
         // Guard deoptimization (arity-specific)

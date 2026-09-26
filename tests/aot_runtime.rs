@@ -608,3 +608,39 @@ fn equality_honours_a_class_operator() {
     assert_eq!(r.exit_code, 0, "stderr:\n{}", r.stderr);
     assert_eq!(r.stdout, "true\ntrue\nfalse\ntrue\n");
 }
+
+#[test]
+fn export_checks_what_it_declares() {
+    let r = compile_link_run(
+        r#"class Tally {
+  #export = "new(t: Num)"
+  construct new(t) { _t = t }
+  #export = "bump(x: Num) -> Num"
+  bump(x) {
+    _t = _t + x
+    return _t
+  }
+  #export = "total -> Num"
+  total { _t }
+  #export = "name(s: String) -> String"
+  static name(s) { s + "!" }
+  #export = "bad -> Num"
+  static bad { "no" }
+}
+var t = Tally.new(0)
+for (i in 0...20000) t.bump(1)
+System.print(t.total)
+System.print(Tally.name("hi"))
+System.print(Fiber.new { t.bump("x") }.try())
+System.print(Fiber.new { Tally.new(null) }.try())
+System.print(Fiber.new { Tally.name(3) }.try())
+System.print(Fiber.new { Tally.bad }.try())
+System.print(t.total)
+"#,
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "20000\nhi!\nbump(_) expects Num for `x`\nnew(_) expects Num for `t`\nname(_) expects String for `s`\nbad returns Num\n20000\n"
+    );
+}

@@ -245,6 +245,45 @@ impl<'a> MirBuilder<'a> {
         self.current_block = block;
     }
 
+    /// `v`, checked to be `ty`: the function raises `msg` when it is
+    /// not.
+    fn emit_declared_check(
+        &mut self,
+        v: ValueId,
+        ty: crate::sema::export::Checked,
+        msg: &str,
+    ) -> ValueId {
+        let class = self.intern(ty.class_name());
+        let message = self.intern(msg).index();
+        self.emit(Instruction::CheckType {
+            value: v,
+            class,
+            message,
+        })
+    }
+
+    /// Check every return of the finished body against the declared
+    /// result type.
+    fn check_returns(&mut self, ty: crate::sema::export::Checked, msg: &str) {
+        let blocks: Vec<BlockId> = (0..self.func.blocks.len())
+            .map(|i| BlockId(i as u32))
+            .collect();
+        for b in blocks {
+            let v = match self.func.block(b).terminator {
+                Terminator::Return(v) => Some(v),
+                Terminator::ReturnNull => None,
+                _ => continue,
+            };
+            self.switch_to(b);
+            let v = v.unwrap_or_else(|| self.emit(Instruction::ConstNull));
+            let checked = self.emit_declared_check(v, ty, msg);
+            self.set_terminator(Terminator::Return(checked));
+        }
+        if ty == crate::sema::export::Checked::Num {
+            self.func.declares_num_result = true;
+        }
+    }
+
     /// True for methods the MIR builder knows can never write the
     /// heap. Used to set `pure_call: true` on the emitted
     /// Instruction::Call so CSE can keep its memory-read cache valid
@@ -1934,6 +1973,16 @@ fn compile_class(
         // AST node's span start.
         let method_scope_id = method_spanned.1.start;
 
+        // What an `#export` declares is checked on entry and on return
+        // and relied on after. A malformed one was reported by the
+        // resolver.
+        let export = crate::sema::export::Export::from_ast(&method.attributes, interner)
+            .and_then(|(e, _)| e.ok());
+        let param_names: Vec<String> = params
+            .iter()
+            .map(|p| interner.resolve(p.0).to_string())
+            .collect();
+
         let mut builder = MirBuilder::with_boxed(
             method_name,
             arity,
@@ -1980,7 +2029,22 @@ fn compile_class(
                 (param.0, val)
             })
             .collect();
-        for (name, val) in raw_params {
+        let mut checked_params = Vec::with_capacity(raw_params.len());
+        for (i, (name, val)) in raw_params.into_iter().enumerate() {
+            let val = match export.as_ref().and_then(|e| e.checked_param(i)) {
+                Some(ty) => {
+                    let msg = format!(
+                        "{sig_str} expects {} for `{}`",
+                        ty.class_name(),
+                        param_names[i]
+                    );
+                    builder.emit_declared_check(val, ty, &msg)
+                }
+                None => val,
+            };
+            checked_params.push((name, val));
+        }
+        for (name, val) in checked_params {
             let stored = builder.box_if_captured(name, val);
             builder.variables.insert(name, stored);
         }
@@ -2003,6 +2067,9 @@ fn compile_class(
                     None => Terminator::ReturnNull,
                 }
             };
+        }
+        if !is_constructor && let Some(ty) = export.as_ref().and_then(|e| e.checked_ret()) {
+            builder.check_returns(ty, &format!("{sig_str} returns {}", ty.class_name()));
         }
         builder.func.compute_predecessors();
 

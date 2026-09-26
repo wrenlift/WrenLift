@@ -1627,6 +1627,7 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::Shl(..)
                 | Instruction::Shr(..) => MirType::Value,
                 Instruction::GuardNum(src)
+                | Instruction::CheckType { value: src, .. }
                 | Instruction::GuardBool(src)
                 | Instruction::Move(src)
                 | Instruction::SetField(_, _, src)
@@ -2546,6 +2547,15 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
         }
         #[cfg(not(feature = "cranelift"))]
         _ => {
+            // Declared-type checks are lowered by the Cranelift and LLVM
+            // backends only; such a function stays interpreted here.
+            if mir.blocks.iter().any(|b| {
+                b.instructions
+                    .iter()
+                    .any(|(_, i)| matches!(i, Instruction::CheckType { .. }))
+            }) {
+                return Err("declared-type checks need the Cranelift backend".into());
+            }
             // Disable inline IC on x86_64 until register conflicts are resolved.
             #[cfg(not(target_arch = "aarch64"))]
             let callsite_ic_ptrs: Option<Vec<usize>> = None;
@@ -4637,6 +4647,9 @@ impl<'a> LowerCtx<'a> {
             | Instruction::ColdLoopExit { .. }
             | Instruction::SlowPathExit { .. } => {
                 panic!("integer arithmetic is lowered by the Cranelift backend only")
+            }
+            Instruction::CheckType { .. } => {
+                unreachable!("a function with a declared-type check stays interpreted here")
             }
             // -- IsType: inline tag checks for primitives, class ptr for objects --
             Instruction::IsType(a, sym) => {

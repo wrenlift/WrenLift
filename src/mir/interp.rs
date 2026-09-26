@@ -332,6 +332,7 @@ pub fn eval_pure_instruction(
         Instruction::StringConcat(_) => Err(InterpError::Unsupported("StringConcat".into())),
         Instruction::ToString(_) => Err(InterpError::Unsupported("ToString".into())),
         Instruction::IsType(_, _) => Err(InterpError::Unsupported("IsType".into())),
+        Instruction::CheckType { .. } => Err(InterpError::Unsupported("CheckType".into())),
         Instruction::ClassIs(_, _)
         | Instruction::ObjectIs(_, _)
         | Instruction::ClosureFnIs(_, _) => {

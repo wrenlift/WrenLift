@@ -511,6 +511,15 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_method(&mut self, method: &Method, scope_id: usize) {
+        if let Some((export, span)) =
+            super::export::Export::from_ast(&method.attributes, self.interner)
+            && let Err(msg) = export.and_then(|e| e.check_member(&method.signature))
+        {
+            self.errors.push(
+                Diagnostic::error(format!("invalid #export: {msg}"))
+                    .with_label(span, "on this member"),
+            );
+        }
         if method.is_foreign {
             return; // Foreign methods have no body.
         }

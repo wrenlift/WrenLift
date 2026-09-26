@@ -1438,6 +1438,9 @@ impl<'a> MirWasmEmitter<'a> {
             | Instruction::ListCount(_) => {
                 return Err("planted in native compile clones only".into());
             }
+            Instruction::CheckType { .. } => {
+                return Err("declared-type checks stay interpreted on this backend".into());
+            }
             Instruction::GuardNum(a)
             | Instruction::GuardNumAt { value: a, .. }
             | Instruction::GuardBool(a) => {

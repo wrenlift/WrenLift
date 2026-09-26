@@ -2085,6 +2085,23 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     let val = get_reg(&values, src);
                     set_reg(&mut values, dst, val);
                 }
+                Op::CheckType => {
+                    let dst = read_u16(code, &mut pc);
+                    let src = read_u16(code, &mut pc);
+                    let class = SymbolId::from_raw(read_u32(code, &mut pc));
+                    let message = SymbolId::from_raw(read_u32(code, &mut pc));
+                    let value = get_reg(&values, src);
+                    let mut cls = vm.class_of(value);
+                    while !cls.is_null() && unsafe { (*cls).name } != class {
+                        cls = unsafe { (*cls).superclass };
+                    }
+                    if cls.is_null() {
+                        return Err(RuntimeError::Error(
+                            vm.interner.resolve(message).to_string(),
+                        ));
+                    }
+                    set_reg(&mut values, dst, value);
+                }
                 Op::IsType => {
                     let dst = read_u16(code, &mut pc);
                     let val_reg = read_u16(code, &mut pc);

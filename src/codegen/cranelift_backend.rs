@@ -7316,6 +7316,100 @@ pub mod cl {
             // A speculative guard at the entry: the body was specialised
             // on the profiled type, so a value of another type hands the
             // call to the interpreter and the function back to baseline.
+            Instruction::CheckType {
+                value,
+                class,
+                message,
+            } => {
+                let v = get(value);
+                // The f64 inner body carries only Nums.
+                if f64_self_id.is_some() {
+                    return Ok(Some(v));
+                }
+                let ok = if interner.resolve(*class) == "Num" {
+                    let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                    let masked = builder.ins().band(v, qnan);
+                    builder.ins().icmp(IntCC::NotEqual, masked, qnan)
+                } else {
+                    let f = get_runtime_fn(module, builder, "wren_is_type", 2)?;
+                    let class_val = match aot_config {
+                        Some(cfg) => {
+                            let slot = aot_intern_symbol(cfg, class.index(), interner);
+                            let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
+                            let base = builder.ins().symbol_value(types::I64, gv);
+                            builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                base,
+                                (slot as i32) * 8,
+                            )
+                        }
+                        None => builder.ins().iconst(types::I64, class.index() as i64),
+                    };
+                    let call = builder.ins().call(f, &[v, class_val]);
+                    let r = builder.inst_results(call)[0];
+                    let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+                    builder.ins().icmp(IntCC::Equal, r, t)
+                };
+                let fail = builder.create_block();
+                let cont = builder.create_block();
+                builder.set_cold_block(fail);
+                builder.ins().brif(ok, cont, &[], fail, &[]);
+                builder.switch_to_block(fail);
+                let msg = match aot_config {
+                    Some(cfg) => {
+                        let slot = {
+                            let mut tbl = cfg.const_strings.borrow_mut();
+                            match tbl.iter().position(|(s, _)| *s == *message) {
+                                Some(s) => s,
+                                None => {
+                                    let text = interner
+                                        .resolve(crate::intern::SymbolId::from_raw(*message))
+                                        .to_string();
+                                    tbl.push((*message, text));
+                                    tbl.len() - 1
+                                }
+                            }
+                        };
+                        let gv = module.declare_data_in_func(cfg.consts_data, builder.func);
+                        let base = builder.ins().symbol_value(types::I64, gv);
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
+                    }
+                    None => {
+                        let f = get_runtime_fn(module, builder, "wren_const_string", 1)?;
+                        let idx = builder.ins().iconst(types::I64, *message as i64);
+                        let call = builder.ins().call(f, &[idx]);
+                        builder.inst_results(call)[0]
+                    }
+                };
+                let raise = get_runtime_fn(module, builder, "wren_raise", 1)?;
+                builder.ins().call(raise, &[msg]);
+                // Leave as a raising call does: through an AOT body's
+                // exit, which releases its roots, or straight out.
+                let aot_exit = aot_config
+                    .filter(|cfg| cfg.current_jit_roots_snapshot_var.borrow().is_some())
+                    .map(|cfg| {
+                        let existing = *cfg.current_abort_exit_block.borrow();
+                        existing.unwrap_or_else(|| {
+                            let b = builder.create_block();
+                            *cfg.current_abort_exit_block.borrow_mut() = Some(b);
+                            b
+                        })
+                    });
+                match aot_exit {
+                    Some(exit) => {
+                        builder.ins().jump(exit, &[]);
+                    }
+                    None => {
+                        let null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                        builder.ins().return_(&[null]);
+                    }
+                }
+                builder.switch_to_block(cont);
+                Ok(Some(v))
+            }
             Instruction::GuardNum(src) => {
                 let v = get(src);
                 if f64_self_id.is_some() || aot_config.is_some() {

@@ -134,6 +134,7 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
         | Not(a)
         | BitNot(a)
         | GuardNum(a)
+        | CheckType { value: a, .. }
         | GuardBool(a)
         | Unbox(a)
         | Box(a)

@@ -110,7 +110,10 @@ pub enum Op {
     Unreachable = 0x44, // 1B
     Branch = 0x45,      // variable: op + target(4) + argc(1) + [dst(2),src(2)]*argc
     CondBranch = 0x46,  // variable: op + cond(2) + true_off(4) + t_argc(1) + [dst,src]*t_argc
-                        //           + false_off(4) + f_argc(1) + [dst,src]*f_argc
+    //           + false_off(4) + f_argc(1) + [dst,src]*f_argc
+
+    // -- 13B: op + dst(2) + src(2) + class(4) + message(4) --
+    CheckType = 0x47,
 }
 
 impl Op {
@@ -647,6 +650,17 @@ impl<'a> Encoder<'a> {
             | Instruction::F64ToI64(_)
             | Instruction::IsNum(_) => {
                 unreachable!("integer arithmetic exists only in JIT compile clones")
+            }
+            Instruction::CheckType {
+                value,
+                class,
+                message,
+            } => {
+                self.emit_op(Op::CheckType);
+                self.emit_reg(dst);
+                self.emit_reg(*value);
+                self.emit_u32(class.index());
+                self.emit_u32(*message);
             }
             Instruction::IsType(a, sym) => {
                 self.emit_op(Op::IsType);
