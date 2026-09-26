@@ -439,6 +439,7 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_install_native_lib",
     "wlift_aot_resolve_runtime_import",
     "wlift_aot_invoke_module_body",
+    "wlift_aot_take_error",
 ];
 
 /// Populate the first slots of a per-module `wlift_modvars_<n>`
@@ -1317,6 +1318,29 @@ pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
     let ptr = saved as *const JitContext;
     let prev = unsafe { *ptr };
     set_jit_context(prev);
+}
+
+/// After a module body: report the error it left uncaught, as the
+/// interpreter does, and return the exit code for it, 70; 0 when the
+/// body finished cleanly.
+///
+/// # Safety
+/// `vm` must be the VM the bootstrap made.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_take_error(vm: *mut WrenVM) -> c_int {
+    let Some(vm) = (unsafe { vm.as_mut() }) else {
+        return 70;
+    };
+    if !vm.has_error {
+        return 0;
+    }
+    let msg = vm
+        .last_error
+        .take()
+        .unwrap_or_else(|| "runtime error".to_string());
+    vm.report_error(&msg);
+    70
 }
 
 /// Invoke an AOT-compiled module top-level body. It runs on the host

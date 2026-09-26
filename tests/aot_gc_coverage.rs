@@ -305,10 +305,11 @@ fn stress_fiber_spawn_and_call() {
 var sum = 0
 for (i in 1..50) {
     var f = Fiber.new { i * 3 }
-    sum = sum + f.call
+    sum = sum + f.call()
 }
 System.print(sum)
 "#;
-    let (exit, _stdout, stderr) = run_under_stress(source);
+    let (exit, stdout, stderr) = run_under_stress(source);
     assert_clean("fiber_spawn_and_call", exit, &stderr);
+    assert_eq!(stdout, "3825\n");
 }

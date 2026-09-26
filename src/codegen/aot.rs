@@ -2243,6 +2243,7 @@ fn emit_aot_bootstrap_main(
         None,
     )?;
     let exit_ctx = declare_import(module, "wlift_aot_exit", &[ptr_ty], None)?;
+    let take_error = declare_import(module, "wlift_aot_take_error", &[ptr_ty], Some(types::I32))?;
     let invoke_module_body = declare_import(
         module,
         "wlift_aot_invoke_module_body",
@@ -2653,6 +2654,7 @@ fn emit_aot_bootstrap_main(
         let install_native_lib_ref = module.declare_func_in_func(install_native_lib, builder.func);
         let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
+        let take_error_ref = module.declare_func_in_func(take_error, builder.func);
         let invoke_module_body_ref = module.declare_func_in_func(invoke_module_body, builder.func);
 
         // entry: vm = wlift_aot_new_vm(); brif vm == 0 → err else body.
@@ -3001,6 +3003,16 @@ fn emit_aot_bootstrap_main(
             let _ = builder.ins().call(invoke_module_body_ref, &[fn_addr]);
 
             let _ = builder.ins().call(exit_ref, &[saved_addr]);
+
+            // An error the body left uncaught ends the program with it.
+            let rc_call = builder.ins().call(take_error_ref, &[vm]);
+            let rc = builder.inst_results(rc_call)[0];
+            let next_block = builder.create_block();
+            let raised_block = builder.create_block();
+            builder.ins().brif(rc, raised_block, &[], next_block, &[]);
+            builder.switch_to_block(raised_block);
+            builder.ins().return_(&[rc]);
+            builder.switch_to_block(next_block);
         }
 
         let _ = builder.ins().call(free_vm_ref, &[vm]);

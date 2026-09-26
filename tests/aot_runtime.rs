@@ -93,6 +93,14 @@ fn print_literal() {
 }
 
 #[test]
+fn an_uncaught_error_is_reported_and_ends_the_program() {
+    let r = compile_link_run("System.print(1)\nFiber.abort(\"boom\")\nSystem.print(2)\n");
+    assert_eq!(r.exit_code, 70, "stdout: {}", r.stdout);
+    assert_eq!(r.stdout, "1\n");
+    assert!(r.stderr.contains("boom"), "stderr: {}", r.stderr);
+}
+
+#[test]
 fn arithmetic() {
     let r = compile_link_run("System.print(1 + 2 * 3 - 4)\n");
     assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
