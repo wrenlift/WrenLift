@@ -1391,6 +1391,12 @@ pub mod cl {
     }
 
     thread_local! {
+        /// Whether the receiver of the element access being lowered is
+        /// a List a dominating class guard proves.
+        static KNOWN_LIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
         /// Where an element read whose result is guarded next leaves
         /// the function instead of calling the helper: the read's
         /// bytecode offset and the registers live before it.
@@ -3696,11 +3702,41 @@ pub mod cl {
         };
 
         #[cfg_attr(not(feature = "aot"), allow(unused_labels))]
+        // Receivers a class guard proves are Lists, per block, by the
+        // value each stands for.
+        let list_class = crate::codegen::jit_list_class();
+        let (list_roots, list_facts) = if list_class != 0
+            && aot_config.is_none()
+            && mir.blocks.iter().any(|b| {
+                b.instructions.iter().any(|(_, i)| {
+                    matches!(i, Instruction::GuardClassAt { class, .. } if *class == list_class)
+                })
+            }) {
+            let mut clone = mir.clone();
+            let roots: HashMap<ValueId, ValueId> =
+                crate::mir::opt::hoist_guards::value_roots(&mut clone)
+                    .into_iter()
+                    .filter(|(v, r)| v != r)
+                    .collect();
+            let facts = crate::mir::opt::hoist_guards::class_facts(mir, &roots);
+            (roots, facts)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        let list_root = |v: &ValueId| list_roots.get(v).copied().unwrap_or(*v);
+
         'block_loop: for &block_idx in &rpo {
             let block = &mir.blocks[block_idx];
             let bid = BlockId(block_idx as u32);
             let cl_block = block_map[&bid];
             builder.switch_to_block(cl_block);
+            let mut known_lists: HashSet<ValueId> = list_facts
+                .get(&block_idx)
+                .into_iter()
+                .flatten()
+                .filter(|(_, c)| *c == list_class)
+                .map(|(r, _)| *r)
+                .collect();
 
             if !reachable.contains(&block_idx) {
                 builder
@@ -4158,6 +4194,13 @@ pub mod cl {
                     _ => None,
                 };
                 MISS_EXIT.with(|m| *m.borrow_mut() = miss);
+                KNOWN_LIST.set(match inst {
+                    Instruction::SubscriptGet { receiver, .. }
+                    | Instruction::SubscriptSet { receiver, .. } => {
+                        known_lists.contains(&list_root(receiver))
+                    }
+                    _ => false,
+                });
                 let result = lower_instruction(
                     inst,
                     mir,
@@ -4179,6 +4222,12 @@ pub mod cl {
                     Some(vid),
                 )?;
                 MISS_EXIT.with(|m| m.borrow_mut().take());
+                KNOWN_LIST.set(false);
+                if let Instruction::GuardClassAt { value, class, .. } = inst
+                    && *class == list_class
+                {
+                    known_lists.insert(list_root(value));
+                }
                 if let Some(val) = result {
                     val_map.insert(vid, val);
                     // A promotable baseline body profiles what each
@@ -6728,6 +6777,7 @@ pub mod cl {
                 let r = get(receiver);
                 let idx = get(&args[0]);
                 let miss = MISS_EXIT.with(|m| m.borrow_mut().take());
+                let known_list = KNOWN_LIST.replace(false);
 
                 let after_is_obj = builder.create_block();
                 let typed_array_block = builder.create_block();
@@ -6750,12 +6800,17 @@ pub mod cl {
                 // 1. Receiver must be an object-kind NaN-boxed
                 //    value. Object values have their top 16 bits
                 //    equal to 0xFFFC (QNAN | sign bit).
-                let shr48 = builder.ins().ushr_imm_u(r, 48);
-                let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
-                let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
-                builder
-                    .ins()
-                    .brif(is_obj, after_is_obj, &[], slow_block, &[]);
+                //    A guarded List skips to its element read.
+                if known_list {
+                    builder.ins().jump(after_is_obj, &[]);
+                } else {
+                    let shr48 = builder.ins().ushr_imm_u(r, 48);
+                    let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
+                    let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
+                    builder
+                        .ins()
+                        .brif(is_obj, after_is_obj, &[], slow_block, &[]);
+                }
 
                 // 2. Unbox pointer, load obj_type byte, branch on
                 //    List, then TypedArray / Simd tags.
@@ -6771,9 +6826,13 @@ pub mod cl {
                     .ins()
                     .iconst(types::I64, crate::runtime::object::ObjType::List as i64);
                 let is_list = builder.ins().icmp(IntCC::Equal, obj_type_byte, list_tag);
-                builder
-                    .ins()
-                    .brif(is_list, list_block, &[], type_miss_block, &[]);
+                if known_list {
+                    builder.ins().jump(list_block, &[]);
+                } else {
+                    builder
+                        .ins()
+                        .brif(is_list, list_block, &[], type_miss_block, &[]);
+                }
                 builder.switch_to_block(type_miss_block);
                 let ta_tag = builder
                     .ins()
@@ -7081,6 +7140,7 @@ pub mod cl {
                 let r = get(receiver);
                 let idx = get(&args[0]);
                 let val = get(value);
+                let known_list = KNOWN_LIST.replace(false);
 
                 let after_is_obj = builder.create_block();
                 let fast_block = builder.create_block();
@@ -7092,27 +7152,109 @@ pub mod cl {
                 let merge_block = builder.create_block();
                 builder.append_block_param(merge_block, types::I64);
 
-                // 1. Receiver must be an object (NaN-boxed pointer).
-                let shr48 = builder.ins().ushr_imm_u(r, 48);
-                let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
-                let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
-                builder
-                    .ins()
-                    .brif(is_obj, after_is_obj, &[], slow_block, &[]);
+                // 1. Receiver must be an object (NaN-boxed pointer);
+                //    a guarded List skips to its store.
+                if known_list {
+                    builder.ins().jump(after_is_obj, &[]);
+                } else {
+                    let shr48 = builder.ins().ushr_imm_u(r, 48);
+                    let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
+                    let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
+                    builder
+                        .ins()
+                        .brif(is_obj, after_is_obj, &[], slow_block, &[]);
+                }
 
-                // 2. Obj_type must be TypedArray.
+                // 2. Obj_type must be List or TypedArray.
                 builder.switch_to_block(after_is_obj);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(r, ptr_mask);
-                let obj_type_byte =
+                let list_block = builder.create_block();
+                let not_list_block = builder.create_block();
+                if known_list {
+                    builder.ins().jump(list_block, &[]);
+                } else {
+                    let obj_type_byte = builder.ins().uload8(
+                        types::I64,
+                        MemFlags::trusted(),
+                        obj_ptr,
+                        HEADER_OBJ_TYPE,
+                    );
+                    let list_tag = builder
+                        .ins()
+                        .iconst(types::I64, crate::runtime::object::ObjType::List as i64);
+                    let is_list = builder.ins().icmp(IntCC::Equal, obj_type_byte, list_tag);
                     builder
                         .ins()
-                        .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
-                let ta_tag = builder
+                        .brif(is_list, list_block, &[], not_list_block, &[]);
+                    builder.switch_to_block(not_list_block);
+                    let ta_tag = builder
+                        .ins()
+                        .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
+                    let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
+                    builder.ins().brif(is_ta, fast_block, &[], slow_block, &[]);
+                }
+
+                // 2b. List: a Num stored at an integral index within the
+                //     count. A Num is no instance, so the element class
+                //     becomes mixed; anything else is the helper's.
+                builder.switch_to_block(list_block);
+                let list_idx = if let Some(i) =
+                    int_source(mir, &args[0]).and_then(|i| val_map.get(&i).copied())
+                {
+                    i
+                } else {
+                    let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                    let masked = builder.ins().band(idx, qnan);
+                    let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                    let num_block = builder.create_block();
+                    builder.ins().brif(is_box, slow_block, &[], num_block, &[]);
+                    builder.switch_to_block(num_block);
+                    let f = builder.ins().bitcast(types::F64, MemFlags::new(), idx);
+                    let i = builder.ins().fcvt_to_sint_sat(types::I64, f);
+                    let back = builder.ins().fcvt_from_sint(types::F64, i);
+                    let integral = builder.ins().fcmp(FloatCC::Equal, back, f);
+                    let int_block = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(integral, int_block, &[], slow_block, &[]);
+                    builder.switch_to_block(int_block);
+                    i
+                };
+                let count = builder
                     .ins()
-                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
-                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
-                builder.ins().brif(is_ta, fast_block, &[], slow_block, &[]);
+                    .uload32(MemFlags::trusted(), obj_ptr, LIST_COUNT);
+                let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, list_idx, count);
+                let list_num_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(in_range, list_num_block, &[], slow_block, &[]);
+                builder.switch_to_block(list_num_block);
+                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                let masked = builder.ins().band(val, qnan);
+                let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                let list_store_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_box, slow_block, &[], list_store_block, &[]);
+                builder.switch_to_block(list_store_block);
+                let mixed = builder
+                    .ins()
+                    .iconst(types::I64, crate::runtime::object::ELEM_CLASS_MIXED as i64);
+                builder.ins().store(
+                    MemFlags::trusted(),
+                    mixed,
+                    obj_ptr,
+                    crate::runtime::object_layout::LIST_ELEM_CLASS,
+                );
+                let elements =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj_ptr, LIST_ELEMENTS);
+                let off = builder.ins().imul_imm_s(list_idx, VALUE_SIZE as i64);
+                let addr = builder.ins().iadd(elements, off);
+                builder.ins().store(MemFlags::trusted(), val, addr, 0);
+                builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
 
                 // 3. Index must be a Num in [0, count). Negative
                 //    indices → slow path (preserves Wren semantics
