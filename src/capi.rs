@@ -441,6 +441,9 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_invoke_module_body",
     "wlift_aot_take_error",
     "wlift_aot_stack_top",
+    "wlift_aot_raise_stack_top",
+    "wlift_aot_register_program",
+    "wlift_aot_run_programs",
     "wlift_aot_set_native_loader",
     "wlift_error_pending",
 ];
@@ -1375,6 +1378,64 @@ pub unsafe extern "C" fn wlift_aot_stack_top(top: *const u8) {
         .store(top as usize, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = top;
+}
+
+/// Like [`wlift_aot_stack_top`], but only ever moves the top up: a
+/// compiled frame entered from a host's frame shallower than the last
+/// entry still has the host's frames scanned between them. Elsewhere a
+/// no-op.
+///
+/// # Safety
+/// `top` must be in the calling frame, which must outlive every
+/// compiled frame it calls.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_raise_stack_top(top: *const u8) {
+    #[cfg(target_arch = "wasm32")]
+    crate::codegen::runtime_fns::WASM_STACK_TOP
+        .fetch_max(top as usize, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = top;
+}
+
+/// A compiled program built as a library: runs its module bodies in a
+/// VM its host made; 0, or the exit code of the error it left uncaught.
+pub type AotProgramRun = unsafe extern "C" fn(*mut WrenVM) -> c_int;
+
+#[cfg(feature = "aot_runtime")]
+static AOT_PROGRAMS: std::sync::Mutex<Vec<AotProgramRun>> = std::sync::Mutex::new(Vec::new());
+
+/// Called from a library program's static constructor, so a host that
+/// links several learns of each without naming any.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn wlift_aot_register_program(run: AotProgramRun) {
+    AOT_PROGRAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(run);
+}
+
+/// Run every registered library program in `vm`, in the order their
+/// constructors ran; the first nonzero code stops the rest. 0 when there
+/// are none.
+///
+/// # Safety
+/// `vm` must be a live VM the host made for these programs.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_run_programs(vm: *mut WrenVM) -> c_int {
+    let programs = AOT_PROGRAMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for run in programs {
+        let rc = unsafe { run(vm) };
+        if rc != 0 {
+            return rc;
+        }
+    }
+    0
 }
 
 /// After a module body: report the error it left uncaught, as the

@@ -12,7 +12,8 @@ use std::process::Command;
 
 use wren_lift::codegen::aot::{AotBundleMeta, walk_imports};
 use wren_lift::codegen::llvm_aot::{
-    LlvmTarget, compile_modules_to_llvm_object, link_wasm, place_wasm_libraries,
+    AotEntry, LlvmTarget, compile_modules_to_llvm_object, compile_modules_to_llvm_object_as,
+    link_wasm, place_wasm_libraries,
 };
 
 /// How the program object and the runtime object become one module.
@@ -580,6 +581,155 @@ class Box {
         ],
         "crate 1\nsub 2\ncrate 3\nbox box 4\nCrate does not implement 'make(_)'\n2\nbox 10\n610\n",
     );
+}
+
+/// A library program runs in the VM its host makes, registered from a
+/// static constructor, and each `#export` member is an external symbol
+/// under caribou's link rule taking and returning NaN-boxed values.
+#[test]
+fn a_library_runs_in_its_hosts_vm_and_exports_its_members() {
+    use wasmtime::{Engine, Linker, Module, Store};
+    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+
+    let Some(runtime) = common::runtime_object() else {
+        eprintln!("no runtime object; skipping");
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("wlift_wasm_library_")
+        .tempdir()
+        .expect("tempdir");
+    let entry = dir.path().join("tally.wren");
+    std::fs::write(
+        &entry,
+        r#"
+class Tally {
+  #export = "new(start: Num)"
+  construct new(start) { _total = start }
+
+  #export = "add(n: Num) -> Num"
+  add(n) {
+    _total = _total + n
+    return _total
+  }
+
+  #export = "total -> Num"
+  total { _total }
+
+  #export = "double(n: Num) -> Num"
+  static double(n) { n * 2 }
+
+  #export = "fail()"
+  static fail() { Fiber.abort("boom") }
+}
+System.print("module ran")
+"#,
+    )
+    .expect("write source");
+    let mut walk = walk_imports(&entry).expect("walk");
+    walk.modules.last_mut().unwrap().request_name = "demo/tally".to_string();
+    let object = dir.path().join("tally.o");
+    let target = LlvmTarget::new("wasm32-wasip1", None, None);
+    compile_modules_to_llvm_object_as(
+        &walk.modules,
+        &AotBundleMeta::default(),
+        &target,
+        AotEntry::Library,
+        &object,
+    )
+    .expect("compile a library");
+
+    let symbol = |kind: &str, name: &str, arity: usize| {
+        format!(
+            "caribou_4wren_12demo_2ftally_5Tally_{kind}{}{name}_{arity}",
+            name.len()
+        )
+    };
+    let (new, add, total, double, fail) = (
+        symbol("c", "new", 1),
+        symbol("m", "add", 1),
+        symbol("g", "total", 0),
+        symbol("t", "double", 1),
+        symbol("t", "fail", 0),
+    );
+    let read = |path: &Path| {
+        let bytes = std::fs::read(path).expect("read object");
+        ash_wasm_link::read(&path.display().to_string(), &bytes).expect("parse object")
+    };
+    let options = ash_wasm_link::LinkOptions {
+        roots: [
+            "wlift_aot_new_vm",
+            "wlift_aot_run_programs",
+            "wlift_aot_take_error",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([&new, &add, &total, &double, &fail].map(|s| s.clone()))
+        .collect(),
+        ..Default::default()
+    };
+    let module = ash_wasm_link::link(vec![read(&object), read(&runtime)], &options).expect("link");
+
+    let engine = Engine::default();
+    let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 16);
+    let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+        .stdout(stdout.clone())
+        .inherit_stderr()
+        .build_p1();
+    let mut store: Store<WasiP1Ctx> = Store::new(&engine, wasi);
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    preview1::add_to_linker_sync(&mut linker, |s| s).expect("wasi imports");
+    let module = Module::new(&engine, &module).expect("load the library");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let f = |store: &mut Store<WasiP1Ctx>, name: &str| {
+        instance
+            .get_func(&mut *store, name)
+            .unwrap_or_else(|| panic!("{name} exported"))
+    };
+
+    let vm = f(&mut store, "wlift_aot_new_vm")
+        .typed::<(), i32>(&store)
+        .unwrap()
+        .call(&mut store, ())
+        .expect("new vm");
+    let run = f(&mut store, "wlift_aot_run_programs")
+        .typed::<i32, i32>(&store)
+        .unwrap();
+    assert_eq!(run.call(&mut store, vm).expect("run"), 0);
+    assert_eq!(
+        String::from_utf8(stdout.contents().to_vec()).unwrap(),
+        "module ran\n"
+    );
+
+    let num = |x: f64| x.to_bits() as i64;
+    let back = |v: i64| f64::from_bits(v as u64);
+    let tally = f(&mut store, &new)
+        .typed::<i64, i64>(&store)
+        .unwrap()
+        .call(&mut store, num(10.0))
+        .expect("construct");
+    let add = f(&mut store, &add)
+        .typed::<(i64, i64), i64>(&store)
+        .unwrap();
+    assert_eq!(back(add.call(&mut store, (tally, num(5.0))).unwrap()), 15.0);
+    assert_eq!(back(add.call(&mut store, (tally, num(2.5))).unwrap()), 17.5);
+    let total = f(&mut store, &total).typed::<i64, i64>(&store).unwrap();
+    assert_eq!(back(total.call(&mut store, tally).unwrap()), 17.5);
+    let double = f(&mut store, &double).typed::<i64, i64>(&store).unwrap();
+    assert_eq!(back(double.call(&mut store, num(21.0)).unwrap()), 42.0);
+
+    let take_error = f(&mut store, "wlift_aot_take_error")
+        .typed::<i32, i32>(&store)
+        .unwrap();
+    assert_eq!(take_error.call(&mut store, vm).unwrap(), 0);
+    f(&mut store, &fail)
+        .typed::<(), i64>(&store)
+        .unwrap()
+        .call(&mut store, ())
+        .expect("a raising member returns");
+    assert_eq!(take_error.call(&mut store, vm).unwrap(), 70);
 }
 
 /// A native library as a `dylink.0` side module, the shape an Ash host

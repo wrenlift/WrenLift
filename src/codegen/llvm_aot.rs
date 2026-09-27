@@ -117,12 +117,41 @@ fn aot_passes() -> String {
     std::env::var("WLIFT_LLVM_AOT_PASSES").unwrap_or_else(|_| "default<O3>".to_string())
 }
 
+/// What an object's bootstrap is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AotEntry {
+    /// A program: `main` (`__main_void` and `_start` on wasm) makes a
+    /// VM, runs the modules and frees it.
+    #[default]
+    Main,
+    /// A library a host links: a static constructor registers a run
+    /// function (`wlift_aot_run_programs` runs it in the host's VM), and
+    /// each `#export` member is an external symbol named by caribou's
+    /// link rule, the module being its `request_name`. Its arguments and
+    /// result are NaN-boxed values (a Num is its `f64` bits); an
+    /// instance member takes its receiver first. After a call,
+    /// `wlift_aot_take_error(vm)` is nonzero if the member raised.
+    Library,
+}
+
 /// Lower `modules` (dependencies first, entry last) into one object at
-/// `output` for `target`.
+/// `output` for `target`, as a program.
 pub fn compile_modules_to_llvm_object(
     modules: &[AotModule],
     bundle: &AotBundleMeta,
     target: &LlvmTarget,
+    output: &Path,
+) -> Result<Vec<AotManifest>, AotError> {
+    compile_modules_to_llvm_object_as(modules, bundle, target, AotEntry::Main, output)
+}
+
+/// Lower `modules` (dependencies first, entry last) into one object at
+/// `output` for `target`, with `entry` as its bootstrap.
+pub fn compile_modules_to_llvm_object_as(
+    modules: &[AotModule],
+    bundle: &AotBundleMeta,
+    target: &LlvmTarget,
+    entry: AotEntry,
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
     if modules.is_empty() {
@@ -205,7 +234,18 @@ pub fn compile_modules_to_llvm_object(
         let main_fn = lower(&m.mir.top_level, &fn_symbol)?;
         let mut classes = Vec::new();
         let mut method_fns = Vec::new();
+        let mut exports = Vec::new();
         for plan in plan_classes(m, &fn_symbol) {
+            if entry == AotEntry::Library
+                && let Some(slot) = plan.slot
+            {
+                let class_name = m.interner.resolve(plan.class.name);
+                for method in &plan.class.methods {
+                    if let Some(x) = export_plan(m, class_name, slot, method, &env)? {
+                        exports.push(x);
+                    }
+                }
+            }
             if plan.class.native_library.is_some() && !target.is_wasm() {
                 return Err(AotError::UnsupportedTarget(format!(
                     "{}: foreign classes in an LLVM AOT build",
@@ -278,6 +318,7 @@ pub fn compile_modules_to_llvm_object(
             closures: closures_table,
             closure_fns,
             method_fns,
+            exports,
         });
         manifests.push(AotManifest {
             fn_symbol,
@@ -306,7 +347,7 @@ pub fn compile_modules_to_llvm_object(
         b: ctx.create_builder(),
         strings: 0,
     }
-    .emit(&manifests, &tables, target.is_wasm())
+    .emit(&manifests, &tables, target.is_wasm(), entry)
     .map_err(module_err)?;
 
     module
@@ -458,7 +499,35 @@ fn link_error(msg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::link_error;
+    use super::{link_error, link_symbol};
+
+    #[test]
+    fn a_link_symbol_spells_every_part_with_its_length() {
+        assert_eq!(
+            link_symbol("wren", "bench/tally", "Tally", 'm', "add", 1),
+            "caribou_4wren_13bench_2ftally_5Tally_m3add_1"
+        );
+        assert_eq!(
+            link_symbol("haxe", "game.Player", "Player", 't', "spawnAt", 2),
+            "caribou_4haxe_13game_2ePlayer_6Player_t7spawnAt_2"
+        );
+        assert_eq!(
+            link_symbol("math", "Math", "Math", 't', "hypot", 2),
+            "caribou_4math_4Math_4Math_t5hypot_2"
+        );
+        assert_eq!(
+            link_symbol("wren", "m", "C", 's', "hp", 1),
+            "caribou_4wren_1m_1C_s2hp_1"
+        );
+        assert_eq!(
+            link_symbol("wren", "m", "C", 'm', "+", 1),
+            "caribou_4wren_1m_1C_m3_2b_1"
+        );
+        assert_eq!(
+            link_symbol("wren", "m", "C", 'm', "a_b", 0),
+            "caribou_4wren_1m_1C_m5a_5fb_0"
+        );
+    }
 
     #[test]
     fn an_out_of_step_runtime_is_reported_in_wlifts_terms() {
@@ -550,6 +619,123 @@ struct ModuleTables<'ctx> {
     closure_fns: Vec<FunctionValue<'ctx>>,
     /// Per installed class, its method bodies in manifest order.
     method_fns: Vec<Vec<FunctionValue<'ctx>>>,
+    /// In a library, the `#export` members to give symbols.
+    exports: Vec<ExportPlan>,
+}
+
+/// The symbol a member links under across languages: `caribou`, then the
+/// language, the module as its language spells it, the class, the kind's
+/// letter (`m` method, `g` getter, `s` setter, `t` static, `c`
+/// constructor) with the member's name, and the arity, each after a `_`,
+/// and each name as its length and its text. A byte that is not a C
+/// identifier's is `_` and two hex digits, `_` included. The rule is
+/// caribou's (`caribou_mangle`); its test vectors are below.
+fn link_symbol(
+    lang: &str,
+    module: &str,
+    class: &str,
+    kind: char,
+    name: &str,
+    arity: usize,
+) -> String {
+    fn segment(out: &mut String, text: &str) {
+        let mut escaped = String::with_capacity(text.len());
+        for b in text.bytes() {
+            if b.is_ascii_alphanumeric() {
+                escaped.push(b as char);
+            } else {
+                escaped.push_str(&format!("_{b:02x}"));
+            }
+        }
+        out.push_str(&escaped.len().to_string());
+        out.push_str(&escaped);
+    }
+    let mut out = String::from("caribou");
+    for part in [lang, module, class] {
+        out.push('_');
+        segment(&mut out, part);
+    }
+    out.push('_');
+    out.push(kind);
+    segment(&mut out, name);
+    out.push('_');
+    out.push_str(&arity.to_string());
+    out
+}
+
+/// An `#export` member of a library: the symbol it links under and how
+/// to call it.
+struct ExportPlan {
+    symbol: String,
+    /// The class's slot in its module's variables.
+    class_slot: u32,
+    /// The method's signature in the module's symbol table.
+    sig_slot: u32,
+    /// Its Wren parameters, the receiver aside.
+    arity: usize,
+    /// An instance member takes its receiver; a static or constructor
+    /// is called on the class.
+    has_receiver: bool,
+}
+
+/// The export plan for `method` of the class `class_name` in slot
+/// `slot`, when it carries `#export`.
+fn export_plan(
+    m: &AotModule,
+    class_name: &str,
+    slot: u32,
+    method: &crate::mir::MethodMir,
+    env: &AotEnv,
+) -> Result<Option<ExportPlan>, AotError> {
+    let export = crate::sema::export::Export::from_entries(&method.attributes)
+        .map_err(|e| AotError::Frontend(format!("{class_name}.{}: {e}", method.signature)))?;
+    let Some(export) = export else {
+        return Ok(None);
+    };
+    let arity = export.params.len();
+    if arity > 8 {
+        return Err(AotError::UnsupportedTarget(format!(
+            "{class_name}.{}: an #export member takes at most 8 parameters",
+            method.signature
+        )));
+    }
+    let kind = if method.is_constructor {
+        'c'
+    } else if method.is_static {
+        't'
+    } else if export.is_setter {
+        's'
+    } else if !export.has_params {
+        'g'
+    } else {
+        'm'
+    };
+    let symbol = link_symbol(
+        "wren",
+        &m.request_name,
+        class_name,
+        kind,
+        &export.name,
+        arity,
+    );
+    // The signature goes in the symbol table beside the ones the bodies
+    // use, under an id no interned symbol has.
+    let mut remap = env.symbol_remap.borrow_mut();
+    let sig_slot = match remap.iter().position(|(_, text)| *text == method.signature) {
+        Some(i) => i,
+        None => {
+            let id = u32::MAX - remap.len() as u32;
+            remap.push((id, method.signature.clone()));
+            remap.len() - 1
+        }
+    };
+    Ok(Some(ExportPlan {
+        symbol,
+        class_slot: slot,
+        sig_slot: sig_slot as u32,
+        arity,
+        has_receiver: !(method.is_static || method.is_constructor),
+    }))
 }
 
 /// A zeroed `[i64; n]` (at least one slot) under `name`.
@@ -752,7 +938,9 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         manifests: &[AotManifest],
         tables: &[ModuleTables<'ctx>],
         wasm: bool,
+        entry_kind: AotEntry,
     ) -> Result<(), String> {
+        let library = entry_kind == AotEntry::Library;
         use P::*;
         let i32t = self.ctx.i32_type();
         let new_vm = self.import("wlift_aot_new_vm", &[], Some(Ptr));
@@ -804,8 +992,13 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         );
 
         // wasi-libc's startup calls `__main_void` when main takes no
-        // arguments.
-        let (name, main_ty) = if wasm {
+        // arguments. A library's run takes its host's VM instead.
+        let (name, main_ty) = if library {
+            (
+                "wlift_program_run",
+                i32t.fn_type(&[self.ptr().into()], false),
+            )
+        } else if wasm {
             ("__main_void", i32t.fn_type(&[], false))
         } else {
             (
@@ -813,7 +1006,9 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                 i32t.fn_type(&[i32t.into(), self.ptr().into()], false),
             )
         };
-        let main = self.module.add_function(name, main_ty, None);
+        let main = self
+            .module
+            .add_function(name, main_ty, library.then_some(Linkage::Internal));
         stamp_target(self.ctx, self.machine, main);
         let entry = self.ctx.append_basic_block(main, "entry");
         let body = self.ctx.append_basic_block(main, "body");
@@ -831,8 +1026,17 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             .map_err(e)?;
         if wasm {
             // Compiled frames all run below this one: the collector scans
-            // the shadow stack up to the end of the context buffer.
-            let stack_top = self.import("wlift_aot_stack_top", &[Ptr], None);
+            // the shadow stack up to the end of the context buffer. A
+            // library's run only raises it, below its host's frames.
+            let stack_top = self.import(
+                if library {
+                    "wlift_aot_raise_stack_top"
+                } else {
+                    "wlift_aot_stack_top"
+                },
+                &[Ptr],
+                None,
+            );
             let end = unsafe {
                 self.b.build_in_bounds_gep(
                     self.ctx.i64_type(),
@@ -844,10 +1048,20 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             .map_err(e)?;
             self.call(stack_top, &[end.into()])?;
         }
-        let vm = self
-            .call(new_vm, &[])?
-            .ok_or("new_vm")?
-            .into_pointer_value();
+        let vm = if library {
+            let vm = main
+                .get_nth_param(0)
+                .ok_or("run takes the VM")?
+                .into_pointer_value();
+            self.b
+                .build_store(self.program_vm().as_pointer_value(), vm)
+                .map_err(e)?;
+            vm
+        } else {
+            self.call(new_vm, &[])?
+                .ok_or("new_vm")?
+                .into_pointer_value()
+        };
         let null = self.b.build_is_null(vm, "novm").map_err(e)?;
         self.b
             .build_conditional_branch(null, fail, body)
@@ -1059,16 +1273,157 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             self.b.build_return(Some(&rc)).map_err(e)?;
             self.b.position_at_end(next);
         }
-        self.call(free_vm, &[vmv])?;
+        if !library {
+            self.call(free_vm, &[vmv])?;
+        }
         self.b.build_return(Some(&i32t.const_zero())).map_err(e)?;
 
         self.b.position_at_end(fail);
         self.b
             .build_return(Some(&i32t.const_int(70, false)))
             .map_err(e)?;
-        if wasm {
+        if library {
+            self.emit_registration(main)?;
+            for (m, t) in manifests.iter().zip(tables) {
+                for x in &t.exports {
+                    self.emit_export(m, t, x, wasm)?;
+                }
+            }
+        } else if wasm {
             self.emit_start(main)?;
         }
+        Ok(())
+    }
+
+    /// The VM a library program runs in, set by its run function and read
+    /// by its exported members.
+    fn program_vm(&self) -> GlobalValue<'ctx> {
+        if let Some(g) = self.module.get_global("wlift_program_vm") {
+            return g;
+        }
+        let g = self.module.add_global(self.ptr(), None, "wlift_program_vm");
+        g.set_linkage(Linkage::Internal);
+        g.set_initializer(&self.ptr().const_null());
+        g
+    }
+
+    /// A static constructor handing `run` to the runtime, so a host
+    /// linking this library runs it without naming it.
+    fn emit_registration(&self, run: FunctionValue<'ctx>) -> Result<(), String> {
+        let e = |e: inkwell::builder::BuilderError| e.to_string();
+        let register = self.import("wlift_aot_register_program", &[P::Ptr], None);
+        let f = self.module.add_function(
+            "wlift_program_register",
+            self.ctx.void_type().fn_type(&[], false),
+            Some(Linkage::Internal),
+        );
+        stamp_target(self.ctx, self.machine, f);
+        self.b
+            .position_at_end(self.ctx.append_basic_block(f, "entry"));
+        self.call(register, &[run.as_global_value().as_pointer_value().into()])?;
+        self.b.build_return(None).map_err(e)?;
+        let i32t = self.ctx.i32_type();
+        let entry_ty = self
+            .ctx
+            .struct_type(&[i32t.into(), self.ptr().into(), self.ptr().into()], false);
+        let ctors = entry_ty.const_array(&[entry_ty.const_named_struct(&[
+            i32t.const_int(65535, false).into(),
+            f.as_global_value().as_pointer_value().into(),
+            self.ptr().const_null().into(),
+        ])]);
+        let g = self
+            .module
+            .add_global(ctors.get_type(), None, "llvm.global_ctors");
+        g.set_linkage(Linkage::Appending);
+        g.set_initializer(&ctors);
+        Ok(())
+    }
+
+    /// The external symbol for an `#export` member: it enters the
+    /// program's context and makes the call Wren code would, so a
+    /// constructor, a static and an inherited method behave as they do
+    /// there.
+    fn emit_export(
+        &mut self,
+        m: &AotManifest,
+        t: &ModuleTables<'ctx>,
+        x: &ExportPlan,
+        wasm: bool,
+    ) -> Result<(), String> {
+        use P::*;
+        let e = |e: inkwell::builder::BuilderError| e.to_string();
+        let i64t = self.ctx.i64_type();
+        let n_params = x.arity + x.has_receiver as usize;
+        let params: Vec<BasicMetadataTypeEnum> = (0..n_params).map(|_| i64t.into()).collect();
+        let f = self
+            .module
+            .add_function(&x.symbol, i64t.fn_type(&params, false), None);
+        stamp_target(self.ctx, self.machine, f);
+        let entry = self.ctx.append_basic_block(f, "entry");
+        let call = self.ctx.append_basic_block(f, "call");
+        let unrun = self.ctx.append_basic_block(f, "unrun");
+        self.b.position_at_end(entry);
+        let vm = self
+            .b
+            .build_load(self.ptr(), self.program_vm().as_pointer_value(), "vm")
+            .map_err(e)?
+            .into_pointer_value();
+        let none = self.b.build_is_null(vm, "unrun").map_err(e)?;
+        self.b
+            .build_conditional_branch(none, unrun, call)
+            .map_err(e)?;
+
+        self.b.position_at_end(unrun);
+        let null = i64t.const_int(crate::runtime::value::Value::null().to_bits(), false);
+        self.b.build_return(Some(&null)).map_err(e)?;
+
+        self.b.position_at_end(call);
+        let saved = self
+            .b
+            .build_array_alloca(i64t, i64t.const_int(16, false), "saved")
+            .map_err(e)?;
+        if wasm {
+            let raise = self.import("wlift_aot_raise_stack_top", &[Ptr], None);
+            let end = unsafe {
+                self.b
+                    .build_in_bounds_gep(i64t, saved, &[i64t.const_int(16, false)], "top")
+            }
+            .map_err(e)?;
+            self.call(raise, &[end.into()])?;
+        }
+        let enter = self.import("wlift_aot_enter", &[Ptr, Ptr, Word, Ptr, Word, Ptr], None);
+        let exit = self.import("wlift_aot_exit", &[Ptr], None);
+        let (mname, mlen) = self.string(&m.module_name);
+        self.call(
+            enter,
+            &[
+                vm.into(),
+                t.modvars.as_pointer_value().into(),
+                self.wordc(m.modvars_count as u64),
+                mname,
+                mlen,
+                saved.into(),
+            ],
+        )?;
+        let mut args: Vec<BasicValueEnum> = Vec::with_capacity(n_params + 2);
+        let receiver: BasicValueEnum = if x.has_receiver {
+            f.get_nth_param(0).ok_or("receiver")?
+        } else {
+            let slot = self.slot_ptr(t.modvars, x.class_slot as u64)?;
+            self.b.build_load(i64t, slot, "class").map_err(e)?
+        };
+        args.push(receiver);
+        let sym = self.slot_ptr(t.symbols, x.sig_slot as u64)?;
+        args.push(self.b.build_load(i64t, sym, "sig").map_err(e)?);
+        args.extend(f.get_param_iter().skip(x.has_receiver as usize));
+        let call_fn = self.import(
+            &format!("wren_call_{}", x.arity),
+            &vec![I64; x.arity + 2],
+            Some(I64),
+        );
+        let result = self.call(call_fn, &args)?.ok_or("wren_call")?;
+        self.call(exit, &[saved.into()])?;
+        self.b.build_return(Some(&result)).map_err(e)?;
         Ok(())
     }
 
