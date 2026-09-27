@@ -122,6 +122,38 @@ fn aot_passes() -> String {
     std::env::var("WLIFT_LLVM_AOT_PASSES").unwrap_or_else(|_| "default<O3>".to_string())
 }
 
+/// A module another language supplies to a linked program: its classes'
+/// members are external link symbols, left undefined for the final link.
+/// An import of `name` binds to these classes as an import of a compiled
+/// module binds to its classes.
+#[derive(Clone, Debug)]
+pub struct AotForeignModule {
+    /// The name imports use, such as `haxe:Bench`.
+    pub name: String,
+    pub classes: Vec<AotForeignClass>,
+}
+
+/// A class of an [`AotForeignModule`], installed at start-up with
+/// `Object` as its parent and no fields of its own.
+#[derive(Clone, Debug)]
+pub struct AotForeignClass {
+    pub name: String,
+    pub members: Vec<AotForeignMember>,
+}
+
+/// A member of an [`AotForeignClass`]. Calling it calls `symbol` with one
+/// NaN-boxed value per argument, the receiver first for an instance
+/// member, and answers what it returns. A constructor such as `new()` is
+/// a static member that returns the instance. The symbol raises through
+/// WrenLift's API (`wrenAbortFiber`), as a native does.
+#[derive(Clone, Debug)]
+pub struct AotForeignMember {
+    /// The Wren signature: `add(_)`, `new()`, `v`, `v=(_)`, `[_]`.
+    pub signature: String,
+    pub is_static: bool,
+    pub symbol: String,
+}
+
 /// What an object's bootstrap is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AotEntry {
@@ -170,7 +202,7 @@ pub fn compile_modules_to_llvm_object_as(
     entry: AotEntry,
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
-    compile_modules_to_llvm_object_with(modules, bundle, target, entry, false, output)
+    compile_modules_to_llvm_object_with(modules, bundle, target, entry, false, &[], output)
 }
 
 /// [`compile_modules_to_llvm_object_as`], and when `reloadable`, a
@@ -179,12 +211,15 @@ pub fn compile_modules_to_llvm_object_as(
 /// so it reaches whatever methods the class has now, and the bootstrap
 /// registers each module's variables by name. Link it with
 /// [`link_wasm_reloadable`].
+///
+/// `foreign` are the modules another language supplies ([`AotForeignModule`]).
 pub fn compile_modules_to_llvm_object_with(
     modules: &[AotModule],
     bundle: &AotBundleMeta,
     target: &LlvmTarget,
     entry: AotEntry,
     reloadable: bool,
+    foreign: &[AotForeignModule],
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
     let reloadable = reloadable || entry == AotEntry::Reload;
@@ -385,6 +420,25 @@ pub fn compile_modules_to_llvm_object_with(
         });
     }
     resolve_manifest_imports(modules, &mut manifests);
+    // A reload object imports foreign classes by name, from the module
+    // the running program published them under.
+    let foreign_imports: Vec<Vec<ForeignImport>> = if entry == AotEntry::Reload {
+        vec![Vec::new(); manifests.len()]
+    } else {
+        manifests
+            .iter_mut()
+            .map(|m| bind_foreign_imports(m, foreign))
+            .collect()
+    };
+    let foreign_tables = if entry == AotEntry::Reload {
+        Vec::new()
+    } else {
+        foreign
+            .iter()
+            .enumerate()
+            .map(|(i, f)| lower_foreign_module(&ctx, &module, &machine, layout, target, i, f))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     Bootstrap {
         ctx: &ctx,
@@ -394,7 +448,14 @@ pub fn compile_modules_to_llvm_object_with(
         b: ctx.create_builder(),
         strings: 0,
     }
-    .emit(&manifests, &tables, target.is_wasm(), entry, reloadable)
+    .emit(
+        &manifests,
+        &tables,
+        target.is_wasm(),
+        entry,
+        reloadable,
+        (&foreign_tables, &foreign_imports),
+    )
     .map_err(module_err)?;
 
     module
@@ -711,6 +772,130 @@ pub fn place_wasm_libraries(
 }
 
 /// What the bootstrap reaches of one lowered module.
+/// An import bound to a foreign class: this module's `target_slot` takes
+/// class `class` of foreign module `module`.
+#[derive(Clone, Copy)]
+struct ForeignImport {
+    target_slot: u32,
+    module: usize,
+    class: usize,
+}
+
+/// Take `m`'s runtime imports of foreign classes out as bindings.
+fn bind_foreign_imports(m: &mut AotManifest, foreign: &[AotForeignModule]) -> Vec<ForeignImport> {
+    let mut bound = Vec::new();
+    m.runtime_imports.retain(|ri| {
+        let found = foreign.iter().enumerate().find_map(|(mi, f)| {
+            (f.name == ri.module_name)
+                .then(|| f.classes.iter().position(|c| c.name == ri.var_name))
+                .flatten()
+                .map(|ci| (mi, ci))
+        });
+        match found {
+            Some((module, class)) => {
+                bound.push(ForeignImport {
+                    target_slot: ri.target_slot,
+                    module,
+                    class,
+                });
+                false
+            }
+            None => true,
+        }
+    });
+    bound
+}
+
+/// A foreign module's classes as the bootstrap installs them: a table
+/// holding each class, and per class its members' bodies.
+struct ForeignTables<'ctx> {
+    name: String,
+    vars: GlobalValue<'ctx>,
+    classes: Vec<(String, Vec<ForeignBody<'ctx>>)>,
+}
+
+/// A foreign member's body, as `wlift_aot_install_class` is given it.
+struct ForeignBody<'ctx> {
+    signature: String,
+    is_static: bool,
+    arity: u8,
+    entry: FunctionValue<'ctx>,
+}
+
+/// The body of each member of foreign module `f`: a call of its symbol
+/// with the receiver first for an instance member, answering its result.
+fn lower_foreign_module<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+    machine: &TargetMachine,
+    layout: Layout,
+    target: &LlvmTarget,
+    index: usize,
+    f: &AotForeignModule,
+) -> Result<ForeignTables<'ctx>, AotError> {
+    let e = |e: inkwell::builder::BuilderError| AotError::Module(e.to_string());
+    let i64t = ctx.i64_type();
+    let b = ctx.create_builder();
+    let mut classes = Vec::with_capacity(f.classes.len());
+    for (ci, class) in f.classes.iter().enumerate() {
+        let mut members = Vec::with_capacity(class.members.len());
+        for (k, member) in class.members.iter().enumerate() {
+            let arity = member.signature.matches('_').count();
+            if arity > 16 {
+                return Err(AotError::Frontend(format!(
+                    "{}.{}: a foreign member takes at most 16 arguments",
+                    class.name, member.signature
+                )));
+            }
+            let n_symbol = arity + !member.is_static as usize;
+            let symbol = match module.get_function(&member.symbol) {
+                Some(s) => s,
+                None => module.add_function(
+                    &member.symbol,
+                    i64t.fn_type(&vec![i64t.into(); n_symbol], false),
+                    Some(Linkage::External),
+                ),
+            };
+            let body = module.add_function(
+                &format!("wlift_foreign_{index}_{ci}_{k}"),
+                i64t.fn_type(&vec![i64t.into(); arity + 1], false),
+                Some(Linkage::Internal),
+            );
+            stamp_target(ctx, machine, body);
+            b.position_at_end(ctx.append_basic_block(body, "entry"));
+            let skip = member.is_static as usize;
+            let args: Vec<BasicMetadataValueEnum> =
+                body.get_param_iter().skip(skip).map(Into::into).collect();
+            let r = b
+                .build_call(symbol, &args, "r")
+                .map_err(e)?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| AotError::Module(format!("{} returns a value", member.symbol)))?;
+            b.build_return(Some(&r)).map_err(e)?;
+            // The receiver is the body's first parameter.
+            let entry = entry_for(ctx, module, machine, layout, target, body, arity as u8 + 1)?;
+            members.push(ForeignBody {
+                signature: member.signature.clone(),
+                is_static: member.is_static,
+                arity: arity as u8,
+                entry,
+            });
+        }
+        classes.push((class.name.clone(), members));
+    }
+    Ok(ForeignTables {
+        name: f.name.clone(),
+        vars: table(
+            ctx,
+            module,
+            &format!("wlift_foreign_vars_{index}"),
+            f.classes.len(),
+        ),
+        classes,
+    })
+}
+
 struct ModuleTables<'ctx> {
     main_fn: FunctionValue<'ctx>,
     modvars: GlobalValue<'ctx>,
@@ -1050,6 +1235,7 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         wasm: bool,
         entry_kind: AotEntry,
         reloadable: bool,
+        (foreign, foreign_imports): (&[ForeignTables<'ctx>], &[Vec<ForeignImport>]),
     ) -> Result<(), String> {
         let reload = entry_kind == AotEntry::Reload;
         // Both run in a VM their host made.
@@ -1209,7 +1395,65 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             let fp = |f: FunctionValue<'ctx>| f.as_global_value().as_pointer_value().into();
             self.call(set, &[fp(open), fp(sym)])?;
         }
-        for (m, t) in manifests.iter().zip(tables).skip(skip) {
+        // Foreign classes first: any module may import them.
+        for f in foreign {
+            let vars: BasicValueEnum = f.vars.as_pointer_value().into();
+            let count = self.wordc(f.classes.len() as u64);
+            self.call(root_region, &[vmv, vars, count])?;
+            for (ci, (class, members)) in f.classes.iter().enumerate() {
+                let mut descs = Vec::with_capacity(members.len());
+                for m in members {
+                    let (sig, sig_len) = self.string(&m.signature);
+                    descs.push(
+                        desc_ty.const_named_struct(&[
+                            sig.as_basic_value_enum(),
+                            sig_len,
+                            m.entry.as_global_value().as_pointer_value().into(),
+                            self.ctx.i8_type().const_int(m.arity as u64, false).into(),
+                            self.ctx
+                                .i8_type()
+                                .const_int(m.is_static as u64, false)
+                                .into(),
+                        ]),
+                    );
+                }
+                let arr = desc_ty.const_array(&descs);
+                let g = self.module.add_global(
+                    arr.get_type(),
+                    None,
+                    &format!(
+                        "{}__foreign_class_{ci}",
+                        f.vars.get_name().to_string_lossy()
+                    ),
+                );
+                g.set_linkage(Linkage::Private);
+                g.set_constant(true);
+                g.set_initializer(&arr);
+                let (name, name_len) = self.string(class);
+                self.call(
+                    install_class,
+                    &[
+                        vmv,
+                        vars,
+                        self.wordc(ci as u64),
+                        name,
+                        name_len,
+                        self.word().const_int(u64::MAX, false).into(),
+                        self.ctx.i16_type().const_zero().into(),
+                        g.as_pointer_value().into(),
+                        self.wordc(members.len() as u64),
+                    ],
+                )?;
+            }
+            let publish = self.import(
+                "wlift_aot_publish_module",
+                &[Ptr, Ptr, Word, Ptr, Word],
+                Some(I32),
+            );
+            let (mp, ml) = self.string(&f.name);
+            self.call(publish, &[vmv, mp, ml, vars, count])?;
+        }
+        for (mi, (m, t)) in manifests.iter().zip(tables).enumerate().skip(skip) {
             let modvars: BasicValueEnum = t.modvars.as_pointer_value().into();
             let consts: BasicValueEnum = t.consts.as_pointer_value().into();
             let count = self.wordc(m.modvars_count as u64);
@@ -1270,6 +1514,15 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                 let (vp, vl) = self.string(&ri.var_name);
                 let slot = self.wordc(ri.target_slot as u64);
                 self.call(runtime_import, &[vmv, modvars, slot, mp, ml, vp, vl])?;
+            }
+            for fi in foreign_imports.get(mi).into_iter().flatten() {
+                let from = self.slot_ptr(foreign[fi.module].vars, fi.class as u64)?;
+                let v = self
+                    .b
+                    .build_load(self.ctx.i64_type(), from, "foreign")
+                    .map_err(e)?;
+                let to = self.slot_ptr(t.modvars, fi.target_slot as u64)?;
+                self.b.build_store(to, v).map_err(e)?;
             }
             for imp in &m.imports {
                 let src = manifests

@@ -942,6 +942,7 @@ fn a_reloaded_module_gives_its_classes_new_methods() {
             &target,
             entry_kind,
             true,
+            &[],
             object,
         )
         .expect("compile");
@@ -1039,6 +1040,165 @@ fn a_reloaded_module_gives_its_classes_new_methods() {
     assert_eq!(
         String::from_utf8(stdout.contents().to_vec()).unwrap(),
         "counter 1\ncounter 2 made 210\n"
+    );
+}
+
+/// An object defining the link symbols a foreign `Calc` class's members
+/// call, as another language's build would: `add(_)` answers its
+/// argument times ten, `make()` 7, `v` 42, `adopt(_)` a new instance of
+/// the class it is given, as a crossing object would be, and the
+/// instance member `bump(_)` its argument plus one when its receiver is
+/// an object.
+fn calc_symbols(target: &LlvmTarget, output: &Path) {
+    use inkwell::context::Context;
+    use inkwell::targets::FileType;
+    // An object's NaN box: the sign bit over a quiet NaN.
+    const TAG_OBJ: u64 = 0xFFFC_0000_0000_0000;
+
+    let machine = target.machine().expect("wasm32 machine");
+    let ctx = Context::create();
+    let module = ctx.create_module("calc");
+    module.set_triple(&machine.get_triple());
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    let i64t = ctx.i64_type();
+    let f64t = ctx.f64_type();
+    let b = ctx.create_builder();
+    let num = |x: f64| i64t.const_int(x.to_bits(), false);
+    let define = |name: &str, params: usize| {
+        let f = module.add_function(name, i64t.fn_type(&vec![i64t.into(); params], false), None);
+        b.position_at_end(ctx.append_basic_block(f, "entry"));
+        f
+    };
+
+    let add = define("test_calc_add", 1);
+    let x = b
+        .build_bit_cast(add.get_nth_param(0).unwrap(), f64t, "x")
+        .unwrap()
+        .into_float_value();
+    let y = b.build_float_mul(x, f64t.const_float(10.0), "y").unwrap();
+    let r = b.build_bit_cast(y, i64t, "r").unwrap();
+    b.build_return(Some(&r)).unwrap();
+
+    define("test_calc_make", 0);
+    b.build_return(Some(&num(7.0))).unwrap();
+    define("test_calc_v", 0);
+    b.build_return(Some(&num(42.0))).unwrap();
+
+    let alloc = module.add_function(
+        "wren_alloc_instance",
+        i64t.fn_type(&[i64t.into()], false),
+        None,
+    );
+    let adopt = define("test_calc_adopt", 1);
+    let class = adopt.get_nth_param(0).unwrap().into_int_value();
+    let made = b
+        .build_call(alloc, &[class.into()], "made")
+        .unwrap()
+        .try_as_basic_value()
+        .basic()
+        .unwrap();
+    b.build_return(Some(&made)).unwrap();
+
+    let bump = define("test_calc_bump", 2);
+    let recv = bump.get_nth_param(0).unwrap().into_int_value();
+    let tag = i64t.const_int(TAG_OBJ, false);
+    let high = b.build_and(recv, tag, "high").unwrap();
+    let is_obj = b
+        .build_int_compare(inkwell::IntPredicate::EQ, high, tag, "obj")
+        .unwrap();
+    let n = b
+        .build_bit_cast(bump.get_nth_param(1).unwrap(), f64t, "n")
+        .unwrap()
+        .into_float_value();
+    let n1 = b.build_float_add(n, f64t.const_float(1.0), "n1").unwrap();
+    let n1 = b.build_bit_cast(n1, i64t, "n1b").unwrap();
+    let r = b.build_select(is_obj, n1, num(-1.0).into(), "r").unwrap();
+    b.build_return(Some(&r)).unwrap();
+
+    machine
+        .write_to_file(&module, FileType::Object, output)
+        .expect("write the symbols object");
+}
+
+/// A module another language supplies binds to its import: its members
+/// call their link symbols, a static with its arguments and an instance
+/// member with its receiver first.
+#[test]
+fn a_foreign_module_calls_its_link_symbols() {
+    use wren_lift::codegen::llvm_aot::{
+        AotForeignClass, AotForeignMember, AotForeignModule, compile_modules_to_llvm_object_with,
+    };
+
+    let Some(runtime) = common::runtime_object() else {
+        eprintln!("no runtime object; skipping");
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("wlift_wasm_foreign_")
+        .tempdir()
+        .expect("tempdir");
+    let entry = dir.path().join("main.wren");
+    std::fs::write(
+        &entry,
+        r#"
+import "haxe:Calc" for Calc
+System.print(Calc.add(2))
+System.print(Calc.make())
+System.print(Calc.v)
+var c = Calc.adopt(Calc)
+System.print(c is Calc)
+System.print(c.bump(4))
+"#,
+    )
+    .expect("write source");
+    let member = |signature: &str, is_static: bool, symbol: &str| AotForeignMember {
+        signature: signature.to_string(),
+        is_static,
+        symbol: symbol.to_string(),
+    };
+    let foreign = [AotForeignModule {
+        name: "haxe:Calc".to_string(),
+        classes: vec![AotForeignClass {
+            name: "Calc".to_string(),
+            members: vec![
+                member("add(_)", true, "test_calc_add"),
+                member("make()", true, "test_calc_make"),
+                member("v", true, "test_calc_v"),
+                member("adopt(_)", true, "test_calc_adopt"),
+                member("bump(_)", false, "test_calc_bump"),
+            ],
+        }],
+    }];
+    let walk = walk_imports(&entry).expect("walk");
+    let target = LlvmTarget::new("wasm32-wasip1", None, None);
+    let program = dir.path().join("main.o");
+    compile_modules_to_llvm_object_with(
+        &walk.modules,
+        &AotBundleMeta::default(),
+        &target,
+        AotEntry::Main,
+        false,
+        &foreign,
+        &program,
+    )
+    .expect("compile");
+    let symbols = dir.path().join("calc.o");
+    calc_symbols(&target, &symbols);
+
+    let read = |path: &Path| {
+        let bytes = std::fs::read(path).expect("read object");
+        ash_wasm_link::read(&path.display().to_string(), &bytes).expect("parse object")
+    };
+    let linked = ash_wasm_link::link(
+        vec![read(&program), read(&symbols), read(&runtime)],
+        &ash_wasm_link::LinkOptions::default(),
+    )
+    .expect("link");
+    let wasm = dir.path().join("main.wasm");
+    std::fs::write(&wasm, linked).expect("write module");
+    assert_eq!(
+        run_module(&wasm, &[]),
+        (0, "20\n7\n42\ntrue\n5\n".to_string())
     );
 }
 

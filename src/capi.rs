@@ -450,6 +450,7 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_import_module_var",
     "wlift_aot_reload_begin",
     "wlift_aot_reload_end",
+    "wlift_aot_publish_module",
     "wlift_error_pending",
 ];
 
@@ -1581,6 +1582,57 @@ pub unsafe extern "C" fn wlift_aot_reload_begin(
         }
     }
     vm.begin_class_reuse(classes);
+    0
+}
+
+/// Publish the `count` classes at `vars` as module `name`, each under
+/// its own name, as a loaded module's variables are: an import by name
+/// finds them there, as does a host looking one up.
+///
+/// # Safety
+/// `name` must be `name_len` bytes of UTF-8 and `vars` must hold `count`
+/// values.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_publish_module(
+    vm: *mut WrenVM,
+    name: *const c_char,
+    name_len: usize,
+    vars: *const u64,
+    count: usize,
+) -> c_int {
+    use crate::runtime::object::{ObjClass, ObjHeader, ObjType};
+    let (Some(vm), Some(name)) = (unsafe { vm.as_mut() }, unsafe { utf8(name, name_len) }) else {
+        return 70;
+    };
+    if vars.is_null() {
+        return 70;
+    }
+    let mut values = Vec::with_capacity(count);
+    let mut names = Vec::with_capacity(count);
+    for i in 0..count {
+        let value = crate::runtime::value::Value::from_bits(unsafe { *vars.add(i) });
+        let Some(ptr) = value.as_object() else {
+            continue;
+        };
+        if unsafe { (*(ptr as *const ObjHeader)).obj_type } != ObjType::Class {
+            continue;
+        }
+        let class_name = vm
+            .interner
+            .resolve(unsafe { (*(ptr as *const ObjClass)).name })
+            .to_string();
+        values.push(value);
+        names.push(class_name);
+    }
+    vm.engine.modules.insert(
+        name.to_string(),
+        crate::runtime::engine::ModuleEntry::new(
+            crate::runtime::engine::FuncId(u32::MAX),
+            values,
+            names,
+        ),
+    );
     0
 }
 
