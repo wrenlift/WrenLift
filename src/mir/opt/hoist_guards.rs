@@ -222,6 +222,10 @@ pub fn value_roots(func: &mut MirFunction) -> HashMap<ValueId, ValueId> {
         .collect()
 }
 
+/// A loop header's parameter, its incoming `(predecessor, argument)`
+/// pairs and the loop's blocks.
+type HeaderParam<'a> = (ValueId, Vec<(BlockId, ValueId)>, &'a HashSet<BlockId>);
+
 /// Where values are defined and which loop each header parameter is
 /// carried around unchanged.
 struct World {
@@ -261,6 +265,9 @@ impl World {
             .iter()
             .map(|l| (l.header, l.body.iter().copied().collect()))
             .collect();
+        // Each header parameter with its incoming (predecessor, argument)
+        // pairs and the loop body.
+        let mut header_params: Vec<HeaderParam> = Vec::new();
         for block in &func.blocks {
             let preds = &block.predecessors;
             for (i, (p, _)) in block.params.iter().enumerate() {
@@ -273,25 +280,42 @@ impl World {
                     })
                     .collect();
                 if let Some(body) = headers.get(&block.id) {
-                    let mut entry = None;
-                    let mut ok = true;
-                    for (pred, a) in &args {
-                        if body.contains(pred) {
-                            if a != p {
-                                ok = false;
-                            }
-                        } else if entry.is_none_or(|e| e == *a) {
-                            entry = Some(*a);
-                        } else {
-                            ok = false;
-                        }
-                    }
-                    if ok && let Some(e) = entry {
-                        carried.insert(*p, e);
-                    }
+                    header_params.push((*p, args, body));
                 } else if preds.len() == 1 && args.len() == 1 {
                     passed.insert(*p, args[0].1);
                 }
+            }
+        }
+        // A back edge may pass a copy of the parameter, through moves,
+        // single-predecessor parameters or an inner loop's carried
+        // parameter; a parameter proven carried can prove an outer one,
+        // so this runs to a fixed point.
+        loop {
+            let mut grew = false;
+            for (p, args, body) in &header_params {
+                if carried.contains_key(p) {
+                    continue;
+                }
+                let mut entry = None;
+                let mut ok = true;
+                for (pred, a) in args {
+                    if body.contains(pred) {
+                        if Self::follow(&moves, &passed, &carried, *a) != *p {
+                            ok = false;
+                        }
+                    } else if entry.is_none_or(|e| e == *a) {
+                        entry = Some(*a);
+                    } else {
+                        ok = false;
+                    }
+                }
+                if ok && let Some(e) = entry {
+                    carried.insert(*p, e);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
             }
         }
         Self {
@@ -300,6 +324,28 @@ impl World {
             passed,
             moves,
         }
+    }
+
+    /// `v` through copies and carried parameters, stopping at the
+    /// first value that is neither.
+    fn follow(
+        moves: &HashMap<ValueId, ValueId>,
+        passed: &HashMap<ValueId, ValueId>,
+        carried: &HashMap<ValueId, ValueId>,
+        v: ValueId,
+    ) -> ValueId {
+        let mut v = v;
+        for _ in 0..64 {
+            match moves
+                .get(&v)
+                .or_else(|| passed.get(&v))
+                .or_else(|| carried.get(&v))
+            {
+                Some(n) => v = *n,
+                None => break,
+            }
+        }
+        v
     }
 
     /// The value `v` stands for outside every loop it is carried
