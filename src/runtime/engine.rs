@@ -2644,12 +2644,32 @@ impl ExecutionEngine {
                 self.jit_code[idx] = self.optimized_code[idx];
                 self.jit_leaf[idx] = self.optimized_leaf[idx];
                 if !self.optimized_code[idx].is_null() {
-                    let entries = encode_osr_entries(&self.optimized_osr_entries[idx]);
+                    let entries = self.optimized_osr_table(idx);
                     self.tier
                         .install_or_swap_osr(id, self.optimized_code[idx] as *mut (), entries);
                 }
             }
         }
+    }
+
+    /// The loop entries published while the optimised body is active:
+    /// its own, and the baseline's for a loop it has none for, so a
+    /// frame still in the interpreter can leave for compiled code.
+    #[cfg(feature = "host")]
+    fn optimized_osr_table(&self, idx: usize) -> Vec<beadie::OsrEntry> {
+        let optimized = &self.optimized_osr_entries[idx];
+        let covered: std::collections::HashSet<crate::mir::BlockId> =
+            optimized.iter().map(|e| e.target_block).collect();
+        let mut entries = encode_osr_entries(optimized);
+        if !self.baseline_code[idx].is_null() {
+            let baseline: Vec<NativeOsrEntry> = self.baseline_osr_entries[idx]
+                .iter()
+                .filter(|e| !covered.contains(&e.target_block))
+                .cloned()
+                .collect();
+            entries.extend(encode_osr_entries(&baseline));
+        }
+        entries
     }
 
     /// The installed OSR entry for `target_block`, if any. Candidates
@@ -4170,10 +4190,11 @@ impl ExecutionEngine {
                 // optimized tier. Beadie bumps the bead's generation
                 // so stale baseline OSR lookups can't race.
                 if !native_ptr.is_null() {
+                    let entries = self.optimized_osr_table(idx);
                     self.tier.install_or_swap_osr(
                         FuncId(idx as u32),
                         native_ptr as *mut (),
-                        encode_osr_entries(&osr_entries),
+                        entries,
                     );
                 }
                 if tier_trace_enabled() {
