@@ -548,7 +548,17 @@ unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Va
 #[inline(always)]
 pub unsafe fn call_entry(fn_ptr: *const u8, args: &[Value]) -> u64 {
     let f: extern "C" fn(*const u64, usize) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-    f(args.as_ptr() as *const u64, args.len())
+    CALLOUT_DEPTH.with(|d| d.set(d.get() + 1));
+    let result = f(args.as_ptr() as *const u64, args.len());
+    CALLOUT_DEPTH.with(|d| d.set(d.get() - 1));
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Runtime frames on this thread in a call into compiled code. Their
+    /// wasm locals may hold heap pointers no scan of linear memory finds.
+    pub static CALLOUT_DEPTH: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
 #[inline(always)]

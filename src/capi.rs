@@ -418,7 +418,7 @@ pub unsafe extern "C" fn wlift_run_aot_program(
 // drive an AOT-compiled program directly, no `vm.interpret` round-trip.
 // ---------------------------------------------------------------------------
 
-/// Every entry point an AOT program's bootstrap or bodies call, and the
+/// Every entry point an AOT program's bootstrap, bodies or host call, and the
 /// data its bodies read, beside the helpers in `RUNTIME_FN_NAMES`. The wasm runtime object must
 /// define each; `tests/wasm_runtime_fresh.rs` checks it.
 pub const AOT_ENTRY_NAMES: &[&str] = &[
@@ -445,6 +445,7 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_register_program",
     "wlift_aot_run_programs",
     "wlift_aot_set_native_loader",
+    "wlift_runtime_callout_depth",
     "wlift_error_pending",
 ];
 
@@ -1463,6 +1464,19 @@ pub unsafe extern "C" fn wlift_aot_raise_stack_top(top: *const u8) {
         .fetch_max(top as usize, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = top;
+}
+
+/// How many runtime frames on this thread are in a call into compiled
+/// Wren. On wasm those frames may keep heap pointers in wasm locals, so a
+/// host collector that scans only linear memory may run only while this
+/// is 0. Always 0 elsewhere.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn wlift_runtime_callout_depth() -> i32 {
+    #[cfg(target_arch = "wasm32")]
+    return crate::codegen::runtime_fns::CALLOUT_DEPTH.with(|d| d.get());
+    #[cfg(not(target_arch = "wasm32"))]
+    0
 }
 
 /// A compiled program built as a library: runs its module bodies in a

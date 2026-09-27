@@ -823,6 +823,46 @@ fn a_foreign_class_calls_the_library_beside_it() {
     assert_eq!(result, (0, "5\nhello, library\nwren\n".to_string()));
 }
 
+const DEPTH_LIBRARY: &str = r#"
+(module
+  (@custom "dylink.0" (before first) "\01\04\00\00\00\00")
+  (import "env" "memory" (memory 0))
+  (import "env" "__indirect_function_table" (table 0 funcref))
+  (import "env" "__memory_base" (global $base i32))
+  (import "env" "__table_base" (global $table_base i32))
+  (import "env" "wrenSetSlotDouble" (func $set (param i32 i32 f64)))
+  (import "env" "wlift_runtime_callout_depth" (func $depth (result i32)))
+  (func (export "wlift_depth_now") (param $vm i32)
+    (call $set (local.get $vm) (i32.const 0)
+      (f64.convert_i32_s (call $depth)))))
+"#;
+
+const DEPTH_PROGRAM: &str = r#"
+#!native = "wlift_depth"
+foreign class Depth {
+  #!symbol = "wlift_depth_now"
+  foreign static now
+}
+System.print(Depth.now)
+System.print(Fn.new { Depth.now }.call())
+System.print(Fn.new { Fn.new { Depth.now }.call() }.call())
+System.print([1].map {|x| Depth.now }.toList)
+System.print(Depth.now)
+"#;
+
+/// A native reached through a runtime call into compiled code sees that
+/// call counted, and the count is back to 0 once it returns.
+#[test]
+fn a_call_into_compiled_code_is_counted_while_it_runs() {
+    let Some(result) = run_with_libraries(
+        &[("main", DEPTH_PROGRAM)],
+        &[("wlift_depth", DEPTH_LIBRARY)],
+    ) else {
+        return;
+    };
+    assert_eq!(result, (0, "0\n1\n2\n[1]\n0\n".to_string()));
+}
+
 /// Without the library, the program stops before running any code.
 #[test]
 fn a_foreign_class_without_its_library_ends_the_program() {
