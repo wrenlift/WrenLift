@@ -3713,7 +3713,7 @@ impl VM {
                 );
                 true
             }
-            #[cfg(feature = "host")]
+            #[cfg(feature = "std_modules")]
             "fs" => {
                 let class = super::core::fs::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -3727,7 +3727,7 @@ impl VM {
                 );
                 true
             }
-            #[cfg(feature = "host")]
+            #[cfg(feature = "std_modules")]
             "os" => {
                 let class = super::core::os::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -3754,7 +3754,7 @@ impl VM {
                 );
                 true
             }
-            #[cfg(feature = "host")]
+            #[cfg(feature = "std_modules")]
             "hash" => {
                 let class = super::core::hash::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -3768,7 +3768,7 @@ impl VM {
                 );
                 true
             }
-            #[cfg(feature = "host")]
+            #[cfg(feature = "std_modules")]
             "crypto" => {
                 let class = super::core::crypto::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -3782,7 +3782,7 @@ impl VM {
                 );
                 true
             }
-            #[cfg(feature = "host")]
+            #[cfg(feature = "std_modules")]
             "zip" => {
                 let class = super::core::zip::register(self);
                 let class_value = Value::object(class as *mut u8);

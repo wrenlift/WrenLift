@@ -13,10 +13,29 @@ use crate::runtime::object::NativeContext;
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
+// The browser has no process environment, so a page's lives in memory.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use super::memfs::{env_var as browser_env, env_vars, remove_env_var, set_env_var};
+
+/// The environment variable `name`, or `None` when unset.
+pub(super) fn env_var(name: &str) -> Option<String> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    return browser_env(name);
+    #[allow(unreachable_code)]
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
 // --- Platform --------------------------------------------------
 
 fn os_platform(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    ctx.alloc_string(std::env::consts::OS.to_string())
+    let platform = if cfg!(all(target_arch = "wasm32", target_os = "unknown")) {
+        "browser"
+    } else if cfg!(target_arch = "wasm32") {
+        "wasi"
+    } else {
+        std::env::consts::OS
+    };
+    ctx.alloc_string(platform.to_string())
 }
 
 fn os_arch(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
@@ -30,8 +49,8 @@ fn os_env(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(name) = super::validate_string(ctx, args[1], "Name") else {
         return Value::null();
     };
-    match std::env::var_os(&name) {
-        Some(v) => ctx.alloc_string(v.to_string_lossy().into_owned()),
+    match env_var(&name) {
+        Some(v) => ctx.alloc_string(v),
         None => Value::null(),
     }
 }
@@ -49,6 +68,9 @@ fn os_set_env(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     // readers. wren_lift is single-threaded at the Wren level, and
     // any background JIT threads don't read env vars, so this is
     // sound in practice.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    set_env_var(&name, &value);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     unsafe {
         std::env::set_var(name, value);
     }
@@ -59,6 +81,9 @@ fn os_unset_env(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(name) = super::validate_string(ctx, args[1], "Name") else {
         return Value::null();
     };
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    remove_env_var(&name);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     unsafe {
         std::env::remove_var(name);
     }
@@ -69,7 +94,11 @@ fn os_unset_env(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn os_env_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     let map = ctx.alloc_map();
     let map_ptr = map.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
-    for (k, v) in std::env::vars() {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let vars = env_vars();
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let vars = std::env::vars();
+    for (k, v) in vars {
         let kv = ctx.alloc_string(k);
         let vv = ctx.alloc_string(v);
         unsafe { (*map_ptr).set(kv, vv) };
@@ -96,6 +125,13 @@ fn os_exit(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             return Value::null();
         }
     };
+    // A page is not a process: nothing can end it from inside.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        ctx.runtime_error(format!("OS.exit({code}): a page has no process to end."));
+        return Value::null();
+    }
+    #[allow(unreachable_code)]
     std::process::exit(code);
 }
 
@@ -131,9 +167,9 @@ fn os_is_tty(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 /// OS.username — best-effort via $USER / $USERNAME (Windows).
 /// Returns null if neither is set.
 fn os_username(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    let name = std::env::var_os("USER").or_else(|| std::env::var_os("USERNAME"));
+    let name = env_var("USER").or_else(|| env_var("USERNAME"));
     match name {
-        Some(n) => ctx.alloc_string(n.to_string_lossy().into_owned()),
+        Some(n) => ctx.alloc_string(n),
         None => Value::null(),
     }
 }

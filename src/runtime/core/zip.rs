@@ -7,7 +7,7 @@
 //! callers can pair this with `FS.readBytes` / `FS.writeBytes`
 //! (or with an in-memory pipeline) without touching the FS.
 //!
-//! Backed by the Rust `zip` crate with `deflate` + `zstd`.
+//! Backed by the Rust `zip` crate: `deflate` everywhere, `zstd` natively.
 
 use std::io::{Cursor, Read, Write};
 
@@ -32,6 +32,7 @@ fn method_from_str(s: &str) -> Option<CompressionMethod> {
     match s {
         "store" | "stored" | "none" => Some(CompressionMethod::Stored),
         "deflate" | "deflated" => Some(CompressionMethod::Deflated),
+        #[cfg(feature = "host")]
         "zstd" | "zstandard" => Some(CompressionMethod::Zstd),
         _ => None,
     }
@@ -41,6 +42,7 @@ fn method_to_str(m: CompressionMethod) -> &'static str {
     match m {
         CompressionMethod::Stored => "store",
         CompressionMethod::Deflated => "deflate",
+        #[cfg(feature = "host")]
         CompressionMethod::Zstd => "zstd",
         _ => "other",
     }

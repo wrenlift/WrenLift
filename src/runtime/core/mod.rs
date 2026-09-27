@@ -28,23 +28,26 @@ pub mod toml;
 mod typed_array;
 pub mod uuid;
 
-// Host-only core modules. Each reaches for syscalls / dynamic
-// linking / heavyweight crypto deps that don't compile (or panic
-// at runtime) on `wasm32-unknown-unknown`. Skipped from the wasm
-// build so the interpreter is portable; user code that does
-// `import "fs"` etc. on wasm sees a clean "module not found"
-// instead of a foreign linker error.
-#[cfg(feature = "host")]
+// Core modules that need the host's sockets, processes or threads are
+// host-only. The rest (crypto, fs, hash, os, zip) are under
+// `std_modules`, which the wasm builds enable too; in the browser, fs
+// and os run over `memfs`.
+#[cfg(feature = "std_modules")]
 pub mod crypto;
-#[cfg(feature = "host")]
+#[cfg(feature = "std_modules")]
 pub mod fs;
-#[cfg(feature = "host")]
+#[cfg(feature = "std_modules")]
 pub mod hash;
 #[cfg(feature = "host")]
 pub mod http;
 #[cfg(feature = "host")]
 pub mod isolate;
-#[cfg(feature = "host")]
+#[cfg(all(
+    feature = "std_modules",
+    any(test, all(target_arch = "wasm32", target_os = "unknown"))
+))]
+pub mod memfs;
+#[cfg(feature = "std_modules")]
 pub mod os;
 #[cfg(feature = "host")]
 pub mod proc;
@@ -52,7 +55,7 @@ pub mod proc;
 pub mod socket;
 #[cfg(feature = "host")]
 pub mod thread;
-#[cfg(feature = "host")]
+#[cfg(feature = "std_modules")]
 pub mod zip;
 
 use super::vm::VM;

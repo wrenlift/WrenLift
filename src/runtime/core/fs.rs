@@ -9,8 +9,14 @@
 //! cooperative yielding across blocking I/O is the caller's job
 //! (spawn a Fiber, Fiber.yield, etc.).
 
+// The browser has no filesystem of its own, so a page's lives in
+// memory; elsewhere, including under WASI, it is the real one.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::fs;
 use std::path::Path;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use super::memfs as fs;
 
 use crate::runtime::object::NativeContext;
 use crate::runtime::value::Value;
@@ -141,21 +147,21 @@ fn fs_exists(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = validate_path(args[1]) else {
         return Value::bool(false);
     };
-    Value::bool(Path::new(&path).exists())
+    Value::bool(fs::metadata(&path).is_ok())
 }
 
 fn fs_is_file(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = validate_path(args[1]) else {
         return Value::bool(false);
     };
-    Value::bool(Path::new(&path).is_file())
+    Value::bool(fs::metadata(&path).is_ok_and(|m| m.is_file()))
 }
 
 fn fs_is_dir(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = validate_path(args[1]) else {
         return Value::bool(false);
     };
-    Value::bool(Path::new(&path).is_dir())
+    Value::bool(fs::metadata(&path).is_ok_and(|m| m.is_dir()))
 }
 
 /// FS.size(path) → Num. File byte count. Aborts if the entry is
@@ -227,7 +233,7 @@ fn fs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         return Value::null();
     };
     let p = Path::new(&path);
-    let result = if p.is_dir() && !p.is_symlink() {
+    let result = if fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
         fs::remove_dir(p)
     } else {
         fs::remove_file(p)
@@ -264,6 +270,9 @@ fn fs_rename(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 // --- Process paths ------------------------------------------------------
 
 fn fs_cwd(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    return ctx.alloc_string(fs::current_dir());
+    #[allow(unreachable_code)]
     match std::env::current_dir() {
         Ok(p) => ctx.alloc_string(p.to_string_lossy().into_owned()),
         Err(e) => {
@@ -274,8 +283,8 @@ fn fs_cwd(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 fn fs_home(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    match std::env::var_os("HOME") {
-        Some(h) => ctx.alloc_string(h.to_string_lossy().into_owned()),
+    match super::os::env_var("HOME") {
+        Some(h) => ctx.alloc_string(h),
         None => {
             ctx.runtime_error("FS.home: HOME not set.".to_string());
             Value::null()
@@ -284,8 +293,11 @@ fn fs_home(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 fn fs_tmp_dir(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    let p = std::env::temp_dir();
-    ctx.alloc_string(p.to_string_lossy().into_owned())
+    // wasm has no temp_dir of its own: TMPDIR, else /tmp.
+    #[cfg(target_arch = "wasm32")]
+    return ctx.alloc_string(super::os::env_var("TMPDIR").unwrap_or_else(|| "/tmp".to_string()));
+    #[allow(unreachable_code)]
+    ctx.alloc_string(std::env::temp_dir().to_string_lossy().into_owned())
 }
 
 // --- Helpers ------------------------------------------------------------

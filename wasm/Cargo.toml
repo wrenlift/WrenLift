@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 # The runtime itself, with host-only deps gated out. We keep the
 # `wasm-encoder` dep enabled so a future track-2 wasm-AOT pipeline
 # can still emit modules from inside this build.
-wren_lift = { path = "..", default-features = false }
+wren_lift = { path = "..", default-features = false, features = ["std_modules"] }
 wasm-bindgen = "0.2"
 # Async wasm-bindgen exports — `pub async fn` becomes a JS
 # Promise-returning function. The scheduler in `lib.rs::run`

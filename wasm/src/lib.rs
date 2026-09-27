@@ -884,6 +884,44 @@ pub fn wlift_host_free(ptr: u32, len: u32) {
     }
 }
 
+/// Put a file into the page's in-memory filesystem, which `import "fs"`
+/// reads; its directories are made as needed. An error names the path.
+#[wasm_bindgen]
+pub fn fs_write_file(path: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        use wren_lift::runtime::core::memfs;
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            memfs::create_dir_all(dir).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+        memfs::write(path, bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let _ = (path, bytes);
+    Ok(())
+}
+
+/// A file from the page's in-memory filesystem, or undefined.
+#[wasm_bindgen]
+pub fn fs_read_file(path: &str) -> Option<Vec<u8>> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    return wren_lift::runtime::core::memfs::read(path).ok();
+    #[allow(unreachable_code)]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Set a variable in the page's environment, which `import "os"` reads.
+#[wasm_bindgen]
+pub fn set_env(name: &str, value: &str) {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    wren_lift::runtime::core::memfs::set_env_var(name, value);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let _ = (name, value);
+}
+
 /// Build identifier — hard-coded for the moment so JS can sanity-
 /// check the loaded wasm matches what its bundler thought it was
 /// importing.

@@ -51,19 +51,11 @@ host = [
     "dep:tempfile",
     "dep:ureq",
     "dep:beadie",
+    "std_modules",
     "dep:zstd",
-    "dep:zip",
-    "dep:sha2",
-    "dep:sha1",
-    "dep:md-5",
-    "dep:hmac",
-    "dep:aes-gcm",
-    "dep:ed25519-dalek",
-    "dep:argon2",
-    "dep:password-hash",
+    "zip/zstd",
     "dep:libc",
     "dep:rand",
-    "dep:rand_core",
     "dep:mimalloc",
     "dep:krio-fiber",
     "dep:wlift_region",
@@ -108,7 +100,21 @@ cranelift = [
 # when driving `wlift build hello.wren -o hello`.
 # The runtime half of AOT: the entry points and helpers a compiled
 # program links against, with no JIT. Builds for wasm32-wasip1.
-aot_runtime = []
+aot_runtime = ["std_modules"]
+# The built-in modules that are pure computation (hash, crypto, zip),
+# which every target can run, wasm included.
+std_modules = [
+    "dep:zip",
+    "dep:sha2",
+    "dep:sha1",
+    "dep:md-5",
+    "dep:hmac",
+    "dep:aes-gcm",
+    "dep:ed25519-dalek",
+    "dep:argon2",
+    "dep:password-hash",
+    "dep:rand_core",
+]
 aot = [
     "aot_runtime",
     "cranelift",
@@ -173,7 +179,7 @@ aes-gcm = { version = "0.10", optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"], optional = true }
 argon2 = { version = "0.5", features = ["std", "password-hash"], optional = true }
 password-hash = { version = "0.5", features = ["std", "alloc"], optional = true }
-zip = { version = "2", default-features = false, features = ["deflate", "zstd"], optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 zstd = { version = "0.13", optional = true }
 rand = { version = "0.9", optional = true }
 rand_core = { version = "0.6", features = ["std"], optional = true }
@@ -263,6 +269,9 @@ windows-sys = { version = "0.59", features = [
 # `getrandom` 0.3's `wasm_js` feature pulls entropy from
 # `crypto.getRandomValues` so `rand` works in browsers / Node.
 getrandom = { version = "0.3", features = ["wasm_js"] }
+# The same for `rand_core` 0.6, which `crypto` draws keys and nonces
+# from and which is on getrandom 0.2.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 # `std::time::Instant::now` compiles on wasm32-unknown-unknown but
 # panics at runtime. `web-time` re-exports the same `Instant` /
 # `SystemTime` API backed by `performance.now()` / `Date.now()`,

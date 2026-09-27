@@ -81,10 +81,12 @@ fn run_linked(files: &[(&str, &str)], how: Link, env: &[(&str, &str)]) -> Option
     Some(run_module(&wasm, env))
 }
 
-/// Run a WASI command module with `env`; its exit code and stdout.
+/// Run a WASI command module with `env`, and the directory it is in as
+/// its working directory; its exit code and stdout.
 fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
     use wasmtime::{Engine, Linker, Module, Store};
     use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+    use wasmtime_wasi::{DirPerms, FilePerms};
 
     let engine = Engine::default();
     let module = Module::from_file(&engine, wasm).expect("loading the program");
@@ -93,6 +95,13 @@ fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
         .stdout(stdout.clone())
         .inherit_stderr()
         .envs(env)
+        .preopened_dir(
+            wasm.parent().expect("program dir"),
+            ".",
+            DirPerms::all(),
+            FilePerms::all(),
+        )
+        .expect("preopening the program's directory")
         .build_p1();
     let mut store = Store::new(&engine, wasi);
     let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
@@ -543,6 +552,75 @@ System.print(keep[199])
 "#,
         )],
         "5\n42\ntrue\n200\ns199000\n",
+    );
+}
+
+/// The pure-computation built-in modules run in the wasm runtime.
+#[test]
+fn hash_crypto_and_zip_modules() {
+    expect(
+        &[(
+            "main",
+            r#"
+import "hash" for HashCore
+import "crypto" for CryptoCore
+import "zip" for ZipCore
+System.print(HashCore.sha256Hex("abc"))
+System.print(HashCore.hmacSha256Hex("key", "msg"))
+System.print(HashCore.base64Encode("hello"))
+System.print(CryptoCore.randomBytes(16).count)
+var key = CryptoCore.aesGcmKey()
+var nonce = CryptoCore.aesGcmNonce()
+var sealed = CryptoCore.aesGcmEncrypt(key, nonce, "secret", null)
+System.print(CryptoCore.aesGcmDecrypt(key, nonce, sealed, null).count)
+System.print(CryptoCore.argon2Verify("pw", CryptoCore.argon2Hash("pw")))
+var z = ZipCore.write({"a.txt": "hello zip"}, "deflate")
+System.print(ZipCore.entries(z))
+System.print(ZipCore.read(z, "a.txt").count)
+"#,
+        )],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n\
+         2d93cbc1be167bcb1637a4a23cbff01a7878f0c50ee833954ea5221bb1b8c628\n\
+         aGVsbG8=\n16\n6\ntrue\n[a.txt]\n9\n",
+    );
+}
+
+/// fs and os run over WASI: files in the directories the host opened,
+/// and the host's environment.
+#[test]
+fn fs_and_os_modules() {
+    let Some((code, out)) = run_linked(
+        &[(
+            "main",
+            r#"
+import "fs" for FS
+import "os" for OS
+FS.mkdirs("scratch/a/b")
+FS.writeText("scratch/a/b/note.txt", "hello fs")
+System.print(FS.readText("scratch/a/b/note.txt"))
+System.print([FS.isDir("scratch/a"), FS.isFile("scratch/a/b/note.txt"), FS.size("scratch/a/b/note.txt")])
+FS.rename("scratch/a/b/note.txt", "scratch/a/moved.txt")
+System.print(FS.listDir("scratch/a"))
+FS.removeTree("scratch")
+System.print(FS.exists("scratch"))
+System.print(OS.platform)
+System.print(OS.env("WLIFT_PROBE"))
+OS.setEnv("WLIFT_PROBE", "set")
+System.print(OS.env("WLIFT_PROBE"))
+OS.exit(3)
+"#,
+        )],
+        Link::Wlift,
+        &[("WLIFT_PROBE", "from host")],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            3,
+            "hello fs\n[true, true, 8]\n[b, moved.txt]\nfalse\nwasi\nfrom host\nset\n"
+        )
     );
 }
 
