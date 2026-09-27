@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1790545085,"nonce":"FXKvadc3+9Zgd5ZYadwHbzmQVTc=","message":"Landed in c826e81266f5ece30f22c6d7ba8c7a76fc3a5235. The foreign test's optimized IR calls test_calc_add straight from the call site, behind the class check.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1790545085,"nonce":"X/HELIJrbe7TRra4FdGD0M3avL0=","status":2}]}
