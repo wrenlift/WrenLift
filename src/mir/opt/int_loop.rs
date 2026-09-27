@@ -157,6 +157,10 @@ impl MirPass for IntSpecialize {
                         continue;
                     }
                     let mut acc = Lat::Bottom;
+                    // A parameter that only passes one value around its
+                    // loop is that value: it takes its range as is,
+                    // without widening.
+                    let mut sources: HashSet<ValueId> = HashSet::new();
                     for &pred in &block.predecessors {
                         let pb = &func.blocks[pred.0 as usize];
                         for (target, args) in edges(&pb.terminator) {
@@ -165,6 +169,10 @@ impl MirPass for IntSpecialize {
                             }
                             let idx = block.params.iter().position(|(q, _)| *q == p).unwrap();
                             let Some(arg) = args.get(idx) else { continue };
+                            if *arg == p {
+                                continue;
+                            }
+                            sources.insert(*arg);
                             let v = refined(*arg, pred, &lat, &facts, &idom);
                             acc = match (acc, v) {
                                 (Lat::Bottom, v) => v,
@@ -178,6 +186,13 @@ impl MirPass for IntSpecialize {
                         }
                     }
                     let old = lat.get(&p).copied().unwrap_or(Lat::Bottom);
+                    if sources.len() == 1 {
+                        if acc != old {
+                            lat.insert(p, acc);
+                            changed = true;
+                        }
+                        continue;
+                    }
                     if acc != old {
                         let grew = match (old, acc) {
                             (Lat::Int(o), Lat::Int(n)) => n.lo < o.lo || n.hi > o.hi,

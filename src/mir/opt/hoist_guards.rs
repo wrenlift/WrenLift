@@ -21,7 +21,7 @@ use super::MirPass;
 use super::licm::{
     compute_dominators, compute_rpo, detect_loops, dominates, merge_loops_by_header,
 };
-use crate::mir::{BlockId, DeoptReg, Instruction, MirFunction, ValueId};
+use crate::mir::{BlockId, DeoptReg, Instruction, MirFunction, Terminator, ValueId};
 
 pub struct HoistGuards;
 
@@ -115,6 +115,97 @@ impl MirPass for HoistGuards {
     }
 }
 
+/// The classes guards prove, per block: `(root, class)` for a
+/// `ClassIs` branch entering the block alone, and for a `GuardClassAt` in
+/// a block that dominates it. A guard in the block itself holds only
+/// after it, which the lowering adds as it passes it. `roots` maps a
+/// value to the one it stands for.
+pub fn class_facts(
+    mir: &MirFunction,
+    roots: &HashMap<ValueId, ValueId>,
+) -> HashMap<usize, Vec<(ValueId, usize)>> {
+    let n = mir.blocks.len();
+    let mut preds = vec![0usize; n];
+    for b in &mir.blocks {
+        for s in b.terminator.successors() {
+            if let Some(c) = preds.get_mut(s.0 as usize) {
+                *c += 1;
+            }
+        }
+    }
+    let class_of: HashMap<ValueId, (ValueId, usize)> = mir
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|(v, inst)| match inst {
+            Instruction::ClassIs(r, c) => Some((*v, (*r, *c))),
+            _ => None,
+        })
+        .collect();
+    let guards: Vec<(usize, ValueId, usize)> = mir
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::CondBranch {
+                condition,
+                true_target,
+                ..
+            } if preds.get(true_target.0 as usize) == Some(&1) => class_of
+                .get(condition)
+                .map(|&(r, c)| (true_target.0 as usize, r, c)),
+            _ => None,
+        })
+        .collect();
+    // An in-place guard holds for the rest of its block, which the
+    // lowering adds as it passes it, and for every block the guard's
+    // block dominates.
+    let in_place: Vec<(usize, ValueId, usize)> = mir
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.instructions
+                .iter()
+                .filter_map(move |(_, inst)| match inst {
+                    Instruction::GuardClassAt { value, class, .. } => Some((
+                        b.id.0 as usize,
+                        roots.get(value).copied().unwrap_or(*value),
+                        *class,
+                    )),
+                    _ => None,
+                })
+        })
+        .collect();
+    let mut facts: HashMap<usize, Vec<(ValueId, usize)>> = HashMap::new();
+    if guards.is_empty() && in_place.is_empty() {
+        return facts;
+    }
+    let rpo = compute_rpo(mir);
+    let idom = compute_dominators(mir, &rpo);
+    for bi in 0..n {
+        let mut d = bi;
+        loop {
+            for &(t, r, c) in &guards {
+                if t == d {
+                    facts.entry(bi).or_default().push((r, c));
+                }
+            }
+            if d != bi {
+                for &(t, r, c) in &in_place {
+                    if t == d {
+                        facts.entry(bi).or_default().push((r, c));
+                    }
+                }
+            }
+            let up = idom.get(d).copied().unwrap_or(usize::MAX);
+            if up == usize::MAX || up == d {
+                break;
+            }
+            d = up;
+        }
+    }
+    facts
+}
+
 /// Every value mapped to the value it stands for outside the loops it
 /// is carried around, for a backend's class facts; a value that
 /// resolves to nothing maps to itself.
@@ -130,6 +221,10 @@ pub fn value_roots(func: &mut MirFunction) -> HashMap<ValueId, ValueId> {
         .map(|v| (*v, world.entered_with(func, *v).unwrap_or(*v)))
         .collect()
 }
+
+/// A loop header's parameter, its incoming `(predecessor, argument)`
+/// pairs and the loop's blocks.
+type HeaderParam<'a> = (ValueId, Vec<(BlockId, ValueId)>, &'a HashSet<BlockId>);
 
 /// Where values are defined and which loop each header parameter is
 /// carried around unchanged.
@@ -170,6 +265,9 @@ impl World {
             .iter()
             .map(|l| (l.header, l.body.iter().copied().collect()))
             .collect();
+        // Each header parameter with its incoming (predecessor, argument)
+        // pairs and the loop body.
+        let mut header_params: Vec<HeaderParam> = Vec::new();
         for block in &func.blocks {
             let preds = &block.predecessors;
             for (i, (p, _)) in block.params.iter().enumerate() {
@@ -182,25 +280,42 @@ impl World {
                     })
                     .collect();
                 if let Some(body) = headers.get(&block.id) {
-                    let mut entry = None;
-                    let mut ok = true;
-                    for (pred, a) in &args {
-                        if body.contains(pred) {
-                            if a != p {
-                                ok = false;
-                            }
-                        } else if entry.is_none_or(|e| e == *a) {
-                            entry = Some(*a);
-                        } else {
-                            ok = false;
-                        }
-                    }
-                    if ok && let Some(e) = entry {
-                        carried.insert(*p, e);
-                    }
+                    header_params.push((*p, args, body));
                 } else if preds.len() == 1 && args.len() == 1 {
                     passed.insert(*p, args[0].1);
                 }
+            }
+        }
+        // A back edge may pass a copy of the parameter, through moves,
+        // single-predecessor parameters or an inner loop's carried
+        // parameter; a parameter proven carried can prove an outer one,
+        // so this runs to a fixed point.
+        loop {
+            let mut grew = false;
+            for (p, args, body) in &header_params {
+                if carried.contains_key(p) {
+                    continue;
+                }
+                let mut entry = None;
+                let mut ok = true;
+                for (pred, a) in args {
+                    if body.contains(pred) {
+                        if Self::follow(&moves, &passed, &carried, *a) != *p {
+                            ok = false;
+                        }
+                    } else if entry.is_none_or(|e| e == *a) {
+                        entry = Some(*a);
+                    } else {
+                        ok = false;
+                    }
+                }
+                if ok && let Some(e) = entry {
+                    carried.insert(*p, e);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
             }
         }
         Self {
@@ -209,6 +324,28 @@ impl World {
             passed,
             moves,
         }
+    }
+
+    /// `v` through copies and carried parameters, stopping at the
+    /// first value that is neither.
+    fn follow(
+        moves: &HashMap<ValueId, ValueId>,
+        passed: &HashMap<ValueId, ValueId>,
+        carried: &HashMap<ValueId, ValueId>,
+        v: ValueId,
+    ) -> ValueId {
+        let mut v = v;
+        for _ in 0..64 {
+            match moves
+                .get(&v)
+                .or_else(|| passed.get(&v))
+                .or_else(|| carried.get(&v))
+            {
+                Some(n) => v = *n,
+                None => break,
+            }
+        }
+        v
     }
 
     /// The value `v` stands for outside every loop it is carried
