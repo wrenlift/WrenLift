@@ -3639,12 +3639,11 @@ pub mod cl {
             seen
         };
 
-        // Loop headers: any block H with a predecessor P where
-        // `P.id >= H.id`. The MIR builder lowers `while` / `for-in`
-        // / `continue` so the back-edge always jumps to a header
-        // whose id is less-than-or-equal to the body's id; this
-        // single CFG check identifies them without a dominator
-        // pass.
+        // Loop headers: any block H with a predecessor P that does
+        // not come before it in reverse postorder. Every cycle has
+        // such an edge, so each iteration of any loop passes one;
+        // block ids are not used, since inlining appends blocks that
+        // jump back to lower ids without closing a loop.
         //
         // Used by the back-edge `wren_jit_roots_restore` emit
         // below: long-running functions (the canonical case is
@@ -3657,10 +3656,18 @@ pub mod cl {
         // entries each iteration; the conservative stack scan
         // covers anything still live across the back-edge.
         let loop_headers: std::collections::HashSet<BlockId> = {
+            let order: HashMap<u32, usize> = rpo
+                .iter()
+                .enumerate()
+                .map(|(pos, &b)| (b as u32, pos))
+                .collect();
             let mut headers = std::collections::HashSet::new();
             for block in &mir.blocks {
+                let Some(&at) = order.get(&block.id.0) else {
+                    continue;
+                };
                 for &pred in &block.predecessors {
-                    if pred.0 >= block.id.0 {
+                    if order.get(&pred.0).is_some_and(|&p| p >= at) {
                         headers.insert(block.id);
                         break;
                     }

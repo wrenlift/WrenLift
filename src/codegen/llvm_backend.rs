@@ -2595,11 +2595,22 @@ pub mod llvm {
             }
             self.int_sources = int_sources(mir);
             self.class_facts = class_facts(mir, &self.move_roots);
+            // A block entered by an edge that does not go forward in
+            // reverse postorder; every cycle has one.
+            let order: HashMap<usize, usize> =
+                rpo.iter().enumerate().map(|(pos, &b)| (b, pos)).collect();
             let loop_headers: HashSet<usize> = mir
                 .blocks
                 .iter()
                 .enumerate()
-                .filter(|(i, b)| b.predecessors.iter().any(|p| p.0 as usize >= *i))
+                .filter(|(i, b)| {
+                    let Some(&at) = order.get(i) else {
+                        return false;
+                    };
+                    b.predecessors
+                        .iter()
+                        .any(|p| order.get(&(p.0 as usize)).is_some_and(|&q| q >= at))
+                })
                 .map(|(i, _)| i)
                 .collect();
             for &bi in &rpo {
