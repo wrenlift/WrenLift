@@ -374,7 +374,9 @@ fn infer_loop_carried_nums(func: &MirFunction) -> HashSet<ValueId> {
                         continue;
                     }
                     let is_num = match inst {
-                        Instruction::ConstNum(_) | Instruction::Box(_) => true,
+                        Instruction::ConstNum(_)
+                        | Instruction::Box(_)
+                        | Instruction::ListCount(_) => true,
                         Instruction::GuardNum(_) | Instruction::GuardNumAt { .. } => true,
                         Instruction::Move(a) | Instruction::Neg(a) => known.contains(a),
                         Instruction::Add(a, b)
