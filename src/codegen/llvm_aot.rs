@@ -482,17 +482,19 @@ pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), Ao
 }
 
 /// The linker's error in wlift's terms. Imports nothing can supply mean
-/// the runtime object is out of step with this wlift, and the linker's
-/// own advice there names another project's build script.
+/// the runtime object is out of step with this wlift or lacks a libc
+/// function, and the linker's own advice there names another project's
+/// build script.
 fn link_error(msg: &str) -> String {
     match msg
         .split_once("no host can supply: ")
         .and_then(|(_, rest)| rest.split_once(".\n"))
     {
         Some((names, _)) => format!(
-            "the program needs {names}, which the runtime object does not define, so it \
-             does not match this wlift. Reinstall wlift, or set WLIFT_WASM_RUNTIME to a \
-             runtime object built from the same sources"
+            "the program needs {names}, which the runtime object does not define: the \
+             object is older than this wlift, or the name is a libc function it leaves \
+             out. Reinstall wlift, or set WLIFT_WASM_RUNTIME to a runtime object built \
+             from the same sources"
         ),
         None => format!("link: {msg}"),
     }

@@ -460,6 +460,73 @@ pub extern "C" fn wlift_aot_set_native_loader(
     crate::runtime::foreign::set_native_loader(crate::runtime::foreign::NativeLoader { open, sym });
 }
 
+/// libm functions LLVM may turn a program's arithmetic into (pow of a
+/// constant base into `exp2`, say) that the runtime does not call
+/// itself. The runtime object is prelinked against libc and keeps only
+/// the members something in it references, so it references these.
+pub const WASM_PROGRAM_LIBM: &[&str] = &[
+    "exp2",
+    "exp10",
+    "log10",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "ldexp",
+    "expm1",
+    "log1p",
+    "hypot",
+    "sincos",
+    "nearbyint",
+];
+
+#[cfg(all(feature = "aot_runtime", target_arch = "wasm32"))]
+mod program_libm {
+    unsafe extern "C" {
+        fn exp2(x: f64) -> f64;
+        fn exp10(x: f64) -> f64;
+        fn log10(x: f64) -> f64;
+        fn sinh(x: f64) -> f64;
+        fn cosh(x: f64) -> f64;
+        fn tanh(x: f64) -> f64;
+        fn asinh(x: f64) -> f64;
+        fn acosh(x: f64) -> f64;
+        fn atanh(x: f64) -> f64;
+        fn ldexp(x: f64, e: i32) -> f64;
+        fn expm1(x: f64) -> f64;
+        fn log1p(x: f64) -> f64;
+        fn hypot(x: f64, y: f64) -> f64;
+        fn sincos(x: f64, s: *mut f64, c: *mut f64);
+        fn nearbyint(x: f64) -> f64;
+    }
+
+    pub struct Table(#[allow(dead_code)] [*const (); 15]);
+    // SAFETY: function addresses, never written.
+    unsafe impl Sync for Table {}
+
+    #[used]
+    #[unsafe(no_mangle)]
+    pub static WLIFT_PROGRAM_LIBM: Table = Table([
+        exp2 as *const (),
+        exp10 as *const (),
+        log10 as *const (),
+        sinh as *const (),
+        cosh as *const (),
+        tanh as *const (),
+        asinh as *const (),
+        acosh as *const (),
+        atanh as *const (),
+        ldexp as *const (),
+        expm1 as *const (),
+        log1p as *const (),
+        hypot as *const (),
+        sincos as *const (),
+        nearbyint as *const (),
+    ]);
+}
+
 /// The signature of an entry point compiled AOT bodies call directly
 /// (the rest are the bootstrap's).
 pub fn aot_body_sig(name: &str) -> Option<crate::codegen::runtime_fns::HelperSig> {

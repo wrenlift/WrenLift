@@ -20,7 +20,7 @@ mod common;
 use common::{runtime_object, rust_lld, wasi_lib_dir};
 
 use wasmparser::{KnownCustom, Linking, Parser, Payload, SymbolFlags, SymbolInfo};
-use wren_lift::capi::AOT_ENTRY_NAMES;
+use wren_lift::capi::{AOT_ENTRY_NAMES, WASM_PROGRAM_LIBM};
 use wren_lift::codegen::runtime_fns::RUNTIME_FN_NAMES;
 use wren_lift::runtime::object_layout::{Layout, layout_mismatches};
 
@@ -143,6 +143,7 @@ fn the_wasm_runtime_defines_what_aot_code_calls() {
     let missing: Vec<&str> = AOT_ENTRY_NAMES
         .iter()
         .chain(RUNTIME_FN_NAMES)
+        .chain(WASM_PROGRAM_LIBM)
         .copied()
         .filter(|n| !defined.contains(*n))
         .collect();
