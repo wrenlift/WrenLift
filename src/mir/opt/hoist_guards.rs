@@ -21,7 +21,7 @@ use super::MirPass;
 use super::licm::{
     compute_dominators, compute_rpo, detect_loops, dominates, merge_loops_by_header,
 };
-use crate::mir::{BlockId, DeoptReg, Instruction, MirFunction, ValueId};
+use crate::mir::{BlockId, DeoptReg, Instruction, MirFunction, Terminator, ValueId};
 
 pub struct HoistGuards;
 
@@ -113,6 +113,97 @@ impl MirPass for HoistGuards {
         }
         true
     }
+}
+
+/// The classes guards prove, per block: `(root, class)` for a
+/// `ClassIs` branch entering the block alone, and for a `GuardClassAt` in
+/// a block that dominates it. A guard in the block itself holds only
+/// after it, which the lowering adds as it passes it. `roots` maps a
+/// value to the one it stands for.
+pub fn class_facts(
+    mir: &MirFunction,
+    roots: &HashMap<ValueId, ValueId>,
+) -> HashMap<usize, Vec<(ValueId, usize)>> {
+    let n = mir.blocks.len();
+    let mut preds = vec![0usize; n];
+    for b in &mir.blocks {
+        for s in b.terminator.successors() {
+            if let Some(c) = preds.get_mut(s.0 as usize) {
+                *c += 1;
+            }
+        }
+    }
+    let class_of: HashMap<ValueId, (ValueId, usize)> = mir
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|(v, inst)| match inst {
+            Instruction::ClassIs(r, c) => Some((*v, (*r, *c))),
+            _ => None,
+        })
+        .collect();
+    let guards: Vec<(usize, ValueId, usize)> = mir
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::CondBranch {
+                condition,
+                true_target,
+                ..
+            } if preds.get(true_target.0 as usize) == Some(&1) => class_of
+                .get(condition)
+                .map(|&(r, c)| (true_target.0 as usize, r, c)),
+            _ => None,
+        })
+        .collect();
+    // An in-place guard holds for the rest of its block, which the
+    // lowering adds as it passes it, and for every block the guard's
+    // block dominates.
+    let in_place: Vec<(usize, ValueId, usize)> = mir
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.instructions
+                .iter()
+                .filter_map(move |(_, inst)| match inst {
+                    Instruction::GuardClassAt { value, class, .. } => Some((
+                        b.id.0 as usize,
+                        roots.get(value).copied().unwrap_or(*value),
+                        *class,
+                    )),
+                    _ => None,
+                })
+        })
+        .collect();
+    let mut facts: HashMap<usize, Vec<(ValueId, usize)>> = HashMap::new();
+    if guards.is_empty() && in_place.is_empty() {
+        return facts;
+    }
+    let rpo = compute_rpo(mir);
+    let idom = compute_dominators(mir, &rpo);
+    for bi in 0..n {
+        let mut d = bi;
+        loop {
+            for &(t, r, c) in &guards {
+                if t == d {
+                    facts.entry(bi).or_default().push((r, c));
+                }
+            }
+            if d != bi {
+                for &(t, r, c) in &in_place {
+                    if t == d {
+                        facts.entry(bi).or_default().push((r, c));
+                    }
+                }
+            }
+            let up = idom.get(d).copied().unwrap_or(usize::MAX);
+            if up == usize::MAX || up == d {
+                break;
+            }
+            d = up;
+        }
+    }
+    facts
 }
 
 /// Every value mapped to the value it stands for outside the loops it
