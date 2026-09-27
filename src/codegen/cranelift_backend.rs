@@ -6722,7 +6722,7 @@ pub mod cl {
                     .brif(is_obj, after_is_obj, &[], slow_block, &[]);
 
                 // 2. Unbox pointer, load obj_type byte, branch on
-                //    TypedArray / Simd tags.
+                //    List, then TypedArray / Simd tags.
                 builder.switch_to_block(after_is_obj);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(r, ptr_mask);
@@ -6730,23 +6730,23 @@ pub mod cl {
                     builder
                         .ins()
                         .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
-                let ta_tag = builder
-                    .ins()
-                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
-                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
-                builder
-                    .ins()
-                    .brif(is_ta, typed_array_block, &[], type_miss_block, &[]);
-                builder.switch_to_block(type_miss_block);
                 let list_block = builder.create_block();
                 let list_tag = builder
                     .ins()
                     .iconst(types::I64, crate::runtime::object::ObjType::List as i64);
                 let is_list = builder.ins().icmp(IntCC::Equal, obj_type_byte, list_tag);
+                builder
+                    .ins()
+                    .brif(is_list, list_block, &[], type_miss_block, &[]);
+                builder.switch_to_block(type_miss_block);
+                let ta_tag = builder
+                    .ins()
+                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
+                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
                 let not_list_block = builder.create_block();
                 builder
                     .ins()
-                    .brif(is_list, list_block, &[], not_list_block, &[]);
+                    .brif(is_ta, typed_array_block, &[], not_list_block, &[]);
                 builder.switch_to_block(not_list_block);
                 let simd_tag = builder.ins().iconst(types::I64, OBJ_TYPE_SIMD as i64);
                 let is_simd = builder.ins().icmp(IntCC::Equal, obj_type_byte, simd_tag);
