@@ -78,7 +78,7 @@ jobs:
         # fail, but doesn't participate in the comparison.
         run: |
           WLIFT="./target/release/wlift"
-          BENCHMARKS="fib method_call binary_trees delta_blue nbody mandelbrot"
+          BENCHMARKS="fib method_call binary_trees delta_blue nbody mandelbrot fannkuch_redux spectral_norm fasta k_nucleotide reverse_complement pidigits regex_redux"
           fail=0
           for bench in $BENCHMARKS; do
             echo "::group::$bench correctness"
@@ -150,7 +150,7 @@ jobs:
             echo "$best"
           }
 
-          BENCHMARKS="fib method_call binary_trees delta_blue nbody mandelbrot"
+          BENCHMARKS="fib method_call binary_trees delta_blue nbody mandelbrot fannkuch_redux spectral_norm fasta k_nucleotide reverse_complement pidigits regex_redux"
           RESULTS="{}"
 
           for bench in $BENCHMARKS; do

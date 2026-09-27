@@ -36,7 +36,7 @@ else
   printf "${YELLOW}Showing WrenLift results only.${RESET}\n\n"
 fi
 
-BENCHMARKS=(fib method_call binary_trees delta_blue nbody mandelbrot)
+BENCHMARKS=(fib method_call binary_trees delta_blue nbody mandelbrot fannkuch_redux spectral_norm fasta k_nucleotide reverse_complement pidigits regex_redux)
 
 # Filter to specific benchmark if given
 if [[ $# -gt 0 ]]; then
