@@ -121,6 +121,8 @@ aot = [
     "dep:cranelift-object",
     "dep:target-lexicon",
     "dep:ash_wasm_link",
+    "dep:ash_wasm_runtime",
+    "dep:tokio",
 ]
 # LLVM top tier above Cranelift. Needs LLVM 21 on the build machine
 # (llvm-config on PATH or LLVM_SYS_211_PREFIX); off by default. The
@@ -254,6 +256,12 @@ wlift_region = { path = "crates/wlift_region", optional = true }
 # Windows: virtual memory for the heap and the safepoint page, thread
 # stack bounds for the conservative scan, and the exception handler
 # that parks a thread at a safepoint.
+# The host `wlift program.wasm` runs a wasm AOT program on: ash's
+# wasmtime host, which answers the fiber, socket and library imports.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ash_wasm_runtime = { git = "https://github.com/rayzor-blade/ash", rev = "312b4a4f0da6cf3f26807aa3d3d6b2dd01da3f56", default-features = false, features = ["native"], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -272,6 +280,9 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # The same for `rand_core` 0.6, which `crypto` draws keys and nonces
 # from and which is on getrandom 0.2.
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# Fibers for compiled wasm: the guest half of ash's wasm runtime, which
+# suspends through the host imports ash's hosts answer.
+ash_wasm_runtime = { git = "https://github.com/rayzor-blade/ash", rev = "312b4a4f0da6cf3f26807aa3d3d6b2dd01da3f56", default-features = false, features = ["guest"] }
 # `std::time::Instant::now` compiles on wasm32-unknown-unknown but
 # panics at runtime. `web-time` re-exports the same `Instant` /
 # `SystemTime` API backed by `performance.now()` / `Date.now()`,

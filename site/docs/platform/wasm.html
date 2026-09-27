@@ -309,9 +309,10 @@ const wlift = await createWlift();   // picks the right binary</code></pre>
         runtime. A program can also be compiled ahead of time into
         its own <code>.wasm</code>. The module holds the compiled
         program and the parts of the runtime it calls, with no
-        compiler inside. It is a WASI command, so a WASI runtime
-        such as wasmtime runs it. This is another way to ship a
-        program; the harness stays the way to run Wren in a page.
+        compiler inside. It is a WASI module that also asks its host
+        for fibers, sockets and native libraries, and
+        <code>wlift</code> is that host. This is another way to ship
+        a program; the harness stays the way to run Wren in a page.
       </p>
 
       <p>
@@ -321,12 +322,13 @@ const wlift = await createWlift();   // picks the right binary</code></pre>
 
       <h3 id="aot-build">Build and run</h3>
 <pre><code>wlift --aot hello.wasm --aot-target wasm32-wasip1 hello.wren
-wasmtime hello.wasm</code></pre>
+wlift hello.wasm</code></pre>
       <p>
         Everything the program imports is compiled in with it: its
         own modules and the path dependencies in its hatchfile. A
         <code>.hatch</code> bundle works as the input too.
-        <code>System.print</code> writes to stdout. An error the
+        <code>System.print</code> writes to stdout, and files are
+        read and written in the working directory. An error the
         program doesn't catch is printed, and the program exits
         with code 70.
       </p>
@@ -341,10 +343,18 @@ wasmtime hello.wasm</code></pre>
 <pre><code>wlift --aot hello.wasm --aot-target wasm32-wasip1 \
   --aot-features +sign-ext,+mutable-globals,+bulk-memory,+nontrapping-fptoint,+multivalue,+reference-types,+simd128 \
   hello.wren</code></pre>
+      <h3 id="aot-fibers">Fibers</h3>
       <p>
-        Fibers that run to completion work as they do everywhere
-        else. Suspending a fiber from inside compiled code comes
-        later; for now it raises an error.
+        Build with <code>--aot-fibers</code> and a fiber suspends
+        inside compiled code and resumes where it stopped, as it
+        does natively:
+      </p>
+<pre><code>wlift --aot game.wasm --aot-target wasm32-wasip1 --aot-fibers game.wren</code></pre>
+      <p>
+        The build saves a suspended fiber's frames in memory of its
+        own, which makes the module larger. Without the flag, fibers
+        that run to completion work the same, and a yield inside
+        compiled code raises an error.
       </p>
 
       <h3 id="aot-native">Native libraries</h3>
@@ -378,9 +388,8 @@ wasmtime hello.wasm</code></pre>
       <p>
         An ahead-of-time build puts each library beside the output
         as <code>&lt;name&gt;.wasm</code> and links the program to
-        host it. The program's host loads the libraries beside it
-        before starting it; plain wasmtime runs a program without
-        native libraries.
+        host it. <code>wlift</code> loads the libraries beside the
+        program before starting it.
       </p>
     </div>
   </main>
@@ -396,6 +405,7 @@ wasmtime hello.wasm</code></pre>
       <li><a href="#threading">Worker vs main</a></li>
       <li><a href="#simd">SIMD detection</a></li>
       <li><a href="#aot">Compile ahead of time</a></li>
+      <li><a href="#aot-fibers">Fibers</a></li>
       <li><a href="#aot-native">Native libraries</a></li>
     </ul>
   </aside>

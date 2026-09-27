@@ -126,6 +126,11 @@ struct Cli {
     #[arg(long, value_name = "FEATURES", requires = "aot_target")]
     aot_features: Option<String>,
 
+    /// With a wasm32 `--aot-target`: fibers suspend and resume inside
+    /// compiled code. Without it, a yield in compiled code raises.
+    #[arg(long, requires = "aot_target")]
+    aot_fibers: bool,
+
     /// Target triple for `--bundle`. Defaults to host-family
     /// (recorded as `target = "native"` in the manifest). Pass
     /// `wasm32` (family marker) or a concrete `wasm32-*` triple
@@ -983,10 +988,11 @@ fn aot_build_for_target(
     triple: &str,
     cpu: Option<&str>,
     features: Option<&str>,
+    fibers: bool,
 ) {
     use wren_lift::codegen::llvm_aot::{
-        LlvmTarget, compile_modules_to_llvm_object, link_wasm, locate_wasm_runtime,
-        place_wasm_libraries,
+        AotBuild, LlvmTarget, WasmLink, compile_modules_to_llvm_object_with, link_wasm_with,
+        locate_wasm_runtime, place_wasm_libraries,
     };
     let target = LlvmTarget::new(triple, cpu, features);
     if !target.is_wasm() {
@@ -1009,8 +1015,13 @@ fn aot_build_for_target(
         .tempdir()
         .unwrap_or_else(|e| fail("tempdir", &e));
     let object = work.path().join("program.o");
-    let manifests = compile_modules_to_llvm_object(&walk.modules, &walk.bundle, &target, &object)
-        .unwrap_or_else(|e| fail("AOT object emit failed", &e));
+    let build = AotBuild {
+        fibers,
+        ..AotBuild::default()
+    };
+    let manifests =
+        compile_modules_to_llvm_object_with(&walk.modules, &walk.bundle, &target, &build, &object)
+            .unwrap_or_else(|e| fail("AOT object emit failed", &e));
     // Native libraries go beside the output as side modules, which the
     // host loads at start-up; the program then links against their imports.
     let libraries =
@@ -1044,8 +1055,40 @@ fn aot_build_for_target(
     {
         eprintln!("wlift: native library {}", placed.display());
     }
-    link_wasm(&object, &runtime, out).unwrap_or_else(|e| fail("link failed", &e));
+    let link = WasmLink {
+        fibers,
+        ..WasmLink::default()
+    };
+    link_wasm_with(&object, &runtime, out, &link).unwrap_or_else(|e| fail("link failed", &e));
     eprintln!("wlift: produced {out_path}");
+}
+
+/// Run a wasm AOT program on the host it imports: WASI, fibers, sockets
+/// and the side modules beside it, with the working directory open to
+/// it. Exits with the program's status.
+#[cfg(feature = "aot")]
+fn run_wasm_program(path: &str) {
+    use ash_wasm_runtime::native::{Outcome, Program};
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("error: {e}");
+        process::exit(1);
+    };
+    let program = Program::load(std::path::Path::new(path)).unwrap_or_else(|e| fail(&e));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap_or_else(|e| fail(&e));
+    let args = vec![path.to_string()];
+    match runtime.block_on(program.run(&args, &[], false)) {
+        Ok(Outcome::Exited(code)) => process::exit(code),
+        Ok(Outcome::Trapped(trap)) => fail(&trap),
+        Err(e) => fail(&e),
+    }
+}
+
+#[cfg(not(feature = "aot"))]
+fn run_wasm_program(_path: &str) {
+    eprintln!("error: running a .wasm program requires `wlift` built with `--features aot`");
+    process::exit(1);
 }
 
 #[cfg(not(all(feature = "aot", feature = "llvm")))]
@@ -1055,6 +1098,7 @@ fn aot_build_for_target(
     _triple: &str,
     _cpu: Option<&str>,
     _features: Option<&str>,
+    _fibers: bool,
 ) {
     eprintln!("error: --aot-target requires `wlift` built with `--features aot,llvm`");
     process::exit(1);
@@ -1441,6 +1485,7 @@ fn main() {
                         triple,
                         cli.aot_cpu.as_deref(),
                         cli.aot_features.as_deref(),
+                        cli.aot_fibers,
                     ),
                     None => aot_build_executable(filename, out_path),
                 }
@@ -1466,6 +1511,11 @@ fn main() {
                 }
             };
 
+            // A wasm AOT program runs on the host its imports ask for.
+            if bytes.starts_with(b"\0asm") {
+                run_wasm_program(filename);
+                return;
+            }
             if wren_lift::hatch::looks_like_hatch(&bytes) {
                 if cli.inspect {
                     inspect_hatch(&bytes);

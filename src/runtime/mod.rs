@@ -15,6 +15,8 @@ pub mod pool;
 pub mod rt;
 #[cfg(feature = "host")]
 pub mod sched;
+#[cfg(stack_fibers)]
+pub mod stack_fiber;
 pub mod stack_scan;
 #[cfg(feature = "host")]
 pub mod stw;

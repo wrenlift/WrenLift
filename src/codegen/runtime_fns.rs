@@ -2772,7 +2772,7 @@ fn handle_jit_fiber_action(
             // never runs for AOT'd bodies. Routing through krio here
             // lets the body run on its own stack so yield can switch
             // back.
-            #[cfg(feature = "host")]
+            #[cfg(stack_fibers)]
             {
                 if is_call
                     && unsafe { (*target).krio_fiber.is_some() }

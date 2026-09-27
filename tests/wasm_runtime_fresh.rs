@@ -200,6 +200,13 @@ fn link_runtime(exports: &[&str]) -> Option<Linked> {
     let mut store = Store::new(&engine, wasi);
     let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
     preview1::add_to_linker_sync(&mut linker, |s| s).expect("wasi imports");
+    // The fiber imports, from a host that cannot suspend: nothing here
+    // yields.
+    linker
+        .func_wrap("env", "ash_host_fiber_yield", || {})
+        .and_then(|l| l.func_wrap("env", "ash_host_fiber_state", || 0i32))
+        .and_then(|l| l.func_wrap("env", "ash_host_fiber_arm", |_: i32, _: i32, _: i32| 0i32))
+        .expect("fiber imports");
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiating the linked module");

@@ -241,7 +241,7 @@ pub struct HotMethodSymbols {
 // VM
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 thread_local! {
     /// Pointer to the active VM. Set by `VM::set_thread_local_current`
     /// at the top-level dispatch entry (interpret, run_fiber) so
@@ -254,13 +254,13 @@ thread_local! {
 
 /// Read the active VM pointer. Returns null if no VM is currently
 /// dispatching on this thread (e.g. called from a unit test or
-/// before VM construction). Host-feature-gated; on wasm/no-host,
-/// always returns null.
-#[cfg(feature = "host")]
+/// before VM construction). Always null where fibers have no stacks of
+/// their own.
+#[cfg(stack_fibers)]
 pub fn current_vm_ptr() -> *mut VM {
     CURRENT_VM.with(|c| c.get())
 }
-#[cfg(not(feature = "host"))]
+#[cfg(not(stack_fibers))]
 pub fn current_vm_ptr() -> *mut VM {
     std::ptr::null_mut()
 }
@@ -270,7 +270,7 @@ pub fn current_vm_ptr() -> *mut VM {
 /// because direct use is reserved for `vm_interp::run_fiber` (and
 /// the few other top-level dispatch entries that need to publish
 /// the VM identity to foreign-method handlers).
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 pub fn __set_thread_local_current_vm(new: *mut VM) -> *mut VM {
     CURRENT_VM.with(|c| {
         let prev = c.get();
@@ -344,8 +344,9 @@ pub struct Shared {
     /// the interpreter's stackless switch. On by default on native;
     /// `WLIFT_KRIO_FIBER=0` keeps the stackless path, which only the
     /// interpreter can suspend on, so an AOT program sets it
-    /// regardless.
-    #[cfg(feature = "host")]
+    /// regardless. A wasm AOT program sets it when it is linked with
+    /// the fiber transform.
+    #[cfg(stack_fibers)]
     pub krio_fiber_active: bool,
 
     /// How to build a VM for an isolate this one spawns: the
@@ -784,7 +785,7 @@ impl VM {
             config,
             output_buffer: None,
             module_sources: HashMap::new(),
-            #[cfg(feature = "host")]
+            #[cfg(stack_fibers)]
             krio_fiber_active,
             // Per-fiber arena. Off by default — see field comment
             // for the escape-barrier requirements that gate flipping
@@ -4334,18 +4335,41 @@ impl VM {
 
     /// An AOT program on wasm: its shadow stack, from here to the frame
     /// that made the VM, where compiled frames store what they hold
-    /// across calls.
+    /// across calls. With fibers, each live fiber's region (its side
+    /// stack, where a suspended frame's locals are, and its own shadow
+    /// stack) and the program's stack under the outermost running
+    /// fiber.
     #[cfg(not(feature = "host"))]
     fn conservative_stack_ranges(&self) -> Vec<(usize, usize)> {
         #[cfg(target_arch = "wasm32")]
         {
             use crate::codegen::runtime_fns::{WASM_STACK_TOP, wasm_stack_here};
             let top = WASM_STACK_TOP.load(std::sync::atomic::Ordering::Relaxed);
+            let mut ranges = Vec::new();
+            #[cfg(stack_fibers)]
+            {
+                self.gc.for_each_fiber(|f| unsafe {
+                    if let Some(k) = (*f).krio_fiber.as_deref()
+                        && !k.is_done()
+                    {
+                        let (lo, len) = k.stack_range();
+                        ranges.push((lo as usize, lo as usize + len));
+                    }
+                });
+                if let Some(sp) = crate::runtime::stack_fiber::outermost_caller_sp() {
+                    if top > sp {
+                        ranges.push((sp, top));
+                    }
+                    return ranges;
+                }
+            }
             let here = wasm_stack_here();
             if top > here {
-                return vec![(here, top)];
+                ranges.push((here, top));
             }
+            return ranges;
         }
+        #[allow(unreachable_code)]
         Vec::new()
     }
 }
@@ -4485,7 +4509,7 @@ impl NativeContext for VM {
         self.fiber
     }
 
-    #[cfg(feature = "host")]
+    #[cfg(stack_fibers)]
     fn krio_vm_raw_ptr(&mut self) -> *mut u8 {
         if self.krio_fiber_active {
             self as *mut VM as *mut u8
@@ -4493,7 +4517,7 @@ impl NativeContext for VM {
             std::ptr::null_mut()
         }
     }
-    #[cfg(feature = "host")]
+    #[cfg(stack_fibers)]
     fn krio_fiber_active(&self) -> bool {
         self.krio_fiber_active
     }

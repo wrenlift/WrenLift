@@ -93,12 +93,14 @@ wlift
 
 ```sh
 wlift --aot program.wasm --aot-target wasm32-wasip1 script.wren
-wasmtime program.wasm
+wlift program.wasm
 ```
 
 The result is a WASI module holding the compiled program and the runtime
-it calls. The [WebAssembly guide](https://wrenlift.com/docs/platform/wasm.html#aot)
-covers native libraries; running Wren in a page goes through `wlift.js`.
+it calls, which `wlift` runs as its host. Add `--aot-fibers` for fibers
+that suspend inside compiled code. The [WebAssembly guide](https://wrenlift.com/docs/platform/wasm.html#aot)
+covers fibers and native libraries; running Wren in a page goes through
+`wlift.js`.
 
 ### Execution modes
 

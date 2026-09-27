@@ -445,6 +445,7 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_register_program",
     "wlift_aot_run_programs",
     "wlift_aot_set_native_loader",
+    "wlift_aot_use_fiber_stacks",
     "wlift_runtime_callout_depth",
     "wlift_aot_register_module",
     "wlift_aot_import_module_var",
@@ -453,6 +454,24 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_publish_module",
     "wlift_error_pending",
 ];
+
+/// Give `vm`'s fibers stacks of their own, so a compiled body suspends
+/// and resumes: what a wasm program linked with the fiber transform
+/// asks for. Native AOT programs always have them.
+///
+/// # Safety
+/// `vm` must be a live VM.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_use_fiber_stacks(vm: *mut WrenVM) {
+    #[cfg(stack_fibers)]
+    if let Some(vm) = unsafe { vm.as_mut() } {
+        vm.krio_fiber_active = true;
+        vm.engine.fibers_have_stacks = true;
+    }
+    #[cfg(not(stack_fibers))]
+    let _ = vm;
+}
 
 /// Let a wasm program reach the side modules its host loaded beside
 /// it, through forwards to the host's `ash_host_dlopen` and
@@ -592,7 +611,7 @@ pub unsafe extern "C" fn wlift_aot_init_prelude(
     // null-`vm_ptr` else branch), so the body's own `vm.fiber = target`
     // assignment leaks out and the next allocation routes through the
     // wrong fiber's arena.
-    #[cfg(feature = "host")]
+    #[cfg(stack_fibers)]
     crate::runtime::vm::__set_thread_local_current_vm(vm);
     let vm_ref = unsafe { &*vm };
     for (i, name) in crate::sema::PRELUDE_NAMES.iter().enumerate() {

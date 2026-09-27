@@ -12,8 +12,8 @@ use std::process::Command;
 
 use wren_lift::codegen::aot::{AotBundleMeta, walk_imports};
 use wren_lift::codegen::llvm_aot::{
-    AotEntry, LlvmTarget, compile_modules_to_llvm_object, compile_modules_to_llvm_object_as,
-    link_wasm, place_wasm_libraries,
+    AotBuild, AotEntry, LlvmTarget, compile_modules_to_llvm_object,
+    compile_modules_to_llvm_object_as, link_wasm, place_wasm_libraries,
 };
 
 /// How the program object and the runtime object become one module.
@@ -81,6 +81,71 @@ fn run_linked(files: &[(&str, &str)], how: Link, env: &[(&str, &str)]) -> Option
     Some(run_module(&wasm, env))
 }
 
+/// The fiber imports, answered as ash's wasmtime host does for a module
+/// linked with the fiber transform: a yield sets the transform's state
+/// so the instrumented frames unwind, or ends a rewind; `arm` points the
+/// transform at a fiber's side stack and swaps the shadow stack pointer.
+/// A module without the transform's globals runs its fibers to the end.
+fn fiber_imports<T: 'static>(linker: &mut wasmtime::Linker<T>) {
+    use wasmtime::{Caller, Extern, Global, Val};
+    const UNWINDING: i32 = 1;
+    const REWINDING: i32 = 2;
+    fn global<T>(caller: &mut Caller<'_, T>, name: &str) -> Option<Global> {
+        match caller.get_export(name) {
+            Some(Extern::Global(g)) => Some(g),
+            _ => None,
+        }
+    }
+    linker
+        .func_wrap(
+            "env",
+            "ash_host_fiber_yield",
+            |mut caller: Caller<'_, T>| {
+                if let Some(state) = global(&mut caller, "ash_fiber_state") {
+                    let now = state.get(&mut caller).i32().unwrap_or(0);
+                    let next = if now == REWINDING { 0 } else { UNWINDING };
+                    state.set(&mut caller, Val::I32(next)).expect("state");
+                }
+            },
+        )
+        .expect("fiber yield");
+    linker
+        .func_wrap(
+            "env",
+            "ash_host_fiber_state",
+            |mut caller: Caller<'_, T>| -> i32 {
+                global(&mut caller, "ash_fiber_state")
+                    .and_then(|g| g.get(&mut caller).i32())
+                    .unwrap_or(0)
+            },
+        )
+        .expect("fiber state");
+    linker
+        .func_wrap(
+            "env",
+            "ash_host_fiber_arm",
+            |mut caller: Caller<'_, T>, data: i32, rewind: i32, sp: i32| -> i32 {
+                if let Some(g) = global(&mut caller, "ash_fiber_data") {
+                    g.set(&mut caller, Val::I32(data)).expect("data");
+                }
+                if let Some(g) = global(&mut caller, "ash_fiber_state") {
+                    let next = if rewind != 0 { REWINDING } else { 0 };
+                    g.set(&mut caller, Val::I32(next)).expect("state");
+                }
+                match global(&mut caller, "__stack_pointer") {
+                    Some(g) if sp != 0 => {
+                        let was = g.get(&mut caller).i32().unwrap_or(0);
+                        g.set(&mut caller, Val::I32(sp)).expect("sp");
+                        was
+                    }
+                    Some(g) => g.get(&mut caller).i32().unwrap_or(0),
+                    None => 0,
+                }
+            },
+        )
+        .expect("fiber arm");
+}
+
 /// Run a WASI command module with `env`, and the directory it is in as
 /// its working directory; its exit code and stdout.
 fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
@@ -106,6 +171,7 @@ fn run_module(wasm: &Path, env: &[(&str, &str)]) -> (i32, String) {
     let mut store = Store::new(&engine, wasi);
     let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
     preview1::add_to_linker_sync(&mut linker, |s| s).expect("wasi imports");
+    fiber_imports(&mut linker);
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiating the program");
@@ -312,6 +378,7 @@ mod host {
         );
         let mut linker: Linker<Host> = Linker::new(engine);
         preview1::add_to_linker_sync(&mut linker, |h| &mut h.wasi).expect("wasi imports");
+        super::fiber_imports(&mut linker);
         linker
             .func_wrap(
                 "env",
@@ -783,6 +850,7 @@ System.print("module ran")
     let mut store: Store<WasiP1Ctx> = Store::new(&engine, wasi);
     let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
     preview1::add_to_linker_sync(&mut linker, |s| s).expect("wasi imports");
+    fiber_imports(&mut linker);
     let module = Module::new(&engine, &module).expect("load the library");
     let instance = linker
         .instantiate(&mut store, &module)
@@ -936,13 +1004,16 @@ fn a_reloaded_module_gives_its_classes_new_methods() {
         std::fs::write(&entry, source).expect("write counter");
         let mut walk = walk_imports(&entry).expect("walk");
         walk.modules.last_mut().unwrap().request_name = "demo/counter".to_string();
+        let build = AotBuild {
+            entry: entry_kind,
+            reloadable: true,
+            ..AotBuild::default()
+        };
         compile_modules_to_llvm_object_with(
             &walk.modules,
             &AotBundleMeta::default(),
             &target,
-            entry_kind,
-            true,
-            &[],
+            &build,
             object,
         )
         .expect("compile");
@@ -1172,13 +1243,15 @@ System.print(c.bump(4))
     let walk = walk_imports(&entry).expect("walk");
     let target = LlvmTarget::new("wasm32-wasip1", None, None);
     let program = dir.path().join("main.o");
+    let build = AotBuild {
+        foreign: &foreign,
+        ..AotBuild::default()
+    };
     compile_modules_to_llvm_object_with(
         &walk.modules,
         &AotBundleMeta::default(),
         &target,
-        AotEntry::Main,
-        false,
-        &foreign,
+        &build,
         &program,
     )
     .expect("compile");
@@ -1354,8 +1427,8 @@ fn an_uncaught_error_ends_the_program_with_70() {
     assert_eq!((code, out.as_str()), (70, "1\n"));
 }
 
-/// A yield inside compiled code needs a fiber stack, which wasm does not
-/// have yet: it raises instead of running on past the yield.
+/// Built without fibers, a yield inside compiled code has no stack to
+/// suspend: it raises instead of running on past the yield.
 #[test]
 fn a_yield_in_compiled_code_raises() {
     let Some((code, out)) = run_wasm(&[(
@@ -1365,6 +1438,92 @@ fn a_yield_in_compiled_code_raises() {
         return;
     };
     assert_eq!((code, out.as_str()), (70, ""));
+}
+
+/// Compile `files` for wasm32 with fibers, link them with the fiber
+/// transform and run it with `env`; its exit code and stdout. `None`
+/// without the runtime object.
+fn run_with_fibers(files: &[(&str, &str)], env: &[(&str, &str)]) -> Option<(i32, String)> {
+    use wren_lift::codegen::llvm_aot::{
+        WasmLink, compile_modules_to_llvm_object_with, link_wasm_with,
+    };
+    let runtime = common::runtime_object()?;
+    let dir = tempfile::Builder::new()
+        .prefix("wlift_wasm_fibers_")
+        .tempdir()
+        .expect("tempdir");
+    for (name, source) in files {
+        std::fs::write(dir.path().join(format!("{name}.wren")), source).expect("write source");
+    }
+    let walk = walk_imports(&dir.path().join(format!("{}.wren", files[0].0))).expect("walk");
+    let object = dir.path().join("program.o");
+    let target = LlvmTarget::new("wasm32-wasip1", None, None);
+    let build = AotBuild {
+        fibers: true,
+        ..AotBuild::default()
+    };
+    compile_modules_to_llvm_object_with(
+        &walk.modules,
+        &AotBundleMeta::default(),
+        &target,
+        &build,
+        &object,
+    )
+    .expect("compile");
+    let wasm = dir.path().join("program.wasm");
+    let link = WasmLink {
+        fibers: true,
+        ..WasmLink::default()
+    };
+    link_wasm_with(&object, &runtime, &wasm, &link).expect("link");
+    Some(run_module(&wasm, env))
+}
+
+const SUSPENDING: &str = r#"
+class Counter {
+  static run(from) {
+    var n = from
+    while (true) {
+      var got = Fiber.yield(n)
+      n = n + got
+    }
+  }
+}
+var f = Fiber.new { Counter.run(10) }
+System.print(f.call())
+System.print(f.call(1))
+System.print(f.call(5))
+var g = Fiber.new {
+  Fiber.yield("a")
+  Fiber.yield("b")
+  "done"
+}
+System.print([g.call(), g.call(), g.call(), g.isDone])
+var keep = []
+for (i in 0...20000) keep.add("s%(i)")
+System.print(f.call(100))
+System.print(keep.count)
+"#;
+const SUSPENDED: &str = "10\n11\n16\n[a, b, done, true]\n116\n20000\n";
+
+/// Built with fibers, a fiber suspends inside compiled code and resumes
+/// where it stopped, with the values `call` and `yield` pass.
+#[test]
+fn a_fiber_suspends_inside_compiled_code() {
+    let Some(result) = run_with_fibers(&[("main", SUSPENDING)], &[]) else {
+        return;
+    };
+    assert_eq!(result, (0, SUSPENDED.to_string()));
+}
+
+/// A suspended fiber's frames are in its side stack, where the collector
+/// finds them: collecting at every allocation loses none.
+#[test]
+fn a_collection_keeps_what_a_suspended_fiber_holds() {
+    let Some(result) = run_with_fibers(&[("main", SUSPENDING)], &[("WLIFT_GC_STRESS", "1")]) else {
+        return;
+    };
+    assert_eq!(result, (0, SUSPENDED.to_string()));
 }
 
 /// The features of an object compiled for `target`, as its

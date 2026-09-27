@@ -152,11 +152,11 @@ pub(crate) fn fiber_new_inner(
             // a per-fiber mmap stack and a body closure that runs the
             // Wren-level fiber body on that stack. Fiber.call drives
             // krio.resume_with(input); Fiber.yield inside calls
-            // krio_fiber::yield_value to switch back synchronously.
+            // crate::runtime::stack_fiber::yield_value to switch back synchronously.
             // The fiber's mir_frames is already prepared above by
             // setup_fiber_from_closure — the body just needs to point
             // `vm.fiber` at us and run the existing interpreter loop.
-            #[cfg(feature = "host")]
+            #[cfg(stack_fibers)]
             if ctx.krio_fiber_active() {
                 let vm_ptr = ctx.krio_vm_raw_ptr();
                 if !vm_ptr.is_null() {
@@ -180,12 +180,18 @@ pub(crate) fn fiber_new_inner(
                         .map(|kb| kb * 1024)
                         .or(parent_stack_request)
                         .unwrap_or(256 * 1024);
-                    let krio = krio_fiber::Fiber::with_stack_size(stack_bytes, move || {
-                        krio_fiber_body(vm_ptr_usize, target_ptr_usize);
-                    });
+                    let krio = crate::runtime::stack_fiber::Fiber::with_stack_size(
+                        stack_bytes,
+                        move || {
+                            krio_fiber_body(vm_ptr_usize, target_ptr_usize);
+                        },
+                    );
                     unsafe {
                         (*fiber).krio_fiber = Some(crate::runtime::object::KrioStack::new(krio));
-                        (*fiber).thread = crate::runtime::stw::thread_key();
+                        #[cfg(feature = "host")]
+                        {
+                            (*fiber).thread = crate::runtime::stw::thread_key();
+                        }
                     }
                     // Charge the krio mmap stack against GC pressure.
                     // Without this the Wren heap accounting only sees
@@ -456,7 +462,7 @@ fn fiber_yield_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::null()
 }
 
-/// If the current thread is executing inside a `krio_fiber::Fiber`,
+/// If the current thread is executing inside a `crate::runtime::stack_fiber::Fiber`,
 /// route the yield through krio's synchronous context switch and
 /// return whatever value the host pumps back via `resume_with`. The
 /// `pending_fiber_action` path is skipped entirely on this branch —
@@ -468,9 +474,9 @@ fn fiber_yield_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 /// change a no-op when `WLIFT_KRIO_FIBER` is off OR when the fiber
 /// was allocated under the stackless path (krio fiber backing is
 /// per-ObjFiber, not global).
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 fn try_krio_yield(value: Value) -> Option<Value> {
-    krio_fiber::current_fiber_id()?;
+    crate::runtime::stack_fiber::current_fiber_id()?;
 
     // Caller-aware split: krio's context switch is the right
     // answer for a top-level Fiber.yield (no Wren caller — the
@@ -522,7 +528,7 @@ fn try_krio_yield(value: Value) -> Option<Value> {
     let jit_ctx = crate::codegen::runtime_fns::read_jit_ctx();
     let jit_depth = crate::codegen::runtime_fns::jit_depth();
     let frames = crate::codegen::runtime_fns::native_frames_state();
-    let received: Option<u64> = krio_fiber::yield_u64(value.to_bits());
+    let received: Option<u64> = crate::runtime::stack_fiber::yield_u64(value.to_bits());
     crate::codegen::runtime_fns::set_jit_context(jit_ctx);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
     crate::codegen::runtime_fns::set_native_frames_state(frames);
@@ -539,13 +545,13 @@ fn try_krio_yield(value: Value) -> Option<Value> {
 // ObjFiber it belongs to (krio's id is internal), and even if it
 // did, mutating `*mut ObjFiber` from inside the fiber while the
 // host holds `&mut self` would be UB.
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 thread_local! {
     static KRIO_YIELD_ROOTS_HANDOFF: std::cell::RefCell<Vec<Value>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-#[cfg(not(feature = "host"))]
+#[cfg(not(stack_fibers))]
 fn try_krio_yield(_value: Value) -> Option<Value> {
     None
 }
@@ -571,13 +577,13 @@ pub(crate) fn try_krio_yield_pub(value: Value) -> Option<Value> {
 /// Public wrapper around `try_krio_call` so the AOT/JIT fiber-action
 /// helper in `runtime_fns::handle_jit_fiber_action` can route fresh-
 /// fiber Calls through krio without duplicating its body.
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 pub fn try_krio_call_pub(target: *mut ObjFiber, input: Value) -> Option<Value> {
     try_krio_call(target, input)
 }
 
 /// True when this VM was constructed with krio backings active.
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 pub fn current_vm_krio_active(vm: &crate::runtime::vm::VM) -> bool {
     vm.krio_fiber_active
 }
@@ -605,7 +611,7 @@ pub fn current_vm_krio_active(vm: &crate::runtime::vm::VM) -> bool {
 /// to a terminal state where no further code will read those
 /// fields. The remaining `ObjFiber` shell is small (≈few hundred
 /// bytes) and is reaped by a later GC pass.
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
     unsafe {
         (*target).state = terminal;
@@ -631,6 +637,7 @@ unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
         // I missed" from "the drop point is wrong" — if holding
         // the region cures a crash, the bug is a missed barrier
         // somewhere; if it doesn't, the bug is elsewhere.
+        #[cfg(feature = "host")]
         if std::env::var_os("WLIFT_FIBER_ARENA_HOLD").is_some_and(|v| v == "1") {
             // Hold — let the ObjFiber's eventual GC sweep drop it.
         } else {
@@ -639,15 +646,21 @@ unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     let mut input = input;
     loop {
         let v = krio_call_once(target, input)?;
-        let vm_ptr = crate::runtime::vm::current_vm_ptr();
-        let travelling = !vm_ptr.is_null()
-            && unsafe { (*vm_ptr).sched.is_some() }
-            && crate::runtime::sched::park_travels_through_here(vm_ptr);
+        // Only a native scheduler parks a task from under a fiber.
+        #[cfg(feature = "host")]
+        let travelling = {
+            let vm_ptr = crate::runtime::vm::current_vm_ptr();
+            !vm_ptr.is_null()
+                && unsafe { (*vm_ptr).sched.is_some() }
+                && crate::runtime::sched::park_travels_through_here(vm_ptr)
+        };
+        #[cfg(not(feature = "host"))]
+        let travelling = false;
         if !travelling {
             return Some(v);
         }
@@ -659,7 +672,7 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // Establish that target has a krio backing before we start
     // doing any save/restore work. Early-return None lets the
@@ -669,7 +682,9 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     }
     // A fiber runs on the thread that made it: its stack is scanned
     // and its register files registered there.
+    #[cfg(feature = "host")]
     let owner = unsafe { (*target).thread };
+    #[cfg(feature = "host")]
     if owner != 0 && owner != crate::runtime::stw::thread_key() {
         let vm_ptr = crate::runtime::vm::current_vm_ptr();
         if !vm_ptr.is_null() {
@@ -726,12 +741,13 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // raw pointers — the host's borrow ends at the resume_with
     // call boundary because the body's first statement is a
     // context switch onto the fiber's stack.
-    let krio_ptr: *mut krio_fiber::Fiber = unsafe { (*target).krio_fiber.as_deref_mut().unwrap() };
+    let krio_ptr: *mut crate::runtime::stack_fiber::Fiber =
+        unsafe { (*target).krio_fiber.as_deref_mut().unwrap() };
     // The stack this switches away from is suspended from here, and the
     // target's from wherever it yields, for a host that scans stacks
     // itself (see `rt`). Told before the switch and after the return,
     // so a collection in between sees both.
-    let outgoing = krio_fiber::current_fiber_id().unwrap_or(0);
+    let outgoing = crate::runtime::stack_fiber::current_fiber_id().unwrap_or(0);
     unsafe { crate::runtime::rt::stack_suspended(outgoing, super::super::stack_scan::approx_sp()) };
     // A host's state per stack goes with the switch, both ways.
     let target_id = unsafe { (*krio_ptr).id() };
@@ -743,7 +759,7 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     let frames = crate::codegen::runtime_fns::native_frames_state();
     // `resume_with_u64` is the alloc-free counterpart of the
     // generic `resume_with::<u64>` — see the matching comment on
-    // `krio_fiber::yield_u64` in `try_krio_yield`.
+    // `crate::runtime::stack_fiber::yield_u64` in `try_krio_yield`.
     let step = unsafe { (*krio_ptr).resume_with_u64(input.to_bits()) };
     crate::codegen::runtime_fns::set_jit_context(jit_ctx);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
@@ -769,7 +785,7 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // body emptied JIT_ROOTS_STORE on exit (or it's still got
     // whatever leaked into it, which we collect for the next
     // re-entry).
-    let saved_fiber_roots = if matches!(step, krio_fiber::FiberStep::Yielded) {
+    let saved_fiber_roots = if matches!(step, crate::runtime::stack_fiber::FiberStep::Yielded) {
         KRIO_YIELD_ROOTS_HANDOFF.with(|cell| cell.replace(Vec::new()))
     } else {
         crate::codegen::runtime_fns::take_jit_roots()
@@ -781,10 +797,10 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     crate::codegen::runtime_fns::set_jit_roots(host_roots);
 
     let result = match step {
-        krio_fiber::FiberStep::Yielded => {
+        crate::runtime::stack_fiber::FiberStep::Yielded => {
             let krio = unsafe { &mut *krio_ptr };
             // `take_yield_u64` reads the alloc-free fast-path slot
-            // populated by `krio_fiber::yield_u64`. `take_yield_any`
+            // populated by `crate::runtime::stack_fiber::yield_u64`. `take_yield_any`
             // would force the fiber side to box the u64 into a
             // `Box<dyn Any>` per yield — the leak this whole path
             // is unwinding.
@@ -813,7 +829,7 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
                 v
             }
         }
-        krio_fiber::FiberStep::Done => {
+        crate::runtime::stack_fiber::FiberStep::Done => {
             // Wren semantics (verified against wren-lang/wren
             // src/vm/wren_core.c: fiber_try is identical to fiber_call
             // except it marks the caller's state as FIBER_TRY for
@@ -861,7 +877,7 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
             }
             v
         }
-        krio_fiber::FiberStep::Errored => {
+        crate::runtime::stack_fiber::FiberStep::Errored => {
             // Escape barrier: the `(*target).error` Value may live
             // in the child's region — same dangling-pointer hazard
             // as the Done arm. Copy out before the region drops.
@@ -885,7 +901,7 @@ fn krio_call_once(target: *mut ObjFiber, input: Value) -> Option<Value> {
     Some(result)
 }
 
-#[cfg(not(feature = "host"))]
+#[cfg(not(stack_fibers))]
 fn try_krio_call(_target: *mut ObjFiber, _input: Value) -> Option<Value> {
     None
 }
@@ -907,7 +923,7 @@ fn try_krio_call(_target: *mut ObjFiber, _input: Value) -> Option<Value> {
 /// fiber (the VM outlives every ObjFiber it allocates). `target_ptr`
 /// must be a valid `*mut ObjFiber` whose mir_frames were prepared
 /// by `setup_fiber_from_closure` before this body runs.
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
     use crate::runtime::object::FiberState;
     use crate::runtime::vm::VM;
@@ -919,7 +935,7 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
     // For `Fiber.call(v)`, v is the closure's first argument; for
     // `Fiber.call()` (no arg) it's null. We bind it into the
     // closure's first arg slot before running the interpreter.
-    let initial_bits: u64 = krio_fiber::take_input::<u64>().unwrap_or(0);
+    let initial_bits: u64 = crate::runtime::stack_fiber::take_input::<u64>().unwrap_or(0);
     let initial_val = Value::from_bits(initial_bits);
 
     unsafe {
@@ -949,7 +965,7 @@ fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
 
         // Run the fiber to completion on this physical stack. If
         // the Wren body calls `Fiber.yield(_)`, try_krio_yield
-        // routes through krio_fiber::yield_value, which performs a
+        // routes through crate::runtime::stack_fiber::yield_value, which performs a
         // synchronous context switch — control returns to the
         // host's resume_with call site, and run_fiber pauses here.
         // On the next resume_with, control re-enters the switch

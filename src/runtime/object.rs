@@ -1201,34 +1201,34 @@ impl std::fmt::Display for StackFrame {
 /// stack: `stack_new` when made, `stack_drop` before the stack is freed
 /// (see `rt`). Boxed because krio_fiber's trampoline holds raw pointers
 /// that must stay at a stable address even if the `ObjFiber` moves.
-#[cfg(feature = "host")]
-pub struct KrioStack(Box<krio_fiber::Fiber>);
+#[cfg(stack_fibers)]
+pub struct KrioStack(Box<crate::runtime::stack_fiber::Fiber>);
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 impl KrioStack {
-    pub fn new(fiber: krio_fiber::Fiber) -> Self {
+    pub fn new(fiber: crate::runtime::stack_fiber::Fiber) -> Self {
         let (base, size) = fiber.stack_range();
         unsafe { crate::runtime::rt::stack_new(fiber.id(), base as usize, size) };
         KrioStack(Box::new(fiber))
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 impl std::ops::Deref for KrioStack {
-    type Target = krio_fiber::Fiber;
-    fn deref(&self) -> &krio_fiber::Fiber {
+    type Target = crate::runtime::stack_fiber::Fiber;
+    fn deref(&self) -> &crate::runtime::stack_fiber::Fiber {
         &self.0
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 impl std::ops::DerefMut for KrioStack {
-    fn deref_mut(&mut self) -> &mut krio_fiber::Fiber {
+    fn deref_mut(&mut self) -> &mut crate::runtime::stack_fiber::Fiber {
         &mut self.0
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(stack_fibers)]
 impl Drop for KrioStack {
     fn drop(&mut self) {
         crate::runtime::live_regs::forget_stack(self.0.id());
@@ -1285,7 +1285,7 @@ pub struct ObjFiber {
     ///
     /// `None` for fibers created under the existing stackless path
     /// (BC interp, JIT, WASM), or anywhere the toggle is off.
-    #[cfg(feature = "host")]
+    #[cfg(stack_fibers)]
     pub krio_fiber: Option<KrioStack>,
     /// The OS thread the fiber runs on: its stack was made there and
     /// its interpreter state is registered there. 0 for any.
@@ -1319,7 +1319,7 @@ pub struct ObjFiber {
     /// Cleared (back to null) every time the host re-enters the
     /// fiber, so a subsequent abnormal exit doesn't return a stale
     /// value.
-    #[cfg(feature = "host")]
+    #[cfg(stack_fibers)]
     pub krio_return_value: Value,
 
     /// Saved JIT_ROOTS_STORE contents for this fiber while it's
@@ -1334,7 +1334,7 @@ pub struct ObjFiber {
     /// Empty Vec means "fiber has no live roots" — equivalent to
     /// installing an empty roots store on resume. Re-snapshotted
     /// every time the fiber yields.
-    #[cfg(feature = "host")]
+    #[cfg(stack_fibers)]
     pub krio_jit_roots: Vec<Value>,
 }
 
@@ -1361,15 +1361,15 @@ impl ObjFiber {
             context_map: Value::null(),
             cancelled: false,
             deadline_ms: None,
-            #[cfg(feature = "host")]
+            #[cfg(stack_fibers)]
             krio_fiber: None,
             #[cfg(feature = "host")]
             thread: 0,
             #[cfg(feature = "host")]
             region: None,
-            #[cfg(feature = "host")]
+            #[cfg(stack_fibers)]
             krio_return_value: Value::null(),
-            #[cfg(feature = "host")]
+            #[cfg(stack_fibers)]
             krio_jit_roots: Vec::new(),
         }
     }

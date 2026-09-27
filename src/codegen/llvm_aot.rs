@@ -154,6 +154,24 @@ pub struct AotForeignMember {
     pub symbol: String,
 }
 
+/// How to build a program object: its bootstrap, and what it is built for.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AotBuild<'a> {
+    pub entry: AotEntry,
+    /// A program whose modules an [`AotEntry::Reload`] object can replace
+    /// while it runs: every call into another class goes through
+    /// dispatch, so it reaches whatever methods the class has now, and
+    /// the bootstrap registers each module's variables by name. Link it
+    /// with [`link_wasm_reloadable`].
+    pub reloadable: bool,
+    /// On wasm, give fibers stacks of their own, so a compiled body
+    /// suspends and resumes; link it with the fiber transform
+    /// ([`WasmLink::fibers`]).
+    pub fibers: bool,
+    /// The modules another language supplies ([`AotForeignModule`]).
+    pub foreign: &'a [AotForeignModule],
+}
+
 /// What an object's bootstrap is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AotEntry {
@@ -202,27 +220,25 @@ pub fn compile_modules_to_llvm_object_as(
     entry: AotEntry,
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
-    compile_modules_to_llvm_object_with(modules, bundle, target, entry, false, &[], output)
+    let build = AotBuild {
+        entry,
+        ..AotBuild::default()
+    };
+    compile_modules_to_llvm_object_with(modules, bundle, target, &build, output)
 }
 
-/// [`compile_modules_to_llvm_object_as`], and when `reloadable`, a
-/// program whose modules an [`AotEntry::Reload`] object can replace
-/// while it runs: every call into another class goes through dispatch,
-/// so it reaches whatever methods the class has now, and the bootstrap
-/// registers each module's variables by name. Link it with
-/// [`link_wasm_reloadable`].
-///
-/// `foreign` are the modules another language supplies ([`AotForeignModule`]).
+/// Lower `modules` (dependencies first, entry last) into one object at
+/// `output` for `target`, as `build` says.
 pub fn compile_modules_to_llvm_object_with(
     modules: &[AotModule],
     bundle: &AotBundleMeta,
     target: &LlvmTarget,
-    entry: AotEntry,
-    reloadable: bool,
-    foreign: &[AotForeignModule],
+    build: &AotBuild,
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
-    let reloadable = reloadable || entry == AotEntry::Reload;
+    let entry = build.entry;
+    let foreign = build.foreign;
+    let reloadable = build.reloadable || entry == AotEntry::Reload;
     if modules.is_empty() {
         return Err(AotError::Frontend("no modules to emit".into()));
     }
@@ -451,9 +467,12 @@ pub fn compile_modules_to_llvm_object_with(
     .emit(
         &manifests,
         &tables,
-        target.is_wasm(),
-        entry,
-        reloadable,
+        Flavor {
+            wasm: target.is_wasm(),
+            entry,
+            reloadable,
+            fibers: build.fibers && target.is_wasm(),
+        },
         (&foreign_tables, &foreign_imports),
     )
     .map_err(module_err)?;
@@ -564,14 +583,30 @@ pub fn locate_wasm_runtime() -> Option<std::path::PathBuf> {
 /// program exports its memory, table, `malloc` and exactly the runtime
 /// functions and data they import.
 pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
-    link_wasm_hosting(program, runtime, output, false)
+    link_wasm_with(program, runtime, output, &WasmLink::default())
 }
 
 /// [`link_wasm`] for a program built reloadable: it also exports what an
 /// [`AotEntry::Reload`] side module imports, the runtime's helpers and
 /// entry points, for its host to load one while it runs.
 pub fn link_wasm_reloadable(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
-    link_wasm_hosting(program, runtime, output, true)
+    let link = WasmLink {
+        reloadable: true,
+        ..WasmLink::default()
+    };
+    link_wasm_with(program, runtime, output, &link)
+}
+
+/// How [`link_wasm_with`] links a program.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WasmLink {
+    /// A program built reloadable ([`AotBuild::reloadable`]).
+    pub reloadable: bool,
+    /// Instrument the program so a fiber can suspend inside compiled
+    /// code and resume there, for a program built with
+    /// [`AotBuild::fibers`]. Its host answers the fiber imports, as
+    /// `wlift run` does.
+    pub fibers: bool,
 }
 
 /// Link an [`AotEntry::Reload`] object into the side module at `output`
@@ -605,11 +640,12 @@ pub fn reload_host_exports() -> (Vec<String>, Vec<String>) {
     )
 }
 
-fn link_wasm_hosting(
+/// [`link_wasm`], as `link` says.
+pub fn link_wasm_with(
     program: &Path,
     runtime: &Path,
     output: &Path,
-    reloadable: bool,
+    link: &WasmLink,
 ) -> Result<(), AotError> {
     let read = |path: &Path| -> Result<ash_wasm_link::Object, AotError> {
         let bytes = std::fs::read(path).map_err(AotError::Io)?;
@@ -622,7 +658,8 @@ fn link_wasm_hosting(
         options.hdll_imports.extend(side.functions);
         options.hdll_data.extend(side.data);
     }
-    if reloadable {
+    options.fibers = link.fibers;
+    if link.reloadable {
         let (functions, data) = reload_host_exports();
         options.hdll_imports.extend(functions);
         options.hdll_data.extend(data);
@@ -772,6 +809,16 @@ pub fn place_wasm_libraries(
 }
 
 /// What the bootstrap reaches of one lowered module.
+/// What a bootstrap is for: the target, the kind of object, and whether
+/// the program is reloadable and has fiber stacks.
+#[derive(Clone, Copy)]
+struct Flavor {
+    wasm: bool,
+    entry: AotEntry,
+    reloadable: bool,
+    fibers: bool,
+}
+
 /// An import bound to a foreign class: this module's `target_slot` takes
 /// class `class` of foreign module `module`.
 #[derive(Clone, Copy)]
@@ -1232,11 +1279,15 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         mut self,
         manifests: &[AotManifest],
         tables: &[ModuleTables<'ctx>],
-        wasm: bool,
-        entry_kind: AotEntry,
-        reloadable: bool,
+        flavor: Flavor,
         (foreign, foreign_imports): (&[ForeignTables<'ctx>], &[Vec<ForeignImport>]),
     ) -> Result<(), String> {
+        let Flavor {
+            wasm,
+            entry: entry_kind,
+            reloadable,
+            fibers,
+        } = flavor;
         let reload = entry_kind == AotEntry::Reload;
         // Both run in a VM their host made.
         let library = entry_kind == AotEntry::Library || reload;
@@ -1378,6 +1429,11 @@ impl<'ctx> Bootstrap<'ctx, '_> {
 
         self.b.position_at_end(body);
         let vmv: BasicValueEnum = vm.into();
+        // The program it reloads into already has them.
+        if fibers && !reload {
+            let stacks = self.import("wlift_aot_use_fiber_stacks", &[Ptr], None);
+            self.call(stacks, &[vmv])?;
+        }
         // Only a program with foreign classes reaches the side modules its
         // host loaded, and only it imports Ash's dlopen and dlsym.
         if wasm
