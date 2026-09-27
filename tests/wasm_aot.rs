@@ -730,6 +730,12 @@ System.print("module ran")
         .call(&mut store, ())
         .expect("a raising member returns");
     assert_eq!(take_error.call(&mut store, vm).unwrap(), 70);
+    assert_eq!(
+        take_error.call(&mut store, vm).unwrap(),
+        0,
+        "taking the error clears it"
+    );
+    assert_eq!(back(double.call(&mut store, num(4.0)).unwrap()), 8.0);
 }
 
 /// A native library as a `dylink.0` side module, the shape an Ash host

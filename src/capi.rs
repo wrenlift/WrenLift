@@ -1438,9 +1438,9 @@ pub unsafe extern "C" fn wlift_aot_run_programs(vm: *mut WrenVM) -> c_int {
     0
 }
 
-/// After a module body: report the error it left uncaught, as the
-/// interpreter does, and return the exit code for it, 70; 0 when the
-/// body finished cleanly.
+/// After a module body, or a call into a library's member: report the
+/// error it left uncaught, as the interpreter does, clear it, and return
+/// the exit code for it, 70; 0 when there was none.
 ///
 /// # Safety
 /// `vm` must be the VM the bootstrap made.
@@ -1453,6 +1453,7 @@ pub unsafe extern "C" fn wlift_aot_take_error(vm: *mut WrenVM) -> c_int {
     if !vm.has_error {
         return 0;
     }
+    vm.has_error = false;
     let msg = vm
         .last_error
         .take()
