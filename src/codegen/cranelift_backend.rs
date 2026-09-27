@@ -63,13 +63,24 @@ pub mod cl {
         (-3..=4).contains(&exp)
     }
 
+    /// The constant an f64 value holds: a float constant, or an integer
+    /// constant converted.
     pub(crate) fn const_f64_of(mir: &MirFunction, vid: ValueId) -> Option<f64> {
-        mir.blocks.iter().find_map(|b| {
-            b.instructions.iter().find_map(|(d, i)| match i {
-                Instruction::ConstF64(c) if *d == vid => Some(*c),
-                _ => None,
+        let def = |v: ValueId| {
+            mir.blocks.iter().find_map(|b| {
+                b.instructions
+                    .iter()
+                    .find_map(|(d, i)| (*d == v).then_some(i))
             })
-        })
+        };
+        match def(vid)? {
+            Instruction::ConstF64(c) => Some(*c),
+            Instruction::I64ToF64(i) => match def(*i)? {
+                Instruction::ConstI64(n) => Some(*n as f64),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub(crate) fn is_positive_power_of_two(c: f64) -> bool {
@@ -7317,7 +7328,17 @@ pub mod cl {
             Instruction::AddF64(a, b) => Ok(Some(builder.ins().fadd(get(a), get(b)))),
             Instruction::SubF64(a, b) => Ok(Some(builder.ins().fsub(get(a), get(b)))),
             Instruction::MulF64(a, b) => Ok(Some(builder.ins().fmul(get(a), get(b)))),
-            Instruction::DivF64(a, b) => Ok(Some(builder.ins().fdiv(get(a), get(b)))),
+            // Dividing by a power of two multiplies by its reciprocal,
+            // which is exact, so the product rounds as the quotient does.
+            Instruction::DivF64(a, b) => {
+                match const_f64_of(mir, *b).filter(|c| is_positive_power_of_two(c.abs())) {
+                    Some(c) => {
+                        let inv = builder.ins().f64const(1.0 / c);
+                        Ok(Some(builder.ins().fmul(get(a), inv)))
+                    }
+                    None => Ok(Some(builder.ins().fdiv(get(a), get(b)))),
+                }
+            }
             Instruction::ModF64(a, b) => {
                 let av = get(a);
                 let bv = get(b);
