@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":5,"timestamp":1790467655,"nonce":"57+yfZfHX6Xhl03Htq2fhJnQbP4=","added":["perf","area:jit"],"removed":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":2,"timestamp":1790468766,"nonce":"YMxZa0pEyRwjaKO6+mqZZljc0j0=","title":"Close the gap to LuaJIT (JIT on) across the benchmark suite","was":"Benchmarks Game kernels: where a published Wren JIT is ahead"}]}
