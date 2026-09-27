@@ -2690,8 +2690,8 @@ pub mod llvm {
                 self.vals.insert(vid, v);
             }
             for (i, &(vid, ref inst)) in block.instructions.iter().enumerate() {
-                // A call whose result is guarded next may leave the
-                // function on a class miss instead of calling.
+                // A call or element read whose result is guarded next
+                // may leave the function on a miss instead of calling.
                 self.miss_exit = match block.instructions.get(i + 1) {
                     Some((
                         _,
@@ -2703,10 +2703,11 @@ pub mod llvm {
                             ..
                         },
                     )) if *value == vid
-                        && matches!(
-                            inst,
-                            Instruction::Call { .. } | Instruction::CallKnownFunc { .. }
-                        ) =>
+                        && match inst {
+                            Instruction::Call { .. } | Instruction::CallKnownFunc { .. } => true,
+                            Instruction::SubscriptGet { args, .. } => args.len() == 1,
+                            _ => false,
+                        } =>
                     {
                         let regs: Vec<DeoptReg> = live
                             .iter()

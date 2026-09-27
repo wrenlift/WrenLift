@@ -1391,6 +1391,14 @@ pub mod cl {
     }
 
     thread_local! {
+        /// Where an element read whose result is guarded next leaves
+        /// the function instead of calling the helper: the read's
+        /// bytecode offset and the registers live before it.
+        static MISS_EXIT: std::cell::RefCell<Option<(u32, Vec<DeoptReg>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    thread_local! {
         /// The receiver of a body being spliced behind its class check,
         /// with that class.
         static INLINE_CLASS: std::cell::Cell<Option<(Value, usize)>> =
@@ -3985,7 +3993,7 @@ pub mod cl {
             }
 
             // Lower each instruction
-            for &(vid, ref inst) in &block.instructions {
+            for (inst_idx, &(vid, ref inst)) in block.instructions.iter().enumerate() {
                 if pre_defined.contains(&vid) {
                     continue;
                 }
@@ -4124,6 +4132,32 @@ pub mod cl {
                 // The code emitted for the instruction carries its site,
                 // so a return address into it names the site.
                 builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(site));
+                let miss = match (inst, block.instructions.get(inst_idx + 1), aot_config) {
+                    (
+                        Instruction::SubscriptGet { args, .. },
+                        Some((
+                            _,
+                            Instruction::GuardNumAt {
+                                value,
+                                live,
+                                call_pc,
+                                call_live,
+                                ..
+                            },
+                        )),
+                        None,
+                    ) if *value == vid && args.len() == 1 => {
+                        let regs: Vec<DeoptReg> = live
+                            .iter()
+                            .filter(|r| r.reg != vid.0)
+                            .chain(call_live.iter())
+                            .cloned()
+                            .collect();
+                        Some((*call_pc, regs))
+                    }
+                    _ => None,
+                };
+                MISS_EXIT.with(|m| *m.borrow_mut() = miss);
                 let result = lower_instruction(
                     inst,
                     mir,
@@ -4144,6 +4178,7 @@ pub mod cl {
                     Some((&raw_bools, &exit_value_types)),
                     Some(vid),
                 )?;
+                MISS_EXIT.with(|m| m.borrow_mut().take());
                 if let Some(val) = result {
                     val_map.insert(vid, val);
                     // A promotable baseline body profiles what each
@@ -6692,6 +6727,7 @@ pub mod cl {
             Instruction::SubscriptGet { receiver, args } if args.len() == 1 => {
                 let r = get(receiver);
                 let idx = get(&args[0]);
+                let miss = MISS_EXIT.with(|m| m.borrow_mut().take());
 
                 let after_is_obj = builder.create_block();
                 let typed_array_block = builder.create_block();
@@ -6986,8 +7022,27 @@ pub mod cl {
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(simd_i32_bits)]);
 
-                // 7. Slow path: existing runtime dispatch.
+                // 7. Slow path: a read whose result is guarded as a Num
+                //    leaves for the interpreter at the read, so the loop
+                //    around it keeps no value across a call; otherwise
+                //    the runtime dispatch.
                 builder.switch_to_block(slow_block);
+                if let (Some((pc, live)), Some((raw_bools, value_types))) = (miss, deopt_state) {
+                    builder.set_cold_block(slow_block);
+                    emit_deopt_at(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        jit_func_id(),
+                        pc,
+                        &live,
+                        val_map,
+                        raw_bools,
+                        value_types,
+                    )?;
+                    builder.switch_to_block(merge_block);
+                    return Ok(Some(builder.block_params(merge_block)[0]));
+                }
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_get", 2)?;
                 emit_cur_frame(builder);
                 let slow_call = builder.ins().call(slow_fn, &[r, idx]);
