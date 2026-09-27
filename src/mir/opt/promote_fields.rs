@@ -400,7 +400,7 @@ pub fn promote_fields(func: &mut MirFunction, classes: &Classes) -> bool {
     // entry.
     let mut split: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
     let mut extra: Vec<Vec<(ValueId, Vec<ValueId>)>> = vec![Vec::new(); nblocks];
-    for bi in 0..nblocks {
+    for (bi, extra_here) in extra.iter_mut().enumerate() {
         if !reachable.contains(&bi) {
             continue;
         }
@@ -425,7 +425,7 @@ pub fn promote_fields(func: &mut MirFunction, classes: &Classes) -> bool {
             for (f, v) in vals.iter().enumerate() {
                 func.scalar_param_sources.insert(*v, (n, f as u16));
             }
-            extra[bi].push((n, vals));
+            extra_here.push((n, vals));
         }
     }
     let originals: Vec<Vec<ValueId>> = func

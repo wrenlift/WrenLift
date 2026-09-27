@@ -2595,11 +2595,22 @@ pub mod llvm {
             }
             self.int_sources = int_sources(mir);
             self.class_facts = class_facts(mir, &self.move_roots);
+            // A block entered by an edge that does not go forward in
+            // reverse postorder; every cycle has one.
+            let order: HashMap<usize, usize> =
+                rpo.iter().enumerate().map(|(pos, &b)| (b, pos)).collect();
             let loop_headers: HashSet<usize> = mir
                 .blocks
                 .iter()
                 .enumerate()
-                .filter(|(i, b)| b.predecessors.iter().any(|p| p.0 as usize >= *i))
+                .filter(|(i, b)| {
+                    let Some(&at) = order.get(i) else {
+                        return false;
+                    };
+                    b.predecessors
+                        .iter()
+                        .any(|p| order.get(&(p.0 as usize)).is_some_and(|&q| q >= at))
+                })
                 .map(|(i, _)| i)
                 .collect();
             for &bi in &rpo {
@@ -2679,8 +2690,8 @@ pub mod llvm {
                 self.vals.insert(vid, v);
             }
             for (i, &(vid, ref inst)) in block.instructions.iter().enumerate() {
-                // A call whose result is guarded next may leave the
-                // function on a class miss instead of calling.
+                // A call or element read whose result is guarded next
+                // may leave the function on a miss instead of calling.
                 self.miss_exit = match block.instructions.get(i + 1) {
                     Some((
                         _,
@@ -2692,10 +2703,11 @@ pub mod llvm {
                             ..
                         },
                     )) if *value == vid
-                        && matches!(
-                            inst,
-                            Instruction::Call { .. } | Instruction::CallKnownFunc { .. }
-                        ) =>
+                        && match inst {
+                            Instruction::Call { .. } | Instruction::CallKnownFunc { .. } => true,
+                            Instruction::SubscriptGet { args, .. } => args.len() == 1,
+                            _ => false,
+                        } =>
                     {
                         let regs: Vec<DeoptReg> = live
                             .iter()

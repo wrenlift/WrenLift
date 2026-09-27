@@ -63,13 +63,24 @@ pub mod cl {
         (-3..=4).contains(&exp)
     }
 
+    /// The constant an f64 value holds: a float constant, or an integer
+    /// constant converted.
     pub(crate) fn const_f64_of(mir: &MirFunction, vid: ValueId) -> Option<f64> {
-        mir.blocks.iter().find_map(|b| {
-            b.instructions.iter().find_map(|(d, i)| match i {
-                Instruction::ConstF64(c) if *d == vid => Some(*c),
-                _ => None,
+        let def = |v: ValueId| {
+            mir.blocks.iter().find_map(|b| {
+                b.instructions
+                    .iter()
+                    .find_map(|(d, i)| (*d == v).then_some(i))
             })
-        })
+        };
+        match def(vid)? {
+            Instruction::ConstF64(c) => Some(*c),
+            Instruction::I64ToF64(i) => match def(*i)? {
+                Instruction::ConstI64(n) => Some(*n as f64),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub(crate) fn is_positive_power_of_two(c: f64) -> bool {
@@ -1377,6 +1388,14 @@ pub mod cl {
     /// next compile; pass 0 to clear.
     pub fn set_jit_modvars_cell(addr: usize) {
         JIT_MODVARS_CELL.with(|c| c.set(addr));
+    }
+
+    thread_local! {
+        /// Where an element read whose result is guarded next leaves
+        /// the function instead of calling the helper: the read's
+        /// bytecode offset and the registers live before it.
+        static MISS_EXIT: std::cell::RefCell<Option<(u32, Vec<DeoptReg>)>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     thread_local! {
@@ -3639,12 +3658,11 @@ pub mod cl {
             seen
         };
 
-        // Loop headers: any block H with a predecessor P where
-        // `P.id >= H.id`. The MIR builder lowers `while` / `for-in`
-        // / `continue` so the back-edge always jumps to a header
-        // whose id is less-than-or-equal to the body's id; this
-        // single CFG check identifies them without a dominator
-        // pass.
+        // Loop headers: any block H with a predecessor P that does
+        // not come before it in reverse postorder. Every cycle has
+        // such an edge, so each iteration of any loop passes one;
+        // block ids are not used, since inlining appends blocks that
+        // jump back to lower ids without closing a loop.
         //
         // Used by the back-edge `wren_jit_roots_restore` emit
         // below: long-running functions (the canonical case is
@@ -3657,10 +3675,18 @@ pub mod cl {
         // entries each iteration; the conservative stack scan
         // covers anything still live across the back-edge.
         let loop_headers: std::collections::HashSet<BlockId> = {
+            let order: HashMap<u32, usize> = rpo
+                .iter()
+                .enumerate()
+                .map(|(pos, &b)| (b as u32, pos))
+                .collect();
             let mut headers = std::collections::HashSet::new();
             for block in &mir.blocks {
+                let Some(&at) = order.get(&block.id.0) else {
+                    continue;
+                };
                 for &pred in &block.predecessors {
-                    if pred.0 >= block.id.0 {
+                    if order.get(&pred.0).is_some_and(|&p| p >= at) {
                         headers.insert(block.id);
                         break;
                     }
@@ -3967,7 +3993,7 @@ pub mod cl {
             }
 
             // Lower each instruction
-            for &(vid, ref inst) in &block.instructions {
+            for (inst_idx, &(vid, ref inst)) in block.instructions.iter().enumerate() {
                 if pre_defined.contains(&vid) {
                     continue;
                 }
@@ -4106,6 +4132,32 @@ pub mod cl {
                 // The code emitted for the instruction carries its site,
                 // so a return address into it names the site.
                 builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(site));
+                let miss = match (inst, block.instructions.get(inst_idx + 1), aot_config) {
+                    (
+                        Instruction::SubscriptGet { args, .. },
+                        Some((
+                            _,
+                            Instruction::GuardNumAt {
+                                value,
+                                live,
+                                call_pc,
+                                call_live,
+                                ..
+                            },
+                        )),
+                        None,
+                    ) if *value == vid && args.len() == 1 => {
+                        let regs: Vec<DeoptReg> = live
+                            .iter()
+                            .filter(|r| r.reg != vid.0)
+                            .chain(call_live.iter())
+                            .cloned()
+                            .collect();
+                        Some((*call_pc, regs))
+                    }
+                    _ => None,
+                };
+                MISS_EXIT.with(|m| *m.borrow_mut() = miss);
                 let result = lower_instruction(
                     inst,
                     mir,
@@ -4126,6 +4178,7 @@ pub mod cl {
                     Some((&raw_bools, &exit_value_types)),
                     Some(vid),
                 )?;
+                MISS_EXIT.with(|m| m.borrow_mut().take());
                 if let Some(val) = result {
                     val_map.insert(vid, val);
                     // A promotable baseline body profiles what each
@@ -6674,6 +6727,7 @@ pub mod cl {
             Instruction::SubscriptGet { receiver, args } if args.len() == 1 => {
                 let r = get(receiver);
                 let idx = get(&args[0]);
+                let miss = MISS_EXIT.with(|m| m.borrow_mut().take());
 
                 let after_is_obj = builder.create_block();
                 let typed_array_block = builder.create_block();
@@ -6704,7 +6758,7 @@ pub mod cl {
                     .brif(is_obj, after_is_obj, &[], slow_block, &[]);
 
                 // 2. Unbox pointer, load obj_type byte, branch on
-                //    TypedArray / Simd tags.
+                //    List, then TypedArray / Simd tags.
                 builder.switch_to_block(after_is_obj);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(r, ptr_mask);
@@ -6712,23 +6766,23 @@ pub mod cl {
                     builder
                         .ins()
                         .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
-                let ta_tag = builder
-                    .ins()
-                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
-                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
-                builder
-                    .ins()
-                    .brif(is_ta, typed_array_block, &[], type_miss_block, &[]);
-                builder.switch_to_block(type_miss_block);
                 let list_block = builder.create_block();
                 let list_tag = builder
                     .ins()
                     .iconst(types::I64, crate::runtime::object::ObjType::List as i64);
                 let is_list = builder.ins().icmp(IntCC::Equal, obj_type_byte, list_tag);
+                builder
+                    .ins()
+                    .brif(is_list, list_block, &[], type_miss_block, &[]);
+                builder.switch_to_block(type_miss_block);
+                let ta_tag = builder
+                    .ins()
+                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
+                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
                 let not_list_block = builder.create_block();
                 builder
                     .ins()
-                    .brif(is_list, list_block, &[], not_list_block, &[]);
+                    .brif(is_ta, typed_array_block, &[], not_list_block, &[]);
                 builder.switch_to_block(not_list_block);
                 let simd_tag = builder.ins().iconst(types::I64, OBJ_TYPE_SIMD as i64);
                 let is_simd = builder.ins().icmp(IntCC::Equal, obj_type_byte, simd_tag);
@@ -6968,8 +7022,27 @@ pub mod cl {
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(simd_i32_bits)]);
 
-                // 7. Slow path: existing runtime dispatch.
+                // 7. Slow path: a read whose result is guarded as a Num
+                //    leaves for the interpreter at the read, so the loop
+                //    around it keeps no value across a call; otherwise
+                //    the runtime dispatch.
                 builder.switch_to_block(slow_block);
+                if let (Some((pc, live)), Some((raw_bools, value_types))) = (miss, deopt_state) {
+                    builder.set_cold_block(slow_block);
+                    emit_deopt_at(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        jit_func_id(),
+                        pc,
+                        &live,
+                        val_map,
+                        raw_bools,
+                        value_types,
+                    )?;
+                    builder.switch_to_block(merge_block);
+                    return Ok(Some(builder.block_params(merge_block)[0]));
+                }
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_get", 2)?;
                 emit_cur_frame(builder);
                 let slow_call = builder.ins().call(slow_fn, &[r, idx]);
@@ -7310,7 +7383,17 @@ pub mod cl {
             Instruction::AddF64(a, b) => Ok(Some(builder.ins().fadd(get(a), get(b)))),
             Instruction::SubF64(a, b) => Ok(Some(builder.ins().fsub(get(a), get(b)))),
             Instruction::MulF64(a, b) => Ok(Some(builder.ins().fmul(get(a), get(b)))),
-            Instruction::DivF64(a, b) => Ok(Some(builder.ins().fdiv(get(a), get(b)))),
+            // Dividing by a power of two multiplies by its reciprocal,
+            // which is exact, so the product rounds as the quotient does.
+            Instruction::DivF64(a, b) => {
+                match const_f64_of(mir, *b).filter(|c| is_positive_power_of_two(c.abs())) {
+                    Some(c) => {
+                        let inv = builder.ins().f64const(1.0 / c);
+                        Ok(Some(builder.ins().fmul(get(a), inv)))
+                    }
+                    None => Ok(Some(builder.ins().fdiv(get(a), get(b)))),
+                }
+            }
             Instruction::ModF64(a, b) => {
                 let av = get(a);
                 let bv = get(b);
