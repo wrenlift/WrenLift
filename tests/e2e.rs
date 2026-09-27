@@ -4902,6 +4902,51 @@ System.print("%(sum) %(r) %(acc.a)")
 }
 
 #[test]
+fn e2e_top_tier_element_read_speculation_deopts() {
+    // The top tier guards a list read the baseline only ever saw answer
+    // a Num. A list holding a string later fails that guard; the
+    // interpreter resumes past the read with the string in hand.
+    let src = r#"
+class Mix {
+  static total(list) {
+    var t = 0
+    for (i in 0...list.count) {
+      var x = list[i]
+      t = t + (x is Num ? x : x.count)
+    }
+    return t
+  }
+}
+var nums = [1, 2, 3, 4, 5]
+var s = 0
+for (k in 0...40000) s = s + Mix.total(nums)
+System.print("%(s) %(Mix.total([1, "abc", 2]))")
+"#;
+    let run = |mode: ExecutionMode| {
+        let config = VMConfig {
+            execution_mode: mode,
+            jit_threshold: 20,
+            opt_threshold: 40,
+            ..VMConfig::default()
+        };
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", src);
+        let output = vm.take_output();
+        (result, output, vm.engine.deopt_exits)
+    };
+    let (r0, expected, _) = run(ExecutionMode::Interpreter);
+    assert!(matches!(r0, InterpretResult::Success));
+    assert_eq!(expected.trim(), "600000 6");
+    let (r1, output, deopts) = run(ExecutionMode::Tiered);
+    assert!(matches!(r1, InterpretResult::Success));
+    assert_eq!(output, expected);
+    if wren_lift::codegen::top_tier() != wren_lift::codegen::TopTier::Off {
+        assert_eq!(deopts, 1, "the guard on `list[i]` fires exactly once");
+    }
+}
+
+#[test]
 fn e2e_top_tier_class_miss_on_guarded_call_deopts() {
     // A guarded getter's class check has no slow path: when the
     // receiver is a different class, even one whose getter also

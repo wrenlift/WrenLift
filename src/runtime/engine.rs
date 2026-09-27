@@ -3769,7 +3769,12 @@ impl ExecutionEngine {
                             continue;
                         }
                     }
-                    Instruction::SubscriptGet { .. } | Instruction::SubscriptSet { .. } => false,
+                    // An element read that has only answered Nums is
+                    // guarded like a call result.
+                    Instruction::SubscriptGet { .. } => {
+                        result_kinds.get(dst.0 as usize).copied().unwrap_or(0) == RESULT_NUM
+                    }
+                    Instruction::SubscriptSet { .. } => false,
                     _ => continue,
                 };
                 let Some(&call_pc) = call_offsets.get(dst) else {

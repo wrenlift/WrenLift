@@ -341,6 +341,39 @@ pub mod cl {
         builder.ins().store(MemFlags::trusted(), seen, p, 0);
     }
 
+    /// Note an element read's `result` at `slot` only when `receiver` is
+    /// a List: a map answers null for a missing key as a matter of
+    /// course, so its reads are not speculated on.
+    fn emit_note_list_read(
+        builder: &mut FunctionBuilder,
+        slot: usize,
+        receiver: Value,
+        result: Value,
+    ) {
+        let object = builder.create_block();
+        let note = builder.create_block();
+        let done = builder.create_block();
+        let high = builder.ins().ushr_imm_u(receiver, 48);
+        let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
+        let is_obj = builder.ins().icmp(IntCC::Equal, high, obj_tag);
+        builder.ins().brif(is_obj, object, &[], done, &[]);
+        builder.switch_to_block(object);
+        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+        let ptr = builder.ins().band(receiver, ptr_mask);
+        let ty = builder
+            .ins()
+            .uload8(types::I64, MemFlags::trusted(), ptr, HEADER_OBJ_TYPE);
+        let list = builder
+            .ins()
+            .iconst(types::I64, crate::runtime::object::ObjType::List as i64);
+        let is_list = builder.ins().icmp(IntCC::Equal, ty, list);
+        builder.ins().brif(is_list, note, &[], done, &[]);
+        builder.switch_to_block(note);
+        emit_note_call_result(builder, slot, result);
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+    }
+
     fn emit_class_load_guarded(
         builder: &mut FunctionBuilder,
         recv: cranelift_codegen::ir::Value,
@@ -4093,18 +4126,26 @@ pub mod cl {
                 if let Some(val) = result {
                     val_map.insert(vid, val);
                     // A promotable baseline body profiles what each
-                    // call returns for the top tier to speculate on.
+                    // call and list element read returns for the top
+                    // tier to speculate on.
                     if let Some(ref hook) = tier_hook
                         && hook.result_kinds != 0
                         && (vid.0 as usize) < hook.result_kinds_len
-                        && matches!(
-                            inst,
-                            Instruction::Call { .. }
-                                | Instruction::CallKnownFunc { .. }
-                                | Instruction::SuperCall { .. }
-                        )
                     {
-                        emit_note_call_result(builder, hook.result_kinds + vid.0 as usize, val);
+                        let slot = hook.result_kinds + vid.0 as usize;
+                        match inst {
+                            Instruction::Call { .. }
+                            | Instruction::CallKnownFunc { .. }
+                            | Instruction::SuperCall { .. } => {
+                                emit_note_call_result(builder, slot, val);
+                            }
+                            Instruction::SubscriptGet { receiver, .. } => {
+                                if let Some(&r) = val_map.get(receiver) {
+                                    emit_note_list_read(builder, slot, r, val);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     if let Some(var) = osr_vars.get(&vid) {
                         builder.def_var(*var, val);

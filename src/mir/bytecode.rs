@@ -850,6 +850,7 @@ impl<'a> Encoder<'a> {
                 for a in args {
                     self.emit_reg(*a);
                 }
+                self.resume_after_call.insert(dst, self.code.len() as u32);
             }
             Instruction::SubscriptSet {
                 receiver,
