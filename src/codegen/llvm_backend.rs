@@ -5000,9 +5000,9 @@ pub mod llvm {
                     continue;
                 };
                 let class = self.table_load(modvars, imp.class_slot as usize)?;
-                // A static method's receiver is the class itself; an
-                // instance method's, an instance of it.
-                let same = if imp.is_static {
+                // A static method's or constructor's receiver is the
+                // class itself; an instance method's, an instance of it.
+                let same = if imp.is_static || imp.is_constructor {
                     self.icmp(IntPredicate::EQ, r, class)?
                 } else {
                     let expected = self.and(class, self.c64(PTR_MASK))?;
@@ -5016,7 +5016,10 @@ pub mod llvm {
                 let next = self.new_block("dcn");
                 self.cbr(hit, fast, next)?;
                 self.b.position_at_end(fast);
-                let v = match imp.trivial_getter_field.filter(|_| !imp.is_static) {
+                let v = match imp
+                    .trivial_getter_field
+                    .filter(|_| !imp.is_static && !imp.is_constructor)
+                {
                     Some(idx) => {
                         let fields = self
                             .b
@@ -5038,8 +5041,15 @@ pub mod llvm {
                                 None,
                             ),
                         };
+                        // A constructor's initializer runs on a fresh
+                        // instance, which the call answers.
+                        let this = if imp.is_constructor {
+                            self.call_helper("wren_alloc_instance", &[r])?
+                        } else {
+                            r
+                        };
                         let null = self.c64(TAG_NULL);
-                        let a: Vec<BasicMetadataValueEnum> = std::iter::once(r)
+                        let a: Vec<BasicMetadataValueEnum> = std::iter::once(this)
                             .chain(args.iter().copied())
                             .chain(std::iter::repeat(null))
                             .take(arity)
@@ -5054,7 +5064,7 @@ pub mod llvm {
                             .ok_or("a method body returns a value")?
                             .into_int_value();
                         self.error_poll()?;
-                        v
+                        if imp.is_constructor { this } else { v }
                     }
                 };
                 incoming.push((v.into(), self.b.get_insert_block().unwrap()));

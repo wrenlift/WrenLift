@@ -3035,6 +3035,9 @@ pub mod cl {
         pub class_slot: u32,
         /// Called on the class object itself rather than an instance.
         pub is_static: bool,
+        /// Called on the class too; the body is the initializer, run on
+        /// a fresh instance, which the call then answers.
+        pub is_constructor: bool,
     }
 
     /// Per-emit defining-class context for static-field
@@ -5160,10 +5163,10 @@ pub mod cl {
                                 modvars_addr,
                                 (impl_.class_slot as i32) * 8,
                             );
-                            // A static method's receiver is the class
-                            // itself; an instance method's, an instance
-                            // of it.
-                            let eq = if impl_.is_static {
+                            // A static method's or constructor's receiver
+                            // is the class itself; an instance method's,
+                            // an instance of it.
+                            let eq = if impl_.is_static || impl_.is_constructor {
                                 builder.ins().icmp(IntCC::Equal, r, boxed_cls)
                             } else {
                                 let cls_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
@@ -5175,8 +5178,9 @@ pub mod cl {
                             builder.ins().brif(eq, fast_block, &[], next_check, &[]);
 
                             builder.switch_to_block(fast_block);
-                            let fast_result = if let Some(field_idx) =
-                                impl_.trivial_getter_field.filter(|_| !impl_.is_static)
+                            let fast_result = if let Some(field_idx) = impl_
+                                .trivial_getter_field
+                                .filter(|_| !impl_.is_static && !impl_.is_constructor)
                             {
                                 // Inline trivial getter: load
                                 // recv.fields[field_idx].
@@ -5209,7 +5213,17 @@ pub mod cl {
                                     .map_err(|e| e.to_string())?;
                                 let fn_ref = module.declare_func_in_func(body_id, builder.func);
                                 let user_arity = (impl_.arity as usize).saturating_sub(1);
-                                let mut call_args = vec![r];
+                                // A constructor's initializer runs on a
+                                // fresh instance, which the call answers.
+                                let this = if impl_.is_constructor {
+                                    let alloc =
+                                        get_runtime_fn(module, builder, "wren_alloc_instance", 1)?;
+                                    let call = builder.ins().call(alloc, &[r]);
+                                    builder.inst_results(call)[0]
+                                } else {
+                                    r
+                                };
+                                let mut call_args = vec![this];
                                 for a in args.iter().take(user_arity) {
                                     call_args.push(get(a));
                                 }
@@ -5229,7 +5243,11 @@ pub mod cl {
                                 emit_cur_frame(builder);
                                 let call = builder.ins().call(fn_ref, &call_args);
                                 emit_error_poll(builder, module, get_runtime_fn)?;
-                                builder.inst_results(call)[0]
+                                if impl_.is_constructor {
+                                    this
+                                } else {
+                                    builder.inst_results(call)[0]
+                                }
                             };
                             builder
                                 .ins()

@@ -628,6 +628,7 @@ class Tally {
 
 // Through Tally's exported add, an instance of this reaches its own.
 class Loud is Tally {
+  #export = "new(start: Num)"
   construct new(start) { super(start) }
   add(n) { super.add(n * 10) }
 }
@@ -654,6 +655,7 @@ System.print("module ran")
             name.len()
         )
     };
+    let loud_new = "caribou_4wren_12demo_2ftally_4Loud_c3new_1".to_string();
     let (new, add, total, double, fail, loud) = (
         symbol("c", "new", 1),
         symbol("m", "add", 1),
@@ -674,7 +676,7 @@ System.print("module ran")
         ]
         .iter()
         .map(|s| s.to_string())
-        .chain([&new, &add, &total, &double, &fail, &loud].map(|s| s.clone()))
+        .chain([&new, &add, &total, &double, &fail, &loud, &loud_new].map(|s| s.clone()))
         .collect(),
         ..Default::default()
     };
@@ -758,6 +760,14 @@ System.print("module ran")
         "the override runs"
     );
     assert_eq!(back(total.call(&mut store, loud).unwrap()), 21.0);
+
+    // A constructor that calls super is made through dispatch.
+    let quiet = f(&mut store, &loud_new)
+        .typed::<i64, i64>(&store)
+        .unwrap()
+        .call(&mut store, num(5.0))
+        .expect("a subclass constructed through its export");
+    assert_eq!(back(add.call(&mut store, (quiet, num(1.0))).unwrap()), 15.0);
 }
 
 /// A native library as a `dylink.0` side module, the shape an Ash host

@@ -677,10 +677,11 @@ struct ExportPlan {
     /// An instance member takes its receiver; a static or constructor
     /// is called on the class.
     has_receiver: bool,
-    /// The compiled body, when the export can call it directly: not a
-    /// constructor (its body is the initializer) and not a body that
-    /// needs its defining class installed (super, static fields).
+    /// The compiled body, when the export can call it directly: not one
+    /// that needs its defining class installed (super, static fields).
     body: Option<String>,
+    /// A constructor's body is its initializer, run on a fresh instance.
+    constructor: bool,
 }
 
 /// The export plan for `method` of the class `class_name` in slot
@@ -741,9 +742,9 @@ fn export_plan(
         sig_slot: sig_slot as u32,
         arity,
         has_receiver: !(method.is_static || method.is_constructor),
-        body: (!method.is_constructor
-            && !crate::codegen::aot::method_uses_defining_class(&method.mir))
-        .then(|| body.to_string()),
+        body: (!crate::codegen::aot::method_uses_defining_class(&method.mir))
+            .then(|| body.to_string()),
+        constructor: method.is_constructor,
     }))
 }
 
@@ -1516,9 +1517,19 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                     self.b.build_unconditional_branch(direct).map_err(e)?;
                 }
                 self.b.position_at_end(direct);
-                let mut args: Vec<BasicMetadataValueEnum> = vec![receiver.into()];
+                // A constructor allocates the instance its initializer
+                // runs on; the receiver is then the class.
+                let this = if x.constructor {
+                    let alloc = self.import("wren_alloc_instance", &[I64], Some(I64));
+                    self.call(alloc, &[receiver.into()])?
+                        .ok_or("wren_alloc_instance")?
+                        .into_int_value()
+                } else {
+                    receiver
+                };
+                let mut args: Vec<BasicMetadataValueEnum> = vec![this.into()];
                 args.extend(user_args.iter().map(|a| BasicMetadataValueEnum::from(*a)));
-                let v = self
+                let returned = self
                     .b
                     .build_call(body, &args, "direct")
                     .map_err(e)?
@@ -1526,6 +1537,7 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                     .basic()
                     .ok_or("a method body returns a value")?
                     .into_int_value();
+                let v = if x.constructor { this } else { returned };
                 incoming.push((v, self.b.get_insert_block().unwrap()));
                 self.b.build_unconditional_branch(join).map_err(e)?;
                 self.b.position_at_end(join);

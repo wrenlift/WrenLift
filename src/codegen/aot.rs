@@ -1822,11 +1822,6 @@ pub(crate) fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                 if method_uses_defining_class(&method.mir) {
                     continue;
                 }
-                // A constructor's body is its initializer, which only
-                // the constructor call runs on a fresh instance.
-                if method.is_constructor {
-                    continue;
-                }
                 let fn_symbol = format!("{}__method_{}_{}", fn_prefix, c_idx, m_idx);
                 let trivial =
                     crate::runtime::engine::ExecutionEngine::mir_trivial_getter_field(&method.mir);
@@ -1846,6 +1841,7 @@ pub(crate) fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                     impl_.class_modvars_symbol == modvars_symbol
                         && impl_.class_slot == class_slot as u32
                         && impl_.is_static == method.is_static
+                        && impl_.is_constructor == method.is_constructor
                 }) {
                     *existing = AotMethodImpl {
                         class_name: class_name.clone(),
@@ -1855,6 +1851,7 @@ pub(crate) fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
                         is_static: method.is_static,
+                        is_constructor: method.is_constructor,
                     };
                 } else {
                     entry.push(AotMethodImpl {
@@ -1865,6 +1862,7 @@ pub(crate) fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
                         is_static: method.is_static,
+                        is_constructor: method.is_constructor,
                     });
                 }
             }
