@@ -287,12 +287,21 @@ pub fn compile_modules_to_llvm_object_with(
             )
         })
         .collect();
+    // Foreign classes' tables exist before any body, which may check a
+    // receiver against one of their classes.
+    let foreign_vars: Vec<GlobalValue> = foreign
+        .iter()
+        .enumerate()
+        .map(|(i, f)| table(&ctx, &module, &foreign_vars_symbol(i), f.classes.len()))
+        .collect();
     let cha = std::rc::Rc::new(if reloadable {
         crate::codegen::cranelift_backend::cl::AotCha {
             by_sig: Default::default(),
         }
     } else {
-        build_cha(modules, last)
+        let mut cha = build_cha(modules, last);
+        add_foreign_members(&mut cha, foreign);
+        cha
     });
     let mut manifests = Vec::with_capacity(modules.len());
     let mut tables = Vec::with_capacity(modules.len());
@@ -451,8 +460,11 @@ pub fn compile_modules_to_llvm_object_with(
     } else {
         foreign
             .iter()
+            .zip(&foreign_vars)
             .enumerate()
-            .map(|(i, f)| lower_foreign_module(&ctx, &module, &machine, layout, target, i, f))
+            .map(|(i, (f, &vars))| {
+                lower_foreign_module(&ctx, &module, &machine, layout, target, f, (i, vars))
+            })
             .collect::<Result<Vec<_>, _>>()?
     };
 
@@ -869,16 +881,62 @@ struct ForeignBody<'ctx> {
     entry: FunctionValue<'ctx>,
 }
 
+/// The table holding foreign module `index`'s classes.
+fn foreign_vars_symbol(index: usize) -> String {
+    format!("wlift_foreign_vars_{index}")
+}
+
+/// The body of member `member` of class `class` of foreign module `index`.
+fn foreign_body_symbol(index: usize, class: usize, member: usize) -> String {
+    format!("wlift_foreign_{index}_{class}_{member}")
+}
+
+/// Foreign members as the class hierarchy knows compiled ones, so a call
+/// whose receiver is a foreign class (or, for an instance member, one of
+/// its instances) calls the member's body directly, and the body, a call
+/// of the symbol, inlines into it.
+fn add_foreign_members(
+    cha: &mut crate::codegen::cranelift_backend::cl::AotCha,
+    foreign: &[AotForeignModule],
+) {
+    use crate::codegen::cranelift_backend::cl::AotMethodImpl;
+    for (i, f) in foreign.iter().enumerate() {
+        for (ci, class) in f.classes.iter().enumerate() {
+            for (k, member) in class.members.iter().enumerate() {
+                let arity = member.signature.matches('_').count();
+                if arity > 16 {
+                    continue;
+                }
+                cha.by_sig
+                    .entry(member.signature.clone())
+                    .or_default()
+                    .push(AotMethodImpl {
+                        class_name: class.name.clone(),
+                        fn_symbol: foreign_body_symbol(i, ci, k),
+                        arity: arity as u8 + 1,
+                        trivial_getter_field: None,
+                        class_modvars_symbol: foreign_vars_symbol(i),
+                        class_slot: ci as u32,
+                        is_static: member.is_static,
+                        is_constructor: false,
+                    });
+            }
+        }
+    }
+}
+
 /// The body of each member of foreign module `f`: a call of its symbol
 /// with the receiver first for an instance member, answering its result.
+/// `index` is the module's place in the build's list, and `vars` the
+/// table its classes are installed in.
 fn lower_foreign_module<'ctx>(
     ctx: &'ctx Context,
     module: &Module<'ctx>,
     machine: &TargetMachine,
     layout: Layout,
     target: &LlvmTarget,
-    index: usize,
     f: &AotForeignModule,
+    (index, vars): (usize, GlobalValue<'ctx>),
 ) -> Result<ForeignTables<'ctx>, AotError> {
     let e = |e: inkwell::builder::BuilderError| AotError::Module(e.to_string());
     let i64t = ctx.i64_type();
@@ -903,11 +961,16 @@ fn lower_foreign_module<'ctx>(
                     Some(Linkage::External),
                 ),
             };
-            let body = module.add_function(
-                &format!("wlift_foreign_{index}_{ci}_{k}"),
-                i64t.fn_type(&vec![i64t.into(); arity + 1], false),
-                Some(Linkage::Internal),
-            );
+            // A direct call may have declared it already.
+            let name = foreign_body_symbol(index, ci, k);
+            let body = module.get_function(&name).unwrap_or_else(|| {
+                module.add_function(
+                    &name,
+                    i64t.fn_type(&vec![i64t.into(); arity + 1], false),
+                    None,
+                )
+            });
+            body.set_linkage(Linkage::Internal);
             stamp_target(ctx, machine, body);
             b.position_at_end(ctx.append_basic_block(body, "entry"));
             let skip = member.is_static as usize;
@@ -933,12 +996,7 @@ fn lower_foreign_module<'ctx>(
     }
     Ok(ForeignTables {
         name: f.name.clone(),
-        vars: table(
-            ctx,
-            module,
-            &format!("wlift_foreign_vars_{index}"),
-            f.classes.len(),
-        ),
+        vars,
         classes,
     })
 }
