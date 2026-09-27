@@ -161,7 +161,7 @@ mod host {
     };
     use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
-    struct Host {
+    pub struct Host {
         wasi: WasiP1Ctx,
         libraries: HashMap<String, Instance>,
         table: Option<Table>,
@@ -186,13 +186,15 @@ mod host {
         index
     }
 
-    fn load(
+    /// Load the side module `bytes` into `main`'s memory and table as
+    /// `lib`, and run its initializers.
+    pub fn load(
         store: &mut Store<Host>,
         linker: &Linker<Host>,
         main: Instance,
         lib: &str,
         bytes: &[u8],
-    ) {
+    ) -> Instance {
         let side = ash_wasm_link::read_side_module(bytes)
             .expect("reading dylink.0")
             .expect("a side module");
@@ -276,17 +278,22 @@ mod host {
         }
         store.data_mut().table = Some(table);
         store.data_mut().libraries.insert(lib.to_string(), instance);
+        instance
     }
 
-    pub fn run(program: &Path) -> (i32, String) {
-        let engine = Engine::default();
-        let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 20);
+    /// A store and linker for a program whose stdout goes to `stdout`,
+    /// with `ash_host_dlopen` / `ash_host_dlsym` over the libraries
+    /// loaded into it.
+    pub fn host(
+        engine: &Engine,
+        stdout: &wasmtime_wasi::pipe::MemoryOutputPipe,
+    ) -> (Store<Host>, Linker<Host>) {
         let wasi = wasmtime_wasi::WasiCtxBuilder::new()
             .stdout(stdout.clone())
             .inherit_stderr()
             .build_p1();
-        let mut store = Store::new(
-            &engine,
+        let store = Store::new(
+            engine,
             Host {
                 wasi,
                 libraries: HashMap::new(),
@@ -294,7 +301,7 @@ mod host {
                 resolved: HashMap::new(),
             },
         );
-        let mut linker: Linker<Host> = Linker::new(&engine);
+        let mut linker: Linker<Host> = Linker::new(engine);
         preview1::add_to_linker_sync(&mut linker, |h| &mut h.wasi).expect("wasi imports");
         linker
             .func_wrap(
@@ -341,6 +348,13 @@ mod host {
                 },
             )
             .expect("dlsym");
+        (store, linker)
+    }
+
+    pub fn run(program: &Path) -> (i32, String) {
+        let engine = Engine::default();
+        let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 20);
+        let (mut store, linker) = host(&engine, &stdout);
         let module = Module::from_file(&engine, program).expect("loading the program");
         let main = linker
             .instantiate(&mut store, &module)
@@ -768,6 +782,186 @@ System.print("module ran")
         .call(&mut store, num(5.0))
         .expect("a subclass constructed through its export");
     assert_eq!(back(add.call(&mut store, (quiet, num(1.0))).unwrap()), 15.0);
+}
+
+const COUNTER_V1: &str = r#"
+import "./helper" for Helper
+
+class Counter {
+  #export = "new(start: Num)"
+  construct new(start) { _n = start }
+
+  #export = "step() -> Num"
+  step() {
+    _n = _n + 1
+    return _n
+  }
+
+  #export = "version() -> Num"
+  static version() { 1 }
+}
+var Made = Counter.new(100)
+System.print("counter 1")
+"#;
+
+const COUNTER_V2: &str = r#"
+import "./helper" for Helper
+
+class Counter {
+  #export = "new(start: Num)"
+  construct new(start) { _n = start }
+
+  #export = "step() -> Num"
+  step() {
+    _n = _n + Helper.bump
+    return _n
+  }
+
+  #export = "version() -> Num"
+  static version() { 2 }
+}
+var Made = Counter.new(200)
+System.print("counter 2 made %(Made.step())")
+"#;
+
+/// A module compiled again while its program runs replaces its classes'
+/// methods in place: an instance made before the reload runs the new
+/// ones, the module body runs again, and its imports reach the running
+/// program's modules.
+#[test]
+fn a_reloaded_module_gives_its_classes_new_methods() {
+    use wasmtime::{Engine, Module};
+    use wren_lift::codegen::llvm_aot::{
+        compile_modules_to_llvm_object_with, link_wasm_reload, reload_host_exports,
+    };
+
+    let Some(runtime) = common::runtime_object() else {
+        eprintln!("no runtime object; skipping");
+        return;
+    };
+    if wren_lift::side_module::wasm_linker().is_none() {
+        eprintln!("no wasm linker; skipping");
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("wlift_wasm_reload_")
+        .tempdir()
+        .expect("tempdir");
+    let entry = dir.path().join("counter.wren");
+    std::fs::write(
+        dir.path().join("helper.wren"),
+        "class Helper {\n  static bump { 10 }\n}\n",
+    )
+    .expect("write helper");
+    let target = LlvmTarget::new("wasm32-wasip1", None, None);
+    let compile = |source: &str, entry_kind: AotEntry, object: &Path| {
+        std::fs::write(&entry, source).expect("write counter");
+        let mut walk = walk_imports(&entry).expect("walk");
+        walk.modules.last_mut().unwrap().request_name = "demo/counter".to_string();
+        compile_modules_to_llvm_object_with(
+            &walk.modules,
+            &AotBundleMeta::default(),
+            &target,
+            entry_kind,
+            true,
+            object,
+        )
+        .expect("compile");
+    };
+
+    let program = dir.path().join("counter.o");
+    compile(COUNTER_V1, AotEntry::Library, &program);
+    let symbol = |kind: &str, name: &str, arity: usize| {
+        format!(
+            "caribou_4wren_14demo_2fcounter_7Counter_{kind}{}{name}_{arity}",
+            name.len()
+        )
+    };
+    let (new, step, version) = (
+        symbol("c", "new", 1),
+        symbol("m", "step", 0),
+        symbol("t", "version", 0),
+    );
+    let read = |path: &Path| {
+        let bytes = std::fs::read(path).expect("read object");
+        ash_wasm_link::read(&path.display().to_string(), &bytes).expect("parse object")
+    };
+    let (functions, data) = reload_host_exports();
+    let options = ash_wasm_link::LinkOptions {
+        roots: [
+            "wlift_aot_new_vm",
+            "wlift_aot_run_programs",
+            "wlift_aot_take_error",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([&new, &step, &version].map(|s| s.clone()))
+        .collect(),
+        hdll_imports: functions
+            .into_iter()
+            .chain(["malloc".to_string()])
+            .collect(),
+        hdll_data: data,
+        ..Default::default()
+    };
+    let linked = ash_wasm_link::link(vec![read(&program), read(&runtime)], &options).expect("link");
+
+    let reload_object = dir.path().join("reload.o");
+    compile(COUNTER_V2, AotEntry::Reload, &reload_object);
+    let reload_module = dir.path().join("reload.wasm");
+    link_wasm_reload(&reload_object, &reload_module).expect("link the reload");
+
+    let engine = Engine::default();
+    let stdout = wasmtime_wasi::pipe::MemoryOutputPipe::new(1 << 16);
+    let (mut store, linker) = host::host(&engine, &stdout);
+    let module = Module::new(&engine, &linked).expect("load the program");
+    let main = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let call = |store: &mut wasmtime::Store<host::Host>, name: &str, args: &[i64]| -> i64 {
+        let f = main
+            .get_func(&mut *store, name)
+            .unwrap_or_else(|| panic!("{name} exported"));
+        let args: Vec<wasmtime::Val> = args.iter().map(|&a| wasmtime::Val::I64(a)).collect();
+        let mut out = [wasmtime::Val::I64(0)];
+        f.call(&mut *store, &args, &mut out).expect(name);
+        out[0].unwrap_i64()
+    };
+    let vm = main
+        .get_typed_func::<(), i32>(&mut store, "wlift_aot_new_vm")
+        .unwrap()
+        .call(&mut store, ())
+        .expect("new vm");
+    let run = main
+        .get_typed_func::<i32, i32>(&mut store, "wlift_aot_run_programs")
+        .unwrap();
+    assert_eq!(run.call(&mut store, vm).expect("run"), 0);
+
+    let num = |x: f64| x.to_bits() as i64;
+    let back = |v: i64| f64::from_bits(v as u64);
+    let before = call(&mut store, &new, &[num(0.0)]);
+    assert_eq!(back(call(&mut store, &step, &[before])), 1.0);
+    assert_eq!(back(call(&mut store, &version, &[])), 1.0);
+
+    let bytes = std::fs::read(&reload_module).expect("read the reload");
+    let reload = host::load(&mut store, &linker, main, "reload", &bytes);
+    let reload_run = reload
+        .get_typed_func::<i32, i32>(&mut store, "wlift_reload_run")
+        .expect("the reload exports its run");
+    assert_eq!(reload_run.call(&mut store, vm).expect("reload"), 0);
+
+    assert_eq!(
+        back(call(&mut store, &step, &[before])),
+        11.0,
+        "the new step"
+    );
+    assert_eq!(back(call(&mut store, &version, &[])), 2.0);
+    let after = call(&mut store, &new, &[num(5.0)]);
+    assert_eq!(back(call(&mut store, &step, &[after])), 15.0);
+    assert_eq!(
+        String::from_utf8(stdout.contents().to_vec()).unwrap(),
+        "counter 1\ncounter 2 made 210\n"
+    );
 }
 
 /// A native library as a `dylink.0` side module, the shape an Ash host

@@ -87,6 +87,10 @@ impl LlvmTarget {
     }
 
     pub fn machine(&self) -> Result<TargetMachine, AotError> {
+        self.machine_with(RelocMode::Default)
+    }
+
+    fn machine_with(&self, reloc: RelocMode) -> Result<TargetMachine, AotError> {
         init_targets();
         let triple = TargetTriple::create(&self.triple);
         let target = Target::from_triple(&triple)
@@ -97,7 +101,7 @@ impl LlvmTarget {
                 &self.cpu,
                 &self.features,
                 OptimizationLevel::Aggressive,
-                RelocMode::Default,
+                reloc,
                 CodeModel::Default,
             )
             .ok_or_else(|| AotError::UnsupportedTarget(self.triple.clone()))
@@ -133,6 +137,17 @@ pub enum AotEntry {
     /// instance member takes its receiver first. After a call,
     /// `wlift_aot_take_error(vm)` is nonzero if the member raised.
     Library,
+    /// The last module, compiled to replace itself in a running program
+    /// built reloadable (see [`compile_modules_to_llvm_object_with`]).
+    /// The object is position independent, for [`link_wasm_reload`] to
+    /// make a side module of, and defines `wlift_reload_run(vm) -> i32`:
+    /// the module's classes keep their identity and get its new methods,
+    /// and its body runs again. 0, or the exit code of the error it
+    /// left uncaught; 70 when the program has no such module.
+    ///
+    /// `modules` is the program's walk up to and including that module,
+    /// so its imports resolve as they did when the program was built.
+    Reload,
 }
 
 /// Lower `modules` (dependencies first, entry last) into one object at
@@ -155,6 +170,24 @@ pub fn compile_modules_to_llvm_object_as(
     entry: AotEntry,
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
+    compile_modules_to_llvm_object_with(modules, bundle, target, entry, false, output)
+}
+
+/// [`compile_modules_to_llvm_object_as`], and when `reloadable`, a
+/// program whose modules an [`AotEntry::Reload`] object can replace
+/// while it runs: every call into another class goes through dispatch,
+/// so it reaches whatever methods the class has now, and the bootstrap
+/// registers each module's variables by name. Link it with
+/// [`link_wasm_reloadable`].
+pub fn compile_modules_to_llvm_object_with(
+    modules: &[AotModule],
+    bundle: &AotBundleMeta,
+    target: &LlvmTarget,
+    entry: AotEntry,
+    reloadable: bool,
+    output: &Path,
+) -> Result<Vec<AotManifest>, AotError> {
+    let reloadable = reloadable || entry == AotEntry::Reload;
     if modules.is_empty() {
         return Err(AotError::Frontend("no modules to emit".into()));
     }
@@ -169,7 +202,11 @@ pub fn compile_modules_to_llvm_object_as(
             target.triple
         )));
     }
-    let machine = target.machine()?;
+    let machine = target.machine_with(if entry == AotEntry::Reload {
+        RelocMode::PIC
+    } else {
+        RelocMode::Default
+    })?;
     let ctx = Context::create();
     let module = ctx.create_module("wlift_aot");
     module.set_triple(&machine.get_triple());
@@ -199,7 +236,13 @@ pub fn compile_modules_to_llvm_object_as(
             )
         })
         .collect();
-    let cha = std::rc::Rc::new(build_cha(modules, last));
+    let cha = std::rc::Rc::new(if reloadable {
+        crate::codegen::cranelift_backend::cl::AotCha {
+            by_sig: Default::default(),
+        }
+    } else {
+        build_cha(modules, last)
+    });
     let mut manifests = Vec::with_capacity(modules.len());
     let mut tables = Vec::with_capacity(modules.len());
     for (idx, m) in modules.iter().enumerate() {
@@ -242,7 +285,10 @@ pub fn compile_modules_to_llvm_object_as(
             {
                 let class_name = m.interner.resolve(plan.class.name);
                 for (method, body) in plan.class.methods.iter().zip(&plan.methods) {
-                    if let Some(x) = export_plan(m, class_name, slot, method, body, &env)? {
+                    if let Some(mut x) = export_plan(m, class_name, slot, method, body, &env)? {
+                        if reloadable {
+                            x.body = None;
+                        }
                         exports.push(x);
                     }
                 }
@@ -348,7 +394,7 @@ pub fn compile_modules_to_llvm_object_as(
         b: ctx.create_builder(),
         strings: 0,
     }
-    .emit(&manifests, &tables, target.is_wasm(), entry)
+    .emit(&manifests, &tables, target.is_wasm(), entry, reloadable)
     .map_err(module_err)?;
 
     module
@@ -457,6 +503,53 @@ pub fn locate_wasm_runtime() -> Option<std::path::PathBuf> {
 /// program exports its memory, table, `malloc` and exactly the runtime
 /// functions and data they import.
 pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
+    link_wasm_hosting(program, runtime, output, false)
+}
+
+/// [`link_wasm`] for a program built reloadable: it also exports what an
+/// [`AotEntry::Reload`] side module imports, the runtime's helpers and
+/// entry points, for its host to load one while it runs.
+pub fn link_wasm_reloadable(program: &Path, runtime: &Path, output: &Path) -> Result<(), AotError> {
+    link_wasm_hosting(program, runtime, output, true)
+}
+
+/// Link an [`AotEntry::Reload`] object into the side module at `output`
+/// that a reloadable program's host loads, exporting `wlift_reload_run`.
+pub fn link_wasm_reload(object: &Path, output: &Path) -> Result<(), AotError> {
+    crate::side_module::link(object, &["wlift_reload_run".to_string()], output)
+        .map_err(AotError::Module)
+}
+
+/// Data a compiled body reads from the runtime, which a reload side
+/// module reaches through the program's exports.
+const RELOAD_DATA: &[&str] = &["wlift_error_pending"];
+
+/// What a program built reloadable exports for the reload side modules
+/// its host loads later: the functions, then the data. A host linking
+/// the program itself adds them to its linker's `hdll_imports` and
+/// `hdll_data`, with `malloc`.
+pub fn reload_host_exports() -> (Vec<String>, Vec<String>) {
+    use crate::capi::{AOT_ENTRY_NAMES, WASM_PROGRAM_LIBM};
+    use crate::codegen::runtime_fns::RUNTIME_FN_NAMES;
+    let functions = RUNTIME_FN_NAMES
+        .iter()
+        .chain(AOT_ENTRY_NAMES)
+        .chain(WASM_PROGRAM_LIBM)
+        .filter(|n| !RELOAD_DATA.contains(n))
+        .map(|n| n.to_string())
+        .collect();
+    (
+        functions,
+        RELOAD_DATA.iter().map(|n| n.to_string()).collect(),
+    )
+}
+
+fn link_wasm_hosting(
+    program: &Path,
+    runtime: &Path,
+    output: &Path,
+    reloadable: bool,
+) -> Result<(), AotError> {
     let read = |path: &Path| -> Result<ash_wasm_link::Object, AotError> {
         let bytes = std::fs::read(path).map_err(AotError::Io)?;
         let name = path.display().to_string();
@@ -467,6 +560,11 @@ pub fn link_wasm(program: &Path, runtime: &Path, output: &Path) -> Result<(), Ao
     for side in side_modules_beside(output) {
         options.hdll_imports.extend(side.functions);
         options.hdll_data.extend(side.data);
+    }
+    if reloadable {
+        let (functions, data) = reload_host_exports();
+        options.hdll_imports.extend(functions);
+        options.hdll_data.extend(data);
     }
     if !options.hdll_imports.is_empty() {
         // A side module's data is placed with the program's allocator.
@@ -951,8 +1049,14 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         tables: &[ModuleTables<'ctx>],
         wasm: bool,
         entry_kind: AotEntry,
+        reloadable: bool,
     ) -> Result<(), String> {
-        let library = entry_kind == AotEntry::Library;
+        let reload = entry_kind == AotEntry::Reload;
+        // Both run in a VM their host made.
+        let library = entry_kind == AotEntry::Library || reload;
+        // A reload object runs the last module only, into the program's
+        // registered modules.
+        let skip = if reload { manifests.len() - 1 } else { 0 };
         use P::*;
         let i32t = self.ctx.i32_type();
         let new_vm = self.import("wlift_aot_new_vm", &[], Some(Ptr));
@@ -1005,7 +1109,12 @@ impl<'ctx> Bootstrap<'ctx, '_> {
 
         // wasi-libc's startup calls `__main_void` when main takes no
         // arguments. A library's run takes its host's VM instead.
-        let (name, main_ty) = if library {
+        let (name, main_ty) = if reload {
+            (
+                "wlift_reload_run",
+                i32t.fn_type(&[self.ptr().into()], false),
+            )
+        } else if library {
             (
                 "wlift_program_run",
                 i32t.fn_type(&[self.ptr().into()], false),
@@ -1018,9 +1127,11 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                 i32t.fn_type(&[i32t.into(), self.ptr().into()], false),
             )
         };
-        let main = self
-            .module
-            .add_function(name, main_ty, library.then_some(Linkage::Internal));
+        let main = self.module.add_function(
+            name,
+            main_ty,
+            (library && !reload).then_some(Linkage::Internal),
+        );
         stamp_target(self.ctx, self.machine, main);
         let entry = self.ctx.append_basic_block(main, "entry");
         let body = self.ctx.append_basic_block(main, "body");
@@ -1098,12 +1209,36 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             let fp = |f: FunctionValue<'ctx>| f.as_global_value().as_pointer_value().into();
             self.call(set, &[fp(open), fp(sym)])?;
         }
-        for (m, t) in manifests.iter().zip(tables) {
+        for (m, t) in manifests.iter().zip(tables).skip(skip) {
             let modvars: BasicValueEnum = t.modvars.as_pointer_value().into();
             let consts: BasicValueEnum = t.consts.as_pointer_value().into();
             let count = self.wordc(m.modvars_count as u64);
+            if reload {
+                let begin = self.import(
+                    "wlift_aot_reload_begin",
+                    &[Ptr, Ptr, Word, Ptr, Word],
+                    Some(I32),
+                );
+                let (mp, ml) = self.string(&m.module_name);
+                let rc = self
+                    .call(begin, &[vmv, mp, ml, modvars, count])?
+                    .ok_or("reload_begin")?
+                    .into_int_value();
+                self.bail_if_nonzero(main, rc)?;
+            }
             self.call(init_prelude, &[vmv, modvars, count])?;
             self.call(root_region, &[vmv, modvars, count])?;
+            if reloadable && !reload {
+                let register = self.import(
+                    "wlift_aot_register_module",
+                    &[Ptr, Ptr, Word, Ptr, Word],
+                    Some(I32),
+                );
+                for name in std::iter::once(&m.module_name).chain(&m.module_aliases) {
+                    let (mp, ml) = self.string(name);
+                    self.call(register, &[vmv, mp, ml, modvars, count])?;
+                }
+            }
             let nconsts = self.wordc(m.const_texts.len() as u64);
             self.call(root_region, &[vmv, consts, nconsts])?;
             for (k, text) in m.const_texts.iter().enumerate() {
@@ -1141,6 +1276,23 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                     .iter()
                     .position(|s| s.modvars_symbol == imp.source_modvars_symbol)
                     .ok_or_else(|| format!("no module owns {}", imp.source_modvars_symbol))?;
+                if reload {
+                    // The source is the running program's.
+                    let import = self.import(
+                        "wlift_aot_import_module_var",
+                        &[Ptr, Ptr, Word, Ptr, Word, Word],
+                        Some(I32),
+                    );
+                    let (mp, ml) = self.string(&manifests[src].module_name);
+                    let target = self.wordc(imp.target_slot as u64);
+                    let slot = self.wordc(imp.source_slot as u64);
+                    let rc = self
+                        .call(import, &[vmv, modvars, target, mp, ml, slot])?
+                        .ok_or("import_module_var")?
+                        .into_int_value();
+                    self.bail_if_nonzero(main, rc)?;
+                    continue;
+                }
                 let from = self.slot_ptr(tables[src].modvars, imp.source_slot as u64)?;
                 let v = self
                     .b
@@ -1262,6 +1414,10 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                     self.b.position_at_end(next);
                 }
             }
+            if reload {
+                let end = self.import("wlift_aot_reload_end", &[Ptr], None);
+                self.call(end, &[vmv])?;
+            }
             let (mname, mlen) = self.string(&m.module_name);
             self.call(enter, &[vmv, modvars, count, mname, mlen, saved.into()])?;
             let fp = t.main_fn.as_global_value().as_pointer_value().into();
@@ -1294,16 +1450,44 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         self.b
             .build_return(Some(&i32t.const_int(70, false)))
             .map_err(e)?;
-        if library {
+        // A reload object's run is found by name; nothing registers it.
+        if library && !reload {
             self.emit_registration(main)?;
             for (m, t) in manifests.iter().zip(tables) {
                 for x in &t.exports {
                     self.emit_export(m, t, x, wasm)?;
                 }
             }
-        } else if wasm {
+        } else if !library && wasm {
             self.emit_start(main)?;
         }
+        Ok(())
+    }
+
+    /// Return `rc` from `f` when it is nonzero, else go on.
+    fn bail_if_nonzero(
+        &mut self,
+        f: FunctionValue<'ctx>,
+        rc: IntValue<'ctx>,
+    ) -> Result<(), String> {
+        let e = |e: inkwell::builder::BuilderError| e.to_string();
+        let failed = self
+            .b
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                rc,
+                rc.get_type().const_zero(),
+                "failed",
+            )
+            .map_err(e)?;
+        let bail = self.ctx.append_basic_block(f, "bail");
+        let next = self.ctx.append_basic_block(f, "ok");
+        self.b
+            .build_conditional_branch(failed, bail, next)
+            .map_err(e)?;
+        self.b.position_at_end(bail);
+        self.b.build_return(Some(&rc)).map_err(e)?;
+        self.b.position_at_end(next);
         Ok(())
     }
 

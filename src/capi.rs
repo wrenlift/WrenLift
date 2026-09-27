@@ -446,6 +446,10 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_run_programs",
     "wlift_aot_set_native_loader",
     "wlift_runtime_callout_depth",
+    "wlift_aot_register_module",
+    "wlift_aot_import_module_var",
+    "wlift_aot_reload_begin",
+    "wlift_aot_reload_end",
     "wlift_error_pending",
 ];
 
@@ -781,7 +785,15 @@ pub unsafe extern "C" fn wlift_aot_install_class(
     }
 
     let class_name_sym = vm_ref.interner.intern(class_name);
-    let class_ptr = vm_ref.gc.alloc_class(class_name_sym, superclass);
+    let class_ptr = match vm_ref.reused_class(class_name) {
+        Some(existing) => {
+            unsafe {
+                crate::runtime::vm::reset_class_for_reload(existing, class_name_sym, superclass)
+            };
+            existing
+        }
+        None => vm_ref.gc.alloc_class(class_name_sym, superclass),
+    };
     unsafe {
         (*class_ptr).header.class = vm_ref.class_class;
         let inherited = if !superclass.is_null() {
@@ -1464,6 +1476,137 @@ pub unsafe extern "C" fn wlift_aot_raise_stack_top(top: *const u8) {
         .fetch_max(top as usize, std::sync::atomic::Ordering::Relaxed);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = top;
+}
+
+/// Record that a module of a reloadable program keeps its `count`
+/// variables at `modvars`, under `name`, one of the names it is
+/// imported as. A module compiled later to reload finds its imports
+/// and the classes it replaces here.
+///
+/// # Safety
+/// `name` must be `name_len` bytes of UTF-8 and `modvars` must outlive
+/// the VM.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_register_module(
+    vm: *mut WrenVM,
+    name: *const c_char,
+    name_len: usize,
+    modvars: *mut u64,
+    count: usize,
+) -> c_int {
+    let (Some(vm), Some(name)) = (unsafe { vm.as_mut() }, unsafe { utf8(name, name_len) }) else {
+        return 70;
+    };
+    vm.aot_modules.insert(name.to_string(), (modvars, count));
+    0
+}
+
+/// Copy variable `slot` of the module registered as `name` into
+/// `modvars[target]`: an import of a module compiled to reload, from the
+/// program it reloads into. 70 when no module is registered as `name`.
+///
+/// # Safety
+/// `name` must be `name_len` bytes of UTF-8 and `modvars` must hold
+/// `target + 1` values.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_import_module_var(
+    vm: *mut WrenVM,
+    modvars: *mut u64,
+    target: usize,
+    name: *const c_char,
+    name_len: usize,
+    slot: usize,
+) -> c_int {
+    let (Some(vm), Some(name)) = (unsafe { vm.as_mut() }, unsafe { utf8(name, name_len) }) else {
+        return 70;
+    };
+    match vm.aot_modules.get(name) {
+        Some(&(vars, count)) if slot < count && !modvars.is_null() => {
+            unsafe { *modvars.add(target) = *vars.add(slot) };
+            0
+        }
+        _ => 70,
+    }
+}
+
+/// Start reloading the module registered as `name` from newly compiled
+/// code whose variables are `modvars`: until [`wlift_aot_reload_end`],
+/// a class installed under the name of one of the old module's classes
+/// is that class again, so instances made before get the new methods.
+/// Every name the module was registered under now means `modvars`. 70
+/// when no module is registered as `name`.
+///
+/// # Safety
+/// `name` must be `name_len` bytes of UTF-8 and `modvars` must outlive
+/// the VM.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_reload_begin(
+    vm: *mut WrenVM,
+    name: *const c_char,
+    name_len: usize,
+    modvars: *mut u64,
+    count: usize,
+) -> c_int {
+    use crate::runtime::object::ObjClass;
+    let (Some(vm), Some(name)) = (unsafe { vm.as_mut() }, unsafe { utf8(name, name_len) }) else {
+        return 70;
+    };
+    let Some(&(old, old_count)) = vm.aot_modules.get(name) else {
+        vm.report_error(&format!("Module '{name}' is not loaded."));
+        return 70;
+    };
+    let mut classes = std::collections::HashMap::new();
+    for slot in 0..old_count {
+        let value = crate::runtime::value::Value::from_bits(unsafe { *old.add(slot) });
+        let Some(ptr) = value.as_object() else {
+            continue;
+        };
+        let header = ptr as *const crate::runtime::object::ObjHeader;
+        if unsafe { (*header).obj_type } != crate::runtime::object::ObjType::Class {
+            continue;
+        }
+        let class = ptr as *mut ObjClass;
+        let class_name = vm.interner.resolve(unsafe { (*class).name }).to_string();
+        if vm.core_class_value(&class_name) == Some(value) {
+            continue;
+        }
+        classes.insert(class_name, class);
+    }
+    for entry in vm.aot_modules.values_mut() {
+        if entry.0 == old {
+            *entry = (modvars, count);
+        }
+    }
+    vm.begin_class_reuse(classes);
+    0
+}
+
+/// End what [`wlift_aot_reload_begin`] started, once the reloaded
+/// module's classes are installed.
+///
+/// # Safety
+/// `vm` must be a live VM.
+#[cfg(feature = "aot_runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wlift_aot_reload_end(vm: *mut WrenVM) {
+    if let Some(vm) = unsafe { vm.as_mut() } {
+        vm.end_class_reuse();
+    }
+}
+
+/// `len` bytes at `ptr` as UTF-8.
+///
+/// # Safety
+/// `ptr` must be null or valid for `len` bytes that outlive the result.
+#[cfg(feature = "aot_runtime")]
+unsafe fn utf8<'a>(ptr: *const c_char, len: usize) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }).ok()
 }
 
 /// How many runtime frames on this thread are in a call into compiled

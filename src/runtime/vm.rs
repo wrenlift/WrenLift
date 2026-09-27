@@ -460,6 +460,11 @@ pub struct Shared {
     /// `None` outside of a reload.
     reload_class_table: Option<HashMap<String, *mut ObjClass>>,
 
+    /// Each module of a reloadable AOT program, by every name it is
+    /// imported as: where its variables are and how many.
+    #[cfg(feature = "aot_runtime")]
+    pub(crate) aot_modules: HashMap<String, (*mut u64, usize)>,
+
     /// Last-seen mtime per absolute-path module, captured at install
     /// time and updated on each reload. Used by
     /// [`Self::check_pending_reload`] to decide which modules a
@@ -796,6 +801,8 @@ impl VM {
             field_layouts: HashMap::new(),
             closure_fns: Vec::new(),
             reload_class_table: None,
+            #[cfg(feature = "aot_runtime")]
+            aot_modules: HashMap::new(),
             module_mtimes: HashMap::new(),
             reload_callbacks: Vec::new(),
             before_reload_callbacks: Vec::new(),
@@ -1781,6 +1788,28 @@ impl VM {
         )
     }
 
+    /// Until [`Self::end_class_reuse`], a class installed under a name in
+    /// `classes` reuses that class, as `reload_module`'s install does.
+    #[cfg(feature = "aot_runtime")]
+    pub(crate) fn begin_class_reuse(&mut self, classes: HashMap<String, *mut ObjClass>) {
+        self.reload_class_table = Some(classes);
+    }
+
+    /// The class an install of `name` reuses, during a reload.
+    #[cfg(feature = "aot_runtime")]
+    pub(crate) fn reused_class(&self, name: &str) -> Option<*mut ObjClass> {
+        self.reload_class_table.as_ref()?.get(name).copied()
+    }
+
+    /// End a reload's class reuse and drop what dispatch cached from
+    /// the classes' old method tables.
+    #[cfg(feature = "aot_runtime")]
+    pub(crate) fn end_class_reuse(&mut self) {
+        self.reload_class_table = None;
+        self.engine.invalidate_inline_caches();
+        self.method_cache.invalidate();
+    }
+
     /// Re-parse and re-install a previously loaded module. Preserves
     /// the identity of classes declared in the module so instances
     /// created before the reload keep working — their `class` pointer
@@ -2363,30 +2392,7 @@ impl VM {
                 .and_then(|t| t.get(&class_name_str).copied());
             let class_ptr = match reused {
                 Some(existing) => {
-                    unsafe {
-                        // Drop stale methods/attributes; the method-
-                        // binding loop below repopulates. Seed the
-                        // table with whatever the (possibly new)
-                        // superclass exposes so inherited methods
-                        // still resolve.
-                        let parent_methods = if !superclass.is_null() {
-                            (*superclass).methods.clone()
-                        } else {
-                            Vec::new()
-                        };
-                        (*existing).methods = parent_methods;
-                        (*existing).static_fields.clear();
-                        (*existing).method_attributes.clear();
-                        (*existing).attributes.clear();
-                        (*existing).superclass = superclass;
-                        (*existing).name = class_mir.name;
-                        (*existing).is_foreign = false;
-                        (*existing).flags = if superclass.is_null() {
-                            0
-                        } else {
-                            (*superclass).flags
-                        };
-                    }
+                    unsafe { reset_class_for_reload(existing, class_mir.name, superclass) };
                     existing
                 }
                 None => self.gc.alloc_class(class_mir.name, superclass),
@@ -6587,6 +6593,38 @@ fn constructor_field_kinds(class: &crate::mir::ClassMir, total_fields: usize) ->
         .into_iter()
         .map(|e| if e { 0 } else { FIELD_OTHER })
         .collect()
+}
+
+/// Ready `existing` to be installed again as `name` under `superclass`:
+/// only what `superclass` exposes stays bound, for the install to bind
+/// the rest, so instances made before a reload dispatch to the new
+/// methods.
+///
+/// # Safety
+/// `existing` must be a live class and `superclass` live or null.
+pub(crate) unsafe fn reset_class_for_reload(
+    existing: *mut ObjClass,
+    name: SymbolId,
+    superclass: *mut ObjClass,
+) {
+    unsafe {
+        (*existing).methods = if superclass.is_null() {
+            Vec::new()
+        } else {
+            (*superclass).methods.clone()
+        };
+        (*existing).static_fields.clear();
+        (*existing).method_attributes.clear();
+        (*existing).attributes.clear();
+        (*existing).superclass = superclass;
+        (*existing).name = name;
+        (*existing).is_foreign = false;
+        (*existing).flags = if superclass.is_null() {
+            0
+        } else {
+            (*superclass).flags
+        };
+    }
 }
 
 #[cfg(test)]
