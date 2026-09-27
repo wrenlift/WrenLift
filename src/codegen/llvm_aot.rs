@@ -20,7 +20,8 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, StructType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, GlobalValue, PointerValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, GlobalValue, IntValue,
+    PointerValue,
 };
 
 use crate::codegen::aot::{
@@ -240,8 +241,8 @@ pub fn compile_modules_to_llvm_object_as(
                 && let Some(slot) = plan.slot
             {
                 let class_name = m.interner.resolve(plan.class.name);
-                for method in &plan.class.methods {
-                    if let Some(x) = export_plan(m, class_name, slot, method, &env)? {
+                for (method, body) in plan.class.methods.iter().zip(&plan.methods) {
+                    if let Some(x) = export_plan(m, class_name, slot, method, body, &env)? {
                         exports.push(x);
                     }
                 }
@@ -676,6 +677,10 @@ struct ExportPlan {
     /// An instance member takes its receiver; a static or constructor
     /// is called on the class.
     has_receiver: bool,
+    /// The compiled body, when the export can call it directly: not a
+    /// constructor (its body is the initializer) and not a body that
+    /// needs its defining class installed (super, static fields).
+    body: Option<String>,
 }
 
 /// The export plan for `method` of the class `class_name` in slot
@@ -685,6 +690,7 @@ fn export_plan(
     class_name: &str,
     slot: u32,
     method: &crate::mir::MethodMir,
+    body: &str,
     env: &AotEnv,
 ) -> Result<Option<ExportPlan>, AotError> {
     let export = crate::sema::export::Export::from_entries(&method.attributes)
@@ -735,6 +741,9 @@ fn export_plan(
         sig_slot: sig_slot as u32,
         arity,
         has_receiver: !(method.is_static || method.is_constructor),
+        body: (!method.is_constructor
+            && !crate::codegen::aot::method_uses_defining_class(&method.mir))
+        .then(|| body.to_string()),
     }))
 }
 
@@ -1405,23 +1414,128 @@ impl<'ctx> Bootstrap<'ctx, '_> {
                 saved.into(),
             ],
         )?;
-        let mut args: Vec<BasicValueEnum> = Vec::with_capacity(n_params + 2);
-        let receiver: BasicValueEnum = if x.has_receiver {
-            f.get_nth_param(0).ok_or("receiver")?
+        let receiver: IntValue<'ctx> = if x.has_receiver {
+            f.get_nth_param(0).ok_or("receiver")?.into_int_value()
         } else {
             let slot = self.slot_ptr(t.modvars, x.class_slot as u64)?;
-            self.b.build_load(i64t, slot, "class").map_err(e)?
+            self.b
+                .build_load(i64t, slot, "class")
+                .map_err(e)?
+                .into_int_value()
         };
-        args.push(receiver);
-        let sym = self.slot_ptr(t.symbols, x.sig_slot as u64)?;
-        args.push(self.b.build_load(i64t, sym, "sig").map_err(e)?);
-        args.extend(f.get_param_iter().skip(x.has_receiver as usize));
-        let call_fn = self.import(
-            &format!("wren_call_{}", x.arity),
-            &vec![I64; x.arity + 2],
-            Some(I64),
-        );
-        let result = self.call(call_fn, &args)?.ok_or("wren_call")?;
+        let user_args: Vec<BasicValueEnum> =
+            f.get_param_iter().skip(x.has_receiver as usize).collect();
+        let dispatch = |this: &mut Self| -> Result<IntValue<'ctx>, String> {
+            let sym = this.slot_ptr(t.symbols, x.sig_slot as u64)?;
+            let sig = this
+                .b
+                .build_load(i64t, sym, "sig")
+                .map_err(|e| e.to_string())?;
+            let mut args: Vec<BasicValueEnum> = vec![receiver.into(), sig];
+            args.extend(user_args.iter().copied());
+            let call_fn = this.import(
+                &format!("wren_call_{}", x.arity),
+                &vec![I64; x.arity + 2],
+                Some(I64),
+            );
+            Ok(this
+                .call(call_fn, &args)?
+                .ok_or("wren_call")?
+                .into_int_value())
+        };
+        let body = x
+            .body
+            .as_deref()
+            .and_then(|s| self.module.get_function(s))
+            .filter(|b| b.count_params() as usize == x.arity + 1);
+        let result = match body {
+            None => dispatch(self)?,
+            Some(body) => {
+                let direct = self.ctx.append_basic_block(f, "direct");
+                let join = self.ctx.append_basic_block(f, "join");
+                let mut incoming: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+                    Vec::new();
+                if x.has_receiver {
+                    // Straight to the body only for an instance of this very
+                    // class; a subclass may override the method.
+                    use crate::codegen::cranelift_backend::cl::{PTR_MASK, TAG_OBJ};
+                    let check = self.ctx.append_basic_block(f, "check");
+                    let other = self.ctx.append_basic_block(f, "dispatch");
+                    let tag = i64t.const_int(TAG_OBJ, false);
+                    let high = self.b.build_and(receiver, tag, "high").map_err(e)?;
+                    let is_obj = self
+                        .b
+                        .build_int_compare(inkwell::IntPredicate::EQ, high, tag, "isobj")
+                        .map_err(e)?;
+                    self.b
+                        .build_conditional_branch(is_obj, check, other)
+                        .map_err(e)?;
+                    self.b.position_at_end(check);
+                    let mask = i64t.const_int(PTR_MASK, false);
+                    let addr = self.b.build_and(receiver, mask, "addr").map_err(e)?;
+                    let header = self
+                        .b
+                        .build_int_add(
+                            addr,
+                            i64t.const_int(self.layout.header_class as u64, false),
+                            "hdr",
+                        )
+                        .map_err(e)?;
+                    let header = self
+                        .b
+                        .build_int_to_ptr(header, self.ptr(), "hdrp")
+                        .map_err(e)?;
+                    let class_word = self
+                        .b
+                        .build_load(self.word(), header, "cls")
+                        .map_err(e)?
+                        .into_int_value();
+                    let class_ptr = self
+                        .b
+                        .build_int_z_extend_or_bit_cast(class_word, i64t, "clsw")
+                        .map_err(e)?;
+                    let slot = self.slot_ptr(t.modvars, x.class_slot as u64)?;
+                    let class = self
+                        .b
+                        .build_load(i64t, slot, "class")
+                        .map_err(e)?
+                        .into_int_value();
+                    let expected = self.b.build_and(class, mask, "want").map_err(e)?;
+                    let same = self
+                        .b
+                        .build_int_compare(inkwell::IntPredicate::EQ, class_ptr, expected, "same")
+                        .map_err(e)?;
+                    self.b
+                        .build_conditional_branch(same, direct, other)
+                        .map_err(e)?;
+                    self.b.position_at_end(other);
+                    let v = dispatch(self)?;
+                    incoming.push((v, self.b.get_insert_block().unwrap()));
+                    self.b.build_unconditional_branch(join).map_err(e)?;
+                } else {
+                    self.b.build_unconditional_branch(direct).map_err(e)?;
+                }
+                self.b.position_at_end(direct);
+                let mut args: Vec<BasicMetadataValueEnum> = vec![receiver.into()];
+                args.extend(user_args.iter().map(|a| BasicMetadataValueEnum::from(*a)));
+                let v = self
+                    .b
+                    .build_call(body, &args, "direct")
+                    .map_err(e)?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or("a method body returns a value")?
+                    .into_int_value();
+                incoming.push((v, self.b.get_insert_block().unwrap()));
+                self.b.build_unconditional_branch(join).map_err(e)?;
+                self.b.position_at_end(join);
+                let phi = self.b.build_phi(i64t, "result").map_err(e)?;
+                for (v, bb) in &incoming {
+                    phi.add_incoming(&[(v, *bb)]);
+                }
+                phi.as_basic_value().into_int_value()
+            }
+        };
         self.call(exit, &[saved.into()])?;
         self.b.build_return(Some(&result)).map_err(e)?;
         Ok(())

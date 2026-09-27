@@ -621,6 +621,15 @@ class Tally {
 
   #export = "fail()"
   static fail() { Fiber.abort("boom") }
+
+  #export = "loud(start: Num)"
+  static loud(start) { Loud.new(start) }
+}
+
+// Through Tally's exported add, an instance of this reaches its own.
+class Loud is Tally {
+  construct new(start) { super(start) }
+  add(n) { super.add(n * 10) }
 }
 System.print("module ran")
 "#,
@@ -645,12 +654,13 @@ System.print("module ran")
             name.len()
         )
     };
-    let (new, add, total, double, fail) = (
+    let (new, add, total, double, fail, loud) = (
         symbol("c", "new", 1),
         symbol("m", "add", 1),
         symbol("g", "total", 0),
         symbol("t", "double", 1),
         symbol("t", "fail", 0),
+        symbol("t", "loud", 1),
     );
     let read = |path: &Path| {
         let bytes = std::fs::read(path).expect("read object");
@@ -664,7 +674,7 @@ System.print("module ran")
         ]
         .iter()
         .map(|s| s.to_string())
-        .chain([&new, &add, &total, &double, &fail].map(|s| s.clone()))
+        .chain([&new, &add, &total, &double, &fail, &loud].map(|s| s.clone()))
         .collect(),
         ..Default::default()
     };
@@ -736,6 +746,18 @@ System.print("module ran")
         "taking the error clears it"
     );
     assert_eq!(back(double.call(&mut store, num(4.0)).unwrap()), 8.0);
+
+    let loud = f(&mut store, &loud)
+        .typed::<i64, i64>(&store)
+        .unwrap()
+        .call(&mut store, num(1.0))
+        .expect("a subclass instance");
+    assert_eq!(
+        back(add.call(&mut store, (loud, num(2.0))).unwrap()),
+        21.0,
+        "the override runs"
+    );
+    assert_eq!(back(total.call(&mut store, loud).unwrap()), 21.0);
 }
 
 /// A native library as a `dylink.0` side module, the shape an Ash host

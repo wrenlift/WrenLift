@@ -1763,7 +1763,7 @@ pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result
 /// Excluding these methods from devirt keeps the runtime's
 /// implicit-context contract intact at the cost of one
 /// `wren_call_N` per affected site.
-fn method_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
+pub(crate) fn method_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
     use crate::mir::Instruction;
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
