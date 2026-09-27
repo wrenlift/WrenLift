@@ -2574,11 +2574,21 @@ impl ExecutionEngine {
             let Some(bytecode) = bytecode else { continue };
             let ic_table = unsafe { &*bytecode.ic_table.get() };
             for entry in ic_table.iter() {
-                if entry
-                    .snapshot()
-                    .is_some_and(|e| e.names_function() && e.func_id == target_id)
-                {
-                    entry.clear();
+                let Some(e) = entry.snapshot() else { continue };
+                if !e.names_function() || e.func_id != target_id {
+                    continue;
+                }
+                // The closure an entry names stays the target; only a
+                // cached entry point goes stale. Keeping the target
+                // lets a caller compiled now still see the site warm.
+                match e.kind {
+                    2 | 7 => {}
+                    1 | 6 => entry.store(crate::mir::bytecode::CallSiteIC {
+                        jit_ptr: std::ptr::null(),
+                        kind: 2,
+                        ..e
+                    }),
+                    _ => entry.clear(),
                 }
             }
         }
@@ -6187,11 +6197,11 @@ mod tests {
             .map(|b| b as *const crate::mir::threaded::ThreadedCode);
         assert_eq!(after, Some(before), "the body moved with the table");
     }
-    /// Installing function N clears the entries that call N, not the
-    /// ones whose `func_id` holds N for another reason: a getter of
-    /// field N keeps its entry.
+    /// Installing function N drops the entry points cached for calls of
+    /// N and keeps the target they name; entries whose `func_id` holds
+    /// N for another reason, a getter of field N, are left alone.
     #[test]
-    fn installing_a_function_clears_only_entries_naming_it() {
+    fn installing_a_function_drops_only_entry_points_to_it() {
         use crate::mir::bytecode::CallSiteIC;
         let mut interner = Interner::new();
         let name = interner.intern("caller");
@@ -6202,7 +6212,7 @@ mod tests {
         mir.block_mut(bb)
             .instructions
             .push((recv, crate::mir::Instruction::BlockParam(0)));
-        for _ in 0..2 {
+        for _ in 0..4 {
             let v = mir.new_value();
             mir.block_mut(bb).instructions.push((
                 v,
@@ -6219,7 +6229,7 @@ mod tests {
         let caller = engine.register_function(mir);
         let bc = engine.ensure_bytecode(caller).expect("bytecode");
         let table = unsafe { &*(*bc).ic_table.get() };
-        assert!(table.len() >= 2);
+        assert!(table.len() >= 4);
         let entry = |kind: u64| CallSiteIC {
             class: 0x1000,
             jit_ptr: std::ptr::null(),
@@ -6228,9 +6238,18 @@ mod tests {
             kind,
         };
         table[0].store(entry(5));
-        table[1].store(entry(1));
+        table[1].store(CallSiteIC {
+            jit_ptr: 0x2000 as *const u8,
+            ..entry(1)
+        });
+        table[2].store(entry(2));
+        table[3].store(entry(3));
         engine.invalidate_ic_entries_for(FuncId(0));
         assert_eq!(table[0].kind(), 5, "a getter of field 0 stays");
-        assert_eq!(table[1].kind(), 0, "a call of function 0 goes");
+        let call = table[1].snapshot().expect("entry");
+        assert_eq!(call.kind, 2, "a call of function 0 keeps its target");
+        assert!(call.jit_ptr.is_null(), "and drops its entry point");
+        assert_eq!(table[2].kind(), 2, "a closure entry stays");
+        assert_eq!(table[3].kind(), 0, "a constructor entry goes");
     }
 }
