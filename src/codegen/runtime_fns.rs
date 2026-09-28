@@ -2607,7 +2607,7 @@ fn dispatch_call(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
     }
 }
 
-fn dispatch_call_rooted(
+pub(crate) fn dispatch_call_rooted(
     vm: &mut crate::runtime::vm::VM,
     j: *mut JitThread,
     recv: Value,

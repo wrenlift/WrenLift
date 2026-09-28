@@ -29,6 +29,7 @@ use crate::codegen::aot::{
     plan_classes, resolve_manifest_imports,
 };
 use crate::codegen::llvm_backend::llvm::{AotEnv, lower_aot_function, stamp_target};
+use crate::mir::ValueId;
 use crate::runtime::object_layout::Layout;
 
 /// The wasm32 features a default build uses: what wasmtime and current
@@ -348,6 +349,7 @@ pub fn compile_modules_to_llvm_object_with(
                     if let Some(mut x) = export_plan(m, class_name, slot, method, body, &env)? {
                         if reloadable {
                             x.body = None;
+                            x.frameless = None;
                         }
                         exports.push(x);
                     }
@@ -1072,6 +1074,174 @@ struct ExportPlan {
     body: Option<String>,
     /// A constructor's body is its initializer, run on a fresh instance.
     constructor: bool,
+    /// The body, when the export can run it without the runtime.
+    frameless: Option<Frameless>,
+}
+
+/// A member body an export runs itself, with no runtime context: one
+/// block of instructions that cannot allocate, collect, suspend or raise
+/// once the export's checks pass. A check that would raise sends the call
+/// the full way instead, which is safe because nothing has been written
+/// before any check.
+#[derive(Clone)]
+struct Frameless {
+    ops: Vec<(ValueId, FramelessOp)>,
+    /// `None` answers null.
+    result: Option<ValueId>,
+}
+
+#[derive(Clone, Copy)]
+enum FramelessOp {
+    /// The receiver (0) or a parameter.
+    Param(u16),
+    Copy(ValueId),
+    /// A boxed value or raw f64, by its bits.
+    Bits(u64),
+    /// The value, which the full path takes when it is not a Num.
+    CheckNum(ValueId),
+    Unbox(ValueId),
+    Box(ValueId),
+    Arith(ArithOp, ValueId, ValueId),
+    Neg(ValueId),
+    /// A raw integer as a raw f64.
+    IntToF64(ValueId),
+    /// A field of the receiver.
+    Field(u16),
+    /// Store a Num in a field of the receiver.
+    SetField(u16, ValueId),
+}
+
+#[derive(Clone, Copy)]
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// `mir` as a [`Frameless`] body, if it is one. `num` is the symbol of
+/// the Num class in `mir`'s interner.
+fn frameless_body(
+    mir: &crate::mir::MirFunction,
+    num: Option<crate::intern::SymbolId>,
+) -> Option<Frameless> {
+    use crate::mir::{Instruction as I, Terminator};
+    use std::collections::HashSet;
+    let [block] = mir.blocks.as_slice() else {
+        return None;
+    };
+    // Boxed values known to be Nums, raw f64 values and raw integers.
+    let mut nums: HashSet<ValueId> = HashSet::new();
+    let mut raw: HashSet<ValueId> = HashSet::new();
+    let mut ints: HashSet<ValueId> = HashSet::new();
+    let mut written = false;
+    let mut ops = Vec::with_capacity(block.instructions.len());
+    for (v, inst) in &block.instructions {
+        let op = match inst {
+            I::BlockParam(i) => FramelessOp::Param(*i),
+            I::Move(a) => {
+                if nums.contains(a) {
+                    nums.insert(*v);
+                }
+                if raw.contains(a) {
+                    raw.insert(*v);
+                }
+                FramelessOp::Copy(*a)
+            }
+            I::ConstNum(x) => {
+                nums.insert(*v);
+                FramelessOp::Bits(x.to_bits())
+            }
+            I::ConstF64(x) => {
+                raw.insert(*v);
+                FramelessOp::Bits(x.to_bits())
+            }
+            I::ConstI64(x) => {
+                ints.insert(*v);
+                FramelessOp::Bits(*x as u64)
+            }
+            I::I64ToF64(a) if ints.contains(a) => {
+                raw.insert(*v);
+                FramelessOp::IntToF64(*a)
+            }
+            I::ConstNull => FramelessOp::Bits(crate::runtime::value::Value::null().to_bits()),
+            I::ConstBool(b) => FramelessOp::Bits(crate::runtime::value::Value::bool(*b).to_bits()),
+            I::CheckType { value, class, .. } if Some(*class) == num => {
+                if !nums.contains(value) && written {
+                    return None;
+                }
+                nums.insert(*v);
+                FramelessOp::CheckNum(*value)
+            }
+            I::Unbox(a) if nums.contains(a) => {
+                raw.insert(*v);
+                FramelessOp::Unbox(*a)
+            }
+            I::Box(a) if raw.contains(a) => {
+                nums.insert(*v);
+                FramelessOp::Box(*a)
+            }
+            I::AddF64(a, b) | I::SubF64(a, b) | I::MulF64(a, b) | I::DivF64(a, b)
+                if raw.contains(a) && raw.contains(b) =>
+            {
+                raw.insert(*v);
+                let op = match inst {
+                    I::AddF64(..) => ArithOp::Add,
+                    I::SubF64(..) => ArithOp::Sub,
+                    I::MulF64(..) => ArithOp::Mul,
+                    _ => ArithOp::Div,
+                };
+                FramelessOp::Arith(op, *a, *b)
+            }
+            I::NegF64(a) if raw.contains(a) => {
+                raw.insert(*v);
+                FramelessOp::Neg(*a)
+            }
+            // A generic operator on Nums, before anything is written: the
+            // full path takes any other operands.
+            I::Add(a, b) | I::Sub(a, b) | I::Mul(a, b) | I::Div(a, b)
+                if !written || (nums.contains(a) && nums.contains(b)) =>
+            {
+                let op = match inst {
+                    I::Add(..) => ArithOp::Add,
+                    I::Sub(..) => ArithOp::Sub,
+                    I::Mul(..) => ArithOp::Mul,
+                    _ => ArithOp::Div,
+                };
+                // Checked in place: the values are Nums from here on.
+                for x in [a, b] {
+                    if !nums.contains(x) {
+                        ops.push((*x, FramelessOp::CheckNum(*x)));
+                        nums.insert(*x);
+                    }
+                }
+                nums.insert(*v);
+                FramelessOp::Arith(op, *a, *b)
+            }
+            I::GetField(recv, idx) if is_receiver(block, *recv) => FramelessOp::Field(*idx),
+            I::SetField(recv, idx, val) if is_receiver(block, *recv) && nums.contains(val) => {
+                written = true;
+                nums.insert(*v);
+                FramelessOp::SetField(*idx, *val)
+            }
+            _ => return None,
+        };
+        ops.push((*v, op));
+    }
+    let result = match &block.terminator {
+        Terminator::Return(v) => Some(*v),
+        Terminator::ReturnNull => None,
+        _ => return None,
+    };
+    Some(Frameless { ops, result })
+}
+
+/// Whether `v` is the receiver, the block's first parameter.
+fn is_receiver(block: &crate::mir::BasicBlock, v: ValueId) -> bool {
+    block
+        .instructions
+        .iter()
+        .any(|(id, inst)| *id == v && matches!(inst, crate::mir::Instruction::BlockParam(0)))
 }
 
 /// The export plan for `method` of the class `class_name` in slot
@@ -1135,6 +1305,11 @@ fn export_plan(
         body: (!crate::codegen::aot::method_uses_defining_class(&method.mir))
             .then(|| body.to_string()),
         constructor: method.is_constructor,
+        frameless: if method.is_constructor {
+            None
+        } else {
+            frameless_body(&method.mir, m.interner.lookup("Num"))
+        },
     }))
 }
 
@@ -1941,6 +2116,11 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         self.b.build_return(Some(&null)).map_err(e)?;
 
         self.b.position_at_end(call);
+        if let Some(body) = &x.frameless {
+            let full = self.ctx.append_basic_block(f, "full");
+            self.emit_frameless(f, t, x, body, full)?;
+            self.b.position_at_end(full);
+        }
         let saved = self
             .b
             .build_array_alloca(i64t, i64t.const_int(16, false), "saved")
@@ -2102,6 +2282,197 @@ impl<'ctx> Bootstrap<'ctx, '_> {
             }
         };
         self.call(exit, &[saved.into()])?;
+        self.b.build_return(Some(&result)).map_err(e)?;
+        Ok(())
+    }
+
+    /// Run `body` for export `x` in `f` and return its result, going to
+    /// `full` wherever a check fails: the receiver of an instance member
+    /// not an instance of the class itself, or a value the body takes as
+    /// a Num not one.
+    fn emit_frameless(
+        &mut self,
+        f: FunctionValue<'ctx>,
+        t: &ModuleTables<'ctx>,
+        x: &ExportPlan,
+        body: &Frameless,
+        full: inkwell::basic_block::BasicBlock<'ctx>,
+    ) -> Result<(), String> {
+        use crate::codegen::cranelift_backend::cl::{PTR_MASK, QNAN, TAG_OBJ};
+        let e = |e: inkwell::builder::BuilderError| e.to_string();
+        let i64t = self.ctx.i64_type();
+        let f64t = self.ctx.f64_type();
+        let slot = self.slot_ptr(t.modvars, x.class_slot as u64)?;
+        let class = self
+            .b
+            .build_load(i64t, slot, "class")
+            .map_err(e)?
+            .into_int_value();
+        let receiver = if x.has_receiver {
+            let r = f.get_nth_param(0).ok_or("receiver")?.into_int_value();
+            // Only an instance of this very class: a subclass may
+            // override the member.
+            let tag = i64t.const_int(TAG_OBJ, false);
+            let high = self.b.build_and(r, tag, "high").map_err(e)?;
+            let is_obj = self
+                .b
+                .build_int_compare(inkwell::IntPredicate::EQ, high, tag, "isobj")
+                .map_err(e)?;
+            let check = self.ctx.append_basic_block(f, "fl_class");
+            self.b
+                .build_conditional_branch(is_obj, check, full)
+                .map_err(e)?;
+            self.b.position_at_end(check);
+            let mask = i64t.const_int(PTR_MASK, false);
+            let addr = self.b.build_and(r, mask, "addr").map_err(e)?;
+            let header = self
+                .b
+                .build_int_add(
+                    addr,
+                    i64t.const_int(self.layout.header_class as u64, false),
+                    "hdr",
+                )
+                .map_err(e)?;
+            let header = self
+                .b
+                .build_int_to_ptr(header, self.ptr(), "hdrp")
+                .map_err(e)?;
+            let word = self
+                .b
+                .build_load(self.word(), header, "cls")
+                .map_err(e)?
+                .into_int_value();
+            let word = self
+                .b
+                .build_int_z_extend_or_bit_cast(word, i64t, "clsw")
+                .map_err(e)?;
+            let expected = self.b.build_and(class, mask, "want").map_err(e)?;
+            let same = self
+                .b
+                .build_int_compare(inkwell::IntPredicate::EQ, word, expected, "same")
+                .map_err(e)?;
+            let go = self.ctx.append_basic_block(f, "fl_body");
+            self.b.build_conditional_branch(same, go, full).map_err(e)?;
+            self.b.position_at_end(go);
+            r
+        } else {
+            class
+        };
+        let field = |this: &mut Self, idx: u16| -> Result<PointerValue<'ctx>, String> {
+            let mask = i64t.const_int(PTR_MASK, false);
+            let obj = this.b.build_and(receiver, mask, "obj").map_err(e)?;
+            let at = this
+                .b
+                .build_int_add(
+                    obj,
+                    i64t.const_int(this.layout.instance_size as u64 + 8 * idx as u64, false),
+                    "fld",
+                )
+                .map_err(e)?;
+            this.b.build_int_to_ptr(at, this.ptr(), "fldp").map_err(e)
+        };
+        let mut vals: std::collections::HashMap<ValueId, IntValue<'ctx>> = Default::default();
+        let get = |vals: &std::collections::HashMap<ValueId, IntValue<'ctx>>, v: &ValueId| {
+            vals.get(v)
+                .copied()
+                .ok_or_else(|| format!("frameless: {v:?} unset"))
+        };
+        for (v, op) in &body.ops {
+            let value = match *op {
+                FramelessOp::Param(0) => receiver,
+                FramelessOp::Param(i) => {
+                    let at = i as u32 - !x.has_receiver as u32;
+                    match f.get_nth_param(at) {
+                        Some(p) => p.into_int_value(),
+                        None => {
+                            i64t.const_int(crate::runtime::value::Value::null().to_bits(), false)
+                        }
+                    }
+                }
+                FramelessOp::Copy(a) | FramelessOp::Unbox(a) | FramelessOp::Box(a) => {
+                    get(&vals, &a)?
+                }
+                FramelessOp::Bits(b) => i64t.const_int(b, false),
+                FramelessOp::CheckNum(a) => {
+                    let a = get(&vals, &a)?;
+                    let q = i64t.const_int(QNAN, false);
+                    let m = self.b.build_and(a, q, "q").map_err(e)?;
+                    let is_num = self
+                        .b
+                        .build_int_compare(inkwell::IntPredicate::NE, m, q, "isnum")
+                        .map_err(e)?;
+                    let ok = self.ctx.append_basic_block(f, "fl_num");
+                    self.b
+                        .build_conditional_branch(is_num, ok, full)
+                        .map_err(e)?;
+                    self.b.position_at_end(ok);
+                    a
+                }
+                FramelessOp::Arith(op, a, b) => {
+                    let a = self
+                        .b
+                        .build_bit_cast(get(&vals, &a)?, f64t, "a")
+                        .map_err(e)?
+                        .into_float_value();
+                    let b = self
+                        .b
+                        .build_bit_cast(get(&vals, &b)?, f64t, "b")
+                        .map_err(e)?
+                        .into_float_value();
+                    let r = match op {
+                        ArithOp::Add => self.b.build_float_add(a, b, "r"),
+                        ArithOp::Sub => self.b.build_float_sub(a, b, "r"),
+                        ArithOp::Mul => self.b.build_float_mul(a, b, "r"),
+                        ArithOp::Div => self.b.build_float_div(a, b, "r"),
+                    }
+                    .map_err(e)?;
+                    self.b
+                        .build_bit_cast(r, i64t, "rb")
+                        .map_err(e)?
+                        .into_int_value()
+                }
+                FramelessOp::Neg(a) => {
+                    let a = self
+                        .b
+                        .build_bit_cast(get(&vals, &a)?, f64t, "a")
+                        .map_err(e)?
+                        .into_float_value();
+                    let r = self.b.build_float_neg(a, "r").map_err(e)?;
+                    self.b
+                        .build_bit_cast(r, i64t, "rb")
+                        .map_err(e)?
+                        .into_int_value()
+                }
+                FramelessOp::IntToF64(a) => {
+                    let r = self
+                        .b
+                        .build_signed_int_to_float(get(&vals, &a)?, f64t, "f")
+                        .map_err(e)?;
+                    self.b
+                        .build_bit_cast(r, i64t, "fb")
+                        .map_err(e)?
+                        .into_int_value()
+                }
+                FramelessOp::Field(idx) => {
+                    let p = field(self, idx)?;
+                    self.b
+                        .build_load(i64t, p, "fv")
+                        .map_err(e)?
+                        .into_int_value()
+                }
+                FramelessOp::SetField(idx, val) => {
+                    let val = get(&vals, &val)?;
+                    let p = field(self, idx)?;
+                    self.b.build_store(p, val).map_err(e)?;
+                    val
+                }
+            };
+            vals.insert(*v, value);
+        }
+        let result = match &body.result {
+            Some(v) => get(&vals, v)?,
+            None => i64t.const_int(crate::runtime::value::Value::null().to_bits(), false),
+        };
         self.b.build_return(Some(&result)).map_err(e)?;
         Ok(())
     }

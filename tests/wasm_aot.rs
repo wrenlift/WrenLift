@@ -783,6 +783,18 @@ class Tally {
 
   #export = "loud(start: Num)"
   static loud(start) { Loud.new(start) }
+
+  #export = "adder(n: Num)"
+  static adder(n) { Fn.new {|x| x + n } }
+
+  #export = "caller()"
+  static caller() { Callable.new() }
+}
+
+// Called by the host as a function, through dispatch.
+class Callable {
+  construct new() {}
+  call() { 42 }
 }
 
 // Through Tally's exported add, an instance of this reaches its own.
@@ -823,6 +835,7 @@ System.print("module ran")
         symbol("t", "fail", 0),
         symbol("t", "loud", 1),
     );
+    let (adder, caller) = (symbol("t", "adder", 1), symbol("t", "caller", 0));
     let read = |path: &Path| {
         let bytes = std::fs::read(path).expect("read object");
         ash_wasm_link::read(&path.display().to_string(), &bytes).expect("parse object")
@@ -832,10 +845,17 @@ System.print("module ran")
             "wlift_aot_new_vm",
             "wlift_aot_run_programs",
             "wlift_aot_take_error",
+            "wlift_aot_call_fn_0",
+            "wlift_aot_call_fn_1",
         ]
         .iter()
         .map(|s| s.to_string())
-        .chain([&new, &add, &total, &double, &fail, &loud, &loud_new].map(|s| s.clone()))
+        .chain(
+            [
+                &new, &add, &total, &double, &fail, &loud, &loud_new, &adder, &caller,
+            ]
+            .map(|s| s.clone()),
+        )
         .collect(),
         ..Default::default()
     };
@@ -908,6 +928,13 @@ System.print("module ran")
         "taking the error clears it"
     );
     assert_eq!(back(double.call(&mut store, num(4.0)).unwrap()), 8.0);
+    // A value the member does not take as declared goes the full way, and
+    // raises there.
+    let null = wren_lift::runtime::value::Value::null().to_bits() as i64;
+    double
+        .call(&mut store, null)
+        .expect("a raising member returns");
+    assert_eq!(take_error.call(&mut store, vm).unwrap(), 70);
 
     let loud = f(&mut store, &loud)
         .typed::<i64, i64>(&store)
@@ -928,6 +955,36 @@ System.print("module ran")
         .call(&mut store, num(5.0))
         .expect("a subclass constructed through its export");
     assert_eq!(back(add.call(&mut store, (quiet, num(1.0))).unwrap()), 15.0);
+
+    // A Wren function the host holds, called with its arguments.
+    let plus = f(&mut store, &adder)
+        .typed::<i64, i64>(&store)
+        .unwrap()
+        .call(&mut store, num(5.0))
+        .expect("a function");
+    let call_1 = f(&mut store, "wlift_aot_call_fn_1")
+        .typed::<(i64, i64), i64>(&store)
+        .unwrap();
+    assert_eq!(
+        back(call_1.call(&mut store, (plus, num(2.0))).unwrap()),
+        7.0
+    );
+    assert_eq!(take_error.call(&mut store, vm).unwrap(), 0);
+    // Anything else with a call method goes through dispatch.
+    let callable = f(&mut store, &caller)
+        .typed::<(), i64>(&store)
+        .unwrap()
+        .call(&mut store, ())
+        .expect("an object");
+    let call_0 = f(&mut store, "wlift_aot_call_fn_0")
+        .typed::<i64, i64>(&store)
+        .unwrap();
+    assert_eq!(back(call_0.call(&mut store, callable).unwrap()), 42.0);
+    // A function called with the wrong number of arguments raises.
+    call_1
+        .call(&mut store, (callable, num(1.0)))
+        .expect("returns");
+    assert_eq!(take_error.call(&mut store, vm).unwrap(), 70);
 }
 
 const COUNTER_V1: &str = r#"

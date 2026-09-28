@@ -263,7 +263,10 @@ pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
         vm.krio_fiber_active = true;
         vm.engine.fibers_have_stacks = true;
     }
-    Box::into_raw(Box::new(vm))
+    let vm = Box::into_raw(Box::new(vm));
+    #[cfg(feature = "aot_runtime")]
+    PROGRAM_VM.store(vm, std::sync::atomic::Ordering::Relaxed);
+    vm
 }
 
 #[unsafe(no_mangle)]
@@ -452,6 +455,23 @@ pub const AOT_ENTRY_NAMES: &[&str] = &[
     "wlift_aot_reload_begin",
     "wlift_aot_reload_end",
     "wlift_aot_publish_module",
+    "wlift_aot_call_fn_0",
+    "wlift_aot_call_fn_1",
+    "wlift_aot_call_fn_2",
+    "wlift_aot_call_fn_3",
+    "wlift_aot_call_fn_4",
+    "wlift_aot_call_fn_5",
+    "wlift_aot_call_fn_6",
+    "wlift_aot_call_fn_7",
+    "wlift_aot_call_fn_8",
+    "wlift_aot_call_fn_9",
+    "wlift_aot_call_fn_10",
+    "wlift_aot_call_fn_11",
+    "wlift_aot_call_fn_12",
+    "wlift_aot_call_fn_13",
+    "wlift_aot_call_fn_14",
+    "wlift_aot_call_fn_15",
+    "wlift_aot_call_fn_16",
     "wlift_error_pending",
 ];
 
@@ -1693,6 +1713,95 @@ pub extern "C" fn wlift_runtime_callout_depth() -> i32 {
     0
 }
 
+/// The VM a program's compiled code runs in: the one it made, or the one
+/// its host ran it in. What an entry point a host calls without naming a
+/// VM uses.
+#[cfg(feature = "aot_runtime")]
+static PROGRAM_VM: std::sync::atomic::AtomicPtr<WrenVM> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Call the Wren function `f` with `args`, as compiled `f.call(..)` does
+/// when it knows `f` is a closure: its compiled body directly, after an
+/// arity check. Anything else with a `call` method of that arity is
+/// called through dispatch. A raise leaves the error pending, as in any
+/// compiled code.
+#[cfg(feature = "aot_runtime")]
+fn call_fn(f: u64, args: &[u64]) -> u64 {
+    use crate::runtime::object::{ObjClosure, ObjHeader, ObjType};
+    use crate::runtime::value::Value;
+    let Some(vm) = (unsafe {
+        PROGRAM_VM
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .as_mut()
+    }) else {
+        return Value::null().to_bits();
+    };
+    // Everything the call holds is in this frame, under the stack top the
+    // collector scans to.
+    let mut frame = [0u64; 20];
+    frame[0] = f;
+    frame[1..=args.len()].copy_from_slice(args);
+    unsafe { wlift_aot_raise_stack_top(frame.as_ptr().wrapping_add(frame.len()) as *const u8) };
+    let values: Vec<Value> = frame[1..=args.len()]
+        .iter()
+        .map(|&b| Value::from_bits(b))
+        .collect();
+    let roots = crate::codegen::runtime_fns::wren_jit_roots_snapshot();
+    let callee = Value::from_bits(frame[0]);
+    let closure = callee.as_object().filter(|&p| unsafe {
+        (*(p as *const ObjHeader)).obj_type == ObjType::Closure
+            && (*(*(p as *const ObjClosure)).function).arity as usize == args.len()
+    });
+    let result = match closure {
+        Some(p) => crate::codegen::runtime_fns::call_closure_jit_or_sync(
+            vm,
+            p as *mut ObjClosure,
+            &values,
+            None,
+        ),
+        None => {
+            let signature = format!("call({})", vec!["_"; args.len()].join(","));
+            let method = vm.interner.intern(&signature).index() as u64;
+            let j = crate::codegen::runtime_fns::jit_state();
+            crate::codegen::runtime_fns::dispatch_call_rooted(vm, j, callee, method, &values)
+        }
+    };
+    crate::codegen::runtime_fns::wren_jit_roots_restore(roots);
+    std::hint::black_box(&frame);
+    result
+}
+
+macro_rules! call_fn_exports {
+    ($($name:ident($($a:ident),*);)*) => {$(
+        /// Call the Wren function `f` with these arguments; see `call_fn`.
+        #[cfg(feature = "aot_runtime")]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn $name(f: u64 $(, $a: u64)*) -> u64 {
+            call_fn(f, &[$($a),*])
+        }
+    )*};
+}
+
+call_fn_exports! {
+    wlift_aot_call_fn_0();
+    wlift_aot_call_fn_1(a0);
+    wlift_aot_call_fn_2(a0, a1);
+    wlift_aot_call_fn_3(a0, a1, a2);
+    wlift_aot_call_fn_4(a0, a1, a2, a3);
+    wlift_aot_call_fn_5(a0, a1, a2, a3, a4);
+    wlift_aot_call_fn_6(a0, a1, a2, a3, a4, a5);
+    wlift_aot_call_fn_7(a0, a1, a2, a3, a4, a5, a6);
+    wlift_aot_call_fn_8(a0, a1, a2, a3, a4, a5, a6, a7);
+    wlift_aot_call_fn_9(a0, a1, a2, a3, a4, a5, a6, a7, a8);
+    wlift_aot_call_fn_10(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
+    wlift_aot_call_fn_11(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+    wlift_aot_call_fn_12(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    wlift_aot_call_fn_13(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
+    wlift_aot_call_fn_14(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13);
+    wlift_aot_call_fn_15(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+    wlift_aot_call_fn_16(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
+}
+
 /// A compiled program built as a library: runs its module bodies in a
 /// VM its host made; 0, or the exit code of the error it left uncaught.
 pub type AotProgramRun = unsafe extern "C" fn(*mut WrenVM) -> c_int;
@@ -1720,6 +1829,7 @@ pub extern "C" fn wlift_aot_register_program(run: AotProgramRun) {
 #[cfg(feature = "aot_runtime")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_aot_run_programs(vm: *mut WrenVM) -> c_int {
+    PROGRAM_VM.store(vm, std::sync::atomic::Ordering::Relaxed);
     let programs = AOT_PROGRAMS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
