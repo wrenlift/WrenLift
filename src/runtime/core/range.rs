@@ -33,25 +33,32 @@ fn range_is_inclusive(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn range_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let range = receiver_range(args);
+    match range_iterate_value(range, args[1]) {
+        Some(value) => value,
+        None => {
+            ctx.runtime_error("Iterator must be a number.".to_string());
+            Value::null()
+        }
+    }
+}
 
+/// The side-effect-free part of Range.iterate(_), shared with compiled
+/// sends so both paths agree on ascending, descending and empty ranges.
+#[inline(always)]
+pub(crate) fn range_iterate_value(range: &ObjRange, iterator: Value) -> Option<Value> {
     // If the iterator is null, we return the start of the range.
-    if args[1].is_null() {
+    if iterator.is_null() {
         // Empty range check: exclusive range where from == to has no elements.
         if !range.is_inclusive && range.from == range.to {
-            return Value::bool(false);
+            return Some(Value::bool(false));
         }
-        return Value::num(range.from);
+        return Some(Value::num(range.from));
     }
 
-    if !args[1].is_num() {
-        ctx.runtime_error("Iterator must be a number.".to_string());
-        return Value::null();
-    }
-
-    let current = args[1].as_num().unwrap();
+    let current = iterator.as_num()?;
 
     // Determine step direction.
-    if range.from < range.to {
+    let value = if range.from < range.to {
         let next = current + 1.0;
         if range.is_inclusive {
             if next > range.to {
@@ -80,7 +87,8 @@ fn range_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     } else {
         // from == to, inclusive range with single element; already yielded.
         Value::bool(false)
-    }
+    };
+    Some(value)
 }
 
 fn range_iterator_value(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {

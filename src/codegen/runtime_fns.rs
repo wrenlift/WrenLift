@@ -24,7 +24,7 @@
 use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::object::{
     MapKey, Method, NativeContext, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap,
-    ObjSimd, ObjString, ObjType, SimdKind,
+    ObjRange, ObjSimd, ObjString, ObjType, SimdKind,
 };
 use crate::runtime::value::Value;
 use std::sync::OnceLock;
@@ -251,6 +251,31 @@ fn try_dispatch_list_native_fastpath(
     None
 }
 
+/// The Range protocol has no allocation or VM callbacks. Answer sends to
+/// the built-in Range class before method lookup and frame setup.
+#[inline(always)]
+fn try_dispatch_range_native_fastpath(
+    vm: &crate::runtime::vm::VM,
+    recv: Value,
+    method_sym: crate::intern::SymbolId,
+    args: &[Value],
+) -> Option<u64> {
+    if args.len() != 2 {
+        return None;
+    }
+    let range = unsafe { &*(recv.as_object()? as *const ObjRange) };
+    let syms = vm.hot_method_symbols;
+    if Some(method_sym) == syms.list_iterator_value {
+        return Some(args[1].to_bits());
+    }
+    if Some(method_sym) != syms.list_iterate {
+        return None;
+    }
+    // A nonnumeric iterator takes the generic path, which reports the
+    // same runtime error as interpreted Range.iterate(_).
+    crate::runtime::core::range_iterate_value(range, args[1]).map(Value::to_bits)
+}
+
 #[inline(always)]
 fn try_dispatch_trivial_accessor_fastpath(
     vm: &mut crate::runtime::vm::VM,
@@ -397,6 +422,16 @@ fn try_dispatch_call_noframe_fast(
             s.dispatch_call_entries += 1;
         });
         note_list_fast_path_ic(vm, j, ic_idx);
+        return Frameless::Done(result);
+    }
+
+    if class == vm.range_class
+        && let Some(result) = try_dispatch_range_native_fastpath(vm, recv, method_sym, args)
+    {
+        vm.engine.note_runtime_call_stats(|s| {
+            s.wren_call_noframe_fastpath += 1;
+            s.dispatch_call_entries += 1;
+        });
         return Frameless::Done(result);
     }
 
@@ -2666,6 +2701,11 @@ pub(crate) fn dispatch_call_rooted(
         && let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args)
     {
         note_list_fast_path_ic(vm, j, ic_idx);
+        return result;
+    }
+    if class == vm.range_class
+        && let Some(result) = try_dispatch_range_native_fastpath(vm, recv, method_sym, args)
+    {
         return result;
     }
     let ic_ptr = ic_idx.and_then(|(idx, func)| current_jit_callsite_ic(vm, j, idx, func));

@@ -17,6 +17,7 @@ mod num;
 mod obj;
 pub mod random;
 mod range;
+pub(crate) use range::range_iterate_value;
 pub mod regex;
 mod sequence;
 mod simd;

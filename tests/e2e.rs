@@ -5456,6 +5456,29 @@ fn run_after_top_tier(warm: &str, name: &str, then: &str) -> Option<(String, u32
     Some((output, vm.engine.deopt_exits - before))
 }
 
+#[test]
+fn e2e_tiered_range_protocol_fastpath_preserves_direction_and_endpoints() {
+    let warm = r#"
+class K {
+  static sum(r) {
+    var iterator = r.iterate(null)
+    var digits = 0
+    while (iterator != false) {
+      digits = digits * 10 + r.iteratorValue(iterator)
+      iterator = r.iterate(iterator)
+    }
+    return digits
+  }
+}
+for (k in 0...30000) K.sum(0...4)
+"#;
+    let then = "import \"main\" for K\nSystem.print(K.sum(0...4))\nSystem.print(K.sum(4...0))\nSystem.print(K.sum(2...2))\nSystem.print(K.sum(2..2))\nSystem.print(K.sum(4..2))\n";
+    let Some((output, _)) = run_after_top_tier(warm, "sum(_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "123\n4321\n0\n2\n432");
+}
+
 const PROMOTED_ACC: &str = r#"
 class Acc {
   construct new(v) { _v = v }
