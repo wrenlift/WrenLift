@@ -618,6 +618,7 @@ pub struct RuntimeCallStats {
     pub dispatch_call_ic_class_misses: u64,
     pub dispatch_call_method_cache_hits: u64,
     pub dispatch_call_method_cache_misses: u64,
+    pub dispatch_call_cached_closure: u64,
     pub dispatch_call_list_native_fastpath: u64,
     pub dispatch_method_native: u64,
     pub dispatch_method_closure: u64,
@@ -2874,7 +2875,7 @@ impl ExecutionEngine {
         if runtime != RuntimeCallStats::default() {
             eprintln!("=== WLIFT runtime call stats ===");
             eprintln!(
-                "wren_call={} noframe_fastpath={} dispatch_call={} fn_fastpath={} list_native_fastpath={} ic_attempts={} ic_class_misses={} method_cache={}/{}",
+                "wren_call={} noframe_fastpath={} dispatch_call={} fn_fastpath={} list_native_fastpath={} ic_attempts={} ic_class_misses={} method_cache={}/{} cached_closure={}",
                 runtime.wren_call_entries,
                 runtime.wren_call_noframe_fastpath,
                 runtime.dispatch_call_entries,
@@ -2884,6 +2885,7 @@ impl ExecutionEngine {
                 runtime.dispatch_call_ic_class_misses,
                 runtime.dispatch_call_method_cache_hits,
                 runtime.dispatch_call_method_cache_misses,
+                runtime.dispatch_call_cached_closure,
             );
             eprintln!(
                 "dispatch_method native={} closure={} ctor={} trivial_getter={} trivial_setter={} call_closure={} native_candidates={} native_entries={} interp_fallbacks={} ctx_save_restore={}",

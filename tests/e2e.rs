@@ -2334,6 +2334,50 @@ System.print(list.count)
 }
 
 #[test]
+fn e2e_tiered_static_closure_survives_explicit_gc() {
+    let source = r#"
+class Worker {
+  static run(values) {
+    var total = 0
+    for (i in 0...10000) {
+      total = total + step(values, i, 0)
+    }
+    return total
+  }
+
+  static step(values, index, extra) {
+    values.add(index + extra)
+    if (values.count % 1000 == 0) System.gc()
+    return values.count
+  }
+}
+
+var values = []
+System.print(Worker.run(values))
+System.print(values.count)
+System.print(values[9999])
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered static closure call failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(output.trim(), "50005000\n10000\n9999");
+}
+
+#[test]
 fn e2e_tiered_nonleaf_loop_preserves_object_local() {
     let source = r#"
 class Keeper {

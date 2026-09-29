@@ -308,6 +308,9 @@ enum Frameless {
     Done(u64),
     /// The method cache resolved a host method; it runs under a frame.
     Host(crate::runtime::object::HostFn, usize),
+    /// A closure resolved before the frame was pushed. Dispatch it under
+    /// the frame without repeating the method-cache lookup.
+    CachedClosure(*mut ObjClosure, *mut ObjClass),
     Miss,
 }
 
@@ -414,6 +417,17 @@ fn try_dispatch_call_noframe_fast(
                 s.dispatch_call_method_cache_hits += 1;
             });
             return Frameless::Host(host_fn, context);
+        }
+        if let Method::Closure(closure) = method
+            && ic_idx.is_none()
+            && !vm.is_call_sym(method_sym)
+        {
+            vm.engine.note_runtime_call_stats(|s| {
+                s.dispatch_call_entries += 1;
+                s.dispatch_call_method_cache_hits += 1;
+                s.dispatch_call_cached_closure += 1;
+            });
+            return Frameless::CachedClosure(closure, defining_class);
         }
     }
 
@@ -3243,6 +3257,15 @@ fn wren_call_inner<const M: usize>(
                     unsafe { (*j).frames.pop() };
                     result
                 }
+                Frameless::CachedClosure(closure, defining_class) => {
+                    let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+                    push_frame_on(j, jit_fp as usize, func_id, ret_addr as usize);
+                    vm.engine
+                        .note_runtime_call_stats(|s| s.dispatch_method_closure += 1);
+                    let result = call_found_closure(vm, closure, &args, defining_class);
+                    unsafe { (*j).frames.pop() };
+                    result
+                }
                 Frameless::Miss => {
                     let func_id = unsafe { (*j).ctx.current_func_id } as u32;
                     push_frame_on(j, jit_fp as usize, func_id, ret_addr as usize);
@@ -3583,6 +3606,15 @@ fn wren_call_n_inner(receiver: u64, method: u64, args_in: &[u64]) -> u64 {
                         Some(action) => handle_jit_fiber_action(vm, action),
                         None => result,
                     };
+                    unsafe { (*j).frames.pop() };
+                    result
+                }
+                Frameless::CachedClosure(closure, defining_class) => {
+                    let func_id = unsafe { (*j).ctx.current_func_id } as u32;
+                    push_frame_on(j, 0, func_id, 0);
+                    vm.engine
+                        .note_runtime_call_stats(|s| s.dispatch_method_closure += 1);
+                    let result = call_found_closure(vm, closure, &args, defining_class);
                     unsafe { (*j).frames.pop() };
                     result
                 }
