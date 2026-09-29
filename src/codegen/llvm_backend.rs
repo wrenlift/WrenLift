@@ -5104,6 +5104,23 @@ pub mod llvm {
             for a in args {
                 arg_vals.push(self.boxed(a)?);
             }
+            if self.sh.aot.is_none()
+                && self.inline_depth == 0
+                && args.len() == 1
+                && self.sh.mir.defines_range(*receiver)
+            {
+                match self.sh.interner.resolve(method) {
+                    "iteratorValue(_)" => {
+                        self.take_ic_idx();
+                        return Ok(arg_vals[0]);
+                    }
+                    "iterate(_)" => {
+                        self.take_ic_idx();
+                        return self.call_helper("wren_range_iterate_known", &[r, arg_vals[0]]);
+                    }
+                    _ => {}
+                }
+            }
             if let Some(env) = self.sh.aot
                 && args.len() <= 8
                 && let Some(impls) = env.cha.by_sig.get(self.sh.interner.resolve(method))

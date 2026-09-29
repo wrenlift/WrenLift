@@ -2451,7 +2451,11 @@ pub fn helper_can_raise(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
         || matches!(
             name,
-            "wren_to_string" | "wren_subscript_get" | "wren_subscript_set" | "wren_raise"
+            "wren_to_string"
+                | "wren_subscript_get"
+                | "wren_subscript_set"
+                | "wren_raise"
+                | "wren_range_iterate_known"
         )
 }
 
@@ -4927,6 +4931,29 @@ pub extern "C" fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
     unsafe { finish_alloc(vm, val) }
 }
 
+/// `Range.iterate(_)` when the compiler proved the receiver came from
+/// `MakeRange`. This avoids method lookup while retaining the protocol's
+/// error for a nonnumeric iterator.
+#[cfg_attr(
+    any(not(target_arch = "wasm32"), feature = "aot_runtime"),
+    unsafe(no_mangle)
+)]
+pub extern "C" fn wren_range_iterate_known(receiver: u64, iterator: u64) -> u64 {
+    let recv = Value::from_bits(receiver);
+    let range = unsafe { &*(recv.as_object().unwrap() as *const ObjRange) };
+    match crate::runtime::core::range_iterate_value(range, Value::from_bits(iterator)) {
+        Some(value) => value.to_bits(),
+        None => {
+            if let Some(vm) = unsafe { vm_ref() }
+                && !vm.has_error
+            {
+                vm.runtime_error("Iterator must be a number.".to_string());
+            }
+            Value::null().to_bits()
+        }
+    }
+}
+
 /// Helper: allocate closure and populate upvalues from a slice of NaN-boxed values.
 fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     let vm = unsafe { vm_ref() };
@@ -6470,6 +6497,7 @@ runtime_helpers! {
     wren_make_map() -> u64;
     wren_map_set(u64, u64, u64);
     wren_make_range(u64, u64, u64) -> u64;
+    wren_range_iterate_known(u64, u64) -> u64;
     wren_make_closure_0(u64) -> u64;
     wren_make_closure_1(u64, u64) -> u64;
     wren_make_closure_2(u64, u64, u64) -> u64;
@@ -6629,6 +6657,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_map" => Some(wren_make_map as *const () as usize),
         "wren_map_set" => Some(wren_map_set as *const () as usize),
         "wren_make_range" => Some(wren_make_range as *const () as usize),
+        "wren_range_iterate_known" => Some(wren_range_iterate_known as *const () as usize),
         // Arity-specific closure creation
         "wren_make_closure_0" => Some(wren_make_closure_0 as *const () as usize),
         "wren_make_closure_1" => Some(wren_make_closure_1 as *const () as usize),

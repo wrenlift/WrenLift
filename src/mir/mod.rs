@@ -1063,6 +1063,17 @@ pub struct MirFunction {
 }
 
 impl MirFunction {
+    /// A value produced by `MakeRange` is always the built-in Range class,
+    /// even when its endpoints are only known at runtime.
+    pub fn defines_range(&self, value: ValueId) -> bool {
+        self.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|(dst, inst)| *dst == value && matches!(inst, Instruction::MakeRange(..)))
+        })
+    }
+
     /// The inline-cache entries the bytecode of this function has, by
     /// the call's result.
     pub fn ic_site_numbering(&self) -> std::collections::HashMap<ValueId, u32> {

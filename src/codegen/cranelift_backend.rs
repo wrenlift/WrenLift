@@ -5153,6 +5153,20 @@ pub mod cl {
                 let r = get(receiver);
                 let arg_vals: Vec<Value> = args.iter().map(get).collect();
 
+                if aot_config.is_none() && args.len() == 1 && mir.defines_range(*receiver) {
+                    match interner.resolve(*method) {
+                        "iteratorValue(_)" => return Ok(Some(arg_vals[0])),
+                        "iterate(_)" => {
+                            let f = get_runtime_fn(module, builder, "wren_range_iterate_known", 2)?;
+                            emit_cur_frame(builder);
+                            let call = builder.ins().call(f, &[r, arg_vals[0]]);
+                            emit_error_poll(builder, module, get_runtime_fn)?;
+                            return Ok(Some(builder.inst_results(call)[0]));
+                        }
+                        _ => {}
+                    }
+                }
+
                 if let Some(simd_result) = try_lower_simd_intrinsic_call(
                     interner,
                     builder,

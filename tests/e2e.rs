@@ -5479,6 +5479,55 @@ for (k in 0...30000) K.sum(0...4)
     assert_eq!(output.trim(), "123\n4321\n0\n2\n432");
 }
 
+#[test]
+fn e2e_tiered_local_range_protocol_uses_dynamic_endpoints() {
+    let warm = r#"
+class K {
+  static sum(a, b) {
+    var r = a..b
+    var iterator = r.iterate(null)
+    var digits = 0
+    while (iterator != false) {
+      digits = digits * 10 + r.iteratorValue(iterator)
+      iterator = r.iterate(iterator)
+    }
+    return digits
+  }
+}
+for (k in 0...30000) K.sum(0, 3)
+"#;
+    let then = "import \"main\" for K\nSystem.print(K.sum(0, 3))\nSystem.print(K.sum(3, 0))\nSystem.print(K.sum(2, 2))\n";
+    let Some((output, _)) = run_after_top_tier(warm, "sum(_,_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "123\n3210\n2");
+}
+
+#[test]
+fn e2e_tiered_local_range_rejects_invalid_iterator() {
+    let warm = r#"
+class K {
+  static step(x) {
+    var r = 0..3
+    var checksum = 0
+    for (i in 0...4) checksum = checksum + i
+    if (checksum != 6) return false
+    return r.iterate(x)
+  }
+}
+for (k in 0...30000) {
+  K.step(null)
+  K.step(1)
+}
+"#;
+    let then = "import \"main\" for K\nSystem.print(Fiber.new { K.step(\"bad\") }.try())\n";
+    let Some((output, deopts)) = run_after_top_tier(warm, "step(_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "Iterator must be a number.");
+    assert_eq!(deopts, 0);
+}
+
 const PROMOTED_ACC: &str = r#"
 class Acc {
   construct new(v) { _v = v }
