@@ -153,6 +153,7 @@ smallvec = "1"
 # improvement that costs ~16 bytes per entry (doubly-linked
 # list bookkeeping).
 indexmap = "2"
+ahash = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }

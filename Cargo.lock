@@ -7655,6 +7655,7 @@ name = "wren_lift"
 version = "0.1.22"
 dependencies = [
  "aes-gcm",
+ "ahash",
  "argon2",
  "ariadne",
  "ash_wasm_link",

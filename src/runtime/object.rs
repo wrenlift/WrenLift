@@ -831,7 +831,7 @@ impl fmt::Debug for MapKey {
 #[repr(C)]
 pub struct ObjMap {
     pub header: ObjHeader,
-    pub entries: indexmap::IndexMap<MapKey, Value>,
+    pub entries: indexmap::IndexMap<MapKey, Value, ahash::RandomState>,
 }
 
 impl Default for ObjMap {
@@ -844,7 +844,7 @@ impl ObjMap {
     pub fn new() -> Self {
         Self {
             header: ObjHeader::new(ObjType::Map),
-            entries: indexmap::IndexMap::new(),
+            entries: indexmap::IndexMap::with_hasher(ahash::RandomState::new()),
         }
     }
 

@@ -5168,9 +5168,13 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
             ObjType::Map => {
                 let map = ptr as *const ObjMap;
                 let map_key = MapKey::new(idx);
-                if let Some(val) = unsafe { (*map).entries.get(&map_key) } {
-                    return val.to_bits();
-                }
+                // A missing Map key is null. Falling through to the
+                // generic method dispatch makes every first insertion in
+                // a counting loop pay for a second lookup and host call.
+                return unsafe { (*map).entries.get(&map_key) }
+                    .copied()
+                    .unwrap_or(Value::null())
+                    .to_bits();
             }
             ObjType::String => {
                 let string = ptr as *const ObjString;
