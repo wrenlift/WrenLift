@@ -169,6 +169,8 @@ pub struct CallSiteIC {
     pub func_id: u64,
     /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native, 5 = getter,
     /// 7 = closure call (`class` holds the `ObjFn` pointer), 8 = host method.
+    /// Kind 10 appears only in JIT compile snapshots: a static closure
+    /// guarded by the exact class-object receiver.
     pub kind: u64,
 }
 
@@ -768,6 +770,7 @@ impl<'a> Encoder<'a> {
                 func_id,
                 method: _,
                 expected_class: _,
+                guard_receiver_identity: _,
                 inline_getter_field: _,
                 direct: _,
                 receiver,

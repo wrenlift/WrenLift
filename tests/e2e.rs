@@ -2378,6 +2378,63 @@ System.print(values[9999])
 }
 
 #[test]
+fn e2e_tiered_static_self_calls_keep_class_identity() {
+    let source = r#"
+class First {
+  static run(n) {
+    var total = 0
+    for (i in 0...n) total = total + step(i)
+    return total
+  }
+  static mixed(n) {
+    var target = this
+    var total = 0
+    for (i in 0...n) {
+      if (i == n / 2) target = Second
+      total = total + target.step(i)
+    }
+    return total
+  }
+  static step(x) { x + 1 }
+}
+class Second {
+  static run(n) {
+    var total = 0
+    for (i in 0...n) total = total + step(i)
+    return total
+  }
+  static step(x) { x + 2 }
+}
+for (repeat in 0...3) {
+  System.print(First.run(50000))
+  System.print(Second.run(50000))
+}
+System.print(First.mixed(10000))
+"#;
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            opt_threshold: 4,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "static self calls failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "1250025000\n1250075000\n1250025000\n1250075000\n1250025000\n1250075000\n50010000"
+    );
+}
+
+#[test]
 fn e2e_tiered_nonleaf_loop_preserves_object_local() {
     let source = r#"
 class Keeper {

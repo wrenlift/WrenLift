@@ -3150,6 +3150,7 @@ pub mod llvm {
                     func_id,
                     method,
                     expected_class,
+                    guard_receiver_identity,
                     inline_getter_field,
                     direct,
                     receiver,
@@ -3159,6 +3160,7 @@ pub mod llvm {
                         *func_id,
                         *method,
                         *expected_class,
+                        *guard_receiver_identity,
                         *inline_getter_field,
                         *direct,
                         receiver,
@@ -5561,6 +5563,7 @@ pub mod llvm {
             func_id: u32,
             method: crate::intern::SymbolId,
             expected_class: usize,
+            guard_receiver_identity: bool,
             inline_getter_field: Option<u16>,
             direct: bool,
             receiver: &ValueId,
@@ -5575,6 +5578,33 @@ pub mod llvm {
                 arg_vals.push(self.boxed(a)?);
             }
             let m = self.c64(method.index() as u64);
+
+            if guard_receiver_identity {
+                if args.len() > 3 {
+                    return self.wren_call(r, m, &arg_vals);
+                }
+                let fast = self.new_block("skf");
+                let slow = self.new_block("sks");
+                let merge = self.new_block("skm");
+                let expected = self.c64(expected_class as u64 | TAG_OBJ);
+                let hit = self.icmp(IntPredicate::EQ, r, expected)?;
+                self.cbr(hit, fast, slow)?;
+                self.b.position_at_end(fast);
+                let fv = self.known_call_nocheck(func_id, method, r, &arg_vals)?;
+                let fast_end = self.b.get_insert_block().unwrap();
+                self.br(merge)?;
+                self.b.position_at_end(slow);
+                let sv = self.wren_call(r, m, &arg_vals)?;
+                let slow_end = self.b.get_insert_block().unwrap();
+                self.br(merge)?;
+                self.b.position_at_end(merge);
+                return Ok(self
+                    .phi(
+                        self.i64t().into(),
+                        &[(fv.into(), fast_end), (sv.into(), slow_end)],
+                    )?
+                    .into_int_value());
+            }
 
             if let Some(bodies) = self.sh.inline_bodies
                 && expected_class != 0

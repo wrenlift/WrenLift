@@ -5914,6 +5914,7 @@ pub mod cl {
                 func_id,
                 method,
                 expected_class,
+                guard_receiver_identity,
                 inline_getter_field,
                 direct,
                 receiver,
@@ -5948,6 +5949,56 @@ pub mod cl {
                     let result =
                         emit_wren_call(builder, module, get_runtime_fn, r, method_val, &arg_vals)?;
                     return Ok(Some(result));
+                }
+
+                if *guard_receiver_identity {
+                    let method_val = builder.ins().iconst(types::I64, method.index() as i64);
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
+                    if args.len() > 3 {
+                        return emit_wren_call(
+                            builder,
+                            module,
+                            get_runtime_fn,
+                            r,
+                            method_val,
+                            &arg_vals,
+                        )
+                        .map(Some);
+                    }
+                    let fast = builder.create_block();
+                    let slow = builder.create_block();
+                    let merge = builder.create_block();
+                    builder.append_block_param(merge, types::I64);
+                    let expected = builder
+                        .ins()
+                        .iconst(types::I64, (*expected_class as u64 | TAG_OBJ) as i64);
+                    let hit = builder.ins().icmp(IntCC::Equal, r, expected);
+                    builder.ins().brif(hit, fast, &[], slow, &[]);
+
+                    builder.switch_to_block(fast);
+                    let packed = (*func_id as u64) | ((method.index() as u64) << 32);
+                    let packed = builder.ins().iconst(types::I64, packed as i64);
+                    let name = match args.len() {
+                        0 => "wren_known_call_0_nocheck",
+                        1 => "wren_known_call_1_nocheck",
+                        2 => "wren_known_call_2_nocheck",
+                        _ => "wren_known_call_3_nocheck",
+                    };
+                    let f = get_runtime_fn(module, builder, name, 2 + args.len())?;
+                    let mut fast_args = vec![packed, r];
+                    fast_args.extend(arg_vals.iter().copied());
+                    emit_cur_frame(builder);
+                    let call = builder.ins().call(f, &fast_args);
+                    emit_error_poll(builder, module, get_runtime_fn)?;
+                    let value = builder.inst_results(call)[0];
+                    builder.ins().jump(merge, &[BlockArg::Value(value)]);
+
+                    builder.switch_to_block(slow);
+                    let value =
+                        emit_wren_call(builder, module, get_runtime_fn, r, method_val, &arg_vals)?;
+                    builder.ins().jump(merge, &[BlockArg::Value(value)]);
+                    builder.switch_to_block(merge);
+                    return Ok(Some(builder.block_params(merge)[0]));
                 }
 
                 // === CHA-driven body inlining ===

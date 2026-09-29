@@ -2428,15 +2428,20 @@ fn devirt_calls_with_ic(
                     // class and function id; whether the callee is
                     // compiled yet only decides which path the guarded
                     // known call takes at run time.
-                    if matches!(ic.kind, 1 | 2 | 6) && ic.class != 0 && ic.func_id != 0 {
+                    if matches!(ic.kind, 1 | 2 | 6 | 10) && ic.class != 0 && ic.func_id != 0 {
                         let fid = ic.func_id as u32;
                         let hint = devirt_hints.and_then(|h| h.get(ic_idx)).copied();
-                        let getter_field = hint.and_then(|h| h.getter_field);
+                        let getter_field = if ic.kind == 10 {
+                            None
+                        } else {
+                            hint.and_then(|h| h.getter_field)
+                        };
                         let direct = hint.map(|h| h.direct).unwrap_or(false);
                         *inst = Instruction::CallKnownFunc {
                             func_id: fid,
                             method: *method,
                             expected_class: ic.class,
+                            guard_receiver_identity: ic.kind == 10,
                             inline_getter_field: getter_field,
                             direct,
                             receiver: *receiver,
@@ -4387,6 +4392,7 @@ impl<'a> LowerCtx<'a> {
                 func_id: _,
                 method: _,
                 expected_class: _,
+                guard_receiver_identity: _,
                 inline_getter_field: _,
                 direct: _,
                 receiver: _,

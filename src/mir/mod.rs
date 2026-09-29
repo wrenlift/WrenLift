@@ -344,6 +344,10 @@ pub enum Instruction {
         func_id: u32,
         method: SymbolId,
         expected_class: usize,
+        /// Compare the receiver with this exact class object, rather than
+        /// comparing the receiver's class. Used for static method calls.
+        #[serde(default)]
+        guard_receiver_identity: bool,
         /// If Some(field_idx), Cranelift emits an inlined field load
         /// (class check + get_field) instead of a function call.
         /// Valid only for trivial getters of the form `{ _field }`.
@@ -1748,6 +1752,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
             func_id,
             method: _,
             expected_class: _,
+            guard_receiver_identity: _,
             inline_getter_field: _,
             direct: _,
             receiver,

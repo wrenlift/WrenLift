@@ -2157,6 +2157,105 @@ impl ExecutionEngine {
             .func_module(id)
             .and_then(|m| self.modules.get(m.as_str()))
             .map(|e| &e.vars);
+        // The method binding identifies the defining class in O(1). Keep
+        // the class rooted through a module variable before reading it, and
+        // verify this function is bound as a static method there.
+        let static_owner = (|| {
+            let (closure, class) = *self.method_binding.get(id.0 as usize)?;
+            if closure.is_null() || class.is_null() {
+                return None;
+            }
+            let rooted = modvars?
+                .iter()
+                .any(|value| value.as_object().is_some_and(|ptr| ptr == class as *mut u8));
+            if !rooted {
+                return None;
+            }
+            let sym = interner.lookup(&format!("static:{}", interner.resolve(mir.name)))?;
+            matches!(unsafe { (*class).find_method(sym) }, Some(Method::Closure(bound)) if *bound == closure)
+                .then_some(class)
+        })();
+        let this_param = mir.blocks.first().and_then(|block| {
+            block
+                .instructions
+                .iter()
+                .find_map(|(dst, inst)| matches!(inst, Instruction::BlockParam(0)).then_some(*dst))
+        });
+        // Loop-carried `this` is a block parameter, often several nested
+        // parameters away from BlockParam(0). Every incoming edge must be
+        // an alias; the reachability pass excludes self-contained cycles.
+        let mut alias_sources: HashMap<crate::mir::ValueId, Vec<crate::mir::ValueId>> =
+            HashMap::new();
+        for block in &mir.blocks {
+            for (value, _) in &block.params {
+                alias_sources.entry(*value).or_default();
+            }
+            for (dst, inst) in &block.instructions {
+                if let Instruction::Move(src) = inst {
+                    alias_sources.insert(*dst, vec![*src]);
+                }
+            }
+        }
+        for block in &mir.blocks {
+            let mut add_edge = |target: crate::mir::BlockId, args: &[crate::mir::ValueId]| {
+                if let Some(successor) = mir.blocks.get(target.0 as usize) {
+                    for ((param, _), arg) in successor.params.iter().zip(args) {
+                        alias_sources.entry(*param).or_default().push(*arg);
+                    }
+                }
+            };
+            match &block.terminator {
+                crate::mir::Terminator::Branch { target, args } => add_edge(*target, args),
+                crate::mir::Terminator::CondBranch {
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                    ..
+                } => {
+                    add_edge(*true_target, true_args);
+                    add_edge(*false_target, false_args);
+                }
+                _ => {}
+            }
+        }
+        let mut possible: std::collections::HashSet<_> = alias_sources.keys().copied().collect();
+        if let Some(param) = this_param {
+            possible.insert(param);
+        }
+        loop {
+            let invalid: Vec<_> = possible
+                .iter()
+                .filter(|&&value| Some(value) != this_param)
+                .filter(|&&value| {
+                    alias_sources.get(&value).is_none_or(|sources| {
+                        sources.is_empty()
+                            || sources.iter().any(|source| !possible.contains(source))
+                    })
+                })
+                .copied()
+                .collect();
+            if invalid.is_empty() {
+                break;
+            }
+            for value in invalid {
+                possible.remove(&value);
+            }
+        }
+        let mut this_aliases: std::collections::HashSet<_> = this_param.into_iter().collect();
+        loop {
+            let mut changed = false;
+            for (&value, sources) in &alias_sources {
+                if possible.contains(&value)
+                    && sources.iter().any(|source| this_aliases.contains(source))
+                {
+                    changed |= this_aliases.insert(value);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         let modvar_of: HashMap<crate::mir::ValueId, u32> = mir
             .blocks
             .iter()
@@ -2221,6 +2320,29 @@ impl ExecutionEngine {
                 let Some(slot) = ic_snapshot.get_mut(ic_idx) else {
                     continue;
                 };
+                if matches!(slot.kind, 0 | 1 | 2 | 6)
+                    && this_aliases.contains(receiver)
+                    && let Some(owner) = static_owner
+                    && let Some(sym) =
+                        interner.lookup(&format!("static:{}", interner.resolve(*method)))
+                    && let Some(Method::Closure(closure)) =
+                        unsafe { (*owner).find_method(sym).copied() }
+                    && !closure.is_null()
+                    && !unsafe { (*closure).function }.is_null()
+                {
+                    let fid = unsafe { (*(*closure).function).fn_id };
+                    if self
+                        .get_mir(FuncId(fid))
+                        .is_some_and(|callee| Self::mir_is_direct_callee(&callee))
+                    {
+                        slot.class = owner as usize;
+                        slot.func_id = fid as u64;
+                        slot.closure = closure as *const u8;
+                        // Compile-only IC kind: exact class-object guard.
+                        slot.kind = 10;
+                        continue;
+                    }
+                }
                 if slot.kind == 0
                     && let Some(impls) = cha.get(method)
                     && impls.len() == 1
@@ -3270,6 +3392,7 @@ impl ExecutionEngine {
                 let mut constructor = None;
                 let guard = match ic.kind {
                     7 => CalleeGuard::ClosureFn(ic.class),
+                    10 if ic.func_id != 0 => CalleeGuard::Object(ic.class),
                     // The receiver is the class itself; the body is its
                     // initialiser, run on a fresh instance.
                     3 if ic.func_id != 0
