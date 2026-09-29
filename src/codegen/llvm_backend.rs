@@ -3371,10 +3371,10 @@ pub mod llvm {
                     let v = self.call_helper("wren_subscript_set", &a)?;
                     v.into()
                 }
-                I::BitAnd(a, b) => self.helper2("wren_bit_and", a, b)?.into(),
+                I::BitAnd(a, b) => self.bitwise_num_binop(a, b, false)?.into(),
                 I::BitOr(a, b) => self.helper2("wren_bit_or", a, b)?.into(),
                 I::BitXor(a, b) => self.helper2("wren_bit_xor", a, b)?.into(),
-                I::Shl(a, b) => self.helper2("wren_bit_shl", a, b)?.into(),
+                I::Shl(a, b) => self.bitwise_num_binop(a, b, true)?.into(),
                 I::Shr(a, b) => self.helper2("wren_bit_shr", a, b)?.into(),
                 I::BitNot(a) => {
                     let v = self.boxed(a)?;
@@ -4700,6 +4700,81 @@ pub mod llvm {
                 .build_call(decl, &[x.into()], "sat")
                 .map_err(|e| e.to_string())?;
             Ok(call.try_as_basic_value().basic().unwrap().into_int_value())
+        }
+
+        fn intrinsic_fptoui_sat(&mut self, x: FloatValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+            let intr = Intrinsic::find("llvm.fptoui.sat").ok_or("no fptoui.sat")?;
+            let decl = intr
+                .get_declaration(
+                    self.sh.module,
+                    &[self.sh.ctx.i32_type().into(), self.f64t().into()],
+                )
+                .ok_or("no fptoui.sat declaration")?;
+            let call = self
+                .b
+                .build_call(decl, &[x.into()], "usat")
+                .map_err(|e| e.to_string())?;
+            Ok(call.try_as_basic_value().basic().unwrap().into_int_value())
+        }
+
+        /// Numeric bitwise operations use the same saturating u32 cast as
+        /// the runtime helper. Other receivers retain method dispatch.
+        fn bitwise_num_binop(
+            &mut self,
+            a: &ValueId,
+            b: &ValueId,
+            shift: bool,
+        ) -> Result<IntValue<'ctx>, String> {
+            let lhs = self.boxed(a)?;
+            let rhs = self.boxed(b)?;
+            let check_rhs = self.new_block("bwc");
+            let fast = self.new_block("bwf");
+            let slow = self.new_block("bws");
+            let merge = self.new_block("bwm");
+            let lhs_boxed = self.is_nan_boxed(lhs)?;
+            self.cbr(lhs_boxed, slow, check_rhs)?;
+            self.b.position_at_end(check_rhs);
+            let rhs_boxed = self.is_nan_boxed(rhs)?;
+            self.cbr(rhs_boxed, slow, fast)?;
+            self.b.position_at_end(fast);
+            let lhs_f = self.f64_of(lhs)?;
+            let rhs_f = self.f64_of(rhs)?;
+            let lhs_i = self.intrinsic_fptoui_sat(lhs_f)?;
+            let rhs_i = self.intrinsic_fptoui_sat(rhs_f)?;
+            let result_i = if shift {
+                let amount = self.and(rhs_i, self.sh.ctx.i32_type().const_int(31, false))?;
+                self.b
+                    .build_left_shift(lhs_i, amount, "bshl")
+                    .map_err(|e| e.to_string())?
+            } else {
+                self.and(lhs_i, rhs_i)?
+            };
+            let result_f = self
+                .b
+                .build_unsigned_int_to_float(result_i, self.f64t(), "bwfloat")
+                .map_err(|e| e.to_string())?;
+            let fast_result = self.bits(result_f)?;
+            let fast_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(slow);
+            let helper = if shift {
+                "wren_bit_shl"
+            } else {
+                "wren_bit_and"
+            };
+            let slow_result = self.call_helper(helper, &[lhs, rhs])?;
+            let slow_end = self.b.get_insert_block().unwrap();
+            self.br(merge)?;
+            self.b.position_at_end(merge);
+            Ok(self
+                .phi(
+                    self.i64t().into(),
+                    &[
+                        (fast_result.into(), fast_end),
+                        (slow_result.into(), slow_end),
+                    ],
+                )?
+                .into_int_value())
         }
 
         /// Boxed arithmetic or comparison with the inline f64 fast path.

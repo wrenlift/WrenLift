@@ -7437,10 +7437,51 @@ pub mod cl {
             }
 
             // === Bitwise ===
-            Instruction::BitAnd(a, b) => {
-                let f = get_runtime_fn(module, builder, "wren_bit_and", 2)?;
-                let result = builder.ins().call(f, &[get(a), get(b)]);
-                Ok(Some(builder.inst_results(result)[0]))
+            Instruction::BitAnd(a, b) | Instruction::Shl(a, b) => {
+                let shift = matches!(inst, Instruction::Shl(..));
+                let helper = if shift {
+                    "wren_bit_shl"
+                } else {
+                    "wren_bit_and"
+                };
+                let lhs = get(a);
+                let rhs = get(b);
+                let check_rhs = builder.create_block();
+                let fast = builder.create_block();
+                let slow = builder.create_block();
+                let merge = builder.create_block();
+                builder.append_block_param(merge, types::I64);
+                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                let lhs_tag = builder.ins().band(lhs, qnan);
+                let lhs_boxed = builder.ins().icmp(IntCC::Equal, lhs_tag, qnan);
+                builder.ins().brif(lhs_boxed, slow, &[], check_rhs, &[]);
+                builder.switch_to_block(check_rhs);
+                let rhs_tag = builder.ins().band(rhs, qnan);
+                let rhs_boxed = builder.ins().icmp(IntCC::Equal, rhs_tag, qnan);
+                builder.ins().brif(rhs_boxed, slow, &[], fast, &[]);
+                builder.switch_to_block(fast);
+                let lhs_f = builder.ins().bitcast(types::F64, MemFlags::new(), lhs);
+                let rhs_f = builder.ins().bitcast(types::F64, MemFlags::new(), rhs);
+                let lhs_i = builder.ins().fcvt_to_uint_sat(types::I32, lhs_f);
+                let rhs_i = builder.ins().fcvt_to_uint_sat(types::I32, rhs_f);
+                let result_i = if shift {
+                    let amount = builder.ins().band_imm_u(rhs_i, 31);
+                    builder.ins().ishl(lhs_i, amount)
+                } else {
+                    builder.ins().band(lhs_i, rhs_i)
+                };
+                let result_f = builder.ins().fcvt_from_uint(types::F64, result_i);
+                let result = builder.ins().bitcast(types::I64, MemFlags::new(), result_f);
+                builder.ins().jump(merge, &[BlockArg::Value(result)]);
+                builder.switch_to_block(slow);
+                let f = get_runtime_fn(module, builder, helper, 2)?;
+                emit_cur_frame(builder);
+                let call = builder.ins().call(f, &[lhs, rhs]);
+                let slow_result = builder.inst_results(call)[0];
+                emit_error_poll(builder, module, get_runtime_fn)?;
+                builder.ins().jump(merge, &[BlockArg::Value(slow_result)]);
+                builder.switch_to_block(merge);
+                Ok(Some(builder.block_params(merge)[0]))
             }
             Instruction::BitOr(a, b) => {
                 let f = get_runtime_fn(module, builder, "wren_bit_or", 2)?;
@@ -7455,11 +7496,6 @@ pub mod cl {
             Instruction::BitNot(a) => {
                 let f = get_runtime_fn(module, builder, "wren_bit_not", 1)?;
                 let result = builder.ins().call(f, &[get(a)]);
-                Ok(Some(builder.inst_results(result)[0]))
-            }
-            Instruction::Shl(a, b) => {
-                let f = get_runtime_fn(module, builder, "wren_bit_shl", 2)?;
-                let result = builder.ins().call(f, &[get(a), get(b)]);
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::Shr(a, b) => {

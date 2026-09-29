@@ -5528,6 +5528,54 @@ for (k in 0...30000) {
     assert_eq!(deopts, 0);
 }
 
+#[test]
+fn e2e_tiered_numeric_bitwise_uses_saturating_u32_operands() {
+    let warm = r#"
+class BitOps {
+  static op(a, b) {
+    var result = (a & b) + (a << b)
+    for (i in 0...4) result = result + i
+    return result
+  }
+}
+for (k in 0...30000) BitOps.op(3, 1)
+"#;
+    let then = "import \"main\" for BitOps\nSystem.print(BitOps.op(3, 1))\nSystem.print(BitOps.op(-1, 7))\nSystem.print(BitOps.op(4294967296, 1))\nSystem.print(BitOps.op(1, 33))\nSystem.print(BitOps.op(3.9, 2.9))\n";
+    let Some((output, deopts)) = run_after_top_tier(warm, "op(_,_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "13\n6\n4294967301\n9\n20");
+    assert_eq!(deopts, 0);
+}
+
+#[test]
+fn e2e_tiered_bitwise_preserves_custom_operators() {
+    let warm = r#"
+class Wrap {
+  construct new() {}
+  &(other) { 99 }
+  <<(other) { 77 }
+}
+class BitOps {
+  static op(a, b) {
+    var result = (a & b) + (a << b)
+    for (i in 0...4) result = result + i
+    return result
+  }
+}
+for (k in 0...30000) {
+  BitOps.op(3, 1)
+  BitOps.op(Wrap.new(), 1)
+}
+"#;
+    let then = "import \"main\" for BitOps, Wrap\nSystem.print(BitOps.op(3, 1))\nSystem.print(BitOps.op(Wrap.new(), 1))\n";
+    let Some((output, deopts)) = run_after_top_tier(warm, "op(_,_)", then) else {
+        return;
+    };
+    assert_eq!(output.trim(), "13\n182");
+    assert_eq!(deopts, 0);
+}
+
 const PROMOTED_ACC: &str = r#"
 class Acc {
   construct new(v) { _v = v }
