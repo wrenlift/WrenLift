@@ -1418,12 +1418,11 @@ pub mod cl {
     /// when the count reaches the cell's next tick, and poll the
     /// cell's re-tier word at each header in `retier_headers`
     /// (outermost loops only), handing the header's live-ins to
-    /// `wren_retier` when the word is set. Every loop header in
-    /// `tick_headers` counts, so a body that lives in one long outer
-    /// loop still reaches its proposal: baseline code counts each down
-    /// in the cell, an optimised body in a register it debits the cell
-    /// from every `LOOP_TICK` iterations, so the count costs its loops
-    /// no store. Every call's result kind is
+    /// `wren_retier` when the word is set. Baseline code counts every
+    /// loop header; optimized code counts outermost headers, keeping
+    /// its counter out of nested hot loops. The optimized counter lives
+    /// in a register and debits the cell every `LOOP_TICK` iterations.
+    /// Every call's result kind is
     /// or'd into the byte at `result_kinds + register` when that base
     /// is non-zero.
     #[derive(Clone, Default)]

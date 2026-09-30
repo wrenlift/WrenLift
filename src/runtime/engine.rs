@@ -4681,9 +4681,8 @@ impl ExecutionEngine {
         }
     }
 
-    /// Outermost loop headers of `mir`, the points baseline code polls
-    /// for a transfer into the top tier.
-    /// Every loop header of `mir`.
+    /// Every loop header of `mir`, sampled by baseline code so a long
+    /// inner loop can reach the first optimized tier.
     fn loop_headers(mir: &MirFunction) -> std::collections::HashSet<crate::mir::BlockId> {
         use crate::mir::opt::licm::{
             compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
@@ -4701,6 +4700,8 @@ impl ExecutionEngine {
             .collect()
     }
 
+    /// Outermost loop headers, used for re-tier polls and the optimized
+    /// Cranelift body's LLVM promotion counter.
     fn retier_headers(mir: &MirFunction) -> std::collections::HashSet<crate::mir::BlockId> {
         use crate::mir::opt::licm::{
             compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
@@ -5093,7 +5094,9 @@ impl ExecutionEngine {
                 cell: self.tier_cells[idx].as_ref() as *const TierCell as usize,
                 generation,
                 retier_headers: Self::retier_headers(&mir),
-                tick_headers: Self::loop_headers(&mir),
+                // Sample outer loops without adding a counter branch to
+                // every iteration of their nested hot loops.
+                tick_headers: Self::retier_headers(&mir),
                 result_kinds: 0,
                 result_kinds_len: 0,
             })
