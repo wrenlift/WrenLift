@@ -8,7 +8,7 @@ class SpectralNorm {
   // The denominator of a(i, j).
   static denominator(i, j) {
     var ij = i + j
-    return (ij * (ij + 1) / 2).floor + i + 1
+    return ij * (ij + 1) / 2 + i + 1
   }
 
   // out = A * v
