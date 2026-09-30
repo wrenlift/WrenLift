@@ -390,6 +390,65 @@ pub fn llvm_gains(mir: &MirFunction) -> bool {
     })
 }
 
+/// Loops with indexed data or substantial arithmetic can benefit from LLVM
+/// before there is enough history to establish sustained activity. This is
+/// only a queue-priority hint: other eligible loops can still reach LLVM.
+fn llvm_eager_loop(mir: &MirFunction) -> bool {
+    use crate::mir::Instruction as I;
+    use crate::mir::opt::licm::{compute_dominators, compute_rpo, detect_loops};
+    if mir.blocks.is_empty() {
+        return false;
+    }
+    let mut with_preds = mir.clone();
+    with_preds.compute_predecessors();
+    let rpo = compute_rpo(&with_preds);
+    let idom = compute_dominators(&with_preds, &rpo);
+    detect_loops(&with_preds, &idom).iter().any(|lp| {
+        lp.body
+            .iter()
+            .filter_map(|b| mir.blocks.get(b.0 as usize))
+            .flat_map(|b| b.instructions.iter().map(|(_, i)| i))
+            .any(|i| {
+                matches!(
+                    i,
+                    I::SubscriptGet { .. }
+                        | I::SubscriptSet { .. }
+                        | I::Mul(..)
+                        | I::Div(..)
+                        | I::Mod(..)
+                        | I::MulF64(..)
+                        | I::DivF64(..)
+                        | I::ModF64(..)
+                        | I::MathUnaryF64(..)
+                        | I::MathBinaryF64(..)
+                        | I::BitAnd(..)
+                        | I::BitOr(..)
+                        | I::BitXor(..)
+                        | I::Shl(..)
+                        | I::Shr(..)
+                )
+            })
+    })
+}
+
+fn observe_llvm_heat(
+    span: &mut Option<(std::time::Instant, std::time::Instant)>,
+    now: std::time::Instant,
+    minimum: std::time::Duration,
+    quiet_gap: std::time::Duration,
+) -> bool {
+    match span {
+        Some((start, last)) if now.duration_since(*last) <= quiet_gap => {
+            *last = now;
+            now.duration_since(*start) >= minimum
+        }
+        _ => {
+            *span = Some((now, now));
+            false
+        }
+    }
+}
+
 /// The class a call's receiver is an instance of, when the MIR says:
 /// a module variable only ever given instances of one class, or the
 /// result of a call on such a receiver to a method that returns its
@@ -1214,6 +1273,10 @@ pub struct ExecutionEngine {
     /// Whether the LLVM tier could win over the installed Cranelift
     /// optimised body; the LLVM tier is proposed only when it could.
     llvm_gain: Vec<bool>,
+    /// A cheap MIR hint for queuing LLVM without waiting for sustained heat.
+    llvm_eager: Vec<bool>,
+    /// First and most recent optimized-tier samples in a continuous hot span.
+    llvm_heat: Vec<Option<(std::time::Instant, std::time::Instant)>>,
     /// Functions a speculative guard failed in; their compiles carry
     /// no speculation from then on.
     speculation_failed: Vec<bool>,
@@ -1511,6 +1574,8 @@ impl ExecutionEngine {
             optimized_gen: Vec::new(),
             optimized_llvm: Vec::new(),
             llvm_gain: Vec::new(),
+            llvm_eager: Vec::new(),
+            llvm_heat: Vec::new(),
             speculation_failed: Vec::new(),
             compile_serial: Vec::new(),
             method_binding: Vec::new(),
@@ -1586,6 +1651,8 @@ impl ExecutionEngine {
         self.optimized_gen.push(0);
         self.optimized_llvm.push(false);
         self.llvm_gain.push(true);
+        self.llvm_eager.push(false);
+        self.llvm_heat.push(None);
         self.speculation_failed.push(false);
         self.compile_serial.push(0);
         self.early_top_serial.push(0);
@@ -4278,6 +4345,12 @@ impl ExecutionEngine {
                 self.optimized_llvm[idx] = llvm;
                 if !llvm {
                     self.llvm_gain[idx] = llvm_gain;
+                    self.llvm_eager[idx] = crate::codegen::top_tier_is_llvm()
+                        && self
+                            .functions
+                            .get(idx)
+                            .is_some_and(|body| llvm_eager_loop(body.mir()));
+                    self.llvm_heat[idx] = None;
                 }
                 let cell = &self.tier_cells[idx];
                 if !native_ptr.is_null() && !osr_entries.is_empty() {
@@ -4407,6 +4480,34 @@ impl ExecutionEngine {
         .unwrap_or(self.opt_threshold.saturating_mul(4))
     }
 
+    /// For call and field dominated loops, wait for activity over several
+    /// optimized-tier samples. A zero override restores immediate queuing.
+    fn llvm_heat_ms() -> u64 {
+        static HEAT_MS: OnceLock<u64> = OnceLock::new();
+        *HEAT_MS.get_or_init(|| {
+            std::env::var("WLIFT_LLVM_HEAT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20)
+        })
+    }
+
+    fn llvm_has_sustained_heat(&mut self, idx: usize) -> bool {
+        let heat_ms = Self::llvm_heat_ms();
+        if heat_ms == 0 || self.llvm_eager.get(idx).copied().unwrap_or(false) {
+            return true;
+        }
+        let Some(span) = self.llvm_heat.get_mut(idx) else {
+            return false;
+        };
+        observe_llvm_heat(
+            span,
+            std::time::Instant::now(),
+            std::time::Duration::from_millis(heat_ms),
+            std::time::Duration::from_millis(5),
+        )
+    }
+
     /// The Cranelift tier's body of `id` crossed a sampling point:
     /// propose the LLVM tier once the count is reached, and set the
     /// next point.
@@ -4419,6 +4520,11 @@ impl ExecutionEngine {
             && !self.optimized_llvm.get(idx).copied().unwrap_or(true)
             && self.llvm_gain.get(idx).copied().unwrap_or(false)
             && !self.promote_refused.get(idx).copied().unwrap_or(true);
+        // Sparse but very frequently used methods still get LLVM eventually,
+        // even if each gap between samples is too long for a continuous span.
+        let hot = wanted
+            && (count >= self.llvm_queue_at().saturating_mul(64)
+                || self.llvm_has_sustained_heat(idx));
         // A loop compiled cold recompiles the body from its caches once
         // it runs; the LLVM tier waits for that body, unless the loop
         // stays cold for long.
@@ -4426,6 +4532,7 @@ impl ExecutionEngine {
             && count < self.llvm_queue_at().saturating_mul(16);
         #[cfg(feature = "cranelift")]
         if wanted
+            && hot
             && !cold
             && self.compiling_tier.get(idx).copied().flatten().is_none()
             && count >= self.llvm_queue_at()
@@ -4439,13 +4546,16 @@ impl ExecutionEngine {
             return;
         };
         if !wanted {
+            if let Some(span) = self.llvm_heat.get_mut(idx) {
+                *span = None;
+            }
             cell.tick_after(u32::MAX);
         } else if self.compiling_tier[idx].is_some() {
             cell.tick_after(1 << 20);
         } else {
             let at = self.promote_retry_at[idx]
                 .max(self.llvm_queue_at())
-                .max(count.saturating_add(64));
+                .max(count.saturating_add(if hot { 64 } else { 256 }));
             cell.tick_after(at - count);
         }
     }
@@ -5931,6 +6041,37 @@ mod tests {
         assert!(!llvm_gains(&calling_loop(false)));
         assert!(llvm_gains(&calling_loop(true)));
         assert!(llvm_gains(&make_mir()));
+        assert!(!llvm_eager_loop(&calling_loop(false)));
+        assert!(llvm_eager_loop(&calling_loop(true)));
+    }
+
+    #[test]
+    fn llvm_heat_resets_after_a_quiet_gap() {
+        use std::time::{Duration, Instant};
+        let mut span = None;
+        let now = Instant::now();
+        let heat = Duration::from_millis(20);
+        let quiet = Duration::from_millis(5);
+        for ms in [0, 4, 8, 12, 16] {
+            assert!(!observe_llvm_heat(
+                &mut span,
+                now + Duration::from_millis(ms),
+                heat,
+                quiet
+            ));
+        }
+        assert!(observe_llvm_heat(
+            &mut span,
+            now + Duration::from_millis(20),
+            heat,
+            quiet
+        ));
+        assert!(!observe_llvm_heat(
+            &mut span,
+            now + Duration::from_millis(30),
+            heat,
+            quiet
+        ));
     }
 
     #[test]
