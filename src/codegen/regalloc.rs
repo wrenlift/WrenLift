@@ -923,17 +923,17 @@ fn rewrite_inst(
         CallLocal { target, args, ret } => CallLocal {
             target: *target,
             args: args.iter().map(|a| m(*a)).collect(),
-            ret: ret.map(&m),
+            ret: ret.map(m),
         },
         CallIndirectAbi { target, args, ret } => CallIndirectAbi {
             target: m(*target),
             args: args.iter().map(|a| m(*a)).collect(),
-            ret: ret.map(&m),
+            ret: ret.map(m),
         },
         CallRuntime { name, args, ret } => CallRuntime {
             name,
             args: args.iter().map(|a| m(*a)).collect(),
-            ret: ret.map(&m),
+            ret: ret.map(m),
         },
 
         // Parallel copies should be resolved before regalloc, but handle gracefully

@@ -710,52 +710,6 @@ fn link_error(msg: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{link_error, link_symbol};
-
-    #[test]
-    fn a_link_symbol_spells_every_part_with_its_length() {
-        assert_eq!(
-            link_symbol("wren", "bench/tally", "Tally", 'm', "add", 1),
-            "caribou_4wren_13bench_2ftally_5Tally_m3add_1"
-        );
-        assert_eq!(
-            link_symbol("haxe", "game.Player", "Player", 't', "spawnAt", 2),
-            "caribou_4haxe_13game_2ePlayer_6Player_t7spawnAt_2"
-        );
-        assert_eq!(
-            link_symbol("math", "Math", "Math", 't', "hypot", 2),
-            "caribou_4math_4Math_4Math_t5hypot_2"
-        );
-        assert_eq!(
-            link_symbol("wren", "m", "C", 's', "hp", 1),
-            "caribou_4wren_1m_1C_s2hp_1"
-        );
-        assert_eq!(
-            link_symbol("wren", "m", "C", 'm', "+", 1),
-            "caribou_4wren_1m_1C_m3_2b_1"
-        );
-        assert_eq!(
-            link_symbol("wren", "m", "C", 'm', "a_b", 0),
-            "caribou_4wren_1m_1C_m5a_5fb_0"
-        );
-    }
-
-    #[test]
-    fn an_out_of_step_runtime_is_reported_in_wlifts_terms() {
-        let msg = "the linked module would import 3 symbol(s) no host can supply: \
-                   env.pthread_create, env.pthread_join, env.pthread_detach.\nThese come from \
-                   the runtime object, so it is older than the compiler that emitted the calls. \
-                   Rebuild it:\n    scripts/build_wasm_runtime.py";
-        let out = link_error(msg);
-        assert!(out.contains("env.pthread_create, env.pthread_join, env.pthread_detach"));
-        assert!(out.contains("Reinstall wlift"));
-        assert!(!out.contains("scripts/"));
-        assert_eq!(link_error("bad object"), "link: bad object");
-    }
-}
-
 /// The side modules in `output`'s directory, other than `output`.
 fn side_modules_beside(output: &Path) -> Vec<ash_wasm_link::SideModule> {
     let dir = match output.parent() {
@@ -2535,5 +2489,51 @@ impl<'ctx> Bootstrap<'ctx, '_> {
         self.b.position_at_end(done);
         self.b.build_return(None).map_err(e)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{link_error, link_symbol};
+
+    #[test]
+    fn a_link_symbol_spells_every_part_with_its_length() {
+        assert_eq!(
+            link_symbol("wren", "bench/tally", "Tally", 'm', "add", 1),
+            "caribou_4wren_13bench_2ftally_5Tally_m3add_1"
+        );
+        assert_eq!(
+            link_symbol("haxe", "game.Player", "Player", 't', "spawnAt", 2),
+            "caribou_4haxe_13game_2ePlayer_6Player_t7spawnAt_2"
+        );
+        assert_eq!(
+            link_symbol("math", "Math", "Math", 't', "hypot", 2),
+            "caribou_4math_4Math_4Math_t5hypot_2"
+        );
+        assert_eq!(
+            link_symbol("wren", "m", "C", 's', "hp", 1),
+            "caribou_4wren_1m_1C_s2hp_1"
+        );
+        assert_eq!(
+            link_symbol("wren", "m", "C", 'm', "+", 1),
+            "caribou_4wren_1m_1C_m3_2b_1"
+        );
+        assert_eq!(
+            link_symbol("wren", "m", "C", 'm', "a_b", 0),
+            "caribou_4wren_1m_1C_m5a_5fb_0"
+        );
+    }
+
+    #[test]
+    fn an_out_of_step_runtime_is_reported_in_wlifts_terms() {
+        let msg = "the linked module would import 3 symbol(s) no host can supply: \
+                   env.pthread_create, env.pthread_join, env.pthread_detach.\nThese come from \
+                   the runtime object, so it is older than the compiler that emitted the calls. \
+                   Rebuild it:\n    scripts/build_wasm_runtime.py";
+        let out = link_error(msg);
+        assert!(out.contains("env.pthread_create, env.pthread_join, env.pthread_detach"));
+        assert!(out.contains("Reinstall wlift"));
+        assert!(!out.contains("scripts/"));
+        assert_eq!(link_error("bad object"), "link: bad object");
     }
 }
