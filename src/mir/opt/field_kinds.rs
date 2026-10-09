@@ -241,6 +241,8 @@ fn effect(inst: &Instruction, is_num: &dyn Fn(ValueId) -> bool) -> Effect {
         | CmpGtF64(..)
         | CmpLeF64(..)
         | CmpGeF64(..)
+        | CmpEqF64(..)
+        | CmpNeF64(..)
         | AddI64(..)
         | SubI64(..)
         | MulI64(..)

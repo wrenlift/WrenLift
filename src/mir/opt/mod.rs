@@ -215,6 +215,8 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
         | CmpGtF64(a, b)
         | CmpLeF64(a, b)
         | CmpGeF64(a, b)
+        | CmpEqF64(a, b)
+        | CmpNeF64(a, b)
         | BitAnd(a, b)
         | BitOr(a, b)
         | BitXor(a, b)

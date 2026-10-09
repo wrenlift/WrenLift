@@ -260,6 +260,18 @@ impl MirPass for TypeSpecialize {
                         expand_cmp(func, &mut new_instructions, *val_id, *a, *b, CmpOp::Ge);
                         changed = true;
                     }
+                    Instruction::CmpEq(a, b)
+                        if known_nums.contains(a) && known_nums.contains(b) =>
+                    {
+                        expand_cmp(func, &mut new_instructions, *val_id, *a, *b, CmpOp::Eq);
+                        changed = true;
+                    }
+                    Instruction::CmpNe(a, b)
+                        if known_nums.contains(a) && known_nums.contains(b) =>
+                    {
+                        expand_cmp(func, &mut new_instructions, *val_id, *a, *b, CmpOp::Ne);
+                        changed = true;
+                    }
 
                     // Inline unary Num math methods: receiver.abs → Unbox → fabs → Box
                     Instruction::Call {
@@ -342,6 +354,8 @@ enum CmpOp {
     Gt,
     Le,
     Ge,
+    Eq,
+    Ne,
 }
 
 /// Block parameters that are provably Num on every incoming edge.
@@ -482,6 +496,8 @@ fn expand_cmp(
             CmpOp::Gt => Instruction::CmpGtF64(ua, ub),
             CmpOp::Le => Instruction::CmpLeF64(ua, ub),
             CmpOp::Ge => Instruction::CmpGeF64(ua, ub),
+            CmpOp::Eq => Instruction::CmpEqF64(ua, ub),
+            CmpOp::Ne => Instruction::CmpNeF64(ua, ub),
         },
     ));
 }
@@ -654,6 +670,36 @@ mod tests {
         let after = eval(&f).unwrap();
         assert_eq!(before, after);
         assert_eq!(after, InterpValue::Boxed(Value::num(1.0)));
+    }
+
+    #[test]
+    fn test_specialize_equality_keeps_ieee_semantics() {
+        // Signed zeros are equal and NaN is unequal to itself.
+        for (x, y, ne) in [(0.0, -0.0, false), (f64::NAN, f64::NAN, true)] {
+            let mut interner = Interner::new();
+            let mut f = make_func(&mut interner);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            let v1 = f.new_value();
+            let v2 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, Instruction::ConstNum(x)));
+                b.instructions.push((v1, Instruction::ConstNum(y)));
+                let cmp = if ne {
+                    Instruction::CmpNe(v0, v1)
+                } else {
+                    Instruction::CmpEq(v0, v1)
+                };
+                b.instructions.push((v2, cmp));
+                b.terminator = Terminator::Return(v2);
+            }
+            assert_eq!(eval(&f).unwrap(), InterpValue::Boxed(Value::bool(true)));
+            assert!(TypeSpecialize::new().run(&mut f));
+            assert!(f.block(bb).instructions.iter().any(|(v, i)| *v == v2
+                && matches!(i, Instruction::CmpEqF64(..) | Instruction::CmpNeF64(..))));
+            assert_eq!(eval(&f).unwrap(), InterpValue::Bool(true));
+        }
     }
 
     // -- Math intrinsic inlining tests --

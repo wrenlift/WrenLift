@@ -257,6 +257,8 @@ pub fn eval_pure_instruction(
         Instruction::CmpGtF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x > y),
         Instruction::CmpLeF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x <= y),
         Instruction::CmpGeF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x >= y),
+        Instruction::CmpEqF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x == y),
+        Instruction::CmpNeF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x != y),
 
         // -- Logical --
         Instruction::Not(a) => Ok(InterpValue::Boxed(Value::bool(!get(*a)?.is_truthy()))),

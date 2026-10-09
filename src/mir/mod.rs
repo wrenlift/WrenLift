@@ -506,6 +506,10 @@ pub enum Instruction {
         class: SymbolId,
         message: u32,
     },
+    /// Num equality, IEEE: NaN is unequal to everything. After
+    /// `CheckType` so serialised bundles keep their variant indices.
+    CmpEqF64(ValueId, ValueId),
+    CmpNeF64(ValueId, ValueId),
 }
 
 /// What a register holds when compiled code hands a function back to
@@ -691,6 +695,8 @@ impl Instruction {
             | Instruction::CmpGtF64(a, b)
             | Instruction::CmpLeF64(a, b)
             | Instruction::CmpGeF64(a, b)
+            | Instruction::CmpEqF64(a, b)
+            | Instruction::CmpNeF64(a, b)
             | Instruction::BitAnd(a, b)
             | Instruction::BitOr(a, b)
             | Instruction::BitXor(a, b)
@@ -1060,6 +1066,11 @@ pub struct MirFunction {
     /// Compile-time only.
     #[serde(skip)]
     pub ic_sites: std::collections::HashMap<ValueId, u32>,
+    /// Values numbered below this are the interpreter's registers for
+    /// the function; a compile clone's later values have none. Zero
+    /// outside a tiered compile. Compile-time only.
+    #[serde(skip)]
+    pub interp_registers: u32,
 }
 
 impl MirFunction {
@@ -1109,6 +1120,7 @@ impl MirFunction {
             loop_entries: std::collections::HashMap::new(),
             osr_excluded: std::collections::HashSet::new(),
             ic_sites: std::collections::HashMap::new(),
+            interp_registers: 0,
         }
     }
 
@@ -1627,6 +1639,33 @@ pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<Valu
         .collect()
 }
 
+/// Where an OSR entry reads a live-in the loop computes from a Num
+/// outside it: the interpreter register holding the Num, which the
+/// entry unboxes, and truncates when the live-in is an integer.
+#[derive(Debug, Clone, Copy)]
+pub struct OsrUnboxed {
+    pub reg: ValueId,
+    pub int: bool,
+}
+
+/// The register an unboxed live-in `v` is rebuilt from: the value it
+/// unboxes, or the box made of it, through an integer conversion.
+pub fn osr_unboxed_source(func: &MirFunction, v: ValueId) -> Option<OsrUnboxed> {
+    let insts = || func.blocks.iter().flat_map(|b| b.instructions.iter());
+    let boxed_of = |f: ValueId| {
+        insts().find_map(|(d, inst)| match inst {
+            Instruction::Unbox(src) if *d == f => Some(*src),
+            Instruction::Box(x) if *x == f => Some(*d),
+            _ => None,
+        })
+    };
+    let (reg, int) = match insts().find(|(d, _)| *d == v) {
+        Some((_, Instruction::F64ToI64(f))) => (boxed_of(*f)?, true),
+        _ => (boxed_of(v)?, false),
+    };
+    (reg.0 < func.interp_registers).then_some(OsrUnboxed { reg, int })
+}
+
 /// Set of block indices reachable via successor edges from `start`.
 /// Guards against out-of-range successor targets so malformed MIR
 /// can't index out of bounds. Used by OSR entry analysis — layout
@@ -1705,6 +1744,8 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CmpGtF64(a, b) => format!("fcmp.gt {}, {}", a, b),
         Instruction::CmpLeF64(a, b) => format!("fcmp.le {}, {}", a, b),
         Instruction::CmpGeF64(a, b) => format!("fcmp.ge {}, {}", a, b),
+        Instruction::CmpEqF64(a, b) => format!("fcmp.eq {}, {}", a, b),
+        Instruction::CmpNeF64(a, b) => format!("fcmp.ne {}, {}", a, b),
 
         Instruction::Not(a) => format!("not {}", a),
         Instruction::BitAnd(a, b) => format!("band {}, {}", a, b),
@@ -1992,6 +2033,8 @@ pub fn infer_value_types(mir: &MirFunction) -> Vec<MirType> {
                 | Instruction::CmpGtF64(..)
                 | Instruction::CmpLeF64(..)
                 | Instruction::CmpGeF64(..)
+                | Instruction::CmpEqF64(..)
+                | Instruction::CmpNeF64(..)
                 | Instruction::Not(_)
                 | Instruction::IsType(..)
                 | Instruction::ClassIs(..)

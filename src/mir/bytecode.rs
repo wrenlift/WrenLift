@@ -114,6 +114,10 @@ pub enum Op {
 
     // -- 13B: op + dst(2) + src(2) + class(4) + message(4) --
     CheckType = 0x47,
+
+    // -- 7B: op + dst(2) + lhs(2) + rhs(2) --
+    CmpEqF64 = 0x48,
+    CmpNeF64 = 0x49,
 }
 
 impl Op {
@@ -615,6 +619,8 @@ impl<'a> Encoder<'a> {
             Instruction::CmpGtF64(a, b) => self.emit_binary(Op::CmpGtF64, dst, *a, *b),
             Instruction::CmpLeF64(a, b) => self.emit_binary(Op::CmpLeF64, dst, *a, *b),
             Instruction::CmpGeF64(a, b) => self.emit_binary(Op::CmpGeF64, dst, *a, *b),
+            Instruction::CmpEqF64(a, b) => self.emit_binary(Op::CmpEqF64, dst, *a, *b),
+            Instruction::CmpNeF64(a, b) => self.emit_binary(Op::CmpNeF64, dst, *a, *b),
             Instruction::BitAnd(a, b) => self.emit_binary(Op::BitAnd, dst, *a, *b),
             Instruction::BitOr(a, b) => self.emit_binary(Op::BitOr, dst, *a, *b),
             Instruction::BitXor(a, b) => self.emit_binary(Op::BitXor, dst, *a, *b),

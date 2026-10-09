@@ -1594,6 +1594,14 @@ pub mod cl {
     const TIER_CELL_COUNTDOWN: i32 = 0;
     const TIER_CELL_RETIER: i32 = 4;
     const TIER_CELL_RETIER_TOP: i32 = 16;
+    const TIER_CELL_ENTRIES: i32 = 20;
+    const _: () = {
+        use crate::runtime::engine::TierCell;
+        assert!(std::mem::offset_of!(TierCell, countdown) == TIER_CELL_COUNTDOWN as usize);
+        assert!(std::mem::offset_of!(TierCell, retier) == TIER_CELL_RETIER as usize);
+        assert!(std::mem::offset_of!(TierCell, retier_top) == TIER_CELL_RETIER_TOP as usize);
+        assert!(std::mem::offset_of!(TierCell, entries) == TIER_CELL_ENTRIES as usize);
+    };
 
     /// Load a word from the safepoint page: unreadable while a
     /// collector waits, so the load faults and the fault handler parks
@@ -2609,26 +2617,25 @@ pub mod cl {
                 target_block,
                 param_count: layout.param_count,
                 func_id,
-                // A live-in that scalar replacement split out of an
-                // object parameter is read from that object's field.
-                live_in_regs: live
-                    .iter()
-                    .map(|v| {
-                        mir.scalar_param_sources
-                            .get(v)
-                            .map(|(o, _)| o.0)
-                            .unwrap_or(v.0)
-                    })
-                    .collect(),
+                live_in_regs: live.iter().map(|v| osr_live_in_reg(mir, *v)).collect(),
                 live_in_num: live
                     .iter()
-                    .map(|v| mir.speculated_num_params.contains(v))
+                    .map(|v| {
+                        mir.speculated_num_params.contains(v)
+                            || crate::mir::osr_unboxed_source(mir, *v).is_some()
+                    })
                     .collect(),
                 live_in_field: live
                     .iter()
                     .map(|v| mir.scalar_param_sources.get(v).map(|(_, f)| *f))
                     .collect(),
-                live_in_int: live.iter().map(|v| i64_params.contains(v)).collect(),
+                live_in_int: live
+                    .iter()
+                    .map(|v| {
+                        i64_params.contains(v)
+                            || crate::mir::osr_unboxed_source(mir, *v).is_some_and(|s| s.int)
+                    })
+                    .collect(),
                 live_in_modvar: live
                     .iter()
                     .map(|v| mir.promoted_modvar_params.get(v).copied())
@@ -2686,6 +2693,17 @@ pub mod cl {
             .any(|target| target.0 <= block.id.0)
     }
 
+    /// The interpreter register an OSR entry reads a live-in from.
+    pub(crate) fn osr_live_in_reg(mir: &MirFunction, v: ValueId) -> u32 {
+        let v = crate::mir::osr_unboxed_source(mir, v).map_or(v, |s| s.reg);
+        // A live-in that scalar replacement split out of an object
+        // parameter is read from that object's field.
+        mir.scalar_param_sources
+            .get(&v)
+            .map(|(o, _)| o.0)
+            .unwrap_or(v.0)
+    }
+
     pub(crate) fn osr_entry_layout(mir: &MirFunction, target: BlockId) -> Option<OsrEntryLayout> {
         let target_idx = target.0 as usize;
         let target_block = mir.blocks.get(target_idx)?;
@@ -2708,11 +2726,12 @@ pub mod cl {
 
         let value_types = infer_osr_value_types(mir);
         let external_args = osr_external_live_values(mir, target);
+        let boxed =
+            |v: &ValueId| matches!(value_types.get(v.0 as usize).copied(), Some(MirType::Value));
         if external_args.iter().any(|vid| {
-            !matches!(
-                value_types.get(vid.0 as usize).copied(),
-                Some(MirType::Value)
-            ) && !f64_params.contains(vid)
+            !boxed(vid)
+                && !f64_params.contains(vid)
+                && !crate::mir::osr_unboxed_source(mir, *vid).is_some_and(|s| boxed(&s.reg))
         }) {
             return None;
         }
@@ -3348,7 +3367,9 @@ pub mod cl {
                     if osr_vars.contains_key(vid) {
                         continue;
                     }
-                    let ty = if f64_params.contains(vid) {
+                    let ty = if f64_params.contains(vid)
+                        || crate::mir::osr_unboxed_source(mir, *vid).is_some_and(|s| !s.int)
+                    {
                         types::F64
                     } else {
                         types::I64
@@ -3458,7 +3479,47 @@ pub mod cl {
         // or, when a loop entry stub posted a frame for this thread, to
         // that loop's header with the interpreter's frame loaded.
         let mut entry_params: Option<Vec<Value>> = None;
+        // An entry joins its loop at a landing block in front of the
+        // header, which the body's own edges into the loop reach too:
+        // what the entry defines merges with the body's outside the
+        // loop, so it stays loop-invariant there.
+        let mut landings: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
+        let mut loop_blocks: HashMap<BlockId, HashSet<usize>> = HashMap::new();
         if let Some(entries) = entries {
+            use crate::mir::opt::licm::{compute_dominators, compute_rpo};
+            let mut with_preds = mir.clone();
+            with_preds.compute_predecessors();
+            let rpo = compute_rpo(&with_preds);
+            let idom = compute_dominators(&with_preds, &rpo);
+            for layout in &entries.layouts {
+                let header = layout.target_block.0 as usize;
+                let dominated: HashSet<usize> = (0..mir.blocks.len())
+                    .filter(|&b| {
+                        let mut cur = b;
+                        loop {
+                            if cur == header {
+                                return true;
+                            }
+                            let next = idom[cur];
+                            if next == usize::MAX || next == cur {
+                                return false;
+                            }
+                            cur = next;
+                        }
+                    })
+                    .collect();
+                loop_blocks.insert(layout.target_block, dominated);
+                let landing = builder.create_block();
+                for (_, ty) in &mir.blocks[header].params {
+                    let cl_type = match ty {
+                        MirType::F64 => types::F64,
+                        MirType::Value if f64_self_id.is_some() => types::F64,
+                        _ => types::I64,
+                    };
+                    builder.append_block_param(landing, cl_type);
+                }
+                landings.insert(layout.target_block, landing);
+            }
             let dispatch = builder.create_block();
             builder.switch_to_block(dispatch);
             for _ in 0..mir.arity {
@@ -3529,9 +3590,10 @@ pub mod cl {
                         slot * VALUE_SIZE,
                     );
                     slot += 1;
-                    let v = if f64_params.contains(vid) {
+                    let unboxed = crate::mir::osr_unboxed_source(mir, *vid);
+                    let v = if f64_params.contains(vid) || unboxed.is_some_and(|s| !s.int) {
                         builder.ins().bitcast(types::F64, MemFlags::new(), v)
-                    } else if i64_params.contains(vid) {
+                    } else if i64_params.contains(vid) || unboxed.is_some_and(|s| s.int) {
                         let f = builder.ins().bitcast(types::F64, MemFlags::new(), v);
                         builder.ins().fcvt_to_sint(types::I64, f)
                     } else {
@@ -3585,7 +3647,16 @@ pub mod cl {
                     };
                     args.push(BlockArg::Value(v));
                 }
-                builder.ins().jump(block_map[&layout.target_block], &args);
+                builder.ins().jump(landings[&layout.target_block], &args);
+            }
+            for (header, landing) in &landings {
+                builder.switch_to_block(*landing);
+                let args: Vec<BlockArg> = builder
+                    .block_params(*landing)
+                    .iter()
+                    .map(|v| BlockArg::Value(*v))
+                    .collect();
+                builder.ins().jump(block_map[header], &args);
             }
             entry_params = Some(params);
         }
@@ -3978,6 +4049,14 @@ pub mod cl {
                 // SetUpvalue lowering site without re-reading TLS or
                 // calling the per-access helper.
                 if let Some(hook) = tier_hook.as_ref().filter(|h| h.cell != 0) {
+                    let cell = builder.ins().iconst(types::I64, hook.cell as i64);
+                    let n = builder
+                        .ins()
+                        .uload32(MemFlags::trusted(), cell, TIER_CELL_ENTRIES);
+                    let n = builder.ins().iadd_imm_s(n, 1);
+                    builder
+                        .ins()
+                        .istore32(MemFlags::trusted(), n, cell, TIER_CELL_ENTRIES);
                     emit_tier_tick(builder, module, &mut get_runtime_fn, hook)?;
                     let zero = builder.ins().iconst(types::I64, 0);
                     builder.def_var(loop_tick_var, zero);
@@ -4185,6 +4264,8 @@ pub mod cl {
                         | Instruction::CmpGtF64(..)
                         | Instruction::CmpLeF64(..)
                         | Instruction::CmpGeF64(..)
+                        | Instruction::CmpEqF64(..)
+                        | Instruction::CmpNeF64(..)
                         | Instruction::ClassIs(..)
                         | Instruction::ObjectIs(..)
                         | Instruction::ClosureFnIs(..)
@@ -4320,7 +4401,17 @@ pub mod cl {
                 let _ = builder.ins().call(f, &[snap]);
             }
 
-            lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools)?;
+            let target_block = |t: &BlockId| match landings.get(t) {
+                Some(l) if !loop_blocks[t].contains(&block_idx) => *l,
+                _ => block_map[t],
+            };
+            lower_terminator(
+                &block.terminator,
+                builder,
+                &val_map,
+                &target_block,
+                &raw_bools,
+            )?;
         }
 
         // Fill in the shared abort-exit block (if any block needed
@@ -7756,6 +7847,12 @@ pub mod cl {
                 get(a),
                 get(b),
             ))),
+            Instruction::CmpEqF64(a, b) => {
+                Ok(Some(builder.ins().fcmp(FloatCC::Equal, get(a), get(b))))
+            }
+            Instruction::CmpNeF64(a, b) => {
+                Ok(Some(builder.ins().fcmp(FloatCC::NotEqual, get(a), get(b))))
+            }
 
             // === Box/Unbox ===
             Instruction::Unbox(a) => {
@@ -8136,7 +8233,7 @@ pub mod cl {
         term: &Terminator,
         builder: &mut FunctionBuilder,
         val_map: &HashMap<ValueId, Value>,
-        block_map: &HashMap<BlockId, cranelift_codegen::ir::Block>,
+        block_map: &dyn Fn(&BlockId) -> cranelift_codegen::ir::Block,
         raw_bools: &std::collections::HashSet<ValueId>,
     ) -> Result<(), String> {
         // Surface undefined-value lookups as `Err` instead of
@@ -8192,7 +8289,7 @@ pub mod cl {
                 // call when `cond` flows through a phi-style block
                 // param. Surfaced as Reader.readLine hanging on the
                 // second call once _lineBuf had any leftover bytes.
-                let cl_block = block_map[target];
+                let cl_block = block_map(target);
                 let cl_args: Vec<BlockArg> = args
                     .iter()
                     .map(|a| {
@@ -8213,8 +8310,8 @@ pub mod cl {
                 false_args,
             } => {
                 let cond = get(condition);
-                let t_block = block_map[true_target];
-                let f_block = block_map[false_target];
+                let t_block = block_map(true_target);
+                let f_block = block_map(false_target);
                 let t_args: Vec<BlockArg> = true_args
                     .iter()
                     .map(|a| {

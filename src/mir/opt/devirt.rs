@@ -219,6 +219,8 @@ impl<'a> Devirt<'a> {
                     | Instruction::CmpGtF64(_, _)
                     | Instruction::CmpLeF64(_, _)
                     | Instruction::CmpGeF64(_, _)
+                    | Instruction::CmpEqF64(_, _)
+                    | Instruction::CmpNeF64(_, _)
                     | Instruction::Not(_)
                     | Instruction::IsType(_, _) => {
                         known.insert(*vid, KnownType::Bool);

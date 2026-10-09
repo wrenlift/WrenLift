@@ -58,7 +58,12 @@ pub struct TierCell {
     /// The interval the countdown was last loaded with.
     pub interval: std::sync::atomic::AtomicU32,
     pub retier_top: std::sync::atomic::AtomicU32,
+    /// Calls compiled code has taken, apart from its loop iterations.
+    pub entries: std::sync::atomic::AtomicU32,
 }
+
+/// Counted iterations per call above which a function's calls are long.
+const LONG_ACTIVATION_TICKS: u32 = 32;
 
 impl TierCell {
     /// Call the helper again after `interval` more entries.
@@ -66,6 +71,15 @@ impl TierCell {
         use std::sync::atomic::Ordering::Relaxed;
         self.interval.store(interval, Relaxed);
         self.countdown.store(interval, Relaxed);
+    }
+
+    /// Whether a call runs long: many counted loop iterations per entry.
+    /// An activation that ends soon needs no way into a newer body from
+    /// inside its loops; its next call takes the new body.
+    fn long_activations(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let entries = self.entries.load(Relaxed).max(1);
+        self.total.load(Relaxed) / entries >= LONG_ACTIVATION_TICKS
     }
 
     /// Credit the interval that just elapsed and return the total.
@@ -372,6 +386,8 @@ pub fn llvm_gains(mir: &MirFunction) -> bool {
                 | I::CmpGtF64(..)
                 | I::CmpLeF64(..)
                 | I::CmpGeF64(..)
+                | I::CmpEqF64(..)
+                | I::CmpNeF64(..)
                 | I::BitAnd(..)
                 | I::BitOr(..)
                 | I::BitXor(..)
@@ -4936,6 +4952,7 @@ impl ExecutionEngine {
             stats.compile_attempts += 1;
         }
         let mut sroa_mir = self.scalar_replaced(id, &mir, interner);
+        Arc::make_mut(&mut sroa_mir).interp_registers = mir.next_value;
         Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
         let (mut callsite_ic_ptrs, callsite_ic_live_ptrs) = self
             .callsite_ic_data_for_compile(id)
@@ -5214,6 +5231,15 @@ impl ExecutionEngine {
             None
         };
         let mut sroa_mir = self.scalar_replaced(id, &mir, interner);
+        // The LLVM tier gives a loop an entry that unboxes its live-ins
+        // only when calls run long: each entry costs the body some code
+        // quality, which short calls never win back.
+        Arc::make_mut(&mut sroa_mir).interp_registers =
+            if use_llvm && !self.tier_cells[idx].long_activations() {
+                0
+            } else {
+                mir.next_value
+            };
         Arc::make_mut(&mut sroa_mir).ic_sites = mir.ic_site_numbering();
         let profile = self.get_type_profile(id).cloned();
         let speculate = !self.speculation_failed[idx];

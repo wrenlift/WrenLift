@@ -1596,6 +1596,8 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::CmpGtF64(..)
                 | Instruction::CmpLeF64(..)
                 | Instruction::CmpGeF64(..)
+                | Instruction::CmpEqF64(..)
+                | Instruction::CmpNeF64(..)
                 | Instruction::Not(_)
                 | Instruction::IsType(..)
                 | Instruction::ClassIs(..)
@@ -3397,6 +3399,8 @@ impl<'a> LowerCtx<'a> {
             Instruction::CmpGtF64(a, b) => self.emit_fp_cmp(dst_val, *a, *b, Cond::Gt),
             Instruction::CmpLeF64(a, b) => self.emit_fp_cmp(dst_val, *a, *b, Cond::Le),
             Instruction::CmpGeF64(a, b) => self.emit_fp_cmp(dst_val, *a, *b, Cond::Ge),
+            Instruction::CmpEqF64(a, b) => self.emit_fp_cmp(dst_val, *a, *b, Cond::Eq),
+            Instruction::CmpNeF64(a, b) => self.emit_fp_cmp(dst_val, *a, *b, Cond::Ne),
 
             // -- Boxing / Unboxing --
             Instruction::Unbox(a) => {

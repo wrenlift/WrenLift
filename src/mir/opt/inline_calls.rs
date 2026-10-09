@@ -151,6 +151,8 @@ pub fn body_has_arithmetic(mir: &MirFunction) -> bool {
                     | Instruction::CmpGtF64(..)
                     | Instruction::CmpLeF64(..)
                     | Instruction::CmpGeF64(..)
+                    | Instruction::CmpEqF64(..)
+                    | Instruction::CmpNeF64(..)
                     | Instruction::MathUnaryF64(..)
                     | Instruction::MathBinaryF64(..)
             );

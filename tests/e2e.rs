@@ -1976,6 +1976,49 @@ System.print(total)
     );
 }
 
+/// Number equality the top tier specialises on guarded list elements
+/// and arguments: signed zeros are equal and NaN equals nothing.
+#[test]
+fn e2e_tiered_num_equality_keeps_ieee_semantics() {
+    let source = r#"
+class K {
+  static eq(a, x) {
+    var n = 0
+    for (i in 0...a.count) if (a[i] == x) n = n + 1
+    return n
+  }
+  static ne(a, x) {
+    var n = 0
+    for (i in 0...a.count) if (a[i] != x) n = n + 1
+    return n
+  }
+}
+var nan = 0 / 0
+var a = [0, -0, nan, 1, 2]
+var s = 0
+for (r in 0...3000) s = s + K.eq(a, 0) * 1000 + K.ne(a, nan) * 10 + K.eq(a, nan)
+System.print(s)
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            jit_threshold: 5,
+            ..Default::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", source);
+        let output = vm.take_output();
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}\n{}",
+            mode,
+            result,
+            output
+        );
+        assert_eq!(output.trim(), "6150000", "{:?} equality mismatch", mode);
+    }
+}
+
 #[test]
 fn e2e_tiered_backedge_does_not_restart_module_entry() {
     let source = r#"

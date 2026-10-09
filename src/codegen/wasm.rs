@@ -616,7 +616,9 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::CmpLtF64(..)
             | Instruction::CmpGtF64(..)
             | Instruction::CmpLeF64(..)
-            | Instruction::CmpGeF64(..) => ValType::I32,
+            | Instruction::CmpGeF64(..)
+            | Instruction::CmpEqF64(..)
+            | Instruction::CmpNeF64(..) => ValType::I32,
 
             // Everything else → i64 (NaN-boxed Value or integer).
             _ => ValType::I64,
@@ -1391,6 +1393,8 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::CmpGtF64(a, b) => self.emit_f64_cmp(func, dst, *a, *b, WasmInst::F64Gt),
             Instruction::CmpLeF64(a, b) => self.emit_f64_cmp(func, dst, *a, *b, WasmInst::F64Le),
             Instruction::CmpGeF64(a, b) => self.emit_f64_cmp(func, dst, *a, *b, WasmInst::F64Ge),
+            Instruction::CmpEqF64(a, b) => self.emit_f64_cmp(func, dst, *a, *b, WasmInst::F64Eq),
+            Instruction::CmpNeF64(a, b) => self.emit_f64_cmp(func, dst, *a, *b, WasmInst::F64Ne),
 
             // -- Boxing / Unboxing --
             Instruction::Unbox(a) => {

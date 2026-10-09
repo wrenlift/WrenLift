@@ -207,6 +207,20 @@ fn op_cmp_ge_f64(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     state.pc + 1
 }
 
+fn op_cmp_eq_f64(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let a = f64::from_bits(get(state, op.a).to_bits());
+    let b = f64::from_bits(get(state, op.b).to_bits());
+    set(state, op.dst, Value::bool(a == b));
+    state.pc + 1
+}
+
+fn op_cmp_ne_f64(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let a = f64::from_bits(get(state, op.a).to_bits());
+    let b = f64::from_bits(get(state, op.b).to_bits());
+    set(state, op.dst, Value::bool(a != b));
+    state.pc + 1
+}
+
 fn op_cmp_eq(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let lhs = get(state, op.a);
     let rhs = get(state, op.b);
@@ -682,6 +696,8 @@ pub fn can_use_threaded(mir: &MirFunction, interner: Option<&crate::intern::Inte
                 | Instruction::CmpGtF64(_, _)
                 | Instruction::CmpLeF64(_, _)
                 | Instruction::CmpGeF64(_, _)
+                | Instruction::CmpEqF64(_, _)
+                | Instruction::CmpNeF64(_, _)
                 | Instruction::Not(_)
                 | Instruction::Neg(_)
                 | Instruction::GetField(_, _)
@@ -951,6 +967,22 @@ pub fn lower_mir_to_threaded(
                 },
                 Instruction::CmpGeF64(a, b) => ThreadedOp {
                     handler: op_cmp_ge_f64,
+                    dst,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
+                },
+                Instruction::CmpEqF64(a, b) => ThreadedOp {
+                    handler: op_cmp_eq_f64,
+                    dst,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
+                },
+                Instruction::CmpNeF64(a, b) => ThreadedOp {
+                    handler: op_cmp_ne_f64,
                     dst,
                     a: a.0 as u16,
                     b: b.0 as u16,

@@ -36,7 +36,8 @@ pub mod llvm {
         OsrEntryLayout, PTR_MASK, QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
         collect_osr_targets, const_f64_of, direct_calls_enabled, env_jit_callsite_ic,
         infer_osr_value_types, is_positive_power_of_two, jit_cur_cell, jit_func_id,
-        jit_modvar_in_range, jit_modvars_cell, osr_entry_layout, should_compile_osr_entries,
+        jit_modvar_in_range, jit_modvars_cell, osr_entry_layout, osr_live_in_reg,
+        should_compile_osr_entries,
     };
     use crate::intern::Interner;
     use crate::mir::{
@@ -541,21 +542,22 @@ pub mod llvm {
                     target,
                     layout.param_count,
                     name,
+                    live.iter().map(|v| osr_live_in_reg(mir, *v)).collect(),
                     live.iter()
                         .map(|v| {
-                            mir.scalar_param_sources
-                                .get(v)
-                                .map(|(o, _)| o.0)
-                                .unwrap_or(v.0)
+                            mir.speculated_num_params.contains(v)
+                                || crate::mir::osr_unboxed_source(mir, *v).is_some()
                         })
-                        .collect(),
-                    live.iter()
-                        .map(|v| mir.speculated_num_params.contains(v))
                         .collect(),
                     live.iter()
                         .map(|v| mir.scalar_param_sources.get(v).map(|(_, f)| *f))
                         .collect(),
-                    live.iter().map(|v| i64_params.contains(v)).collect(),
+                    live.iter()
+                        .map(|v| {
+                            i64_params.contains(v)
+                                || crate::mir::osr_unboxed_source(mir, *v).is_some_and(|s| s.int)
+                        })
+                        .collect(),
                     live.iter()
                         .map(|v| mir.promoted_modvar_params.get(v).copied())
                         .collect(),
@@ -3642,6 +3644,12 @@ pub mod llvm {
                 I::CmpGeF64(a, b) => self
                     .fcmp(FloatPredicate::OGE, self.getf(a)?, self.getf(b)?)?
                     .into(),
+                I::CmpEqF64(a, b) => self
+                    .fcmp(FloatPredicate::OEQ, self.getf(a)?, self.getf(b)?)?
+                    .into(),
+                I::CmpNeF64(a, b) => self
+                    .fcmp(FloatPredicate::UNE, self.getf(a)?, self.getf(b)?)?
+                    .into(),
                 I::Unbox(a) => self.getf(a)?.into(),
                 I::Box(a) => self.boxed(a)?.into(),
                 I::CheckType {
@@ -5969,6 +5977,8 @@ pub mod llvm {
                 | I::CmpGtF64(..)
                 | I::CmpLeF64(..)
                 | I::CmpGeF64(..)
+                | I::CmpEqF64(..)
+                | I::CmpNeF64(..)
                 | I::AddI64(..)
                 | I::SubI64(..)
                 | I::MulI64(..)
@@ -5998,6 +6008,8 @@ pub mod llvm {
                 | Instruction::CmpGtF64(..)
                 | Instruction::CmpLeF64(..)
                 | Instruction::CmpGeF64(..)
+                | Instruction::CmpEqF64(..)
+                | Instruction::CmpNeF64(..)
                 | Instruction::ClassIs(..)
                 | Instruction::ObjectIs(..)
                 | Instruction::ClosureFnIs(..)

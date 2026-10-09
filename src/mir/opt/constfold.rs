@@ -244,6 +244,8 @@ fn try_propagate(inst: &Instruction, constants: &HashMap<ValueId, ConstVal>) -> 
         Instruction::CmpGtF64(a, b) => f64_cmp(constants, *a, *b, |x, y| x > y),
         Instruction::CmpLeF64(a, b) => f64_cmp(constants, *a, *b, |x, y| x <= y),
         Instruction::CmpGeF64(a, b) => f64_cmp(constants, *a, *b, |x, y| x >= y),
+        Instruction::CmpEqF64(a, b) => f64_cmp(constants, *a, *b, |x, y| x == y),
+        Instruction::CmpNeF64(a, b) => f64_cmp(constants, *a, *b, |x, y| x != y),
         _ => None,
     }
 }
@@ -256,7 +258,9 @@ fn should_replace(inst: &Instruction, cv: &ConstVal) -> bool {
         (Instruction::CmpLtF64(..), _)
         | (Instruction::CmpGtF64(..), _)
         | (Instruction::CmpLeF64(..), _)
-        | (Instruction::CmpGeF64(..), _) => false,
+        | (Instruction::CmpGeF64(..), _)
+        | (Instruction::CmpEqF64(..), _)
+        | (Instruction::CmpNeF64(..), _) => false,
         _ => false,
     }
 }

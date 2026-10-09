@@ -27,6 +27,17 @@ impl MirPass for UnboxParams {
             .iter()
             .flat_map(|b| b.instructions.iter().map(|(v, i)| (*v, i.clone())))
             .collect();
+        // A guard follows its value's definition, or opens the entry
+        // block for an argument, so it covers every use of the value.
+        let mut guarded: HashSet<ValueId> = defs
+            .values()
+            .filter_map(|i| match i {
+                Instruction::GuardNumAt { value, .. } | Instruction::GuardNum(value) => {
+                    Some(*value)
+                }
+                _ => None,
+            })
+            .collect();
 
         // Optimistic fixed point over the non-entry parameters.
         let mut chosen: HashSet<ValueId> = func
@@ -49,7 +60,9 @@ impl MirPass for UnboxParams {
                         let Some(&(p, _)) = params.get(i) else {
                             continue;
                         };
-                        if chosen.contains(&p) && f64_source(*arg, &defs, &chosen).is_none() {
+                        if chosen.contains(&p)
+                            && f64_source(*arg, &defs, &guarded, &chosen).is_none()
+                        {
                             chosen.remove(&p);
                             dropped = true;
                         }
@@ -60,6 +73,38 @@ impl MirPass for UnboxParams {
                 break;
             }
         }
+        // A parameter that only passes a guarded value along stays boxed:
+        // as f64 it would hold a float register across its loops with no
+        // arithmetic to show for it. It is still a proven Num, so a
+        // parameter it feeds unboxes it on the edge.
+        let mut passing = chosen.clone();
+        loop {
+            let mut dropped = false;
+            for block in &func.blocks {
+                for (target, args) in edges(&block.terminator) {
+                    let params = &func.blocks[target.0 as usize].params;
+                    for (i, arg) in args.iter().enumerate() {
+                        let Some(&(p, _)) = params.get(i) else {
+                            continue;
+                        };
+                        let passes = match f64_source(*arg, &defs, &guarded, &passing) {
+                            Some(Source::Guarded(_)) => true,
+                            Some(Source::Value(v)) => passing.contains(&v),
+                            _ => false,
+                        };
+                        if passing.contains(&p) && !passes {
+                            passing.remove(&p);
+                            dropped = true;
+                        }
+                    }
+                }
+            }
+            if !dropped {
+                break;
+            }
+        }
+        chosen.retain(|p| !passing.contains(p));
+        guarded.extend(passing);
 
         // Retype the parameters and rewrite the edges.
         for block in &mut func.blocks {
@@ -90,21 +135,22 @@ impl MirPass for UnboxParams {
                     if !chosen.contains(p) {
                         continue;
                     }
-                    out[i] = match f64_source(*arg, &defs, &chosen).expect("checked above") {
-                        Source::Value(v) => v,
-                        Source::Guarded(g) => *unboxes.entry(g).or_insert_with(|| {
-                            let id = ValueId(func.next_value);
-                            func.next_value += 1;
-                            consts.push((id, Instruction::Unbox(g)));
-                            id
-                        }),
-                        Source::Const(c) => *cache.entry(c.to_bits()).or_insert_with(|| {
-                            let id = ValueId(func.next_value);
-                            func.next_value += 1;
-                            consts.push((id, Instruction::ConstF64(c)));
-                            id
-                        }),
-                    };
+                    out[i] =
+                        match f64_source(*arg, &defs, &guarded, &chosen).expect("checked above") {
+                            Source::Value(v) => v,
+                            Source::Guarded(g) => *unboxes.entry(g).or_insert_with(|| {
+                                let id = ValueId(func.next_value);
+                                func.next_value += 1;
+                                consts.push((id, Instruction::Unbox(g)));
+                                id
+                            }),
+                            Source::Const(c) => *cache.entry(c.to_bits()).or_insert_with(|| {
+                                let id = ValueId(func.next_value);
+                                func.next_value += 1;
+                                consts.push((id, Instruction::ConstF64(c)));
+                                id
+                            }),
+                        };
                 }
                 new_args.push(out);
             }
@@ -251,12 +297,16 @@ enum Source {
 fn f64_source(
     v: ValueId,
     defs: &HashMap<ValueId, Instruction>,
+    guarded: &HashSet<ValueId>,
     chosen: &HashSet<ValueId>,
 ) -> Option<Source> {
     let mut cur = v;
     for _ in 0..64 {
         if chosen.contains(&cur) {
             return Some(Source::Value(cur));
+        }
+        if guarded.contains(&cur) {
+            return Some(Source::Guarded(cur));
         }
         match defs.get(&cur)? {
             Instruction::Box(f) => return Some(Source::Value(*f)),
@@ -301,6 +351,8 @@ fn consumes_f64(inst: &Instruction) -> bool {
             | Instruction::CmpGtF64(..)
             | Instruction::CmpLeF64(..)
             | Instruction::CmpGeF64(..)
+            | Instruction::CmpEqF64(..)
+            | Instruction::CmpNeF64(..)
             | Instruction::MathUnaryF64(..)
             | Instruction::MathBinaryF64(..)
             | Instruction::Box(_)
@@ -379,6 +431,68 @@ mod tests {
             insts
                 .iter()
                 .any(|(v, i)| *v == sum && matches!(i, Instruction::AddF64(a, _) if *a == x))
+        );
+    }
+
+    /// A loop variable seeded from a guarded argument is carried raw;
+    /// a parameter that only passes the argument along stays boxed.
+    #[test]
+    fn a_guarded_seed_unboxes_the_variable_but_not_the_pass_through() {
+        let mut interner = Interner::new();
+        let mut f = MirFunction::new(interner.intern("test"), 1);
+        let entry = f.new_block();
+        let header = f.new_block();
+        let exit = f.new_block();
+        let arg = f.new_value();
+        let guard = f.new_value();
+        let pass = f.new_value();
+        let var = f.new_value();
+        let raw = f.new_value();
+        let one = f.new_value();
+        let next = f.new_value();
+        let boxed = f.new_value();
+        let more = f.new_value();
+        {
+            let b = f.block_mut(entry);
+            b.instructions.push((arg, Instruction::BlockParam(1)));
+            b.instructions.push((guard, Instruction::GuardNum(arg)));
+            b.terminator = Terminator::Branch {
+                target: header,
+                args: vec![arg, arg],
+            };
+        }
+        {
+            let b = f.block_mut(header);
+            b.params = vec![(pass, MirType::Value), (var, MirType::Value)];
+            b.instructions.push((raw, Instruction::Unbox(var)));
+            b.instructions.push((one, Instruction::ConstF64(1.0)));
+            b.instructions.push((next, Instruction::SubF64(raw, one)));
+            b.instructions.push((boxed, Instruction::Box(next)));
+            b.instructions
+                .push((more, Instruction::CmpGtF64(next, one)));
+            b.terminator = Terminator::CondBranch {
+                condition: more,
+                true_target: header,
+                true_args: vec![pass, boxed],
+                false_target: exit,
+                false_args: vec![],
+            };
+        }
+        f.block_mut(exit).terminator = Terminator::Return(pass);
+        UnboxParams.run(&mut f);
+        let params = &f.block(header).params;
+        assert_eq!(params[0], (pass, MirType::Value));
+        assert_eq!(params[1], (var, MirType::F64));
+        // The entry edge unboxes the guarded argument for the variable.
+        let Terminator::Branch { args, .. } = &f.block(entry).terminator else {
+            panic!("entry branch");
+        };
+        assert_eq!(args[0], arg);
+        assert!(
+            f.block(entry)
+                .instructions
+                .iter()
+                .any(|(v, i)| *v == args[1] && matches!(i, Instruction::Unbox(a) if *a == arg))
         );
     }
 }

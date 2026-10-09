@@ -490,6 +490,8 @@ fn consumes_f64(inst: &Instruction) -> bool {
             | Instruction::CmpGtF64(..)
             | Instruction::CmpLeF64(..)
             | Instruction::CmpGeF64(..)
+            | Instruction::CmpEqF64(..)
+            | Instruction::CmpNeF64(..)
             | Instruction::MathUnaryF64(..)
             | Instruction::MathBinaryF64(..)
             | Instruction::Box(_)

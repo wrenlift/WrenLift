@@ -369,6 +369,8 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         CmpGtF64(..) => 25,
         CmpLeF64(..) => 26,
         CmpGeF64(..) => 27,
+        CmpEqF64(..) => 85,
+        CmpNeF64(..) => 86,
         Not(..) => 28,
         BitAnd(..) => 29,
         BitOr(..) => 30,

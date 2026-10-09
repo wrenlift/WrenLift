@@ -498,6 +498,25 @@ enum OsrTransfer {
     Return(Value),
 }
 
+/// Or each argument's kind into its result profile byte. Compiled
+/// entries profile arguments; a call that reaches compiled code
+/// through a loop entry never takes one.
+fn note_param_kinds(bc: &BytecodeFunction, values: &[Value]) {
+    use crate::mir::bytecode::{RESULT_NUM, RESULT_OTHER};
+    // SAFETY: the profile is this function's, written only by code
+    // running on this thread.
+    let kinds = unsafe { &mut *bc.result_kinds.get() };
+    for &(reg, idx) in &bc.param_offsets {
+        // The receiver is never a Num.
+        if idx == 0 {
+            continue;
+        }
+        if let (Some(v), Some(k)) = (values.get(reg as usize), kinds.get_mut(reg as usize)) {
+            *k |= if v.is_num() { RESULT_NUM } else { RESULT_OTHER };
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // OSR transfer needs every piece of the live frame context.
 fn try_enter_loop_osr(
     vm: &mut VM,
@@ -529,6 +548,7 @@ fn try_enter_loop_osr(
     else {
         return Ok(OsrTransfer::NotEntered);
     };
+    note_param_kinds(bc, values);
     let Some(entry) = vm.engine.active_osr_entry(func_id, point.target_block) else {
         // A loop compiled cold has no entry; once it proves hot here, ask
         // for the next tier so its caches make it into the code.
@@ -2405,6 +2425,12 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                 }
                 Op::CmpGeF64 => {
                     bc_f64_cmp!(&mut pc, &mut values, |x, y| x >= y, &bc);
+                }
+                Op::CmpEqF64 => {
+                    bc_f64_cmp!(&mut pc, &mut values, |x, y| x == y, &bc);
+                }
+                Op::CmpNeF64 => {
+                    bc_f64_cmp!(&mut pc, &mut values, |x, y| x != y, &bc);
                 }
 
                 // =============================================================
