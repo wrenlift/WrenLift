@@ -13,7 +13,9 @@ jobs:
   test:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Room for a cold build: each new nightly misses the cache, and the
+    # Linux runner then rebuilds the wasm steps from scratch.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
+          # A failed run still leaves its build for the next one.
+          cache-on-failure: true
 
       # A crash under the parallel test harness takes every in-flight
       # test with it and names none; one at a time, the log says which.
@@ -167,6 +171,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: llvm-${{ matrix.os }}
+          # A failed run still leaves its build for the next one.
+          cache-on-failure: true
 
       - name: Serial tests with backtraces (Windows)
         if: runner.os == 'Windows'
