@@ -1206,6 +1206,7 @@ fn emit_aot_function(
             eprintln!("{}", ctx.func.display());
         }
     }
+    crate::codegen::cranelift_backend::cl::align_spill_area(&mut ctx.func);
     module.define_function(func_id, &mut ctx).map_err(|e| {
         if std::env::var_os("WLIFT_AOT_DUMP").is_some() {
             eprintln!("=== AOT define_function failed for {symbol} ===");

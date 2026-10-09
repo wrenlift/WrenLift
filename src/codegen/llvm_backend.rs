@@ -1815,8 +1815,20 @@ pub mod llvm {
             }
             let p = self.addr(obj, self.sh.layout.list_elem_class as i64)?;
             let tag = self.list_tag();
-            let mut cur = self.load_tagged_word(p, tag, "eclass")?;
             let mixed = self.c64(ELEM_CLASS_MIXED as u64);
+            // A Num makes the word MIXED whatever it held: a constant
+            // store, with nothing for a loop to carry.
+            if values.iter().any(|v| self.num_values.contains(v)) {
+                return self.store_elem_class(p, tag, mixed);
+            }
+            // MIXED absorbs every class, so a mixed list skips the fold
+            // and the store.
+            let mut cur = self.load_tagged_word(p, tag, "eclass")?;
+            let is_mixed = self.icmp(IntPredicate::EQ, cur, mixed)?;
+            let fold = self.new_block("ecf");
+            let done = self.new_block("ecd");
+            self.cbr(is_mixed, done, fold)?;
+            self.b.position_at_end(fold);
             for v in values {
                 let (_, _, class) = self.class_of(*v)?;
                 let has_class = self.icmp(IntPredicate::NE, class, self.c64(0))?;
@@ -1837,11 +1849,23 @@ pub mod llvm {
                     .map_err(|e| e.to_string())?
                     .into_int_value();
             }
+            self.store_elem_class(p, tag, cur)?;
+            self.br(done)?;
+            self.b.position_at_end(done);
+            Ok(())
+        }
+
+        fn store_elem_class(
+            &mut self,
+            p: PointerValue<'ctx>,
+            tag: MetadataValue<'ctx>,
+            class: IntValue<'ctx>,
+        ) -> Result<(), String> {
             let w = if self.sh.layout.ptr_size == 8 {
-                cur
+                class
             } else {
                 self.b
-                    .build_int_truncate(cur, self.wordt(), "eclassw")
+                    .build_int_truncate(class, self.wordt(), "eclassw")
                     .map_err(|e| e.to_string())?
             };
             let st = self.b.build_store(p, w).map_err(|e| e.to_string())?;

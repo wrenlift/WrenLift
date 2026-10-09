@@ -232,6 +232,20 @@ pub mod cl {
     /// class, the same class keeps it, anything else is mixed.
     fn emit_note_list_element(builder: &mut FunctionBuilder, obj: Value, value: Value) {
         use crate::runtime::object::ELEM_CLASS_MIXED;
+        let cur = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj, LIST_ELEM_CLASS);
+        // MIXED absorbs every class, so a mixed list skips the fold and
+        // the store.
+        let is_mixed = builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, cur, ELEM_CLASS_MIXED as i64);
+        let fold_block = builder.create_block();
+        let done_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_mixed, done_block, &[], fold_block, &[]);
+        builder.switch_to_block(fold_block);
         let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
         let high = builder.ins().band(value, tag_obj);
         let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
@@ -249,9 +263,6 @@ pub mod cl {
         // The null object's class is zero: not an object, so mixed.
         let has_class = builder.ins().icmp_imm_u(IntCC::NotEqual, class, 0);
         let class = builder.ins().select(has_class, class, mixed);
-        let cur = builder
-            .ins()
-            .load(types::I64, MemFlags::trusted(), obj, LIST_ELEM_CLASS);
         let unseen = builder.ins().icmp_imm_u(IntCC::Equal, cur, 0);
         let same = builder.ins().icmp(IntCC::Equal, cur, class);
         let keep = builder.ins().bor(unseen, same);
@@ -259,6 +270,8 @@ pub mod cl {
         builder
             .ins()
             .store(MemFlags::trusted(), new, obj, LIST_ELEM_CLASS);
+        builder.ins().jump(done_block, &[]);
+        builder.switch_to_block(done_block);
     }
 
     /// Or the kind of `value` into the class's field-kind byte for
@@ -2198,6 +2211,8 @@ pub mod cl {
                     safe_name, errors
                 ));
             }
+            let mut inner_func = inner_func;
+            align_spill_area(&mut inner_func);
             let mut inner_ctx = Context::for_function(inner_func);
             module
                 .define_function(inner_id, &mut inner_ctx)
@@ -2314,6 +2329,8 @@ pub mod cl {
                 eprintln!("{}", func.display());
                 eprintln!("=== end ===");
             }
+            let mut func = func;
+            align_spill_area(&mut func);
             let mut ctx = Context::for_function(func);
             module
                 .define_function(func_id, &mut ctx)
@@ -2417,6 +2434,8 @@ pub mod cl {
                 func.display()
             );
         }
+        let mut func = func;
+        align_spill_area(&mut func);
         let mut ctx = Context::for_function(func);
         module
             .define_function(func_id, &mut ctx)
@@ -2465,6 +2484,21 @@ pub mod cl {
         live_in_field: Vec<Option<u16>>,
         live_in_int: Vec<bool>,
         live_in_modvar: Vec<Option<u16>>,
+    }
+
+    /// Cranelift places register spills right after the explicit stack
+    /// slots, whose area it rounds only to the word. A zero-sized slot
+    /// aligned to 16 bytes ends that area on a 16-byte boundary, so a
+    /// 128-bit spill neither straddles a cache line nor loses store
+    /// forwarding; existing slots keep their offsets.
+    pub(crate) fn align_spill_area(func: &mut cranelift_codegen::ir::Function) {
+        if !func.sized_stack_slots.is_empty() {
+            func.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                0,
+                4,
+            ));
+        }
     }
 
     #[derive(Clone)]
@@ -2554,6 +2588,8 @@ pub mod cl {
                 builder.seal_all_blocks();
                 builder.finalize(module.target_config());
             }
+            let mut func = func;
+            align_spill_area(&mut func);
             let mut ctx = Context::for_function(func);
             module
                 .define_function(func_id, &mut ctx)
@@ -4190,6 +4226,13 @@ pub mod cl {
                             .collect();
                         Some((*call_pc, regs))
                     }
+                    // A store re-runs in the interpreter, which raises
+                    // for a bad index.
+                    (
+                        Instruction::SubscriptSet { args, .. },
+                        Some((_, Instruction::SlowPathExit { pc, live })),
+                        None,
+                    ) if args.len() == 1 => Some((*pc, live.clone())),
                     _ => None,
                 };
                 MISS_EXIT.with(|m| *m.borrow_mut() = miss);
@@ -7205,6 +7248,13 @@ pub mod cl {
                 let idx = get(&args[0]);
                 let val = get(value);
                 let known_list = KNOWN_LIST.replace(false);
+                // A store into a guarded List takes every value inline and
+                // leaves for the interpreter on a bad index, so its loop
+                // keeps nothing across a call.
+                let miss = MISS_EXIT
+                    .with(|m| m.borrow_mut().take())
+                    .filter(|_| known_list)
+                    .zip(deopt_state);
 
                 let after_is_obj = builder.create_block();
                 let fast_block = builder.create_block();
@@ -7298,9 +7348,20 @@ pub mod cl {
                 let masked = builder.ins().band(val, qnan);
                 let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
                 let list_store_block = builder.create_block();
+                let element_block = builder.create_block();
+                let boxed_block = if miss.is_some() {
+                    builder.create_block()
+                } else {
+                    slow_block
+                };
                 builder
                     .ins()
-                    .brif(is_box, slow_block, &[], list_store_block, &[]);
+                    .brif(is_box, boxed_block, &[], list_store_block, &[]);
+                if miss.is_some() {
+                    builder.switch_to_block(boxed_block);
+                    emit_note_list_element(builder, obj_ptr, val);
+                    builder.ins().jump(element_block, &[]);
+                }
                 builder.switch_to_block(list_store_block);
                 let mixed = builder
                     .ins()
@@ -7311,6 +7372,8 @@ pub mod cl {
                     obj_ptr,
                     crate::runtime::object_layout::LIST_ELEM_CLASS,
                 );
+                builder.ins().jump(element_block, &[]);
+                builder.switch_to_block(element_block);
                 let elements =
                     builder
                         .ins()
@@ -7406,6 +7469,22 @@ pub mod cl {
                 // 6. Slow path: runtime handles byte writes +
                 //    validation + anything non-TypedArray.
                 builder.switch_to_block(slow_block);
+                if let Some(((pc, live), (raw_bools, value_types))) = miss {
+                    builder.set_cold_block(slow_block);
+                    emit_deopt_at(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        jit_func_id(),
+                        pc,
+                        &live,
+                        val_map,
+                        raw_bools,
+                        value_types,
+                    )?;
+                    builder.switch_to_block(merge_block);
+                    return Ok(Some(builder.block_params(merge_block)[0]));
+                }
                 let slow_fn = get_runtime_fn(module, builder, "wren_subscript_set", 3)?;
                 emit_cur_frame(builder);
                 let slow_call = builder.ins().call(slow_fn, &[r, idx, val]);
