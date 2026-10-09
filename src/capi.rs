@@ -202,6 +202,25 @@ pub extern "C" fn wrenNewVM(config: *const WrenConfiguration) -> *mut WrenVM {
     Box::into_raw(vm)
 }
 
+/// wasi-libc's thread setup, which its `crt1` runs before anything
+/// else: the thread pointer and the thread list std's thread-local
+/// destructors walk. A program wlift links starts at its own `_start`,
+/// and a host may call into the runtime directly; either way the VM is
+/// made first.
+#[cfg(all(feature = "aot_runtime", target_os = "wasi"))]
+fn wasi_init_tp() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    unsafe extern "C" {
+        fn __wasi_init_tp();
+    }
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::Relaxed) {
+        // SAFETY: wasi-libc's own start-up call, made once before any
+        // thread-local is touched.
+        unsafe { __wasi_init_tp() };
+    }
+}
+
 /// AOT bootstrap VM constructor. The Cranelift-generated
 /// `wlift_aot_main` calls this in place of `wrenNewVM(NULL)` so
 /// the AOT-built binary doesn't inherit the embedding-API
@@ -214,6 +233,8 @@ pub extern "C" fn wrenNewVM(config: *const WrenConfiguration) -> *mut WrenVM {
 #[cfg(feature = "aot_runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
+    #[cfg(target_os = "wasi")]
+    wasi_init_tp();
     // Diagnostic: optional periodic alloc dump (see `alloc_trace`
     // feature in lib.rs). Spawned once per AOT process — the
     // bootstrap calls us before any module init.
