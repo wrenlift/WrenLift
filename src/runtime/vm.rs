@@ -528,6 +528,15 @@ pub struct VM {
     /// means its address-keyed cache is stale.
     #[cfg(feature = "host")]
     collections_seen: u64,
+    /// This view's waits against its running since it last went idle.
+    #[cfg(feature = "host")]
+    idle: IdleClock,
+    /// Bytes allocated as of the last collection this view ran.
+    #[cfg(feature = "host")]
+    allocated_at_collect: usize,
+    /// Collections as of the last time an idle wait handed memory back.
+    #[cfg(feature = "host")]
+    collections_at_trim: u32,
     /// This thread's method cache for fast monomorphic dispatch.
     pub method_cache: super::vm_interp::MethodCache,
     /// Modules currently being loaded (for circular import detection).
@@ -692,6 +701,12 @@ impl VM {
             is_main: false,
             #[cfg(feature = "host")]
             collections_seen: 0,
+            #[cfg(feature = "host")]
+            idle: IdleClock::default(),
+            #[cfg(feature = "host")]
+            allocated_at_collect: 0,
+            #[cfg(feature = "host")]
+            collections_at_trim: 0,
             method_cache: super::vm_interp::MethodCache::new(),
             loading_modules: HashSet::new(),
             fiber: ptr::null_mut(),
@@ -853,6 +868,12 @@ impl VM {
             is_main: true,
             #[cfg(feature = "host")]
             collections_seen: 0,
+            #[cfg(feature = "host")]
+            idle: IdleClock::default(),
+            #[cfg(feature = "host")]
+            allocated_at_collect: 0,
+            #[cfg(feature = "host")]
+            collections_at_trim: 0,
             method_cache: super::vm_interp::MethodCache::new(),
             loading_modules: HashSet::new(),
 
@@ -4037,6 +4058,10 @@ impl VM {
             None
         };
         self.collect_garbage_stopped();
+        #[cfg(feature = "host")]
+        {
+            self.allocated_at_collect = self.gc.stats().total_allocated;
+        }
         #[cfg(all(target_arch = "wasm32", not(feature = "host")))]
         super::tier::forget_collected();
         #[cfg(feature = "host")]
@@ -6038,6 +6063,74 @@ impl Drop for StoppedWorld {
 #[cfg(feature = "host")]
 pub struct Spill([usize; super::stack_scan::SPILL_WORDS]);
 
+/// How long a run of waits must have kept a program idle before a wait
+/// collects.
+#[cfg(feature = "host")]
+const IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
+/// What must have been allocated since the last collection for an idle
+/// one to be worth it.
+#[cfg(feature = "host")]
+const IDLE_BYTES: usize = 8 << 20;
+
+/// A view's time waiting against its time running since it last went
+/// idle. A run of waits stays one idle span while the running between
+/// them is at most a twentieth of it, so a loop that wakes briefly
+/// between short waits is idle and one that works between them is not.
+#[cfg(feature = "host")]
+#[derive(Default)]
+pub(crate) struct IdleClock {
+    since: Option<std::time::Instant>,
+    running: std::time::Duration,
+    woke: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "host")]
+impl IdleClock {
+    fn wait_starts(&mut self, now: std::time::Instant) {
+        if let Some(woke) = self.woke.take() {
+            self.running += now - woke;
+        }
+        let since = *self.since.get_or_insert(now);
+        if self.running * 20 > now - since {
+            self.since = Some(now);
+            self.running = std::time::Duration::ZERO;
+        }
+    }
+
+    fn wait_ends(&mut self, now: std::time::Instant) {
+        self.woke = Some(now);
+    }
+
+    /// When the current idle span will have lasted `IDLE_AFTER`.
+    fn idle_at(&self) -> Option<std::time::Instant> {
+        self.since.map(|since| since + IDLE_AFTER)
+    }
+}
+
+/// `WLIFT_GC_IDLE=0`: no collection while the program waits. Safe to
+/// run with; garbage then stays until something allocates.
+#[cfg(feature = "host")]
+fn idle_collection_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WLIFT_GC_IDLE").is_none_or(|v| v != "0"))
+}
+
+/// Ask the system allocator to return the free pages it holds.
+#[cfg(feature = "host")]
+fn trim_malloc() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 #[cfg(feature = "host")]
 impl Default for Spill {
     fn default() -> Self {
@@ -6166,6 +6259,65 @@ impl VM {
         roots.push(jit_closure);
         roots.push(jit_class);
         roots
+    }
+
+    /// Wait as `wait` does, in a declared blocking wait: safe for a
+    /// collector meanwhile. `wait(until)` returns true when what it waits
+    /// for arrived and false when `until` passed. Once a program has been
+    /// idle for `IDLE_AFTER`, the wait hands the memory collections freed
+    /// back to the OS, collecting first when `IDLE_BYTES` were allocated
+    /// since the last collection, then goes on waiting.
+    pub fn blocking_wait(
+        &mut self,
+        until: Option<std::time::Instant>,
+        mut wait: impl FnMut(Option<std::time::Instant>) -> bool,
+    ) {
+        self.idle.wait_starts(std::time::Instant::now());
+        loop {
+            let due = self.idle_work_due();
+            let stop = match (due, until) {
+                (Some((at, _)), Some(until)) if at < until => Some(at),
+                (Some((at, _)), None) => Some(at),
+                _ => until,
+            };
+            let mut spill = Spill::new();
+            self.enter_safe(&mut spill);
+            let arrived = wait(stop);
+            self.leave_safe();
+            if arrived || stop == until {
+                break;
+            }
+            if due.is_some_and(|(_, collect)| collect) {
+                self.collect_garbage();
+            }
+            self.gc.trim();
+            trim_malloc();
+            self.collections_at_trim = self.gc.stats().collections;
+        }
+        self.idle.wait_ends(std::time::Instant::now());
+    }
+
+    /// When a wait should hand memory back, once the program has been
+    /// idle long enough, and whether it collects first: when it
+    /// allocated enough since the last collection. Nothing to do when no
+    /// collection ran since the last time. None while a native holds
+    /// values a collection would not see, or while other threads run.
+    fn idle_work_due(&self) -> Option<(std::time::Instant, bool)> {
+        if !idle_collection_enabled()
+            || crate::codegen::runtime_fns::collect_suppressed()
+            || self.world.thread_count() > 1
+        {
+            return None;
+        }
+        let stats = self.gc.stats();
+        let collect = stats
+            .total_allocated
+            .saturating_sub(self.allocated_at_collect)
+            >= IDLE_BYTES;
+        if !collect && stats.collections == self.collections_at_trim {
+            return None;
+        }
+        Some((self.idle.idle_at()?, collect))
     }
 
     /// Publish this thread as safe for a collector on another thread:
@@ -6715,6 +6867,63 @@ mod tests {
         let result = vm.interpret("main", source);
         let output = vm.take_output();
         (result, output)
+    }
+
+    /// Short waits with brief running between them are one idle span;
+    /// running for more than a twentieth of the span starts a new one.
+    #[cfg(feature = "host")]
+    #[test]
+    fn idle_clock_spans_short_waits() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut clock = IdleClock::default();
+        clock.wait_starts(ms(0));
+        clock.wait_ends(ms(100));
+        clock.wait_starts(ms(102));
+        clock.wait_ends(ms(200));
+        clock.wait_starts(ms(203));
+        assert_eq!(clock.idle_at(), Some(ms(0) + IDLE_AFTER));
+        clock.wait_ends(ms(300));
+        // Working 80 ms of the 380 is not idle.
+        clock.wait_starts(ms(380));
+        assert_eq!(clock.idle_at(), Some(ms(380) + IDLE_AFTER));
+    }
+
+    /// A wait in an idle program collects when enough was allocated
+    /// since the last collection, and hands memory back once; a later
+    /// wait with nothing new to do does nothing.
+    #[cfg(feature = "host")]
+    #[test]
+    fn an_idle_wait_collects_once() {
+        use std::time::{Duration, Instant};
+        let mut vm = VM::new_default();
+        let result = vm.interpret(
+            "main",
+            "var keep = []\nfor (i in 0...200000) {\n  var s = \"item %(i)\"\n  if (i % 1000 == 0) keep.add(s)\n}\n",
+        );
+        assert_eq!(result, InterpretResult::Success);
+        // As if the last collection ran before the burst.
+        vm.allocated_at_collect = 0;
+        let before = vm.gc.stats().collections;
+        let nap = |until: Option<Instant>| {
+            if let Some(until) = until {
+                std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            }
+            false
+        };
+        vm.blocking_wait(
+            Some(Instant::now() + IDLE_AFTER + Duration::from_millis(100)),
+            nap,
+        );
+        let after = vm.gc.stats().collections;
+        assert_eq!(after, before + 1, "the idle wait collects");
+        assert_eq!(vm.collections_at_trim, after);
+        vm.blocking_wait(
+            Some(Instant::now() + IDLE_AFTER + Duration::from_millis(100)),
+            nap,
+        );
+        assert_eq!(vm.gc.stats().collections, after, "nothing new to collect");
     }
 
     // -- VM creation --

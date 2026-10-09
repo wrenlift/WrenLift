@@ -62,13 +62,19 @@ fn time_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     #[cfg(feature = "host")]
     {
         let vm = ctx.krio_vm_raw_ptr() as *mut VM;
-        let mut spill = crate::runtime::vm::Spill::new();
-        if !vm.is_null() {
-            unsafe { (*vm).enter_safe(&mut spill) };
-        }
-        std::thread::sleep(Duration::from_secs_f64(secs));
-        if !vm.is_null() {
-            unsafe { (*vm).leave_safe() };
+        let end = std::time::Instant::now() + Duration::from_secs_f64(secs);
+        let sleep_until = |until: Option<std::time::Instant>| {
+            let until = until.unwrap_or(end);
+            let now = std::time::Instant::now();
+            if until > now {
+                std::thread::sleep(until - now);
+            }
+            false
+        };
+        if vm.is_null() {
+            sleep_until(Some(end));
+        } else {
+            unsafe { (*vm).blocking_wait(Some(end), sleep_until) };
         }
     }
     #[cfg(not(feature = "host"))]

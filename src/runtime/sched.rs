@@ -858,13 +858,11 @@ impl Sched {
         if let Some(Reverse((when, _, _))) = self.timers.peek() {
             until = Some(until.map_or(*when, |d| d.min(*when)));
         }
-        let mut spill = crate::runtime::vm::Spill::new();
-        unsafe { (*vm).enter_safe(&mut spill) };
-        self.wait_for_wake(until);
-        unsafe { (*vm).leave_safe() };
+        unsafe { (*vm).blocking_wait(until, |until| self.wait_for_wake(until)) };
     }
 
-    fn wait_for_wake(&self, until: Option<Instant>) {
+    /// Wait for a wake or a spawn; false when `until` passed first.
+    fn wait_for_wake(&self, until: Option<Instant>) -> bool {
         let mut wakes = self
             .endpoint
             .wakes
@@ -883,7 +881,7 @@ impl Sched {
                 Some(until) => {
                     let now = Instant::now();
                     if until <= now {
-                        return;
+                        return false;
                     }
                     let (guard, _) = self
                         .endpoint
@@ -901,6 +899,7 @@ impl Sched {
                 }
             }
         }
+        true
     }
 
     /// Step until nothing is ready or `deadline` passes; at least one

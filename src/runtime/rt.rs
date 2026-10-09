@@ -33,7 +33,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Bumped whenever a slot is added, removed or changes signature.
-pub const RT_VERSION: u32 = 6;
+pub const RT_VERSION: u32 = 7;
 
 /// Largest size `alloc_raw` is ever asked for.
 pub const MAX_ALLOC: usize = 32 * 1024;
@@ -173,6 +173,9 @@ runtime_table! {
     scan_range(heap: *mut c_void, lo: usize, hi: usize, visit: Visit, ctx: *mut c_void) = immix::scan_range;
     /// Charge `bytes` held outside the heap against the next collection.
     track_external(heap: *mut c_void, bytes: usize) = immix::track_external;
+    /// Hand the memory the heap holds free back to the OS: the program
+    /// has gone idle after a collection.
+    trim(heap: *mut c_void) = immix::trim;
     /// Have `object_drop` run for the plain allocation at `ptr` once a
     /// cycle finds it dead, as if it had been allocated with `alloc_raw`;
     /// false when `ptr` is not a plain allocation of this heap.
@@ -305,7 +308,7 @@ pub use call::{
     heap_drop, host_poll, host_stop, is_heap_ptr, is_marked, mark_allocation, object_drop,
     object_trace, run_guarded, scan_range, should_collect, stack_drop, stack_new, stack_suspended,
     stack_switch, task_step, task_suspend, thread_running, thread_safe, thread_start, thread_stop,
-    track_external, watch, world_idle, world_live, world_park_drive, world_park_pending,
+    track_external, trim, watch, world_idle, world_live, world_park_drive, world_park_pending,
     world_park_request, world_resume_woken, world_spawn, world_tick, world_waiter_discard,
     world_waiter_new, world_waiter_ready, world_wake, world_workers,
 };
@@ -619,6 +622,10 @@ mod immix {
         unsafe {
             self::heap(heap).track_external(bytes);
         }
+    }
+
+    pub unsafe extern "C" fn trim(heap: *mut c_void) {
+        unsafe { self::heap(heap).hand_back_free_blocks() }
     }
 
     pub unsafe extern "C" fn watch(heap: *mut c_void, ptr: *mut u8) -> bool {

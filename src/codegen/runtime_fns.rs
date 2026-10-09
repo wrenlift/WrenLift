@@ -1976,7 +1976,7 @@ pub fn wasm_stack_here() -> usize {
 }
 
 #[inline(always)]
-fn collect_suppressed() -> bool {
+pub(crate) fn collect_suppressed() -> bool {
     COLLECT_SUPPRESS.with(|c| c.get() != 0)
 }
 

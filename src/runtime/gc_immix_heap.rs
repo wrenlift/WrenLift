@@ -1356,7 +1356,7 @@ impl ImmixHeap {
     /// Return the pages of free blocks beyond the resident float to the
     /// OS. Only called after a quiet collection: a churning workload
     /// would otherwise pay a madvise pair per block per cycle.
-    fn hand_back_free_blocks(&mut self) {
+    pub(crate) fn hand_back_free_blocks(&mut self) {
         let mut pool = self.pool();
         if pool.free_blocks.len() <= RESIDENT_FLOAT {
             return;

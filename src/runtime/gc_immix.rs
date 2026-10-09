@@ -217,6 +217,11 @@ impl ImmixGc {
         unsafe { rt::track_external(self.heap, bytes) };
     }
 
+    /// Hand the memory the heap holds free back to the OS.
+    pub fn trim(&mut self) {
+        unsafe { rt::trim(self.heap) };
+    }
+
     /// True once since the last call if a sweep freed an object that
     /// inline caches or the method cache may point at.
     pub fn take_freed_code_objects(&mut self) -> bool {
