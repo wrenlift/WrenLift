@@ -4317,6 +4317,19 @@ pub mod cl {
                     _ => None,
                 };
                 MISS_EXIT.with(|m| *m.borrow_mut() = miss);
+                // A comparison's raw bool reaches any instruction as a
+                // Wren bool; branches read it raw from the terminator.
+                let raw_operands: Vec<(ValueId, Value)> = inst
+                    .operands()
+                    .into_iter()
+                    .filter(|o| raw_bools.contains(o))
+                    .filter_map(|o| val_map.get(&o).map(|v| (o, *v)))
+                    .collect();
+                for (o, raw) in &raw_operands {
+                    let boxed = box_raw_bool_if_needed(builder, *raw, true);
+                    val_map.insert(*o, boxed);
+                    raw_bools.remove(o);
+                }
                 KNOWN_LIST.set(match inst {
                     Instruction::SubscriptGet { receiver, .. }
                     | Instruction::SubscriptSet { receiver, .. } => {
@@ -4346,6 +4359,10 @@ pub mod cl {
                 )?;
                 MISS_EXIT.with(|m| m.borrow_mut().take());
                 KNOWN_LIST.set(false);
+                for (o, raw) in raw_operands {
+                    val_map.insert(o, raw);
+                    raw_bools.insert(o);
+                }
                 if let Instruction::GuardClassAt { value, class, .. } = inst
                     && *class == list_class
                 {
@@ -8257,7 +8274,8 @@ pub mod cl {
 
         match term {
             Terminator::Return(val) => {
-                let v = get(val);
+                // A comparison's raw bool leaves as a Wren bool.
+                let v = box_raw_bool_if_needed(builder, get(val), raw_bools.contains(val));
                 // Coerce to the function's declared return type. The outer
                 // JIT calling convention is i64 (NaN-boxed); the f64
                 // inner-specialized helpers return f64. When the live value's

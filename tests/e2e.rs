@@ -1976,6 +1976,80 @@ System.print(total)
     );
 }
 
+/// A comparison compiled to a raw bool reaches calls, stores, lists,
+/// other comparisons and `return` as a Wren bool.
+#[test]
+fn e2e_tiered_comparison_results_stay_bools() {
+    let source = r#"
+class Box {
+  construct new() { _v = null }
+  v { _v }
+  v=(x) { _v = x }
+}
+class K {
+  static id(x) { x }
+  static run(n) {
+    var l = []
+    var b = Box.new()
+    var t = 0
+    var i = 0
+    var c = 0
+    while (i < n) {
+      t = t + 0.5
+      var g = t > 3
+      var e = t == 4
+      if (i == n - 1) {
+        l.add(g)
+        b.v = e
+        System.print(K.id(g))
+        System.print(g == true)
+        System.print([g, e, !g])
+      }
+      if (g) c = c + 1
+      i = i + 1
+    }
+    System.print(l)
+    System.print(b.v)
+    return c
+  }
+}
+for (r in 0...3) System.print(K.run(20000))
+class Q {
+  static positive(t) {
+    var s = t
+    var i = 0
+    while (i < 1000) {
+      s = s + 1
+      i = i + 1
+    }
+    return s > 0
+  }
+}
+for (r in 0...200) Q.positive(r)
+System.print(Q.positive(1))
+"#;
+    let line = "true\ntrue\n[true, false, false]\n[true]\nfalse\n19994\n";
+    let expected = line.repeat(3) + "true\n";
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            jit_threshold: 5,
+            ..Default::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", source);
+        let output = vm.take_output();
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}\n{}",
+            mode,
+            result,
+            output
+        );
+        assert_eq!(output, expected, "{:?} comparison results", mode);
+    }
+}
+
 /// A body without calls takes guards on the arguments it has only seen
 /// as Nums, and a later argument of another class leaves through them.
 #[test]
