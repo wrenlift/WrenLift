@@ -1,7 +1,7 @@
 # Wren, WrenJIT and WrenLift on the same scripts
 
-`compare.py` runs every kernel in this repository's `bench/` and
-`bench/ash/`, plus the two scripts WrenJIT publishes its own numbers from,
+`compare.py` runs every kernel in this repository's `bench/`, its
+larger variants, and the two scripts WrenJIT publishes its own numbers from,
 on upstream Wren, WrenJIT and WrenLift. It is not part of CI.
 
 ## What is timed
@@ -24,8 +24,8 @@ crash or an error is reported and not timed.
 
 - `bench/*.wren`: the Benchmarks Game set and the classic Wren
   benchmarks this repository tracks in CI.
-- `bench/ash/*.wren`: call-, dispatch- and arithmetic-heavy kernels at
-  larger sizes.
+- `name (large)`: call-, dispatch- and arithmetic-heavy kernels at
+  larger sizes, kept in a subdirectory of `bench/`.
 - `bench/compare/wrenjit/`: `gc.wren` and `jit.wren` from WrenJIT's
   `scripts/` directory, unchanged apart from a header naming their source
   (MIT). WrenJIT's `mandelbrot (+ others)` row is `jit.wren`. Its
@@ -59,7 +59,7 @@ python3 bench/compare/compare.py \
 On Linux, `--pin 4-7` runs every engine under `taskset` on the same
 cores, which keeps a hybrid CPU's efficiency cores out of the
 comparison; pick its physical performance cores. `--only fib
-ash/nbody` runs a subset. The report ends with the machine, OS and
+'nbody (large)'` runs a subset. The report ends with the machine, OS and
 engine paths; record the engines' revisions and compilers beside it,
 as `results.md` does.
 

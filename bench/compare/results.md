@@ -40,15 +40,15 @@ Median of 7 runs of each kernel's measured region (`System.clock`). Lower is bet
 | `regex_redux` | 825 ms | fails ‡ | 121 ms |
 | `reverse_complement` | 76.7 ms | 127 ms | 25.0 ms |
 | `spectral_norm` | 816 ms | 1157 ms † | 33.3 ms |
-| `ash/binary_trees` | 4044 ms | fails ‡ | 569 ms |
-| `ash/closure_call` | 5767 ms | fails ‡ | 82.9 ms |
-| `ash/dyn_dispatch` | 550 ms | fails ‡ | 120 ms |
-| `ash/fib` | 9035 ms | 13660 ms | 425 ms |
-| `ash/free_call` | 5710 ms | 3762 ms | 125 ms |
-| `ash/inlined_call` | 4586 ms | 3703 ms | 75.3 ms |
-| `ash/mandelbrot` | 20186 ms | fails ‡ | 265 ms |
-| `ash/method_call` | 5645 ms | fails ‡ | 81.1 ms |
-| `ash/nbody` | 52758 ms | fails ‡ | 688 ms |
+| `binary_trees (large)` | 4044 ms | fails ‡ | 569 ms |
+| `closure_call (large)` | 5767 ms | fails ‡ | 82.9 ms |
+| `dyn_dispatch (large)` | 550 ms | fails ‡ | 120 ms |
+| `fib (large)` | 9035 ms | 13660 ms | 425 ms |
+| `free_call (large)` | 5710 ms | 3762 ms | 125 ms |
+| `inlined_call (large)` | 4586 ms | 3703 ms | 75.3 ms |
+| `mandelbrot (large)` | 20186 ms | fails ‡ | 265 ms |
+| `method_call (large)` | 5645 ms | fails ‡ | 81.1 ms |
+| `nbody (large)` | 52758 ms | fails ‡ | 688 ms |
 | `wrenjit/gc` | 61.8 ms | 176 ms | 24.4 ms |
 | `wrenjit/jit` | 8743 ms | 318 ms | 339 ms |
 
@@ -74,15 +74,15 @@ Higher is better: the other engine's time over WrenLift's.
 | `regex_redux` | 6.82x | — |
 | `reverse_complement` | 3.07x | 5.09x |
 | `spectral_norm` | 24.50x | 34.73x |
-| `ash/binary_trees` | 7.10x | — |
-| `ash/closure_call` | 69.54x | — |
-| `ash/dyn_dispatch` | 4.59x | — |
-| `ash/fib` | 21.28x | 32.17x |
-| `ash/free_call` | 45.65x | 30.08x |
-| `ash/inlined_call` | 60.92x | 49.18x |
-| `ash/mandelbrot` | 76.20x | — |
-| `ash/method_call` | 69.62x | — |
-| `ash/nbody` | 76.73x | — |
+| `binary_trees (large)` | 7.10x | — |
+| `closure_call (large)` | 69.54x | — |
+| `dyn_dispatch (large)` | 4.59x | — |
+| `fib (large)` | 21.28x | 32.17x |
+| `free_call (large)` | 45.65x | 30.08x |
+| `inlined_call (large)` | 60.92x | 49.18x |
+| `mandelbrot (large)` | 76.20x | — |
+| `method_call (large)` | 69.62x | — |
+| `nbody (large)` | 76.73x | — |
 | `wrenjit/gc` | 2.54x | 7.22x |
 | `wrenjit/jit` | 25.83x | 0.94x |
 
@@ -96,10 +96,10 @@ Higher is better: the other engine's time over WrenLift's.
 - `mandelbrot` on wrenjit: fail: runtime error: method MethodSymbol#179 is not defined for receiver at FuncId#10:BytecodePc(5)
 - `method_call` on wrenjit: fail: runtime error: entered fused-away instruction at FuncId#3:BytecodePc(2)
 - `nbody` on wrenjit: fail: runtime error: entered fused-away instruction at FuncId#9:BytecodePc(2)
-- `regex_redux` on wrenjit: fail: thread 'main' (1860460) panicked at /home/raikage/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-fronten
-- `ash/binary_trees` on wrenjit: fail: runtime error: method MethodSymbol#0 is not defined for receiver at FuncId#3:BytecodePc(3)
-- `ash/closure_call` on wrenjit: fail: runtime error: method MethodSymbol#99 is not defined for receiver at FuncId#3:BytecodePc(34)
-- `ash/dyn_dispatch` on wrenjit: fail: thread 'main' (1860933) panicked at /home/raikage/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cranelift-fronten
-- `ash/mandelbrot` on wrenjit: fail: runtime error: method MethodSymbol#184 is not defined for receiver at FuncId#10:BytecodePc(5)
-- `ash/method_call` on wrenjit: fail: runtime error: method MethodSymbol#169 is not defined for receiver at FuncId#7:BytecodePc(33)
-- `ash/nbody` on wrenjit: fail: runtime error: entered fused-away instruction at FuncId#9:BytecodePc(2)
+- `regex_redux` on wrenjit: fail: panic in cranelift-frontend's SSA builder
+- `binary_trees (large)` on wrenjit: fail: runtime error: method MethodSymbol#0 is not defined for receiver at FuncId#3:BytecodePc(3)
+- `closure_call (large)` on wrenjit: fail: runtime error: method MethodSymbol#99 is not defined for receiver at FuncId#3:BytecodePc(34)
+- `dyn_dispatch (large)` on wrenjit: fail: panic in cranelift-frontend's SSA builder
+- `mandelbrot (large)` on wrenjit: fail: runtime error: method MethodSymbol#184 is not defined for receiver at FuncId#10:BytecodePc(5)
+- `method_call (large)` on wrenjit: fail: runtime error: method MethodSymbol#169 is not defined for receiver at FuncId#7:BytecodePc(33)
+- `nbody (large)` on wrenjit: fail: runtime error: entered fused-away instruction at FuncId#9:BytecodePc(2)

@@ -34,13 +34,13 @@ NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
 
 def kernels(selected):
-    """Our kernels, the Ash-mirrored ones, and WrenJIT's own two scripts."""
+    """Our kernels, their larger variants, and WrenJIT's own two scripts."""
     found = []
     for path in sorted(BENCH.glob("*.wren")):
         if not path.name.startswith("test_"):
             found.append((path.stem, path))
     for path in sorted((BENCH / "ash").glob("*.wren")):
-        found.append(("ash/" + path.stem, path))
+        found.append((path.stem + " (large)", path))
     for path in sorted((HERE / "wrenjit").glob("*.wren")):
         found.append(("wrenjit/" + path.stem, path))
     if selected:
@@ -77,7 +77,9 @@ def run_once(engine, script, timeout, pin):
     if proc.returncode != 0 or elapsed is None:
         err = (proc.stderr or out).strip().splitlines()
         reason = next((l for l in err if l.strip()), f"exit {proc.returncode}")
-        return None, "\n".join(kept), re.sub(r"\x1b\[[0-9;]*m", "", reason)[:120]
+        reason = re.sub(r"\x1b\[[0-9;]*m", "", reason)
+        reason = re.sub(r"panicked at \S+", "panicked", reason)
+        return None, "\n".join(kept), reason[:120]
     return elapsed, "\n".join(kept), ""
 
 
@@ -165,7 +167,7 @@ def main():
     p.add_argument("--runs", type=int, default=7)
     p.add_argument("--timeout", type=int, default=300, help="seconds per run")
     p.add_argument("--pin", default="", help="CPU list for taskset on Linux, e.g. 4-7")
-    p.add_argument("--only", nargs="*", help="kernel names, e.g. fib ash/nbody")
+    p.add_argument("--only", nargs="*", help="kernel names, e.g. fib 'nbody (large)'")
     p.add_argument("--out", help="also write the Markdown report here")
     args = p.parse_args()
     engines = {name: getattr(args, name) for name in ENGINES}
