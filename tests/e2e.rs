@@ -1976,6 +1976,53 @@ System.print(total)
     );
 }
 
+/// A body without calls takes guards on the arguments it has only seen
+/// as Nums, and a later argument of another class leaves through them.
+#[test]
+fn e2e_tiered_argument_guard_without_calls() {
+    let source = r#"
+class V {
+  construct new(n) { _n = n }
+  n { _n }
+  *(o) { V.new(_n * o.n) }
+  +(o) { V.new(_n + o.n) }
+}
+class K {
+  static sum(a, b, n) {
+    var s = a
+    var i = 0
+    while (i < n) {
+      s = s + a * b
+      i = i + 1
+    }
+    return s
+  }
+}
+var t = 0
+for (r in 0...2000) t = t + K.sum(1, 2, 50)
+System.print(t)
+System.print(K.sum(V.new(1), V.new(2), 3).n)
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            jit_threshold: 5,
+            ..Default::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", source);
+        let output = vm.take_output();
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}\n{}",
+            mode,
+            result,
+            output
+        );
+        assert_eq!(output.trim(), "202000\n7", "{:?} argument guard", mode);
+    }
+}
+
 /// Number equality the top tier specialises on guarded list elements
 /// and arguments: signed zeros are equal and NaN equals nothing.
 #[test]

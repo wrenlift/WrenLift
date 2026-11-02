@@ -4017,7 +4017,12 @@ impl ExecutionEngine {
                 });
             }
         }
-        if sites.is_empty() {
+        // A body without calls can still take guards on its arguments.
+        let num_args = mir.blocks[0].instructions.iter().any(|(vid, inst)| {
+            matches!(inst, Instruction::BlockParam(idx) if *idx > 0)
+                && result_kinds.get(vid.0 as usize).copied() == Some(RESULT_NUM)
+        });
+        if sites.is_empty() && !num_args {
             return mir;
         }
         let sources = DeoptSources::new(authoritative, &mir);
