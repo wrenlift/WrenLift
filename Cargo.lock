@@ -378,8 +378,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beadie"
-version = "0.3.0"
-source = "git+https://github.com/darmie/beadie.git?rev=c403f29c8dd66635b545debcd2406847f613470e#c403f29c8dd66635b545debcd2406847f613470e"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "491642727ad8a2b8a971a8bd686963a3d94a052f0c746ffc32962038b0a46320"
 dependencies = [
  "beadie-backend",
  "beadie-core",
@@ -387,8 +388,9 @@ dependencies = [
 
 [[package]]
 name = "beadie-backend"
-version = "0.3.0"
-source = "git+https://github.com/darmie/beadie.git?rev=c403f29c8dd66635b545debcd2406847f613470e#c403f29c8dd66635b545debcd2406847f613470e"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03458e7d6cbce507df483635b4a0867a7c5502035cda77b410d898faf1bf4ba4"
 dependencies = [
  "beadie-core",
  "crossbeam-channel",
@@ -397,8 +399,9 @@ dependencies = [
 
 [[package]]
 name = "beadie-core"
-version = "0.3.0"
-source = "git+https://github.com/darmie/beadie.git?rev=c403f29c8dd66635b545debcd2406847f613470e#c403f29c8dd66635b545debcd2406847f613470e"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "767cce434a85a0a82a622746cace3237c2c24c2b19045099cb46c873ccc412ec"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
